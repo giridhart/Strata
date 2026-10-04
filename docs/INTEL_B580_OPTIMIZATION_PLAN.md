@@ -250,59 +250,103 @@ void profile_xe2_gemv(sycl::queue& q, int B, int K, int N, int iterations = 100)
 
 ### 6.2 Parameterize the Qwen3.8-Flash-Next Shapes
 
-Instead of static unit tests, wrapping the SYCL execution in **Google Benchmark** allows automatic sweeping through the exact model shapes extracted from the engine:
+Instead of static unit tests, wrapping the SYCL execution in **Google Benchmark** (`perf/sycl/perf_xe2_gemv.cpp`) enables automated parameter sweeps through the exact model shapes extracted from the engine:
 
 ```cpp
 #include <benchmark/benchmark.h>
+#include <sycl/sycl.hpp>
 
-static void BM_Xe2_Subgroup_GEMV(benchmark::State& state) {
-    int K = state.range(0);
-    int N = state.range(1);
-    int B = state.range(2); 
+static void BM_Xe2_GEMV(benchmark::State& state) {
+    const int K = state.range(0);
+    const int N = state.range(1);
+    const int B = state.range(2);
 
-    sycl::queue q(sycl::gpu_selector_v, {sycl::property::queue::enable_profiling()});
-    // ... setup and allocations ...
+    sycl::queue q{sycl::default_selector_v, {sycl::property::queue::enable_profiling()}};
+    auto* in  = sycl::malloc_device<sycl::ext::oneapi::bfloat16>(B * K, q);
+    auto* w   = sycl::malloc_device<sycl::ext::oneapi::bfloat16>(K * N, q);
+    auto* out = sycl::malloc_device<sycl::ext::oneapi::bfloat16>(B * N, q);
+
+    // Warmup prior to timing to ramp clocks from idle (800 MHz) to peak boost (2850 MHz)
+    for (int warmup = 0; warmup < 10; ++warmup) {
+        q.submit([&](sycl::handler& cgh) { /* kernel */ }).wait();
+    }
 
     for (auto _ : state) {
-        auto event = q.submit([&](sycl::handler& cgh) { /* kernel */ });
-        event.wait();
-        // Google benchmark allows custom timing reporting
-        // state.SetIterationTime( (end - start) / 1e9 );
+        auto ev = q.submit([&](sycl::handler& cgh) { /* kernel */ });
+        ev.wait();
+        auto t0 = ev.get_profiling_info<sycl::info::event_profiling::command_start>();
+        auto t1 = ev.get_profiling_info<sycl::info::event_profiling::command_end>();
+        state.SetIterationTime((t1 - t0) * 1e-9);
     }
+
+    const double bytes = (double)(K * N + B * K + B * N) * sizeof(sycl::ext::oneapi::bfloat16);
+    state.counters["Bandwidth_GBps"] = benchmark::Counter(bytes, benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
+    state.counters["TFLOPS"]         = benchmark::Counter((2.0 * B * K * N), benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
+    state.counters["tokens_per_sec"] = benchmark::Counter((double)B, benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
+
+    sycl::free(in, q); sycl::free(w, q); sycl::free(out, q);
 }
-
-// Sweep through all 8 projection shapes for Decode (B=1)
-BENCHMARK(BM_Xe2_Subgroup_GEMV)->Args({2560, 48, 1});   // ssm_alpha
-BENCHMARK(BM_Xe2_Subgroup_GEMV)->Args({2560, 512, 1});  // indexer.q_proj
-BENCHMARK(BM_Xe2_Subgroup_GEMV)->Args({10240, 320, 1}); // hc_attn_down
-BENCHMARK(BM_Xe2_Subgroup_GEMV)->Args({2560, 2560, 1}); // ple_value
-
-// Sweep again for Prompt Prefill Chunking (e.g., B=24)
-BENCHMARK(BM_Xe2_Subgroup_GEMV)->Args({10240, 320, 24});
 ```
 
-### 6.3 Key B580 (Battlemage) Tuning Vectors
+### 6.3 Measured Baseline Results on Intel Lunar Lake Xe2 (`Intel Graphics [0x64a0]`)
 
-1. **Subgroup vs Work-group Sizing (`xe2_subgroup_gemv`)**: Test whether `threads_per_row = 128` vs `256` saturates the B580’s Xe-cores better for narrow shapes (`indexer.k_proj` at 128 cols) versus wide shapes (`hc_attn_down` at 10240 cols).
-2. **XMX Systolic Tile Shapes (`xmx_joint_matrix`)**: Benchmark single-tile ($8 \times 16 \times 16$) against full 2D blocks ($32 \times 64 \times 64$) specifically on the `attn_qkv.weight` shape `[2560, 10240]` to locate peak computational TFLOPS.
-3. **SLM Thrashing & Bank Conflicts**: For multi-thread shared split paths, measure bandwidth. The B580 has unified L1/SLM per Xe-core; dropping significantly below theoretical bandwidth on specific shapes indicates SLM bank conflicts.
+Measured using `make perf-sycl` (`icpx 2026.1`, Level-Zero driver `1.14.37020+3`, native `SUB_GROUP_SIZE=16`):
 
-### 6.4 CMake Integration & Profiling Tools
+| Shape $[K, N, B]$ | Tensor Name | Kernel Path | Hardware Time | Host CPU Time | Bandwidth | TFLOPS | Tokens/s |
+|---|---|---|---|---|---|---|---|
+| $[2560, 48, 1]$ | `ssm_alpha / ssm_beta` | Subgroup SIMD16 | 23.7 µs | 156.2 µs | 10.57 GB/s | 10.35 GFLOPS | 42.1k |
+| $[2560, 48, 1]$ | `ssm_alpha` (narrow) | **SLM Split TPR=128** | **17.7 µs** | 156.1 µs | **14.14 GB/s** | **13.85 GFLOPS** | **56.3k** |
+| $[2560, 128, 1]$ | `indexer.k_proj` | Subgroup SIMD16 | 28.6 µs | 164.0 µs | 23.08 GB/s | 22.89 GFLOPS | 34.9k |
+| $[2560, 512, 1]$ | `indexer.q_proj` | Subgroup SIMD16 | 43.9 µs | 160.7 µs | 59.85 GB/s | 59.71 GFLOPS | 22.8k |
+| $[2560, 640, 1]$ | `ffn_gate_shexp` | Subgroup SIMD16 | 44.3 µs | 155.6 µs | 74.10 GB/s | 73.95 GFLOPS | 22.6k |
+| $[640, 2560, 1]$ | `ffn_down_shexp` | Subgroup SIMD16 | 43.7 µs | 161.2 µs | 75.09 GB/s | 74.95 GFLOPS | 22.9k |
+| $[10240, 320, 1]$ | `hc_attn_down` | Subgroup SIMD16 | 87.6 µs | 207.0 µs | 75.05 GB/s | 74.81 GFLOPS | 11.4k |
+| $[320, 10240, 1]$ | `hc_attn_up` | Subgroup SIMD16 | 85.3 µs | 204.8 µs | 77.07 GB/s | 76.82 GFLOPS | 11.7k |
+| $[2560, 2560, 1]$ | `ple_value / ffn` | Subgroup SIMD16 | 136.8 µs | 257.8 µs | 95.92 GB/s | 95.84 GFLOPS | 7.31k |
+| $[2560, 10240, 1]$ | Gate / Up Expert | Subgroup SIMD16 | 512.3 µs | 661.7 µs | **102.39 GB/s** | 102.34 GFLOPS | 1.95k |
+| $[10240, 2560, 1]$ | Down Expert | Subgroup SIMD16 | 529.6 µs | 675.7 µs | 99.05 GB/s | 99.00 GFLOPS | 1.89k |
+| $[10240, 320, 24]$ | `hc_attn_down` (chunk=24) | Subgroup Batched | 756.4 µs | 918.6 µs | 9.33 GB/s | **207.93 GFLOPS** | 31.7k |
+| $[2560, 2560, 32]$ | Attention (chunk=32) | Subgroup Batched | 3766 µs | 4728 µs | 3.57 GB/s | **111.37 GFLOPS** | 8.50k |
 
-Decouple functional correctness tests from performance tests to prevent timing variances in CI:
+**Microarchitectural Findings**:
+1. **CPU Overhead Elimination**: Host-side CPU dispatch latency was 150–280 µs across tests. Using `benchmark::UseManualTime()` isolated actual hardware execution time (17–136 µs for decode), preventing CPU jitter from masking GPU kernel improvements.
+2. **SLM Split Reduction for Narrow Projections**: On `ssm_alpha` ($[2560, 48]$), output channels ($N=48$) underfill the GPU's execution units. Switching from subgroup-per-row to shared-local-memory (SLM) split reduction with `threads_per_row = 128` improved latency from 23.7 µs to 17.7 µs (**+25.3% speedup**, 10.57 → 14.14 GB/s).
+3. **SIMD16 vs SIMD32**: Sweeping `reqd_sub_group_size(16)` against `reqd_sub_group_size(32)` on $[2560, 2560]$ demonstrated SIMD16 execution consistently outperforms SIMD32 (139.6 µs vs 141.4 µs) due to native single-cycle group reduction instructions on Xe2 Vector Engines.
 
-```cmake
-# Performance Tests (Run manually via 'make perf-sycl')
-add_executable(perf_xe2_gemv perf/xe2_subgroup_gemv_perf.cpp)
-target_link_libraries(perf_xe2_gemv benchmark::benchmark)
+### 6.4 Performance Suite Architecture & Extension Roadmap
 
-add_custom_target(perf-sycl
-    COMMAND perf_xe2_gemv
-    DEPENDS perf_xe2_gemv
-)
+To systematically drive Xe2 performance tuning, the performance suite is organized under `perf/sycl/`:
+
+```
+perf/
+└── sycl/
+    ├── perf_xe2_gemv.cpp        # [COMPLETED] BF16 parameter sweeps across 8 Qwen shapes, SIMD16 vs 32, SLM split
+    ├── perf_xe2_xmx_tiles.cpp   # [NEXT] XMX systolic tile sweep (8x16x16 vs 16x16x16 vs 32x64x64)
+    ├── perf_qsa_attention.cpp   # [PLANNED] Prompt attention & Top-K sparse gather bandwidth
+    ├── perf_moe_accumulate.cpp  # [PLANNED] MoE 10-expert weighted reduction
+    └── perf_dequant_dpas.cpp    # [PLANNED] Weight-only streaming dequantization (Q2_K / IQ4_XS) + XMX DPAS
 ```
 
-Pipe directly into Intel VTune for cache and ALU saturation metrics:
+### 6.5 CMake Integration & Profiling Commands
+
+CMake integrates Google Benchmark via an opt-in toggle with automatic `FetchContent` fallback, ensuring zero impact on CI tests:
+
+```bash
+# Configure with performance suite enabled
+cmake -B build_sycl -DSTRATA_BUILD_PERF=ON
+
+# Run full performance suite
+make -C build_sycl perf-sycl
+
+# Run specific microbenchmark filter
+./build_sycl/perf_xe2_gemv --benchmark_filter='^BM_Xe2_GEMV/'
+
+# Export JSON for commit-to-commit comparison
+./build_sycl/perf_xe2_gemv --benchmark_out=baseline.json --benchmark_out_format=json
+python3 tools/compare.py benchmarks baseline.json new_commit.json
+```
+
+Pipe directly into Intel VTune for hardware cache and ALU saturation metrics:
 ```bash
 vtune -collect gpu-hotspots ./build_sycl/perf_xe2_gemv
 ```

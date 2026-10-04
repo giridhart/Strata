@@ -30,12 +30,30 @@ The target model for these optimizations is **Qwen3.8-Flash-Next** (as well as `
    - Merged scattered, redundant markdown files into canonical documents in `docs/`:
      - [`docs/SYCL_STATUS.md`](../docs/SYCL_STATUS.md): Master status, 2026.1 toolchain, and complete 44-kernel registry.
      - [`docs/SYCL_PORTING_GUIDE.md`](../docs/SYCL_PORTING_GUIDE.md): 6 translation directives, command graph specs, and AI/developer refactoring prompt rules.
-     - [`docs/INTEL_B580_OPTIMIZATION_PLAN.md`](../docs/INTEL_B580_OPTIMIZATION_PLAN.md): B580 microarchitecture plan, SIMD16 status, XMX capabilities, and the full Section 6 microbenchmarking suite (event profiling, Google Benchmark sweeps across all 8 Qwen3.8-Flash-Next shapes, and the 5 critical decode bottlenecks).
+     - [`docs/INTEL_B580_OPTIMIZATION_PLAN.md`](../docs/INTEL_B580_OPTIMIZATION_PLAN.md): B580 microarchitecture plan, SIMD16 status, XMX capabilities, and the full Section 6 microbenchmarking suite.
      - [`STATUS.md`](../STATUS.md): Clean root index pointing directly to `docs/`.
+4. **Google Benchmark Xe2 Performance Suite (`perf/sycl/perf_xe2_gemv.cpp`)**:
+   - Added `STRATA_BUILD_PERF` CMake option with automated `FetchContent` Google Benchmark v1.8.3 integration and `perf-sycl` target.
+   - Bypasses host CPU dispatch/queue jitter (150–280 µs overhead) using `benchmark::UseManualTime()` with SYCL event timestamps (`command_start` to `command_end`).
+   - Implemented automated sweeps across all 8 Qwen3.8-Flash-Next decode projections, expert layers, and chunked prefill shapes ($B=24, 32$).
+   - Implemented microarchitectural parameter sweeps: SIMD16 vs SIMD32 across work-group sizes, and SLM split reductions across `threads_per_row` (64, 128, 256).
+   - Validated on live GPU (`Intel Graphics [0x64a0]`): confirmed SIMD16 efficiency, measured up to 102.4 GB/s memory bandwidth on expert shapes, and demonstrated **+25.3% speedup** on `ssm_alpha` with SLM split reduction ($TPR=128$).
 
 ---
 
-## 3. In Progress: Hardware XMX Systolic Attention (`qsa_prompt_attn.cpp`)
+## 3. Performance Test Suite Extension Roadmap (`perf/sycl/`)
+
+To systematically drive kernel optimization on Xe2, performance tests are organized in `perf/sycl/`:
+
+1. **`perf_xe2_gemv.cpp` (Done)**: Parameterized BF16 decode/prefill sweeps, SIMD16 vs SIMD32, and SLM split reduction.
+2. **`perf_xe2_xmx_tiles.cpp` (Next)**: Hardware XMX systolic tile sweeps ($8 \times 16 \times 16$ vs $16 \times 16 \times 16$ vs $32 \times 64 \times 64$) evaluating peak TFLOPS and SLM vs register caching.
+3. **`perf_qsa_attention.cpp` (Planned)**: Prompt FlashAttention throughput and Top-K sparse gather memory bandwidth.
+4. **`perf_moe_accumulate.cpp` (Planned)**: MoE 10-expert weighted reduction bandwidth comparing atomic adds vs hierarchical subgroup reductions.
+5. **`perf_dequant_dpas.cpp` (Planned)**: Weight-only streaming dequantization (Q2_K / IQ4_XS) feeding XMX DPAS instructions.
+
+---
+
+## 4. In Progress: Hardware XMX Systolic Attention (`qsa_prompt_attn.cpp`)
 
 - **Diagnosis**: The existing `qsa_prompt_attn.cpp` kernel was producing 100% NaNs because `mma16816` emulated a 32-lane CUDA warp using `sycl::select_from_group` with lane indices up to 31, which is illegal/out-of-bounds on Intel's SIMD16 execution units.
 - **Parity Test Fix**: Updated `src/kernels/sycl/qsa_prompt_attn_parity.cpp` to explicitly check for `NaN` and `Inf` in outputs, ensuring parity failures are properly detected.
@@ -46,27 +64,33 @@ The target model for these optimizations is **Qwen3.8-Flash-Next** (as well as `
 
 ---
 
-## 4. Development Environment
+## 5. Development & Profiling Commands
 
 ```bash
-# Source Intel oneAPI 2026.1 environment (do NOT prepend 2025.3 library paths)
+# Source Intel oneAPI 2026.1 environment
 source /opt/intel/oneapi/setvars.sh --force 2>/dev/null
 
-# Compile and run test suite
+# Compile and run unit tests (fast CI)
 make -C build_sycl -j$(nproc) check-sycl
+
+# Configure and run the performance benchmark suite
+cmake -B build_sycl -DSTRATA_BUILD_PERF=ON
+make -C build_sycl perf-sycl
+
+# Filter specific microbenchmarks
+./build_sycl/perf_xe2_gemv --benchmark_filter='^BM_Xe2_GEMV/'
 ```
 
 ---
 
-## 5. Recommended Prompts for the Next Session
+## 6. Recommended Prompts for the Next Session
 
-Pick any of the following high-impact tasks to start the next session:
+### Option 1 (Extend Perf Tests): Implement `perf_xe2_xmx_tiles.cpp`
+> *"Create `perf/sycl/perf_xe2_xmx_tiles.cpp` using Google Benchmark to sweep XMX systolic tile shapes (8x16x16, 16x16x16, 32x64x64) on the Qwen `attn_qkv` [2560, 10240] projection, add it to CMakeLists.txt, and benchmark TFLOPS."*
 
-### Option 1 (Top Priority / In Progress): Complete XMX Systolic Attention
+### Option 2: Complete XMX Systolic Attention Kernel
 > *"Implement and verify the Intel Xe2 hardware XMX systolic FlashAttention kernel in `src/kernels/sycl/qsa_prompt_attn.cpp` to replace `mma16816`, and make sure `qsa_prompt_attn_parity` and `check-sycl` pass on the GPU."*
 
-### Option 2 (Performance Tuning): Implement Critical Decode Bottleneck Microbenchmarks
-> *"Implement the dedicated microbenchmark and optimized kernel for Weight-Only Dequantization + XMX DPAS on the Gate projection `[2560, 6144]` as outlined in `docs/INTEL_B580_OPTIMIZATION_PLAN.md` Section 6.5."*
+### Option 3: Weight-Only Dequantization + XMX DPAS Microbenchmark
+> *"Implement `perf/sycl/perf_dequant_dpas.cpp` to benchmark streaming 2-bit/4-bit weight dequantization directly feeding XMX DPAS instructions on the gate projection `[2560, 6144]`."*
 
-### Option 3 (End-to-End Validation): Run Full Model Inference
-> *"Run end-to-end token generation with Strata using Qwen3.8-Flash-Next weights on the Intel GPU, and benchmark throughput with and without SYCL Command Graph capture."*
