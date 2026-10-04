@@ -29,6 +29,10 @@ The Strata native SYCL 2020 backend documentation has been consolidated into the
 # Source Intel oneAPI 2026.1 environment
 source /opt/intel/oneapi/setvars.sh --force 2>/dev/null
 
-# Compile and run SYCL test suite on GPU
+# Compile and run SYCL unit test suite on GPU (CI fast check)
 make -C build_sycl -j$(nproc) check-sycl
+
+# Build and run Intel Xe2 performance tuning suite (Google Benchmark)
+cmake -B build_sycl -DSTRATA_BUILD_PERF=ON
+make -C build_sycl perf-sycl
 ```
