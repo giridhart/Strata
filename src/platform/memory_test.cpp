@@ -11,6 +11,8 @@
 #include <windows.h>
 #include <psapi.h>
 #pragma comment(lib, "psapi.lib")
+#elif defined(__linux__)
+#include <sys/resource.h>
 #endif
 
 namespace {
@@ -76,6 +78,15 @@ int file_cache_keeps_cases() {
 int main() {
     int fail_keeps = file_cache_keeps_cases();
     const uint64_t bytes = 256ull << 20;
+#if defined(__linux__)
+    struct rlimit rl{};
+    if (getrlimit(RLIMIT_MEMLOCK, &rl) == 0 && rl.rlim_cur != RLIM_INFINITY && rl.rlim_cur < bytes) {
+        std::printf("platform_memory_test: SKIP (ulimit -l is %llu KiB, need %llu KiB for 256 MiB test)\n",
+                    (unsigned long long)(rl.rlim_cur >> 10),
+                    (unsigned long long)(bytes >> 10));
+        return 77;
+    }
+#endif
     void* p = std::malloc(bytes);
     if (p == nullptr) return 2;
     std::memset(p, 1, bytes);

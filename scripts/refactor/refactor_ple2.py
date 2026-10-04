@@ -1,0 +1,62 @@
+import re
+
+with open('src/kernels/sycl/ple.dp.cpp', 'r') as f:
+    text = f.read()
+
+# Headers
+text = text.replace('#include <dpct/dpct.hpp>', '#include <cstdint>')
+
+# Macros
+text = text.replace('__dpct_inline__', 'inline')
+
+# Items
+text = text.replace('sycl::nd_item<3> item_ct1', 'sycl::nd_item<1> item')
+text = text.replace('item_ct1.get_group(2)', 'item.get_group(0)')
+text = text.replace('item_ct1.get_local_range(2)', 'item.get_local_range(0)')
+text = text.replace('item_ct1.get_local_id(2)', 'item.get_local_id(0)')
+text = text.replace('item_ct1.get_group_range(2)', 'item.get_group_range(0)')
+text = text.replace('item_ct1', 'item')
+text = text.replace('sycl::ext::oneapi::this_work_item::get_nd_item<3>()', 'sycl::ext::oneapi::this_work_item::get_nd_item<1>()')
+text = text.replace('dpct::select_from_sub_group', 'sycl::select_from_group')
+text = text.replace('dpct::shift_sub_group_left', 'sycl::shift_group_left')
+text = text.replace('sycl::ext::oneapi::this_work_item::get_sub_group()', 'item.get_sub_group()')
+
+# Dimensions (3D to 1D)
+text = re.sub(r'sycl::nd_range<3>\(sycl::range<3>\(1,\s*1,\s*(.*?)\)\s*\*\s*sycl::range<3>\(1,\s*1,\s*(.*?)\),\s*sycl::range<3>\(1,\s*1,\s*(.*?)\)\)', 
+              r'sycl::nd_range<1>(sycl::range<1>((\1) * (\2)), sycl::range<1>(\3))', text)
+
+text = re.sub(r'void ck\(dpct::err0 e, const char \*what\) \{[\s\S]*?\}\n\n', '', text)
+text = re.sub(r'/\*[\s\S]*?\*/\n', '', text)
+
+text = re.sub(r'(bool ple_available\(\) \{)\n[\s\S]*?\}', r'\1\n    return true;\n}', text)
+
+# Queue and errors
+def fix_func(func_name):
+    global text
+    
+    text = re.sub(r'(void ' + func_name + r'\(.*?\) (?:try )?\{)\n', 
+                  r'\1\n    static sycl::queue default_queue;\n    sycl::queue* q = stream ? static_cast<sycl::queue*>(stream) : &default_queue;\n', text)
+                  
+    text = re.sub(r'\(stream \? \(sycl::queue\*\)stream : &dpct::get_default_queue\(\)\)\s*->', 'q->', text)
+    text = re.sub(r'dpct::queue_ptr st = stream \? \(dpct::queue_ptr\)stream : &dpct::get_default_queue\(\);', '', text)
+    text = re.sub(r'dpct::has_capability_or_fail\([\s\S]*?\);\n\s*', '', text)
+    text = re.sub(r'st->', 'q->', text)
+    
+fix_func('ple_flush')
+fix_func('ple_write_block')
+
+# replace ck(DPCT_CHECK_ERROR(st->memcpy(x, y, z)), "what")
+text = re.sub(r'ck\(DPCT_CHECK_ERROR\(q->memcpy\(([^,]+),\s*([^,]+),\s*([^)]+)\)\)\s*,\s*"[^"]+"\);', r'q->memcpy(\1, \2, \3).wait();', text)
+text = re.sub(r'ck\(DPCT_CHECK_ERROR\(q->memcpy\(([^,]+),\s*([^,]+),\s*([^)]+)\)\.wait\(\)\)\s*,\s*"[^"]+"\);', r'q->memcpy(\1, \2, \3).wait();', text)
+text = re.sub(r'ck\(DPCT_CHECK_ERROR\(\s*q->memcpy\(([^,]+),\s*([^,]+),\s*([^)]+)\)\s*\)\s*,\s*"[^"]+"\);', r'q->memcpy(\1, \2, \3).wait();', text)
+text = re.sub(r'ck\(DPCT_CHECK_ERROR\(\s*q->memcpy\(([^,]+),\s*([^,]+),\s*([^)]+)\)\.wait\(\)\s*\)\s*,\s*"[^"]+"\);', r'q->memcpy(\1, \2, \3).wait();', text)
+text = re.sub(r'const dpct::err0 e = 0;\n\s*ck\(e,\s*"[^"]+"\);', '', text)
+
+# cleanup try catch
+text = re.sub(r'catch \(sycl::exception const &exc\) \{[\s\S]*?\}\n', '', text)
+text = re.sub(r'void ple_flush(.*?) try \{', r'void ple_flush\1 {', text)
+text = re.sub(r'void ple_write_block(.*?) try \{', r'void ple_write_block\1 {', text)
+
+with open('src/kernels/sycl/ple.dp.cpp', 'w') as f:
+    f.write(text)
+
