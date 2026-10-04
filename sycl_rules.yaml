@@ -1,0 +1,21 @@
+rules:
+  - id: strip-dpct-check-error
+    languages: [cpp]
+    message: "Strip DPCT_CHECK_ERROR macro"
+    severity: INFO
+    pattern: DPCT_CHECK_ERROR($X)
+    fix: $X
+
+  - id: replace-dpct-inline
+    languages: [cpp]
+    message: "Replace __dpct_inline__ with inline"
+    severity: INFO
+    pattern-regex: '__dpct_inline__'
+    fix: 'inline'
+
+  - id: strip-dpct-include
+    languages: [cpp]
+    message: "Strip #include <dpct/dpct.hpp>"
+    severity: INFO
+    pattern: '#include <dpct/dpct.hpp>'
+    fix: ''
