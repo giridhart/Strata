@@ -38,12 +38,24 @@ __device__ __forceinline__ int strata_dp4a(const int a, const int b, const int c
     return r;
 }
 #define STRATA_DP4A(a, b, c) strata_dp4a((a), (b), (c))
+#elif defined(STRATA_ENABLE_SYCL) || (!defined(__CUDACC__) && !defined(__HIPCC__))
+inline int strata_dp4a(const int a, const int b, const int c) {
+    const int8_t* a8 = (const int8_t*) &a;
+    const int8_t* b8 = (const int8_t*) &b;
+    return c + a8[0] * b8[0] + a8[1] * b8[1] + a8[2] * b8[2] + a8[3] * b8[3];
+}
+#define STRATA_DP4A(a, b, c) strata_dp4a((a), (b), (c))
 #else
 #define STRATA_DP4A(a, b, c) __dp4a((a), (b), (c))
 #endif
 
 /// Yield the thread while a doorbell flag is being polled.  The length of the pause is a backoff hint, not a
 /// contract, and only pre-Volta CUDA has no `__nanosleep` at all.
+#if defined(STRATA_ENABLE_SYCL) || (!defined(__CUDACC__) && !defined(__HIPCC__))
+inline void strata_spin_pause() {
+    // SYCL / host: bounded spin is the backoff
+}
+#else
 __device__ __forceinline__ void strata_spin_pause() {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 700
     // sm_6x: the loop spins.  Every call site is a single-thread doorbell wait, so nothing else is delayed.
@@ -51,3 +63,4 @@ __device__ __forceinline__ void strata_spin_pause() {
     __nanosleep(100);
 #endif
 }
+#endif

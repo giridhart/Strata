@@ -45,18 +45,18 @@ void rope_table_release(const float* cos_tab);
 /// kernels compute the angle exactly as before).
 RopeTab rope_table_for(const RopeScaling& scaling);
 
-#if defined(__CUDACC__) || defined(__HIPCC__)
+#if 1
 /// ggml rope_multi, is_imrope, sections {11, 11, 10, 0}: sector = pair % 32; sector % 3 == 1 -> h (sector < 33),
 /// == 2 -> w (sector < 30), == 0 -> t (sector < 33).  For pairs 0..31 all three bounds hold, so it is pair % 3.
-__device__ __forceinline__ int mrope_pos(const int32_t* tab, int pos, int pair) {
-    return tab ? __ldg(tab + (size_t) pos * 3 + pair % 3) : pos;
+inline int mrope_pos(const int32_t* tab, int pos, int pair) {
+    return tab ? tab[(size_t) pos * 3 + pair % 3] : pos;
 }
 /// cos and sin of rotary position p, pair `pair` (0..31) from the table (scaling and magnitude included); false
 /// when there is no table or p lies past it - then the caller computes the angle as it always did
-__device__ __forceinline__ bool rope_tab_cs(const RopeTab& t, int p, int pair, float& c, float& s) {
+inline bool rope_tab_cs(const RopeTab& t, int p, int pair, float& c, float& s) {
     if (t.cos == nullptr || p < 0 || p >= t.max_pos) return false;
-    c = __ldg(t.cos + (size_t) p * 32 + pair);
-    s = __ldg(t.sin + (size_t) p * 32 + pair);
+    c = t.cos[(size_t) p * 32 + pair];
+    s = t.sin[(size_t) p * 32 + pair];
     return true;
 }
 #endif
