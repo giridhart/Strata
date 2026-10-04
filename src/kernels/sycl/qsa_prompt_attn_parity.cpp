@@ -176,10 +176,18 @@ int run(int fmt, int64_t ctx, int64_t nq, int reps) {
         }
     }
     // 2. new vs old everywhere
+    bool has_nan = false;
     double diff = 0, scale = 0;
     for (size_t i = 0; i < o.size(); ++i) {
+        if (std::isnan(nw[i]) || std::isinf(nw[i])) {
+            has_nan = true;
+        }
         diff = std::max(diff, (double) std::fabs(o[i] - nw[i]));
         scale = std::max(scale, (double) std::fabs(o[i]));
+    }
+    if (has_nan) {
+        err_new = 1e30;
+        diff = 1e30;
     }
     // 3. speed
     q_ct1.wait();
@@ -194,12 +202,13 @@ int run(int fmt, int64_t ctx, int64_t nq, int reps) {
     q_ct1.wait();
     auto t3 = std::chrono::high_resolution_clock::now();
     float ms_new = std::chrono::duration<float, std::milli>(t3 - t2).count();
-    const bool ok1 = err_new <= std::max(4.0 * err_old, 1e-6 * ref_scale);
-    const bool ok2 = diff <= 1e-4 * scale;
+    const bool ok1 = !has_nan && (err_new <= std::max(4.0 * err_old, 1e-6 * ref_scale));
+    const bool ok2 = !has_nan && (diff <= 1e-4 * scale);
     std::printf("%s %s ctx %lld, %lld queries: vs FP64 old %.3g new %.3g (output scale %.3g); new vs old %.3g (%.2g of "
-                "scale); %.3f -> %.3f ms per chunk (%.2fx)\n",
+                "scale); %.3f -> %.3f ms per chunk (%.2fx)%s\n",
                 ok1 && ok2 ? "PASS" : "FAIL", fmt == 1 ? "int8" : "fp16", (long long) ctx, (long long) nq, err_old,
-                err_new, ref_scale, diff, diff / scale, ms_old / reps, ms_new / reps, ms_old / ms_new);
+                err_new, ref_scale, diff, diff / scale, ms_old / reps, ms_new / reps, ms_old / ms_new,
+                has_nan ? " [CONTAINS NAN/INF]" : "");
     sycl::free((void*)d_ids, q_ct1); sycl::free((void*)d_steps, q_ct1);
     sycl::free((void*)d_q, q_ct1); sycl::free((void*)d_old, q_ct1);
     sycl::free((void*)d_new, q_ct1);
