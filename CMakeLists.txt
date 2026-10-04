@@ -2091,9 +2091,18 @@ if(STRATA_BUILD_PERF)
     target_include_directories(perf_xe2_gemv PRIVATE ${_strata_gpu_include_directories})
     target_link_libraries(perf_xe2_gemv PRIVATE strata_core strata_kernels benchmark::benchmark)
 
+    set(_strata_perf_targets perf_xe2_gemv)
+
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/perf/sycl/perf_xe2_xmx_tiles.cpp")
+      add_executable(perf_xe2_xmx_tiles perf/sycl/perf_xe2_xmx_tiles.cpp)
+      target_include_directories(perf_xe2_xmx_tiles PRIVATE ${_strata_gpu_include_directories})
+      target_link_libraries(perf_xe2_xmx_tiles PRIVATE strata_core strata_kernels benchmark::benchmark)
+      list(APPEND _strata_perf_targets perf_xe2_xmx_tiles)
+    endif()
+
     add_custom_target(perf-sycl
       COMMAND perf_xe2_gemv
-      DEPENDS perf_xe2_gemv
+      DEPENDS ${_strata_perf_targets}
       COMMENT "Running Intel Xe2 Performance Tuning Suite"
       USES_TERMINAL
     )

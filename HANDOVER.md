@@ -38,6 +38,9 @@ The target model for these optimizations is **Qwen3.8-Flash-Next** (as well as `
    - Implemented automated sweeps across all 8 Qwen3.8-Flash-Next decode projections, expert layers, and chunked prefill shapes ($B=24, 32$).
    - Implemented microarchitectural parameter sweeps: SIMD16 vs SIMD32 across work-group sizes, and SLM split reductions across `threads_per_row` (64, 128, 256).
    - Validated on live GPU (`Intel Graphics [0x64a0]`): confirmed SIMD16 efficiency, measured up to 102.4 GB/s memory bandwidth on expert shapes, and demonstrated **+25.3% speedup** on `ssm_alpha` with SLM split reduction ($TPR=128$).
+5. **Hardware XMX Systolic Tile Benchmark Suite (`perf/sycl/perf_xe2_xmx_tiles.cpp`)**:
+   - Built with SYCL 2020 `joint_matrix` systolic matrix multiplication across tile dimensions ($8 \times 16 \times 16$ vs $16 \times 16 \times 16$).
+   - Measured on live Lunar Lake Xe2 GPU (`Intel Graphics [0x64a0]`): on `attn_qkv` ($M=32, K=2560, N=10240$), Tile16 ($16 \times 16 \times 16$) reached **1.23 TFLOPS** (1.73x faster than Tile8's 710 GFLOPS) by amortizing weight bandwidth across 16 rows.
 
 ---
 
@@ -46,8 +49,8 @@ The target model for these optimizations is **Qwen3.8-Flash-Next** (as well as `
 To systematically drive kernel optimization on Xe2, performance tests are organized in `perf/sycl/`:
 
 1. **`perf_xe2_gemv.cpp` (Done)**: Parameterized BF16 decode/prefill sweeps, SIMD16 vs SIMD32, and SLM split reduction.
-2. **`perf_xe2_xmx_tiles.cpp` (Next)**: Hardware XMX systolic tile sweeps ($8 \times 16 \times 16$ vs $16 \times 16 \times 16$ vs $32 \times 64 \times 64$) evaluating peak TFLOPS and SLM vs register caching.
-3. **`perf_qsa_attention.cpp` (Planned)**: Prompt FlashAttention throughput and Top-K sparse gather memory bandwidth.
+2. **`perf_xe2_xmx_tiles.cpp` (Done)**: Hardware XMX systolic tile sweeps ($8 \times 16 \times 16$ vs $16 \times 16 \times 16$: **1.23 TFLOPS** verified).
+3. **`perf_qsa_attention.cpp` (Next)**: Prompt FlashAttention throughput and Top-K sparse gather memory bandwidth.
 4. **`perf_moe_accumulate.cpp` (Planned)**: MoE 10-expert weighted reduction bandwidth comparing atomic adds vs hierarchical subgroup reductions.
 5. **`perf_dequant_dpas.cpp` (Planned)**: Weight-only streaming dequantization (Q2_K / IQ4_XS) feeding XMX DPAS instructions.
 
@@ -85,8 +88,8 @@ make -C build_sycl perf-sycl
 
 ## 6. Recommended Prompts for the Next Session
 
-### Option 1 (Extend Perf Tests): Implement `perf_xe2_xmx_tiles.cpp`
-> *"Create `perf/sycl/perf_xe2_xmx_tiles.cpp` using Google Benchmark to sweep XMX systolic tile shapes (8x16x16, 16x16x16, 32x64x64) on the Qwen `attn_qkv` [2560, 10240] projection, add it to CMakeLists.txt, and benchmark TFLOPS."*
+### Option 1 (Extend Perf Tests): Implement `perf_qsa_attention.cpp`
+> *"Create `perf/sycl/perf_qsa_attention.cpp` using Google Benchmark to sweep QSA FlashAttention throughput and Top-K sparse gather bandwidth across prompt lengths (512 to 32768), add it to CMakeLists.txt, and benchmark on the Intel GPU."*
 
 ### Option 2: Complete XMX Systolic Attention Kernel
 > *"Implement and verify the Intel Xe2 hardware XMX systolic FlashAttention kernel in `src/kernels/sycl/qsa_prompt_attn.cpp` to replace `mma16816`, and make sure `qsa_prompt_attn_parity` and `check-sycl` pass on the GPU."*

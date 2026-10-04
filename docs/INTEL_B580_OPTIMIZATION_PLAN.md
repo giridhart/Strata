@@ -312,6 +312,7 @@ Measured using `make perf-sycl` (`icpx 2026.1`, Level-Zero driver `1.14.37020+3`
 1. **CPU Overhead Elimination**: Host-side CPU dispatch latency was 150–280 µs across tests. Using `benchmark::UseManualTime()` isolated actual hardware execution time (17–136 µs for decode), preventing CPU jitter from masking GPU kernel improvements.
 2. **SLM Split Reduction for Narrow Projections**: On `ssm_alpha` ($[2560, 48]$), output channels ($N=48$) underfill the GPU's execution units. Switching from subgroup-per-row to shared-local-memory (SLM) split reduction with `threads_per_row = 128` improved latency from 23.7 µs to 17.7 µs (**+25.3% speedup**, 10.57 → 14.14 GB/s).
 3. **SIMD16 vs SIMD32**: Sweeping `reqd_sub_group_size(16)` against `reqd_sub_group_size(32)` on $[2560, 2560]$ demonstrated SIMD16 execution consistently outperforms SIMD32 (139.6 µs vs 141.4 µs) due to native single-cycle group reduction instructions on Xe2 Vector Engines.
+4. **XMX Systolic Tile Sizing ($16 \times 16 \times 16$ vs $8 \times 16 \times 16$)**: On the large `attn_qkv` projection ($M=32, K=2560, N=10240$), Tile16 ($16 \times 16 \times 16$) achieves **1.23 TFLOPS** (1364 µs) versus Tile8's 710 GFLOPS (2361 µs), delivering a **1.73x speedup (+73% throughput)** by amortizing weight loads across 16 rows instead of 8.
 
 ### 6.4 Performance Suite Architecture & Extension Roadmap
 
@@ -321,8 +322,8 @@ To systematically drive Xe2 performance tuning, the performance suite is organiz
 perf/
 └── sycl/
     ├── perf_xe2_gemv.cpp        # [COMPLETED] BF16 parameter sweeps across 8 Qwen shapes, SIMD16 vs 32, SLM split
-    ├── perf_xe2_xmx_tiles.cpp   # [NEXT] XMX systolic tile sweep (8x16x16 vs 16x16x16 vs 32x64x64)
-    ├── perf_qsa_attention.cpp   # [PLANNED] Prompt attention & Top-K sparse gather bandwidth
+    ├── perf_xe2_xmx_tiles.cpp   # [COMPLETED] XMX systolic tile sweep (8x16x16 vs 16x16x16: 1.23 TFLOPS on Lunar Lake)
+    ├── perf_qsa_attention.cpp   # [NEXT] Prompt attention & Top-K sparse gather bandwidth
     ├── perf_moe_accumulate.cpp  # [PLANNED] MoE 10-expert weighted reduction
     └── perf_dequant_dpas.cpp    # [PLANNED] Weight-only streaming dequantization (Q2_K / IQ4_XS) + XMX DPAS
 ```
