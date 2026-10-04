@@ -214,9 +214,7 @@ To ensure absolute numerical stability and prevent regressions:
 - Unit testing for command graphs is verified via `build_sycl/sycl_graph`:
   ```bash
   # Prerequisite environment setup
-  source /opt/intel/oneapi/setvars.sh --force
-  source /opt/intel/oneapi/compiler/2025.3/env/vars.sh
-  source /opt/intel/oneapi/mkl/2025.3/env/vars.sh
+  source /opt/intel/oneapi/setvars.sh --force 2>/dev/null
 
   # Run SYCL command graph verification test
   ./build_sycl/sycl_graph
@@ -240,17 +238,17 @@ While the entire computational kernel fleet (100% of 44 kernels), the core runti
 - [x] **Eradicate `<dpct/dpct.hpp>` from Public Headers**:
   Cleaned up DPCT types and headers in `include/strata/core/session.hpp`, `verify.hpp`, `mtp.hpp`, `expert_source.hpp`, `remote_experts.hpp`, `on_device.hpp`, and `coupled_draft.hpp`.
 - [x] **Modernize Host Runtime Dispatchers & Driver**:
-  Refactored `src/core/sycl/session.cpp.dp.cpp`, `layer.cpp.dp.cpp`, `verify.cpp.dp.cpp`, and primary driver `src/program/sycl/generate.cpp.dp.cpp` to use modern `sycl::queue` lifecycle management, eliminating DPCT device queries (`dpct::get_current_device()`), memory queries, and wrappers.
+  Refactored `src/core/sycl/session.cpp`, `layer.cpp`, `verify.cpp`, and primary driver `src/program/sycl/generate.cpp` to use modern `sycl::queue` lifecycle management, eliminating DPCT device queries (`dpct::get_current_device()`), memory queries, and wrappers.
 - [x] **Native Graph API Callers**:
   Transparent compatibility adapter in `mock_cuda_graph.hpp` maps stream captures directly to `sycl::ext::oneapi::experimental::command_graph`.
 
 ### Phase 4: Prefill Pipeline Migration (`src/prefill/sycl/`) - **100% DONE**
 - [x] **Prefill GEMM & Attention**:
-  Refactored `src/prefill/sycl/gemm.dp.cpp` and `kernels.dp.cpp` to pure SYCL 2020 and OneMKL, removing DPCT stream wrappers.
+  Refactored `src/prefill/sycl/gemm.cpp` and `kernels.cpp` to pure SYCL 2020 and OneMKL, removing DPCT stream wrappers.
 - [x] **Prefill MoE & Auxiliary Files**:
-  Modernized `ggml_cuda_host.dp.cpp` and `moe_mmq.dp.cpp` to pure SYCL 2020 queues, USM allocations, and devices.
+  Modernized `ggml_cuda_host.cpp` and `moe_mmq.cpp` to pure SYCL 2020 queues, USM allocations, and devices.
 - [x] **Prefill Scheduler**:
-  Refactored `src/prefill/sycl/prefill.cpp.dp.cpp` to pure SYCL 2020 with in-order queues, events, and barriers.
+  Refactored `src/prefill/sycl/prefill.cpp` to pure SYCL 2020 with in-order queues, events, and barriers.
 
 ### Phase 5: End-to-End Inference Validation & Benchmarking
 - [x] **GPU Device Verification**:
@@ -272,13 +270,36 @@ While the entire computational kernel fleet (100% of 44 kernels), the core runti
 - [x] **Safe Log Parser**:
   Created `tools/extract_warnings.py` to parse compiler logs without saturating LLM context.
 - [x] **CI & Automation Integration**:
-  Added automated `check-sycl` target in `CMakeLists.txt` with full dependency graph, verifying all 13 SYCL tests passing in ~3.3s.
+  Added automated `check-sycl` target in `CMakeLists.txt` with full dependency graph, verifying all 16 SYCL tests passing in ~3.8s.
 
 ---
 
-## 6. References & Further Reading
+## 6. Developer & AI Refactoring Directives (from `cuda_to_sycl.md`)
+
+When refactoring or generating new SYCL kernels from CUDA code, adhere strictly to these 6 directives:
+
+1. **Directive 1: Dimension & Indexing Integrity (Strict!)**
+   - CUDA maps threads in `(x, y, z)` order. DPCT translates `dim3` to `sycl::range<3>` in `(z, y, x)` order to match SYCL's row-major expectation.
+   - When translating index calculations, always flatten to 1D `sycl::nd_range<1>` where possible: `item.get_global_id(0)`. If 2D/3D is strictly necessary, explicitly state dimension mapping assumptions.
+2. **Directive 2: Enforce Queue Synchronization**
+   - `cudaMemcpy` is synchronous; `sycl::queue::memcpy` is asynchronous. Append `.wait()` whenever replicating synchronous boundaries.
+3. **Directive 3: Command-Group Shared Memory Refactoring**
+   - CUDA's `__shared__` memory must be declared as `sycl::local_accessor` in the host `cgh` lambda and passed into the kernel.
+4. **Directive 4: Subgroups & Warp-Level Primitives**
+   - CUDA assumes a 32-thread warp. Intel GPUs execute in SIMD16 (Xe2) or SIMD32.
+   - Use `sycl::reduce_over_group`, `sycl::permute_group_by_xor`, or `sycl::shift_group_left`.
+   - Never assume 32 lanes on Intel Xe2: use `strata::sycl_arch::SUB_GROUP_SIZE` (16) and `sycl::reduce_over_group`.
+5. **Directive 5: Atomics Migration**
+   - Translate CUDA atomic functions (`atomicAdd`, `atomicCAS`) to `sycl::atomic_ref` with appropriate memory scope (`work_group` for SLM, `device` for global memory) and `sycl::memory_order::relaxed`.
+6. **Directive 6: Error Handling Eradication**
+   - Strip all `cudaError_t` boilerplate. Use standard SYCL exceptions or async exception handlers.
+
+---
+
+## 7. References & Related Documents
 
 - [Intel oneAPI SYCL Command Graph Extension Specification](https://github.com/intel/llvm/blob/sycl/sycl/doc/extensions/experimental/sycl_ext_oneapi_graph.asciidoc)
 - [Intel oneAPI Samples: CUDA to SYCL Migration Training](https://github.com/oneapi-src/oneAPI-samples/tree/master/DirectProgramming/C%2B%2BSYCL/Jupyter/cuda-to-sycl-migration-training)
-- [`REFACTORED_KERNELS.md`](../REFACTORED_KERNELS.md): Complete catalog of 44 migrated computational kernels.
-- [`STATUS.md`](../STATUS.md): Current build, environment, and verification status.
+- [`docs/SYCL_STATUS.md`](SYCL_STATUS.md): Master Status, Parity Test Results & 44-Kernel Registry.
+- [`docs/INTEL_B580_OPTIMIZATION_PLAN.md`](INTEL_B580_OPTIMIZATION_PLAN.md): Intel Arc B580 / Xe2 microarchitecture optimization guide.
+- [`HANDOVER.md`](../HANDOVER.md): Engineering handover for Xe2 optimizations & upstream rebase.
