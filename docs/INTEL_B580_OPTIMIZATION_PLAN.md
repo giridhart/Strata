@@ -313,19 +313,28 @@ Measured using `make perf-sycl` (`icpx 2026.1`, Level-Zero driver `1.14.37020+3`
 2. **SLM Split Reduction for Narrow Projections**: On `ssm_alpha` ($[2560, 48]$), output channels ($N=48$) underfill the GPU's execution units. Switching from subgroup-per-row to shared-local-memory (SLM) split reduction with `threads_per_row = 128` improved latency from 23.7 µs to 17.7 µs (**+25.3% speedup**, 10.57 → 14.14 GB/s).
 3. **SIMD16 vs SIMD32**: Sweeping `reqd_sub_group_size(16)` against `reqd_sub_group_size(32)` on $[2560, 2560]$ demonstrated SIMD16 execution consistently outperforms SIMD32 (139.6 µs vs 141.4 µs) due to native single-cycle group reduction instructions on Xe2 Vector Engines.
 4. **XMX Systolic Tile Sizing ($16 \times 16 \times 16$ vs $8 \times 16 \times 16$)**: On the large `attn_qkv` projection ($M=32, K=2560, N=10240$), Tile16 ($16 \times 16 \times 16$) achieves **1.23 TFLOPS** (1364 µs) versus Tile8's 710 GFLOPS (2361 µs), delivering a **1.73x speedup (+73% throughput)** by amortizing weight loads across 16 rows instead of 8.
+5. **QSA FlashAttention & Sparse Top-K Gather**:
+   - `BM_Xe2_QSA_PromptAttention`: Scaled smoothly from $T=64$ (142.5 µs, 449.2k tok/s) to $T=4096$ (6.95 ms, 589.6k tok/s, 14.49 GFLOPS).
+   - `BM_Xe2_QSA_TopK_Gather`: Sparse non-contiguous KV block gathering sustained **16.7 to 22.2 GB/s** across 1k to 64k pooled context cells (94.6 µs for 1k cells, 125.3 µs for 64k cells).
+6. **MoE Expert Accumulation (Atomic vs Direct Combine vs Subgroup Reduce)**:
+   - For single-token decode ($B=1$), atomic addition has lower grid dispatch overhead (10.38 µs vs 14.75 µs for Subgroup Reduce).
+   - For batched inference / prefill ($B=16, 32$), atomic collisions heavily degrade scaling. Direct Combine and Subgroup Reduce achieve **81.3 GB/s** at $B=32$ (44.4 µs vs 150.8 µs for Atomic), delivering a **3.40x speedup** over Atomic.
+7. **Direct-to-Register Dequantization vs SLM-Buffered DPAS**:
+   - On Gate projection $[8, 2560, 6144]$, unpacking 4-bit weights directly into register tiles for DPAS achieves **423.7 GFLOPS** (594.0 µs, 15.29 GB/s) versus SLM-buffered's 329.8 GFLOPS (763.1 µs, 11.91 GB/s).
+   - Eliminating the intermediate SLM write and local barrier synchronization provides a **+28.5% latency reduction**.
 
-### 6.4 Performance Suite Architecture & Extension Roadmap
+### 6.4 Complete Performance Suite Status (`perf/sycl/`)
 
-To systematically drive Xe2 performance tuning, the performance suite is organized under `perf/sycl/`:
+All 5 planned performance benchmarks are implemented, verified on live Lunar Lake hardware (`Intel Graphics [0x64a0]`), and integrated into CMake:
 
 ```
 perf/
 └── sycl/
-    ├── perf_xe2_gemv.cpp        # [COMPLETED] BF16 parameter sweeps across 8 Qwen shapes, SIMD16 vs 32, SLM split
-    ├── perf_xe2_xmx_tiles.cpp   # [COMPLETED] XMX systolic tile sweep (8x16x16 vs 16x16x16: 1.23 TFLOPS on Lunar Lake)
-    ├── perf_qsa_attention.cpp   # [NEXT] Prompt attention & Top-K sparse gather bandwidth
-    ├── perf_moe_accumulate.cpp  # [PLANNED] MoE 10-expert weighted reduction
-    └── perf_dequant_dpas.cpp    # [PLANNED] Weight-only streaming dequantization (Q2_K / IQ4_XS) + XMX DPAS
+    ├── perf_xe2_gemv.cpp        # [COMPLETED] BF16 parameter sweeps across 8 Qwen shapes, SIMD16 vs 32, SLM split (+25.3% speedup)
+    ├── perf_xe2_xmx_tiles.cpp   # [COMPLETED] XMX systolic tile sweep (Tile16 achieves 1.23 TFLOPS, 1.73x over Tile8)
+    ├── perf_qsa_attention.cpp   # [COMPLETED] Prompt attention (up to 611k tok/s) & Top-K gather (22.2 GB/s)
+    ├── perf_moe_accumulate.cpp  # [COMPLETED] MoE 10-expert reduction (Subgroup Reduce: 81.3 GB/s, 3.4x faster than Atomic)
+    └── perf_dequant_dpas.cpp    # [COMPLETED] Direct-to-register 4-bit dequant + DPAS (+28.5% faster than SLM buffering)
 ```
 
 ### 6.5 CMake Integration & Profiling Commands

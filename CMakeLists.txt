@@ -2100,6 +2100,27 @@ if(STRATA_BUILD_PERF)
       list(APPEND _strata_perf_targets perf_xe2_xmx_tiles)
     endif()
 
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/perf/sycl/perf_qsa_attention.cpp")
+      add_executable(perf_qsa_attention perf/sycl/perf_qsa_attention.cpp)
+      target_include_directories(perf_qsa_attention PRIVATE ${_strata_gpu_include_directories})
+      target_link_libraries(perf_qsa_attention PRIVATE strata_core strata_kernels benchmark::benchmark)
+      list(APPEND _strata_perf_targets perf_qsa_attention)
+    endif()
+
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/perf/sycl/perf_moe_accumulate.cpp")
+      add_executable(perf_moe_accumulate perf/sycl/perf_moe_accumulate.cpp)
+      target_include_directories(perf_moe_accumulate PRIVATE ${_strata_gpu_include_directories})
+      target_link_libraries(perf_moe_accumulate PRIVATE strata_core strata_kernels benchmark::benchmark)
+      list(APPEND _strata_perf_targets perf_moe_accumulate)
+    endif()
+
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/perf/sycl/perf_dequant_dpas.cpp")
+      add_executable(perf_dequant_dpas perf/sycl/perf_dequant_dpas.cpp)
+      target_include_directories(perf_dequant_dpas PRIVATE ${_strata_gpu_include_directories})
+      target_link_libraries(perf_dequant_dpas PRIVATE strata_core strata_kernels benchmark::benchmark)
+      list(APPEND _strata_perf_targets perf_dequant_dpas)
+    endif()
+
     add_custom_target(perf-sycl
       COMMAND perf_xe2_gemv
       DEPENDS ${_strata_perf_targets}
