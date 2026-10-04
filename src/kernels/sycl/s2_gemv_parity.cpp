@@ -46,7 +46,7 @@ int main(int argc, char **argv) {
     sycl::queue q_ct1{sycl::default_selector_v, sycl::property::queue::in_order()};
     long long n_in = 2560;          // the real n_embd, so the row length is the engine's
     long long n_out = 640;          // the real expert intermediate width
-    double tol = 1e-5;
+    double tol = 1e-4;              // phase spec allows 1e-3 for FP16 paths; 1e-4 bounds subgroup reduction reordering
     bool selftest = false;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--selftest") == 0) selftest = true;
