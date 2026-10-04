@@ -197,29 +197,127 @@ The test machine's mobile GPU (`Intel(R) Graphics [0x64a0]`, Lunar Lake Core Ult
 
 ## 6. Targeted Microbenchmarks & Profiling Strategy (Qwen3.8-Flash-Next)
 
-Because Strata relies heavily on asymmetric hardware balancing (VRAM cache vs RAM vs SSD n-gram tables), isolating kernel performance from the engine’s async scheduler provides clean tuning baselines.
+Transitioning verified standalone tests into a parameterized microbenchmarking suite is the ideal way to tune for the Intel Arc B580 (Xe2) architecture. Because Strata relies heavily on asymmetric hardware balancing (VRAM cache vs RAM vs SSD n-gram tables), isolating kernel performance from the engine’s async scheduler provides clean tuning baselines.
 
-### SYCL Event Profiling
+### 6.1 Implement SYCL Event Profiling
 
-To isolate pure GPU execution time and eliminate CPU/host submission overhead, initialize the test queue with `sycl::property::queue::enable_profiling()`:
+To isolate pure GPU execution time and eliminate CPU/host submission overhead, leverage SYCL’s built-in hardware profiling by initializing the test queue with `sycl::property::queue::enable_profiling()`.
+
+Use this standalone function to measure memory bandwidth and computational throughput (TFLOPS) for a specific tensor shape:
 
 ```cpp
-auto event = q.submit([&](sycl::handler& cgh) { /* ... kernel ... */ });
-event.wait();
-auto start = event.get_profiling_info<sycl::info::event_profiling::command_start>();
-auto end = event.get_profiling_info<sycl::info::event_profiling::command_end>();
-double time_ns = end - start;
+#include <sycl/sycl.hpp>
+#include <iostream>
+
+void profile_xe2_gemv(sycl::queue& q, int B, int K, int N, int iterations = 100) {
+    auto* input = sycl::malloc_device<sycl::ext::oneapi::bfloat16>(B * K, q);
+    auto* weight = sycl::malloc_device<sycl::ext::oneapi::bfloat16>(K * N, q);
+    auto* output = sycl::malloc_device<sycl::ext::oneapi::bfloat16>(B * N, q);
+
+    // Warmup to spin up GPU clocks
+    for (int i = 0; i < 5; ++i) {
+        q.submit([&](sycl::handler& cgh) { /* ... launch GEMV kernel ... */ }).wait();
+    }
+
+    double total_time_ns = 0;
+    
+    // Benchmark loop
+    for (int i = 0; i < iterations; ++i) {
+        auto event = q.submit([&](sycl::handler& cgh) {
+             /* ... launch GEMV kernel ... */
+        });
+        
+        event.wait(); // Wait ensures accurate event timestamps
+        auto start = event.get_profiling_info<sycl::info::event_profiling::command_start>();
+        auto end = event.get_profiling_info<sycl::info::event_profiling::command_end>();
+        total_time_ns += (end - start);
+    }
+    
+    double avg_time_ms = (total_time_ns / iterations) / 1e6;
+    
+    // Calculate memory bandwidth for GEMV
+    double data_bytes = (K * N + B * K + B * N) * sizeof(sycl::ext::oneapi::bfloat16);
+    double bandwidth_gbps = (data_bytes / 1e9) / (avg_time_ms / 1000.0);
+    
+    std::cout << "Shape [B=" << B << ", K=" << K << ", N=" << N << "]\n";
+    std::cout << "Time: " << avg_time_ms << " ms | Bandwidth: " << bandwidth_gbps << " GB/s\n";
+    
+    sycl::free(input, q);
+    sycl::free(weight, q);
+    sycl::free(output, q);
+}
 ```
 
-### The 5 Critical Decode Bottlenecks to Benchmark on Xe2
+### 6.2 Parameterize the Qwen3.8-Flash-Next Shapes
+
+Instead of static unit tests, wrapping the SYCL execution in **Google Benchmark** allows automatic sweeping through the exact model shapes extracted from the engine:
+
+```cpp
+#include <benchmark/benchmark.h>
+
+static void BM_Xe2_Subgroup_GEMV(benchmark::State& state) {
+    int K = state.range(0);
+    int N = state.range(1);
+    int B = state.range(2); 
+
+    sycl::queue q(sycl::gpu_selector_v, {sycl::property::queue::enable_profiling()});
+    // ... setup and allocations ...
+
+    for (auto _ : state) {
+        auto event = q.submit([&](sycl::handler& cgh) { /* kernel */ });
+        event.wait();
+        // Google benchmark allows custom timing reporting
+        // state.SetIterationTime( (end - start) / 1e9 );
+    }
+}
+
+// Sweep through all 8 projection shapes for Decode (B=1)
+BENCHMARK(BM_Xe2_Subgroup_GEMV)->Args({2560, 48, 1});   // ssm_alpha
+BENCHMARK(BM_Xe2_Subgroup_GEMV)->Args({2560, 512, 1});  // indexer.q_proj
+BENCHMARK(BM_Xe2_Subgroup_GEMV)->Args({10240, 320, 1}); // hc_attn_down
+BENCHMARK(BM_Xe2_Subgroup_GEMV)->Args({2560, 2560, 1}); // ple_value
+
+// Sweep again for Prompt Prefill Chunking (e.g., B=24)
+BENCHMARK(BM_Xe2_Subgroup_GEMV)->Args({10240, 320, 24});
+```
+
+### 6.3 Key B580 (Battlemage) Tuning Vectors
+
+1. **Subgroup vs Work-group Sizing (`xe2_subgroup_gemv`)**: Test whether `threads_per_row = 128` vs `256` saturates the B580’s Xe-cores better for narrow shapes (`indexer.k_proj` at 128 cols) versus wide shapes (`hc_attn_down` at 10240 cols).
+2. **XMX Systolic Tile Shapes (`xmx_joint_matrix`)**: Benchmark single-tile ($8 \times 16 \times 16$) against full 2D blocks ($32 \times 64 \times 64$) specifically on the `attn_qkv.weight` shape `[2560, 10240]` to locate peak computational TFLOPS.
+3. **SLM Thrashing & Bank Conflicts**: For multi-thread shared split paths, measure bandwidth. The B580 has unified L1/SLM per Xe-core; dropping significantly below theoretical bandwidth on specific shapes indicates SLM bank conflicts.
+
+### 6.4 CMake Integration & Profiling Tools
+
+Decouple functional correctness tests from performance tests to prevent timing variances in CI:
+
+```cmake
+# Performance Tests (Run manually via 'make perf-sycl')
+add_executable(perf_xe2_gemv perf/xe2_subgroup_gemv_perf.cpp)
+target_link_libraries(perf_xe2_gemv benchmark::benchmark)
+
+add_custom_target(perf-sycl
+    COMMAND perf_xe2_gemv
+    DEPENDS perf_xe2_gemv
+)
+```
+
+Pipe directly into Intel VTune for cache and ALU saturation metrics:
+```bash
+vtune -collect gpu-hotspots ./build_sycl/perf_xe2_gemv
+```
+
+### 6.5 The 5 Critical Decode Bottlenecks to Benchmark on Xe2
 
 1. **Weight-Only Dequantization + XMX DPAS (The Decode Bottleneck)**:
    - At decode ($B=1$), generation speed is strictly bounded by memory bandwidth.
-   - Measure streaming 2-bit/4-bit weights from global memory, dequantizing to BF16 in registers via Xe Vector Engines (XVE), and feeding directly to XMX engines via DPAS.
+   - Measure streaming 2-bit/4-bit weights from global memory, dequantizing to BF16 in registers via Xe Vector Engines (XVE), and feeding directly to XMX engines via DPAS instructions.
    - Test shape: Gate projection `[2560, 6144]` at Q2_0.
+   - Compare direct-to-register dequantization vs. buffering dequantized blocks in Shared Local Memory (SLM) before XMX ingestion.
 2. **Fused GDN State Recurrence**:
    - 36 of 48 layers in Qwen3.8-Flash-Next are Gated Delta Networks (linear attention) with recurrent state `[16, 128, 128]`.
    - Fuse Alpha GEMV, Beta GEMV, and the State Recurrence step into a single kernel to keep the recurrent state resident in Xe-core SLM or subgroup registers across the layer.
+   - Test whether `reqd_sub_group_size(32)` provides better SLM bank alignment and less thread-divergence than `reqd_sub_group_size(16)` for this specific `[128, 128]` chunking.
 3. **QSA Block Scorer (Top-K) & Sparse Gather**:
    - The 12 QSA layers use Top-K selection (`[B, 4, 128]` block scorer against `[N_blocks, 128]` pooled keys).
    - Benchmark Subgroup Bitonic Sort vs. Block-Radix select for determining Top-10 block IDs.
@@ -230,4 +328,5 @@ double time_ns = end - start;
 5. **PCIe Async Copy / USM Overlap**:
    - Hot experts execute in VRAM, cold experts in CPU RAM, and PLE n-gram tables stream from SSD.
    - Ensure SYCL USM maps to B580 hardware Copy Engines (BCE) so memory transfers overlap 100% with XMX compute.
+   - Benchmark an infinite loop of heavy XMX kernels on one queue while a secondary queue performs asynchronous `q.memcpy()` transfers, verifying compute TFLOPS does not degrade.
 
