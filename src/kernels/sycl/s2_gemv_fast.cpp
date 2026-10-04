@@ -28,6 +28,7 @@
 // reference like every other one - being faster is never a reason to be trusted, and being neutral is not
 // either.
 #include <sycl/sycl.hpp>
+#include "strata/core/sycl_arch.hpp"
 #include "strata/kernels/s_gemv.hpp"
 
 #include <cstdio>
@@ -38,6 +39,7 @@ namespace strata::kernels {
 namespace {
 
 constexpr int QK_S2 = 64;
+constexpr int SG_SIZE = strata::sycl_arch::SUB_GROUP_SIZE;
 constexpr int MAX_SHARED_HALVES = 4096;      // 8 KB of shared for x; n_embd 2560 fits with room
 
 static sycl::queue& default_queue() {
@@ -112,13 +114,24 @@ void s2_gemv_fast_kernel(const uint16_t *__restrict__ x,
             a3 += cv.w() * d * h23[1];
         }
     }
-    partial[tid] = (a0 + a1) + (a2 + a3);
-    item_ct1.barrier(sycl::access::fence_space::local_space);
-    for (int step = threads_per_row / 2; step > 0; step >>= 1) {
-        if (tid < step) partial[tid] += partial[tid + step];
+    float acc_sum = (a0 + a1) + (a2 + a3);
+    const auto sg = item_ct1.get_sub_group();
+    if (threads_per_row <= SG_SIZE) {
+        acc_sum = sycl::reduce_over_group(sg, acc_sum, sycl::plus<float>());
+        if (tid == 0) y[o] = acc_sum;
+    } else {
+        acc_sum = sycl::reduce_over_group(sg, acc_sum, sycl::plus<float>());
+        if (sg.get_local_linear_id() == 0) {
+            partial[tid / SG_SIZE] = acc_sum;
+        }
         item_ct1.barrier(sycl::access::fence_space::local_space);
+        const int num_sgs = threads_per_row / SG_SIZE;
+        if (tid < num_sgs) {
+            float p_val = partial[tid];
+            p_val = sycl::reduce_over_group(sg, p_val, sycl::plus<float>());
+            if (tid == 0) y[o] = p_val;
+        }
     }
-    if (tid == 0) y[o] = partial[0];
 }
 
 }  // namespace

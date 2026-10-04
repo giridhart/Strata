@@ -16,6 +16,7 @@
 // S2 IS SPECIALISED DELIBERATELY: it is 31.64 GiB of the 38 GiB pack, so it is the kernel that matters.  The
 // generic `s_gemv_split` still serves S4 and S8.
 #include <sycl/sycl.hpp>
+#include "strata/core/sycl_arch.hpp"
 #include "strata/kernels/s_gemv.hpp"
 
 #include <cstdio>
@@ -27,6 +28,7 @@ namespace {
 // QK = 64 elements per group; a quad of 4 elements is 1/16 of a group, so
 //     group = (quad * 4) >> 6 = quad >> 4
 constexpr int QK_S2 = 64;
+constexpr int SG_SIZE = strata::sycl_arch::SUB_GROUP_SIZE;
 
 static sycl::queue& default_queue() {
     static sycl::queue q{sycl::property::queue::in_order()};
@@ -66,13 +68,24 @@ void s2_gemv_quads_kernel(const uint16_t* __restrict__ x, const uint8_t* __restr
         a2 += w2 * h23[0];
         a3 += w3 * h23[1];
     }
-    partial[tid] = (a0 + a1) + (a2 + a3);
-    item_ct1.barrier(sycl::access::fence_space::local_space);
-    for (int step = threads_per_row / 2; step > 0; step >>= 1) {
-        if (tid < step) partial[tid] += partial[tid + step];
+    float acc_sum = (a0 + a1) + (a2 + a3);
+    const auto sg = item_ct1.get_sub_group();
+    if (threads_per_row <= SG_SIZE) {
+        acc_sum = sycl::reduce_over_group(sg, acc_sum, sycl::plus<float>());
+        if (tid == 0) y[o] = acc_sum;
+    } else {
+        acc_sum = sycl::reduce_over_group(sg, acc_sum, sycl::plus<float>());
+        if (sg.get_local_linear_id() == 0) {
+            partial[tid / SG_SIZE] = acc_sum;
+        }
         item_ct1.barrier(sycl::access::fence_space::local_space);
+        const int num_sgs = threads_per_row / SG_SIZE;
+        if (tid < num_sgs) {
+            float p_val = partial[tid];
+            p_val = sycl::reduce_over_group(sg, p_val, sycl::plus<float>());
+            if (tid == 0) y[o] = p_val;
+        }
     }
-    if (tid == 0) y[o] = partial[0];
 }
 
 }  // namespace

@@ -5,6 +5,7 @@
 // takes the rest of the per-type attributes as run-time arguments, because the manifest supplies them per
 // tensor and a 13-way switch inside the inner loop would be the naive-but-wrong kind of naive.
 #include <sycl/sycl.hpp>
+#include "strata/core/sycl_arch.hpp"
 #include "strata/kernels/s_gemv.hpp"
 #include "strata/kernels/f16_bits.hpp"
 
@@ -14,6 +15,8 @@
 
 namespace strata::kernels {
 namespace {
+
+constexpr int SG_SIZE = strata::sycl_arch::SUB_GROUP_SIZE;
 
 // `kvalues_iq4nl`: the non-linear codebook, verbatim from ggml-common.h / ggml-quants.c.
 //
@@ -141,7 +144,7 @@ void s_gemv_q8k_kernel(const uint8_t* __restrict__ x, const uint8_t* __restrict_
 /// ONE KERNEL FOR BOTH QUANTIZED ACTIVATIONS, templated on which block format `x` holds.  A second copy with a
 /// different loader would be a second thing to get wrong, and the only difference IS the loader - the weight
 /// decode, the quad loop, the shared codebook and the reduction are identical.
-template <int CODE_BITS, bool Q8K>
+template <int CODE_BITS, bool Q8K, int SUB_SIZE = SG_SIZE>
 void s_gemv_q8_split_kernel(const uint8_t *__restrict__ x,
                             const uint8_t *__restrict__ codes,
                             const float *__restrict__ scales,
@@ -151,10 +154,11 @@ void s_gemv_q8_split_kernel(const uint8_t *__restrict__ x,
                             int group_shift, int has_offset,
                             signed char *s_iq4nl, const sycl::nd_item<1>& item) {
     constexpr int PER_BYTE = 8 / CODE_BITS;
-    const int warps_per_block = (int)(item.get_local_range(0) >> 5);
-    const long long o = (long long)item.get_group(0) * warps_per_block +
-                        (item.get_local_id(0) >> 5);
-    const int lane = item.get_local_id(0) & 31;
+    const auto sg = item.get_sub_group();
+    const int sgs_per_block = (int)(item.get_local_range(0) / SUB_SIZE);
+    const long long o = (long long)item.get_group(0) * sgs_per_block +
+                        (item.get_local_id(0) / SUB_SIZE);
+    const int lane = sg.get_local_linear_id();
 
     // THE CODEBOOK, IN SHARED MEMORY.  16 bytes, loaded once per block by the first 16 threads, instead of a
     // divergent constant read per element - measured at 2.12x of this whole kernel (see the note on `kIq4Nl`).
@@ -208,7 +212,7 @@ void s_gemv_q8_split_kernel(const uint8_t *__restrict__ x,
     constexpr int QW = 4 * CODE_BITS / 8;              // 1 for S2, 2 for S4, 4 for S8
     constexpr unsigned MASK = (1u << CODE_BITS) - 1u;
     long long i = (long long) lane * QE;
-    for (; i + QE <= n_in; i += 32 * QE) {
+    for (; i + QE <= n_in; i += (long long) SUB_SIZE * QE) {
         const long long g = i >> group_shift;          // the whole octet is in one group: group_elems % 8 == 0
         const float d = s[g];
         const float b = off ? off[g] : 0.0f;
@@ -275,7 +279,7 @@ void s_gemv_q8_split_kernel(const uint8_t *__restrict__ x,
         acc15 += w15 * (xd * (float) xq[15]);
     }
     // the last, partial quad - at most one per lane
-    for (; i < n_in; i += 32 * QE) {
+    for (; i < n_in; i += (long long) SUB_SIZE * QE) {
         for (int k = 0; k < QE && i + k < n_in; ++k) {
             const long long e = i + k;
             const long long g = e >> group_shift;
@@ -285,8 +289,7 @@ void s_gemv_q8_split_kernel(const uint8_t *__restrict__ x,
     }
     float acc = (((acc0 + acc1) + (acc2 + acc3)) + ((acc4 + acc5) + (acc6 + acc7))) +
                 (((acc8 + acc9) + (acc10 + acc11)) + ((acc12 + acc13) + (acc14 + acc15)));
-    auto sg = item.get_sub_group();
-    for (int step = 16; step > 0; step >>= 1) acc += sycl::shift_group_left(sg, acc, step);
+    acc = sycl::reduce_over_group(sg, acc, sycl::plus<float>());
     if (lane == 0) y[o] = acc;
 }
 
@@ -480,13 +483,24 @@ void s_gemv_split_kernel(const uint16_t *__restrict__ x,
                      (off ? off[g] : 0.0f)) * f32_from_f16(x[e]);
         }
     }
-    partial[tid] = (acc0 + acc1) + (acc2 + acc3);
-    item.barrier(sycl::access::fence_space::local_space);
-    for (int step = threads_per_row / 2; step > 0; step >>= 1) {
-        if (tid < step) partial[tid] += partial[tid + step];
+    float acc_sum = (acc0 + acc1) + (acc2 + acc3);
+    const auto sg = item.get_sub_group();
+    if (threads_per_row <= SG_SIZE) {
+        acc_sum = sycl::reduce_over_group(sg, acc_sum, sycl::plus<float>());
+        if (tid == 0) y[o] = acc_sum;
+    } else {
+        acc_sum = sycl::reduce_over_group(sg, acc_sum, sycl::plus<float>());
+        if (sg.get_local_linear_id() == 0) {
+            partial[tid / SG_SIZE] = acc_sum;
+        }
         item.barrier(sycl::access::fence_space::local_space);
+        const int num_sgs = threads_per_row / SG_SIZE;
+        if (tid < num_sgs) {
+            float p_val = partial[tid];
+            p_val = sycl::reduce_over_group(sg, p_val, sycl::plus<float>());
+            if (tid == 0) y[o] = p_val;
+        }
     }
-    if (tid == 0) y[o] = partial[0];
 }
 
 }  // namespace
@@ -684,8 +698,8 @@ void s_gemv_q8k_split(const uint8_t* x_q8k, const uint8_t* codes, const float* s
     static sycl::queue default_queue;
     sycl::queue* q = stream ? static_cast<sycl::queue*>(stream) : &default_queue;
     const int threads = 256;
-    const int warps = threads / 32;
-    const unsigned blocks = (unsigned) ((n_out + warps - 1) / warps);
+    const int sgs = threads / SG_SIZE;
+    const unsigned blocks = (unsigned) ((n_out + sgs - 1) / sgs);
     const int cb = (int) form.codebook;
     const int ho = form.has_offset ? 1 : 0;
     switch (form.code_bits) {
@@ -694,8 +708,8 @@ void s_gemv_q8k_split(const uint8_t* x_q8k, const uint8_t* codes, const float* s
             sycl::local_accessor<signed char, 1> s_iq4nl_acc(sycl::range<1>(16), cgh);
             cgh.parallel_for(
                 sycl::nd_range<1>(sycl::range<1>(blocks * threads), sycl::range<1>(threads)),
-                [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(32)]] {
-                    s_gemv_q8_split_kernel<4, true>(
+                [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
+                    s_gemv_q8_split_kernel<4, true, SG_SIZE>(
                         x_q8k, codes, scales, offset, y, n_in, n_out,
                         form.code_bias, cb, group_shift, ho,
                         s_iq4nl_acc.get_multi_ptr<sycl::access::decorated::no>().get(),
@@ -708,8 +722,8 @@ void s_gemv_q8k_split(const uint8_t* x_q8k, const uint8_t* codes, const float* s
             sycl::local_accessor<signed char, 1> s_iq4nl_acc(sycl::range<1>(16), cgh);
             cgh.parallel_for(
                 sycl::nd_range<1>(sycl::range<1>(blocks * threads), sycl::range<1>(threads)),
-                [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(32)]] {
-                    s_gemv_q8_split_kernel<8, true>(
+                [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
+                    s_gemv_q8_split_kernel<8, true, SG_SIZE>(
                         x_q8k, codes, scales, offset, y, n_in, n_out,
                         form.code_bias, cb, group_shift, ho,
                         s_iq4nl_acc.get_multi_ptr<sycl::access::decorated::no>().get(),
@@ -747,8 +761,8 @@ void s_gemv_q8_0_split(const uint8_t* x_q8_0, const uint8_t* codes, const float*
     static sycl::queue default_queue;
     sycl::queue* q = stream ? static_cast<sycl::queue*>(stream) : &default_queue;
     const int threads = 256;
-    const int warps = threads / 32;
-    const unsigned blocks = (unsigned) ((n_out + warps - 1) / warps);
+    const int sgs = threads / SG_SIZE;
+    const unsigned blocks = (unsigned) ((n_out + sgs - 1) / sgs);
     const int cb = (int) form.codebook;
     const int ho = form.has_offset ? 1 : 0;
     switch (form.code_bits) {
@@ -757,8 +771,8 @@ void s_gemv_q8_0_split(const uint8_t* x_q8_0, const uint8_t* codes, const float*
             sycl::local_accessor<signed char, 1> s_iq4nl_acc(sycl::range<1>(16), cgh);
             cgh.parallel_for(
                 sycl::nd_range<1>(sycl::range<1>(blocks * threads), sycl::range<1>(threads)),
-                [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(32)]] {
-                    s_gemv_q8_split_kernel<4, false>(
+                [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
+                    s_gemv_q8_split_kernel<4, false, SG_SIZE>(
                         x_q8_0, codes, scales, offset, y, n_in, n_out,
                         form.code_bias, cb, group_shift, ho,
                         s_iq4nl_acc.get_multi_ptr<sycl::access::decorated::no>().get(),
@@ -771,8 +785,8 @@ void s_gemv_q8_0_split(const uint8_t* x_q8_0, const uint8_t* codes, const float*
             sycl::local_accessor<signed char, 1> s_iq4nl_acc(sycl::range<1>(16), cgh);
             cgh.parallel_for(
                 sycl::nd_range<1>(sycl::range<1>(blocks * threads), sycl::range<1>(threads)),
-                [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(32)]] {
-                    s_gemv_q8_split_kernel<8, false>(
+                [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
+                    s_gemv_q8_split_kernel<8, false, SG_SIZE>(
                         x_q8_0, codes, scales, offset, y, n_in, n_out,
                         form.code_bias, cb, group_shift, ho,
                         s_iq4nl_acc.get_multi_ptr<sycl::access::decorated::no>().get(),
