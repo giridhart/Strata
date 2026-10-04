@@ -100,6 +100,7 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/CMakeLists.txt AND EXISTS ${CMAKE_CU
 endif()
 option(STRATA_BUILD_TESTS "Build the test suite" ${_strata_tests_default})
 option(STRATA_BUILD_CONVERSATION_TESTS "Build standalone conversation cache tests" OFF)
+option(STRATA_BUILD_PERF "Build Google Benchmark performance tuning suite" OFF)
 option(STRATA_WERROR "Treat compiler warnings as errors" OFF)
 
 if(STRATA_BUILD_CONVERSATION_TESTS)
@@ -2059,3 +2060,43 @@ if(STRATA_ENABLE_SYCL)
     USES_TERMINAL
   )
 endif()
+
+# ---- Google Benchmark performance tuning suite ----
+if(STRATA_BUILD_PERF)
+  find_package(benchmark CONFIG QUIET)
+  if(NOT benchmark_FOUND)
+    include(FetchContent)
+    FetchContent_Declare(
+      google_benchmark
+      GIT_REPOSITORY https://github.com/google/benchmark.git
+      GIT_TAG v1.8.3
+    )
+    set(BENCHMARK_ENABLE_TESTING OFF CACHE BOOL "" FORCE)
+    set(BENCHMARK_ENABLE_INSTALL OFF CACHE BOOL "" FORCE)
+    set(BENCHMARK_ENABLE_WERROR OFF CACHE BOOL "" FORCE)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|IntelLLVM")
+      add_compile_options(-Wno-c2y-extensions)
+    endif()
+    FetchContent_MakeAvailable(google_benchmark)
+    if(TARGET benchmark)
+      set_target_properties(benchmark PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON)
+    endif()
+    if(TARGET benchmark_main)
+      set_target_properties(benchmark_main PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON)
+    endif()
+  endif()
+
+  if(STRATA_ENABLE_SYCL AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/perf/sycl/perf_xe2_gemv.cpp")
+    add_executable(perf_xe2_gemv perf/sycl/perf_xe2_gemv.cpp)
+    target_include_directories(perf_xe2_gemv PRIVATE ${_strata_gpu_include_directories})
+    target_link_libraries(perf_xe2_gemv PRIVATE strata_core strata_kernels benchmark::benchmark)
+
+    add_custom_target(perf-sycl
+      COMMAND perf_xe2_gemv
+      DEPENDS perf_xe2_gemv
+      COMMENT "Running Intel Xe2 Performance Tuning Suite"
+      USES_TERMINAL
+    )
+  endif()
+endif()
+
