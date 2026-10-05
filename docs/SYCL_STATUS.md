@@ -3,7 +3,7 @@
 > **Target Hardware**: Intel Core Ultra 5 226V (Lunar Lake Xe2-LPG `0x64a0`) & Intel Arc B580 (Battlemage Xe2-HPG)  
 > **Host OS**: Linux x86_64 (Kernel 6.14.0-33-generic, WSL2 / Native Ubuntu)  
 > **Toolchain**: Intel oneAPI 2026.1 (`icpx -fsycl -qmkl`)  
-> **Build Directory**: `/workspace/Strata/build_sycl`  
+> **Build Directory**: `build_sycl`  
 > **Current Branch**: `main` (cleanly rebased on upstream `origin/main` @ `v0.1.39`)  
 > **Build Status**: Clean build exit 0 | **ZERO compiler warnings** under strict `-Wall -Wextra`  
 > **Production Kernels**: **44/44 Pure SYCL 2020 (100% - Zero DPCT artifacts)**  
