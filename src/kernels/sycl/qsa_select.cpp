@@ -344,6 +344,120 @@ void block_topk_reg_kernel(const float* __restrict__ scores, const int32_t* __re
     }
 }
 
+void block_topk_wide_kernel(const float* __restrict__ scores, const int32_t* __restrict__ steps, int64_t max_blocks,
+                            int64_t cap, int32_t* __restrict__ ids,
+                            int (*hist)[256], int* s_gt, int* s_eq, int& s_digit, int& s_above,
+                            sycl::nd_item<1> item) {
+    auto sg = item.get_sub_group();
+    const int64_t qi = item.get_group(0);
+    const int32_t* st = steps + qi * kStepCount;
+    const int64_t n_kv = st[kStepNKv], n_bid = st[kStepNBid], width = st[kStepWidth];
+    int32_t* out = ids + qi * cap;
+    const int t = item.get_local_id(0), lane = t & 31, warp = t >> 5;
+    if (n_kv <= width) {
+        for (int64_t j = t; j < n_kv; j += TK_T) out[j] = (int32_t)j;
+        return;
+    }
+    const float* sc = scores + qi * max_blocks;
+    const int64_t nb = n_bid + 1;
+    const int64_t per = (nb + TK_T - 1) / TK_T;
+    auto weight = [&](int64_t b) -> int { return b < n_bid ? R : (int)(n_kv - n_bid * R); };
+    uint32_t prefix = 0;
+    int above = 0;
+    for (int shift = 24; shift >= 0; shift -= 8) {
+        for (int i = lane; i < 256; i += 32) hist[warp][i] = 0;
+        item.barrier(sycl::access::fence_space::local_space);
+        const uint32_t hi_mask = shift == 24 ? 0u : (0xffffffffu << (shift + 8));
+        for (int64_t b = t; b < nb; b += TK_T) {
+            const int w = weight(b);
+            if (w == 0) continue;
+            const uint32_t k = order_key(sc[b]);
+            if ((k & hi_mask) == (prefix & hi_mask)) {
+                sycl::atomic_ref<int, sycl::memory_order::relaxed, sycl::memory_scope::work_group,
+                                 sycl::access::address_space::local_space>(hist[warp][(k >> shift) & 255])
+                    .fetch_add(w);
+            }
+        }
+        item.barrier(sycl::access::fence_space::local_space);
+        if (t < 256) {
+            int sum = 0;
+            for (int w2 = 0; w2 < TK_T / 32; ++w2) sum += hist[w2][t];
+            hist[0][t] = sum;
+        }
+        item.barrier(sycl::access::fence_space::local_space);
+        if (t == 0) {
+            int cum = above, d = 255;
+            for (; d > 0; --d) {
+                if (cum + hist[0][d] >= width) break;
+                cum += hist[0][d];
+            }
+            s_digit = d;
+            s_above = cum;
+        }
+        item.barrier(sycl::access::fence_space::local_space);
+        prefix |= (uint32_t)s_digit << shift;
+        above = s_above;
+        item.barrier(sycl::access::fence_space::local_space);
+    }
+    const uint32_t thr = prefix;
+    const int eq_budget = (int)(width - above);
+    const int64_t w0 = (int64_t)warp * 32 * per;
+    int gt = 0, eq = 0;
+    for (int64_t b = w0 + lane; b < nb && b < w0 + 32 * per; b += 32) {
+        const int w = weight(b);
+        if (w == 0) continue;
+        const uint32_t k = order_key(sc[b]);
+        if (k > thr) gt += w;
+        else if (k == thr) eq += w;
+    }
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        gt += sycl::permute_group_by_xor(sg, gt, o);
+        eq += sycl::permute_group_by_xor(sg, eq, o);
+    }
+    if (lane == 0) { s_gt[warp] = gt; s_eq[warp] = eq; }
+    item.barrier(sycl::access::fence_space::local_space);
+    if (t == 0) {
+        int eb = 0, sb = 0;
+        for (int w2 = 0; w2 < TK_T / 32; ++w2) {
+            const int g2 = s_gt[w2], e2 = s_eq[w2];
+            const int take = eq_budget - eb < 0 ? 0 : (eq_budget - eb > e2 ? e2 : eq_budget - eb);
+            s_gt[w2] = sb;
+            s_eq[w2] = eb;
+            sb += g2 + take;
+            eb += e2;
+        }
+    }
+    item.barrier(sycl::access::fence_space::local_space);
+    int run_sel = s_gt[warp], run_eq = s_eq[warp];
+    for (int64_t r0 = w0; r0 < nb && r0 < w0 + 32 * per; r0 += 32) {
+        const int64_t b = r0 + lane;
+        const int w = b < nb ? weight(b) : 0;
+        const uint32_t k = w ? order_key(sc[b]) : 0u;
+        const int my_gt = (w && k > thr) ? w : 0, my_eq = (w && k == thr) ? w : 0;
+        if (!sycl::any_of_group(sg, (my_gt | my_eq) != 0)) continue;
+        int pe = my_eq;
+#pragma unroll
+        for (int o = 1; o < 32; o <<= 1) {
+            const int y = sycl::shift_group_right(sg, pe, o);
+            if (lane >= o) pe += y;
+        }
+        const int left = eq_budget - (run_eq + pe - my_eq);
+        const int take = left < 0 ? 0 : (left > my_eq ? my_eq : left);
+        const int my_sel = my_gt + take;
+        int ps = my_sel;
+#pragma unroll
+        for (int o = 1; o < 32; o <<= 1) {
+            const int y = sycl::shift_group_right(sg, ps, o);
+            if (lane >= o) ps += y;
+        }
+        int32_t* dst = out + run_sel + ps - my_sel;
+        for (int c = 0; c < my_sel; ++c) dst[c] = (int32_t)(b * R + c);
+        run_eq += sycl::select_from_group(sg, pe, 31);
+        run_sel += sycl::select_from_group(sg, ps, 31);
+    }
+}
+
 }  // namespace
 
 void qsa_block_scores(const float* pooled, const float* dead, const float* q_idx, const int32_t* steps, int64_t nq,
@@ -443,7 +557,6 @@ bool qsa_block_topk_cluster(const float* scores, const int32_t* steps, int64_t n
 
 void qsa_block_topk(const float* scores, const int32_t* steps, int64_t nq, int64_t max_blocks, int64_t cap,
                     const QsaShapes& s, int32_t* ids, void* stream, int64_t active_blocks) {
-    (void)active_blocks;
     static const bool old = std::getenv("STRATA_TOPK_OLD") != nullptr;
     if (nq <= 0) return;
 #if !defined(__HIPCC__)
@@ -454,9 +567,9 @@ void qsa_block_topk(const float* scores, const int32_t* steps, int64_t nq, int64
     if (cluster && !old && nq <= 16 && qsa_block_topk_cluster(scores, steps, nq, max_blocks, cap, s, ids, stream))
         return;
 #endif
-    const int64_t reach = max_blocks;
+    const int64_t reach = active_blocks > 0 && active_blocks < max_blocks ? active_blocks : max_blocks;
     const int64_t fit = (int64_t)TK_T * TK_PER;
-    if (old || reach > fit) {
+    if (old) {
         qsa_block_topk_ref(scores, steps, nq, max_blocks, cap, s, ids, stream);
         return;
     }
@@ -467,19 +580,37 @@ void qsa_block_topk(const float* scores, const int32_t* steps, int64_t nq, int64
     static sycl::queue default_queue{sycl::property::queue::in_order()};
     sycl::queue* q_ptr = stream ? static_cast<sycl::queue*>(stream) : &default_queue;
 
-    q_ptr->submit([&](sycl::handler& cgh) {
-        sycl::local_accessor<int[TK_T / 32][256], 0> hist_acc(cgh);
-        sycl::local_accessor<int, 1> s_warp_acc(sycl::range<1>(33), cgh);
-        sycl::local_accessor<int, 0> s_digit_acc(cgh);
-        sycl::local_accessor<int, 0> s_above_acc(cgh);
+    if (reach > fit) {
+        q_ptr->submit([&](sycl::handler& cgh) {
+            sycl::local_accessor<int[TK_T / 32][256], 0> hist_acc(cgh);
+            sycl::local_accessor<int, 1> s_gt_acc(sycl::range<1>(TK_T / 32), cgh);
+            sycl::local_accessor<int, 1> s_eq_acc(sycl::range<1>(TK_T / 32), cgh);
+            sycl::local_accessor<int, 0> s_digit_acc(cgh);
+            sycl::local_accessor<int, 0> s_above_acc(cgh);
 
-        cgh.parallel_for(
-            sycl::nd_range<1>(nq * TK_T, TK_T), [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(32)]] {
-                block_topk_reg_kernel<TK_PER>(scores, steps, max_blocks, cap, ids, hist_acc,
-                                              s_warp_acc.get_multi_ptr<sycl::access::decorated::no>().get(),
-                                              s_digit_acc, s_above_acc, item);
-            });
-    });
+            cgh.parallel_for(
+                sycl::nd_range<1>(nq * TK_T, TK_T), [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(32)]] {
+                    block_topk_wide_kernel(scores, steps, max_blocks, cap, ids, hist_acc,
+                                           s_gt_acc.get_multi_ptr<sycl::access::decorated::no>().get(),
+                                           s_eq_acc.get_multi_ptr<sycl::access::decorated::no>().get(),
+                                           s_digit_acc, s_above_acc, item);
+                });
+        });
+    } else {
+        q_ptr->submit([&](sycl::handler& cgh) {
+            sycl::local_accessor<int[TK_T / 32][256], 0> hist_acc(cgh);
+            sycl::local_accessor<int, 1> s_warp_acc(sycl::range<1>(33), cgh);
+            sycl::local_accessor<int, 0> s_digit_acc(cgh);
+            sycl::local_accessor<int, 0> s_above_acc(cgh);
+
+            cgh.parallel_for(
+                sycl::nd_range<1>(nq * TK_T, TK_T), [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(32)]] {
+                    block_topk_reg_kernel<TK_PER>(scores, steps, max_blocks, cap, ids, hist_acc,
+                                                  s_warp_acc.get_multi_ptr<sycl::access::decorated::no>().get(),
+                                                  s_digit_acc, s_above_acc, item);
+                });
+        });
+    }
 }
 
 }  // namespace strata::kernels

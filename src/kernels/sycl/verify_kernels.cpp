@@ -314,8 +314,9 @@ void mtp_select_kernel(const float* __restrict__ R_src, int64_t stride, const in
     if (item.get_global_id(0) == 0) {
         const int32_t tok = ids[row];
         *tok_dst = tok;
-        if (out != nullptr) ((volatile int32_t*)out)[j] = tok;
         if (probs != nullptr && out_p != nullptr) ((volatile float*)out_p)[j] = probs[row];
+        sycl::atomic_fence(sycl::memory_order::acq_rel, sycl::memory_scope::system);
+        if (out != nullptr) ((volatile int32_t*)out)[j] = tok;
     }
 }
 
@@ -344,14 +345,48 @@ void window_ids_kernel(int32_t* steps, int window, int32_t* ids, long long strid
 
 void resident_plan_kernel(const int32_t* __restrict__ ids, int n, int k, const int32_t* __restrict__ res, int n_expert,
                           const uint8_t* cache_base, const unsigned long long* slot_off, long long blob,
-                          int32_t* __restrict__ pl, long long capx, uint32_t* skip, uint32_t ring) {
-    for (int i = 0; i < n; ++i) {
-        const int32_t e = ids[i];
-        if (e < 0 || e >= n_expert || res[e] < 0) {
-            *skip = 0;
-            return;
+                          int32_t* __restrict__ pl, long long capx, uint32_t* skip, uint32_t ring,
+                          int32_t* s_ids, unsigned long long* s_ptr, int32_t* s_first, int32_t* s_cnt,
+                          int32_t* s_gstart, int* s_bad, sycl::nd_item<1> item) {
+    const int tid = item.get_local_id(0);
+    if (tid == 0) *s_bad = 0;
+    item.barrier(sycl::access::fence_space::local_space);
+
+    int32_t eid = -1;
+    if (tid < n) {
+        eid = ids[tid];
+        s_ids[tid] = eid;
+        const int32_t slot = (eid >= 0 && eid < n_expert) ? res[eid] : -1;
+        if (slot < 0) {
+            sycl::atomic_ref<int, sycl::memory_order::relaxed, sycl::memory_scope::work_group,
+                             sycl::access::address_space::local_space>(*s_bad).fetch_or(1);
+        } else {
+            s_ptr[tid] = (unsigned long long)(cache_base + (slot_off ? (size_t)slot_off[slot] : (size_t)slot * (size_t)blob));
         }
     }
+    item.barrier(sycl::access::fence_space::local_space);
+    if (*s_bad) {
+        if (tid == 0 && skip != nullptr) *skip = 0;
+        return;
+    }
+
+    int first_j = tid;
+    int rank_in_group = 0;
+    int count_same = 0;
+    if (tid < n) {
+        for (int j = 0; j < n; ++j) {
+            if (s_ids[j] == eid) {
+                if (j < first_j) first_j = j;
+                if (j < tid) ++rank_in_group;
+                ++count_same;
+            }
+        }
+        const bool is_first = (first_j == tid);
+        s_first[tid] = is_first ? 1 : 0;
+        s_cnt[tid] = is_first ? count_same : 0;
+    }
+    item.barrier(sycl::access::fence_space::local_space);
+
     int32_t* counts = pl;
     int32_t* start = pl + 4;
     int32_t* dst = start + capx + 1;
@@ -359,34 +394,38 @@ void resident_plan_kernel(const int32_t* __restrict__ ids, int n, int k, const i
     const long long ptr_off = ((4 + (capx + 1) + 2 * capx) + 1) & ~1ll;
     unsigned long long* ptr = (unsigned long long*)(pl + ptr_off);
     int32_t* start2 = pl + ptr_off + 4 * capx;
-    int groups = 0, entries = 0;
-    for (int i0 = 0; i0 < n; ++i0) {
-        bool first = true;
-        for (int j = 0; j < i0; ++j)
-            if (ids[j] == ids[i0]) {
-                first = false;
-                break;
-            }
-        if (!first) continue;
-        const int32_t slot = res[ids[i0]];
-        ptr[groups] =
-            (unsigned long long)(cache_base + (slot_off ? (size_t)slot_off[slot] : (size_t)slot * (size_t)blob));
-        start[groups] = entries;
-        for (int i = i0; i < n; ++i)
-            if (ids[i] == ids[i0]) {
-                dst[entries] = i;
-                tok[entries] = i / k;
-                ++entries;
-            }
-        ++groups;
+
+    if (tid < n && first_j == tid) {
+        int grp_idx = 0;
+        int ent_start = 0;
+        for (int j = 0; j < tid; ++j) {
+            grp_idx += s_first[j];
+            ent_start += s_cnt[j];
+        }
+        ptr[grp_idx] = s_ptr[tid];
+        start[grp_idx] = ent_start;
+        s_gstart[tid] = ent_start;
     }
-    start[groups] = entries;
-    start2[0] = entries;
-    counts[0] = groups;
-    counts[1] = entries;
-    counts[2] = 0;
-    sycl::atomic_fence(sycl::memory_order::acq_rel, sycl::memory_scope::device);
-    *skip = ring;
+    item.barrier(sycl::access::fence_space::local_space);
+
+    if (tid < n) {
+        const int out_idx = s_gstart[first_j] + rank_in_group;
+        dst[out_idx] = tid;
+        tok[out_idx] = tid / k;
+    }
+    if (tid == 0) {
+        int groups = 0;
+        for (int j = 0; j < n; ++j) groups += s_first[j];
+        start[groups] = n;
+        start2[0] = n;
+        counts[0] = groups;
+        counts[1] = n;
+        counts[2] = 0;
+        if (skip != nullptr) {
+            sycl::atomic_fence(sycl::memory_order::acq_rel, sycl::memory_scope::system);
+            *skip = ring;
+        }
+    }
 }
 
 void wait_flag_ge_kernel(const volatile uint32_t* flag, uint32_t value) {
@@ -472,7 +511,7 @@ void ident_hits(const int32_t* ids, int n, int32_t* slot, int32_t* dst, int32_t*
 void mtp_select(const float* R_src, int64_t R_stride, const int32_t* ids, const int32_t* row_dev, float* R_dst,
                 int32_t* tok_dst, int32_t* out, int j, void* stream, const float* probs, float* out_p) {
     sycl::queue* q = stream ? static_cast<sycl::queue*>(stream) : &default_queue();
-    q->parallel_for(sycl::nd_range<1>(sycl::range<1>(16 * 256), sycl::range<1>(256)), [=](sycl::nd_item<1> item) {
+    q->parallel_for(sycl::nd_range<1>(sycl::range<1>(256), sycl::range<1>(256)), [=](sycl::nd_item<1> item) {
         mtp_select_kernel(R_src, R_stride, ids, row_dev, R_dst, tok_dst, out, j, probs, out_p, item);
     });
 }
@@ -598,9 +637,25 @@ void resident_plan(const int32_t* ids, int n_entries, int k, const int32_t* res_
                    const uint8_t* cache_base, const unsigned long long* slot_off, long long blob, int32_t* plan,
                    long long capx, uint32_t* skip, uint32_t ring, void* stream) {
     sycl::queue* q = stream ? static_cast<sycl::queue*>(stream) : &default_queue();
-    q->parallel_for(sycl::nd_range<1>(sycl::range<1>(1), sycl::range<1>(1)), [=](sycl::nd_item<1>) {
-        resident_plan_kernel(ids, n_entries, k, res_layer, n_expert, cache_base, slot_off, blob, plan, capx, skip,
-                             ring);
+    q->submit([&](sycl::handler& cgh) {
+        sycl::local_accessor<int32_t, 1> s_ids(sycl::range<1>(64), cgh);
+        sycl::local_accessor<unsigned long long, 1> s_ptr(sycl::range<1>(64), cgh);
+        sycl::local_accessor<int32_t, 1> s_first(sycl::range<1>(64), cgh);
+        sycl::local_accessor<int32_t, 1> s_cnt(sycl::range<1>(64), cgh);
+        sycl::local_accessor<int32_t, 1> s_gstart(sycl::range<1>(64), cgh);
+        sycl::local_accessor<int, 0> s_bad(cgh);
+        cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(64), sycl::range<1>(64)),
+                         [=](sycl::nd_item<1> item) {
+                             resident_plan_kernel(ids, n_entries, k, res_layer, n_expert, cache_base, slot_off, blob,
+                                                  plan, capx, skip, ring,
+                                                  s_ids.get_multi_ptr<sycl::access::decorated::no>().get(),
+                                                  s_ptr.get_multi_ptr<sycl::access::decorated::no>().get(),
+                                                  s_first.get_multi_ptr<sycl::access::decorated::no>().get(),
+                                                  s_cnt.get_multi_ptr<sycl::access::decorated::no>().get(),
+                                                  s_gstart.get_multi_ptr<sycl::access::decorated::no>().get(),
+                                                  s_bad.get_multi_ptr<sycl::access::decorated::no>().get(),
+                                                  item);
+                         });
     });
 }
 
