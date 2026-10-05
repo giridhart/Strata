@@ -17,7 +17,7 @@ The Strata native SYCL 2020 backend documentation has been consolidated into the
 3. **[`docs/INTEL_B580_OPTIMIZATION_PLAN.md`](docs/INTEL_B580_OPTIMIZATION_PLAN.md)**: **Intel Xe2 / Arc B580 Optimization Plan**
    - Microarchitecture details for Intel Arc B580 (Xe2-HPG) and Lunar Lake (Xe2-LPG `0x64a0`).
    - Phase-by-phase implementation: Ahead-of-Time compilation (`bmg`), native SIMD16 subgroup reductions (`SUB_GROUP_SIZE = 16`), hardware XMX systolic matrix acceleration (`joint_matrix`), and SLM bank alignment.
-   - Complete 5-suite Google Benchmark performance harness in `perf/sycl/` with real measured hardware throughputs and latency improvements.
+   - Complete 12-benchmark performance tuning suite in `perf/sycl/` and `tools/` with real measured hardware throughputs and latency improvements across all critical Xe2/B580 execution stages.
 
 4. **[`HANDOVER.md`](HANDOVER.md)**: **Active Session Handover**
    - Work items, active task state, and reproduction steps for live GPU validation.

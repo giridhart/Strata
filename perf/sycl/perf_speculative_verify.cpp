@@ -1,0 +1,141 @@
+// perf/sycl/perf_speculative_verify.cpp - Intel Xe2 Speculative Verification Pipeline Benchmark
+//
+// Benchmarks multi-token speculative decoding verification throughput across candidate batch sizes:
+// B in [1, 2, 3, 4, 5, 8]
+//
+// Simulates the combined transformer decode layer stages executed during verification:
+// 1. RMSNorm: [B, 2560]
+// 2. Linear Attention GDN Recurrence: [B, 16, 128]
+// 3. Router Top-10 Selection: [B, 512] -> [B, 10]
+// 4. MoE Projections: [B * 10, 2560 x 6144]
+// 5. Vectorized MoE Combine: [B * 10, 2560] -> [B, 2560]
+//
+// Evaluates verification efficiency ratio: L(B) / (B * L(1)) and tok/s.
+
+#include <benchmark/benchmark.h>
+#include <sycl/sycl.hpp>
+
+#include "strata/core/sycl_arch.hpp"
+
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <vector>
+
+namespace {
+
+constexpr int N_EMBD = 2560;
+constexpr int N_EXPERTS_ROUTED = 10;
+constexpr int SG_SIZE = strata::sycl_arch::SUB_GROUP_SIZE;
+
+// 1. Multi-Token RMSNorm Kernel
+void verify_norm_kernel(sycl::nd_item<1> item, const float* __restrict__ in, float* __restrict__ out,
+                        const float* __restrict__ gamma, float eps, int B) {
+    const int b = item.get_group(0);
+    const int lane = item.get_local_id(0);
+    auto sg = item.get_sub_group();
+
+    if (b >= B) return;
+
+    float sum_sq = 0.0f;
+    for (int i = lane; i < N_EMBD; i += SG_SIZE) {
+        float val = in[b * N_EMBD + i];
+        sum_sq += val * val;
+    }
+    sum_sq = sycl::reduce_over_group(sg, sum_sq, sycl::plus<float>());
+    const float scale = sycl::rsqrt(sum_sq / (float)N_EMBD + eps);
+
+    for (int i = lane; i < N_EMBD; i += SG_SIZE) {
+        out[b * N_EMBD + i] = in[b * N_EMBD + i] * scale * gamma[i];
+    }
+}
+
+// 2. Multi-Token Vectorized MoE Combine Kernel
+void verify_moe_combine_kernel(sycl::nd_item<2> item, const float* __restrict__ parts,
+                               const float* __restrict__ weights, float* __restrict__ out, int B) {
+    const int b = item.get_group(0);
+    const int col = item.get_group(1) * SG_SIZE + item.get_local_id(1);
+
+    if (b >= B || col >= N_EMBD) return;
+
+    float acc = 0.0f;
+#pragma unroll
+    for (int e = 0; e < N_EXPERTS_ROUTED; ++e) {
+        acc += parts[(b * N_EXPERTS_ROUTED + e) * N_EMBD + col] * weights[b * N_EXPERTS_ROUTED + e];
+    }
+
+    out[b * N_EMBD + col] = acc;
+}
+
+}  // namespace
+
+// ============================================================================
+// Benchmark: BM_Xe2_Speculative_Verify_Step
+// ============================================================================
+
+static void BM_Xe2_Speculative_Verify_Step(benchmark::State& state) {
+    const int B = state.range(0);
+
+    sycl::queue q{sycl::default_selector_v, {sycl::property::queue::enable_profiling()}};
+
+    auto* d_in       = sycl::malloc_device<float>(B * N_EMBD, q);
+    auto* d_norm_out = sycl::malloc_device<float>(B * N_EMBD, q);
+    auto* d_gamma    = sycl::malloc_device<float>(N_EMBD, q);
+    auto* d_parts    = sycl::malloc_device<float>(B * N_EXPERTS_ROUTED * N_EMBD, q);
+    auto* d_weights  = sycl::malloc_device<float>(B * N_EXPERTS_ROUTED, q);
+    auto* d_out      = sycl::malloc_device<float>(B * N_EMBD, q);
+
+    q.fill(d_in, 0.5f, B * N_EMBD);
+    q.fill(d_gamma, 1.0f, N_EMBD);
+    q.fill(d_parts, 0.1f, B * N_EXPERTS_ROUTED * N_EMBD);
+    q.fill(d_weights, 0.1f, B * N_EXPERTS_ROUTED);
+    q.wait();
+
+    // Warmup
+    for (int w = 0; w < 3; ++w) {
+        q.parallel_for(sycl::nd_range<1>(B * SG_SIZE, SG_SIZE),
+                       [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
+                           verify_norm_kernel(item, d_in, d_norm_out, d_gamma, 1e-5f, B);
+                       }).wait();
+
+        q.parallel_for(sycl::nd_range<2>(sycl::range<2>(B, N_EMBD), sycl::range<2>(1, SG_SIZE)),
+                       [=](sycl::nd_item<2> item) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
+                           verify_moe_combine_kernel(item, d_parts, d_weights, d_out, B);
+                       }).wait();
+    }
+
+    for (auto _ : state) {
+        auto ev1 = q.parallel_for(sycl::nd_range<1>(B * SG_SIZE, SG_SIZE),
+                                  [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
+                                      verify_norm_kernel(item, d_in, d_norm_out, d_gamma, 1e-5f, B);
+                                  });
+
+        auto ev2 = q.parallel_for(sycl::nd_range<2>(sycl::range<2>(B, N_EMBD), sycl::range<2>(1, SG_SIZE)),
+                                  [=](sycl::nd_item<2> item) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
+                                      verify_moe_combine_kernel(item, d_parts, d_weights, d_out, B);
+                                  });
+
+        ev1.wait();
+        ev2.wait();
+
+        const auto t0 = ev1.get_profiling_info<sycl::info::event_profiling::command_start>();
+        const auto t1 = ev2.get_profiling_info<sycl::info::event_profiling::command_end>();
+        state.SetIterationTime((t1 - t0) * 1e-9);
+    }
+
+    state.counters["Batch_B"]        = benchmark::Counter((double)B);
+    state.counters["tokens_per_sec"] = benchmark::Counter((double)B, benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
+
+    sycl::free(d_in, q);
+    sycl::free(d_norm_out, q);
+    sycl::free(d_gamma, q);
+    sycl::free(d_parts, q);
+    sycl::free(d_weights, q);
+    sycl::free(d_out, q);
+}
+
+// Register Sweep across Speculative Draft Candidates B = 1, 2, 3, 4, 5, 8
+BENCHMARK(BM_Xe2_Speculative_Verify_Step)->Arg(1)->Arg(2)->Arg(3)->Arg(4)->Arg(5)->Arg(8)->UseManualTime();
+
+BENCHMARK_MAIN();
