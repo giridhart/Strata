@@ -356,6 +356,94 @@ void doorbell_publish(const float* x, const int32_t* ids, const float* weights, 
     check_launch("doorbell_publish");
 }
 
+void doorbell_publish_res_kernel(const float* __restrict__ x, const int32_t* __restrict__ ids,
+                                 const int32_t* __restrict__ d_res, int n_expert, int n, int k,
+                                 float* x_out, int32_t* ids_out, uint32_t* seq,
+                                 int* s_miss, sycl::nd_item<1> item) {
+    if (item.get_local_id(0) == 0) {
+        *s_miss = 0;
+    }
+    item.barrier(sycl::access::fence_space::local_space);
+    if ((int)item.get_local_id(0) < k) {
+        const int32_t id = ids[item.get_local_id(0)];
+        ids_out[item.get_local_id(0)] = id;
+        if (d_res == nullptr || id < 0 || id >= n_expert || d_res[id] < 0) {
+            sycl::atomic_ref<int, sycl::memory_order::relaxed, sycl::memory_scope::work_group,
+                             sycl::access::address_space::local_space>(*s_miss).store(1);
+        }
+    }
+    item.barrier(sycl::access::fence_space::local_space);
+    if (*s_miss) {
+        for (int i = item.get_local_id(0); i < n; i += item.get_local_range(0))
+            x_out[i] = x[i];
+        sycl::atomic_fence(sycl::memory_order::acq_rel, sycl::memory_scope::system);
+    } else if ((int)item.get_local_id(0) < k) {
+        sycl::atomic_fence(sycl::memory_order::acq_rel, sycl::memory_scope::system);
+    }
+    item.barrier();
+    if (item.get_local_id(0) == 0) {
+        sycl::atomic_fence(sycl::memory_order::acq_rel, sycl::memory_scope::system);
+        *(volatile uint32_t*)seq = *(volatile uint32_t*)seq + 1u;
+    }
+}
+
+void doorbell_publish_res(const float* x, const int32_t* ids, const int32_t* d_res, int n_expert, int64_t n, int64_t k,
+                          float* x_out, int32_t* ids_out, uint32_t* d_seq, void* stream) {
+    static sycl::queue default_queue;
+    sycl::queue* q = stream ? static_cast<sycl::queue*>(stream) : &default_queue;
+
+    if (k > 1024) {
+        std::fprintf(stderr, "doorbell_publish_res: k too large\n");
+        std::exit(1);
+    }
+    q->submit([&](sycl::handler& cgh) {
+        sycl::local_accessor<int, 0> s_miss(cgh);
+        cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(1024), sycl::range<1>(1024)),
+                         [=](sycl::nd_item<1> item) {
+                             doorbell_publish_res_kernel(x, ids, d_res, n_expert, (int)n, (int)k,
+                                                         x_out, ids_out, d_seq,
+                                                         s_miss.get_multi_ptr<sycl::access::decorated::no>().get(),
+                                                         item);
+                         });
+    });
+    check_launch("doorbell_publish_res");
+}
+
+void doorbell_publish_value_kernel(const float* __restrict__ x, const int32_t* __restrict__ ids,
+                                   const float* __restrict__ w, int n, int k, float* x_out, int32_t* ids_out,
+                                   float* w_out, uint32_t* seq, uint32_t value) {
+    auto item = sycl::ext::oneapi::this_work_item::get_nd_item<1>();
+    for (int i = item.get_local_id(0); i < n; i += item.get_local_range(0))
+        x_out[i] = x[i];
+    if ((int)item.get_local_id(0) < k) {
+        ids_out[item.get_local_id(0)] = ids[item.get_local_id(0)];
+        w_out[item.get_local_id(0)] = w[item.get_local_id(0)];
+    }
+    sycl::atomic_fence(sycl::memory_order::acq_rel, sycl::memory_scope::system);
+    item.barrier();
+    if (item.get_local_id(0) == 0) {
+        sycl::atomic_fence(sycl::memory_order::acq_rel, sycl::memory_scope::system);
+        *(volatile uint32_t*)seq = value;
+        sycl::atomic_fence(sycl::memory_order::acq_rel, sycl::memory_scope::system);
+    }
+}
+
+void doorbell_publish_value(const float* x, const int32_t* ids, const float* weights, int64_t n, int64_t k,
+                            float* x_out, int32_t* ids_out, float* weights_out, uint32_t* d_seq, uint32_t value,
+                            void* stream) {
+    static sycl::queue default_queue;
+    sycl::queue* q = stream ? static_cast<sycl::queue*>(stream) : &default_queue;
+
+    if (k > 1024) {
+        std::fprintf(stderr, "doorbell_publish_value: k too large\n");
+        std::exit(1);
+    }
+    q->parallel_for(sycl::nd_range<1>(sycl::range<1>(1024), sycl::range<1>(1024)), [=](sycl::nd_item<1> /*item*/) {
+        doorbell_publish_value_kernel(x, ids, weights, (int)n, (int)k, x_out, ids_out, weights_out, d_seq, value);
+    });
+    check_launch("doorbell_publish_value");
+}
+
 void copy_i32_from_mapped_kernel(int32_t* __restrict__ dst, const volatile int32_t* src, int n) {
     auto item = sycl::ext::oneapi::this_work_item::get_nd_item<1>();
     for (int i = item.get_local_id(0); i < n; i += item.get_local_range(0))

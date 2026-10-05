@@ -172,6 +172,22 @@ void native_quantize_q8_1_kernel(const float* __restrict__ x, Q81Block* __restri
     if (i % Q8K == 0) y[i / Q8K].ds = sycl::half2(d, sum);
 }
 
+void native_swiglu_quantize_q8_1_kernel(const float* __restrict__ gate,
+                                        const float* __restrict__ up,
+                                        Q81Block* __restrict__ y, int n_in) {
+    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    const int i = int(item_ct1.get_group(2)) * QUANT_THREADS + int(item_ct1.get_local_id(2));
+    if (i >= n_in) return;  // n_in is a multiple of 32: only whole warps return.
+    const float gi = gate[i];
+    const float xi = (gi / (1.0f + sycl::native::exp(-gi))) * up[i];
+    const float amax = warp_max(sycl::fabs(xi));
+    const float sum = warp_sum(xi);
+    const float d = amax / 127.0f;
+    const int8_t q = amax == 0.0f ? 0 : sycl::round(xi / d);
+    y[i / Q8K].qs[i % Q8K] = q;
+    if (i % Q8K == 0) y[i / Q8K].ds = sycl::half2(d, sum);
+}
+
 // Exact pinned vec_dot_q5_K_q8_1_impl_vmmq expression and integer dot order.
 inline float q5_q8_dot_impl(const int* __restrict__ vl, const int* __restrict__ vh, const int* __restrict__ u,
                             const uint8_t* __restrict__ sc, const uint8_t* __restrict__ m, const sycl::half2& dm5,
@@ -1424,6 +1440,23 @@ void native_quantize_q8_1(const float* x, void* x_q8_1, int n_in, int ncols, voi
                                          sycl::range<3>(1, 1, QUANT_THREADS)),
                        [=](sycl::nd_item<3> /*item_ct1*/) [[sycl::reqd_sub_group_size(32)]] {
                            native_quantize_q8_1_kernel(x, static_cast<Q81Block*>(x_q8_1), n_total);
+                       });
+    launch_check();
+}
+
+void native_swiglu_quantize_q8_1(const float* gate, const float* up, void* x_q8_1, int n_in, int ncols, void* stream) {
+    validate_shape(n_in, ncols);
+    validate_pointer(gate);
+    validate_pointer(up);
+    validate_pointer(x_q8_1);
+    validate_stream(stream);
+    const int n_total = n_in * ncols;
+    const unsigned blocks = unsigned((std::size_t(n_total) + QUANT_THREADS - 1) / QUANT_THREADS);
+    (stream ? static_cast<sycl::queue*>(stream) : &default_queue())
+        ->parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, blocks) * sycl::range<3>(1, 1, QUANT_THREADS),
+                                         sycl::range<3>(1, 1, QUANT_THREADS)),
+                       [=](sycl::nd_item<3> /*item_ct1*/) [[sycl::reqd_sub_group_size(32)]] {
+                           native_swiglu_quantize_q8_1_kernel(gate, up, static_cast<Q81Block*>(x_q8_1), n_total);
                        });
     launch_check();
 }

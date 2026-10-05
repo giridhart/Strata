@@ -139,9 +139,28 @@ void scale_rows_kernel(float* __restrict__ out, const float* __restrict__ g, int
     if (i < n) out[(size_t)t * n + i] *= g[t];
 }
 
+void sigmoid_scale_rows_kernel(float* __restrict__ out, const float* __restrict__ g, int n,
+                               const sycl::nd_item<2>& item) {
+    const int t = item.get_group(0);
+    const int i = item.get_global_id(1);
+    if (i < n) {
+        const float gt = 1.0f / (1.0f + sycl::native::exp(-g[t]));
+        out[(size_t)t * n + i] *= gt;
+    }
+}
+
+bool fused_swiglu_q81_enabled() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_FUSED_SWIGLU_Q81");
+        return v == nullptr || std::atoi(v) != 0;
+    }();
+    return on;
+}
+
 }  // namespace
 
 void shared_expert_set_native_bf16(bool enabled) { native_bf16 = enabled; }
+bool shared_expert_native_bf16_enabled() { return native_bf16; }
 
 void shared_expert_multi(int n_tok, const float* x, const uint16_t* x_bf16, const NativeSharedWeights& nw,
                          const uint16_t* gate_inp_bf16, float* gate, float* up, float* g, float* out, int64_t n_embd,
@@ -150,23 +169,38 @@ void shared_expert_multi(int n_tok, const float* x, const uint16_t* x_bf16, cons
         throw std::invalid_argument("shared_expert_multi: needs 1..8 tokens, native weights, scratch and a stream");
     static sycl::queue default_queue;
     sycl::queue* q = stream ? static_cast<sycl::queue*>(stream) : &default_queue;
-    native_quantize_q8_1(x, nw.q8_1, (int)n_embd, n_tok, stream);
-    native_mmvq(nw.gate_type, nw.gate_data, nw.q8_1, gate, (int)n_embd, (int)n_ff, n_tok, stream);
-    native_mmvq(nw.up_type, nw.up_data, nw.q8_1, up, (int)n_embd, (int)n_ff, n_tok, stream);
+    const void* x_q8_1 = nw.x_q8_1;
+    if (!x_q8_1) {
+        native_quantize_q8_1(x, nw.q8_1, (int)n_embd, n_tok, stream);
+        x_q8_1 = nw.q8_1;
+    }
+    native_mmvq(nw.gate_type, nw.gate_data, x_q8_1, gate, (int)n_embd, (int)n_ff, n_tok, stream);
+    native_mmvq(nw.up_type, nw.up_data, x_q8_1, up, (int)n_embd, (int)n_ff, n_tok, stream);
     const int n = (int)(n_ff * n_tok);
-    const unsigned grid_swiglu = (unsigned)((n + THREADS - 1) / THREADS);
-    q->parallel_for(sycl::nd_range<1>(sycl::range<1>(grid_swiglu * THREADS), sycl::range<1>(THREADS)),
-                    [=](sycl::nd_item<1> item) { native_swiglu_kernel(gate, up, gate, n, item); });
-    native_quantize_q8_1(gate, nw.q8_1, (int)n_ff, n_tok, stream);
+    if (fused_swiglu_q81_enabled()) {
+        native_swiglu_quantize_q8_1(gate, up, nw.q8_1, (int)n_ff, n_tok, stream);
+    } else {
+        const unsigned grid_swiglu = (unsigned)((n + THREADS - 1) / THREADS);
+        q->parallel_for(sycl::nd_range<1>(sycl::range<1>(grid_swiglu * THREADS), sycl::range<1>(THREADS)),
+                        [=](sycl::nd_item<1> item) { native_swiglu_kernel(gate, up, gate, n, item); });
+        native_quantize_q8_1(gate, nw.q8_1, (int)n_ff, n_tok, stream);
+    }
     native_mmvq(nw.down_type, nw.down_data, nw.q8_1, out, (int)n_ff, (int)n_embd, n_tok, stream);
     static const bool batch = [] {
         const char* v = std::getenv("STRATA_DEC_BATCH");
         return v == nullptr || std::atoi(v) != 0;
     }();
-    if (native_bf16 && batch && n_tok > 1) {  // one gemv for all rows (outputs identical), one sigmoid launch
+    const unsigned grid_scale = (unsigned)((n_embd + THREADS - 1) / THREADS);
+    if (native_bf16 && batch && n_tok > 1) {  // one gemv for all rows (outputs identical), fused sigmoid+scale
         bf16_gemv_fp32_mmvf_multi(x, n_embd, gate_inp_bf16, g, 1, n_embd, 1, n_tok, stream);
-        q->parallel_for(sycl::nd_range<1>(sycl::range<1>(n_tok), sycl::range<1>(n_tok)),
-                        [=](sycl::nd_item<1> item) { native_scalar_sigmoid_multi_kernel(g, item); });
+        q->parallel_for(
+            sycl::nd_range<2>(sycl::range<2>((unsigned)n_tok, grid_scale * THREADS), sycl::range<2>(1, THREADS)),
+            [=](sycl::nd_item<2> item) { sigmoid_scale_rows_kernel(out, g, (int)n_embd, item); });
+    } else if (native_bf16 && n_tok == 1) {
+        bf16_gemv_fp32_mmvf(x, gate_inp_bf16, g, n_embd, 1, stream);
+        q->parallel_for(
+            sycl::nd_range<2>(sycl::range<2>(1, grid_scale * THREADS), sycl::range<2>(1, THREADS)),
+            [=](sycl::nd_item<2> item) { sigmoid_scale_rows_kernel(out, g, (int)n_embd, item); });
     } else {
         for (int t = 0; t < n_tok; ++t) {
             if (native_bf16) {
@@ -188,11 +222,10 @@ void shared_expert_multi(int n_tok, const float* x, const uint16_t* x_bf16, cons
                 });
             }
         }
+        q->parallel_for(
+            sycl::nd_range<2>(sycl::range<2>((unsigned)n_tok, grid_scale * THREADS), sycl::range<2>(1, THREADS)),
+            [=](sycl::nd_item<2> item) { scale_rows_kernel(out, g, (int)n_embd, item); });
     }
-    const unsigned grid_scale = (unsigned)((n_embd + THREADS - 1) / THREADS);
-    q->parallel_for(
-        sycl::nd_range<2>(sycl::range<2>((unsigned)n_tok, grid_scale * THREADS), sycl::range<2>(1, THREADS)),
-        [=](sycl::nd_item<2> item) { scale_rows_kernel(out, g, (int)n_embd, item); });
     if (!stream) default_queue.wait();
 }
 
@@ -274,36 +307,41 @@ void shared_expert(const uint8_t* x_q8_0, const uint8_t* x_q8k, const uint16_t* 
         native_mmvq(native->up_type, native->up_data, native->q8_1, up, (int)n_embd, (int)n_ff, 1, stream);
     else
         gemv(up_form, up_codes, up_scales, up_off, x_q8_0, x_q8k, up, n_embd, n_ff);
-    if (native_projection)
-        q->parallel_for(sycl::nd_range<1>(sycl::range<1>(g_ff * THREADS), sycl::range<1>(THREADS)),
-                        [=](sycl::nd_item<1> item) { native_swiglu_kernel(gate, up, gate, (int)n_ff, item); });
-    else {
-        q->parallel_for(sycl::nd_range<1>(sycl::range<1>(g_ff * THREADS), sycl::range<1>(THREADS)),
-                        [=](sycl::nd_item<1> item) { swiglu_kernel(gate, up, gate, (int)n_ff, item); });
-    }
-
-    // down: (n_ff) -> (n_embd), and THE INTERMEDIATE IS QUANTIZED TO THE DOWN WEIGHT'S OWN CONTRACT - which is
-    // what `ggml_mul_mat` does for every matmul in the model.  It used to be rounded to fp16 with no
-    // justification beyond "the kernel takes fp16".
-    if (native_down) {
-        native_quantize_q8_1(gate, native->q8_1, (int)n_ff, 1, stream);
+    if (native_projection && native_down && fused_swiglu_q81_enabled()) {
+        native_swiglu_quantize_q8_1(gate, up, native->q8_1, (int)n_ff, 1, stream);
         native_mmvq(native->down_type, native->down_data, native->q8_1, out, (int)n_ff, (int)n_embd, 1, stream);
-    } else if (down_form.act_kind == 1) {
-        if (n_ff % 256 != 0) {
-            std::fprintf(stderr,
-                         "shared_expert: the down weight wants Q8_K but n_ff %lld is not a multiple "
-                         "of 256; Q8_K is structurally impossible here\n",
-                         (long long)n_ff);
-            std::exit(1);
-        }
-        quantize_q8_K(gate, h_q8k, n_ff, stream);
-        gemv(down_form, down_codes, down_scales, down_off, h_q8_0, h_q8k, out, n_ff, n_embd);
-    } else if (down_form.code_bits == 2) {
-        quantize_q8_0(gate, h_q8_0, n_ff, stream);
-        gemv(down_form, down_codes, down_scales, down_off, h_q8_0, h_q8k, out, n_ff, n_embd);
     } else {
-        quantize_q8_0(gate, h_q8_0, n_ff, stream);
-        gemv(down_form, down_codes, down_scales, down_off, h_q8_0, h_q8k, out, n_ff, n_embd);
+        if (native_projection)
+            q->parallel_for(sycl::nd_range<1>(sycl::range<1>(g_ff * THREADS), sycl::range<1>(THREADS)),
+                            [=](sycl::nd_item<1> item) { native_swiglu_kernel(gate, up, gate, (int)n_ff, item); });
+        else {
+            q->parallel_for(sycl::nd_range<1>(sycl::range<1>(g_ff * THREADS), sycl::range<1>(THREADS)),
+                            [=](sycl::nd_item<1> item) { swiglu_kernel(gate, up, gate, (int)n_ff, item); });
+        }
+
+        // down: (n_ff) -> (n_embd), and THE INTERMEDIATE IS QUANTIZED TO THE DOWN WEIGHT'S OWN CONTRACT - which is
+        // what `ggml_mul_mat` does for every matmul in the model.  It used to be rounded to fp16 with no
+        // justification beyond "the kernel takes fp16".
+        if (native_down) {
+            native_quantize_q8_1(gate, native->q8_1, (int)n_ff, 1, stream);
+            native_mmvq(native->down_type, native->down_data, native->q8_1, out, (int)n_ff, (int)n_embd, 1, stream);
+        } else if (down_form.act_kind == 1) {
+            if (n_ff % 256 != 0) {
+                std::fprintf(stderr,
+                             "shared_expert: the down weight wants Q8_K but n_ff %lld is not a multiple "
+                             "of 256; Q8_K is structurally impossible here\n",
+                             (long long)n_ff);
+                std::exit(1);
+            }
+            quantize_q8_K(gate, h_q8k, n_ff, stream);
+            gemv(down_form, down_codes, down_scales, down_off, h_q8_0, h_q8k, out, n_ff, n_embd);
+        } else if (down_form.code_bits == 2) {
+            quantize_q8_0(gate, h_q8_0, n_ff, stream);
+            gemv(down_form, down_codes, down_scales, down_off, h_q8_0, h_q8k, out, n_ff, n_embd);
+        } else {
+            quantize_q8_0(gate, h_q8_0, n_ff, stream);
+            gemv(down_form, down_codes, down_scales, down_off, h_q8_0, h_q8k, out, n_ff, n_embd);
+        }
     }
 
     // the per-token scalar gate, then the multiply.  Note the gate is computed from `x`, the ORIGINAL hidden
@@ -313,7 +351,9 @@ void shared_expert(const uint8_t* x_q8_0, const uint8_t* x_q8k, const uint16_t* 
     // round trip.  256 threads is the reduction's width, not the problem's size.
     if (use_native) {
         bf16_gemv_fp32_mmvf(x_f32, gate_inp_bf16, g, n_embd, 1, stream);
-        q->single_task([=]() { native_scalar_sigmoid_kernel(g); });
+        q->parallel_for(
+            sycl::nd_range<2>(sycl::range<2>(1, g_embd * THREADS), sycl::range<2>(1, THREADS)),
+            [=](sycl::nd_item<2> item) { sigmoid_scale_rows_kernel(out, g, (int)n_embd, item); });
     } else {
         q->submit([&](sycl::handler& cgh) {
             sycl::local_accessor<double, 1> scratch_acc(sycl::range<1>(8), cgh);
@@ -325,9 +365,9 @@ void shared_expert(const uint8_t* x_q8_0, const uint8_t* x_q8k, const uint16_t* 
                                                     item);
                              });
         });
+        q->parallel_for(sycl::nd_range<1>(sycl::range<1>(g_embd * THREADS), sycl::range<1>(THREADS)),
+                        [=](sycl::nd_item<1> item) { scale_kernel(out, g, (int)n_embd, item); });
     }
-    q->parallel_for(sycl::nd_range<1>(sycl::range<1>(g_embd * THREADS), sycl::range<1>(THREADS)),
-                    [=](sycl::nd_item<1> item) { scale_kernel(out, g, (int)n_embd, item); });
 
     if (!stream) default_queue.wait();
 }
