@@ -61,6 +61,7 @@ The target model for these optimizations is **Qwen3.8-Flash-Next** (as well as `
 10. **`perf_prefill_gemm.cpp` (Done)**: Native Prefill Tiled GEMM: 1.17–3.00 TFLOPS on Lunar Lake, ready for 117 TFLOPS scaling on B580.
 11. **`perf_speculative_verify.cpp` (Done)**: MTP Multi-Token Speculative Verification: **6.6x throughput scaling** from $B=1$ (10.2k tok/s) to $B=8$ (68.0k tok/s).
 12. **`tools/bench_xe2_e2e.py` (Done)**: Automated Python CLI/HTTP end-to-end benchmark across prompt lengths (1K–128K) and models.
+13. **`tools/run_xe2_perf_benchmarks.py` (Done)**: Unified automated runner and reporter executing all 11 suites, generating `results_consolidated.json` and formatted Markdown tuning report (`report.md`) with B580 hardware comparisons.
 
 ---
 
@@ -134,6 +135,11 @@ make -C build_sycl -j$(nproc) check-sycl
 ./build_sycl/perf_kv_decode
 ./build_sycl/perf_prefill_gemm
 ./build_sycl/perf_speculative_verify
+
+# Run automated Xe2 / Arc B580 benchmark runner and generate Markdown report
+python3 tools/run_xe2_perf_benchmarks.py --quick --out-dir bench_results/smoke_test
+# Or via CMake:
+make -C build_sycl perf-report
 
 # Run automated end-to-end Python macro-benchmark
 python3 tools/bench_xe2_e2e.py --bin build_sycl/strata --tokens 128

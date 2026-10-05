@@ -196,6 +196,7 @@ flowchart TD
 | **P14** | Benchmark Prefill Native Tiled GEMM Scaling on Xe2 XMX | [`perf/sycl/perf_prefill_gemm.cpp`](file:///home/girtam/projects/Strata/perf/sycl/perf_prefill_gemm.cpp) | **COMPLETED & COMPILED** | Up to 3.00 TFLOPS on Lunar Lake; ready for 117 TFLOPS scaling on B580 |
 | **P15** | Benchmark MTP Multi-Token Speculative Verification | [`perf/sycl/perf_speculative_verify.cpp`](file:///home/girtam/projects/Strata/perf/sycl/perf_speculative_verify.cpp) | **COMPLETED & COMPILED** | 6.6x verification throughput scaling from B=1 (10.2k tok/s) to B=8 (68.0k tok/s) |
 | **P16** | End-to-End Inference Throughput & TTFT Macro-Benchmark | [`tools/bench_xe2_e2e.py`](file:///home/girtam/projects/Strata/tools/bench_xe2_e2e.py) | **COMPLETED** | Automated multi-context matrix (1K-128K) measuring tok/s and TTFT on B580 |
+| **P17** | Automated Xe2/B580 Benchmark Runner & Reporter | [`tools/run_xe2_perf_benchmarks.py`](file:///home/girtam/projects/Strata/tools/run_xe2_perf_benchmarks.py) | **COMPLETED** | Single-command execution of all 11 suites, consolidated JSON, and Markdown report generation |
 
 ---
 
@@ -747,5 +748,35 @@ To inspect hardware counter saturation on Intel Arc B580 systems, execute the fo
      -knob compute-engine=all -- ./build_sycl/perf_pcie_overlap
    ```
    *Metrics to inspect*: `BCE Active Time (%)`, `PCIe Read/Write Throughput (GB/s)`, `Compute Preemption Jitter`.
+
+---
+
+### 8.4 Automated Benchmark Runner & Tuning Report Generator
+
+To streamline tuning on target hardware (desktop Intel Arc B580 or integrated Lunar Lake), the automated benchmark suite runner [`tools/run_xe2_perf_benchmarks.py`](file:///home/girtam/projects/Strata/tools/run_xe2_perf_benchmarks.py) orchestrates all 11 Google Benchmark targets, auto-detects hardware features, and writes formatted JSON and Markdown performance reports:
+
+#### Quick Smoke Run (Validation):
+```bash
+python3 tools/run_xe2_perf_benchmarks.py --quick --out-dir bench_results/smoke_test
+```
+*(Runs all 11 suites with 0.05s min_time to verify hardware correctness and collect baseline numbers in ~38s).*
+
+#### Full Tuning Run (Production):
+```bash
+python3 tools/run_xe2_perf_benchmarks.py --out-dir bench_results/b580_tuning_run
+```
+*(Runs full benchmark repetitions, computing average bandwidth, standard deviation, and comparative metrics).*
+
+#### Via CMake Target:
+```bash
+source /opt/intel/oneapi/setvars.sh --force
+make -C build_sycl perf-report
+```
+
+#### Output Artifacts:
+- `report.md`: Markdown summary table with executive findings, per-kernel latency and bandwidth tables, and architecture-specific optimization recommendations.
+- `results_consolidated.json`: Unified JSON containing hardware metadata, device properties, and all captured benchmark counters.
+- `<target>.json`: Individual per-kernel Google Benchmark JSON outputs for automated CI diffing.
+
 
 

@@ -2146,6 +2146,13 @@ if(STRATA_BUILD_PERF)
       COMMENT "Running Intel Xe2 Performance Tuning Suite"
       USES_TERMINAL
     )
+
+    add_custom_target(perf-report
+      COMMAND ${CMAKE_COMMAND} -E env python3 "${CMAKE_CURRENT_SOURCE_DIR}/tools/run_xe2_perf_benchmarks.py" --build-dir "${CMAKE_CURRENT_BINARY_DIR}"
+      DEPENDS ${_strata_perf_targets}
+      COMMENT "Running Automated Intel Xe2 / Arc B580 Performance Benchmarks and Generating Markdown Report"
+      USES_TERMINAL
+    )
   endif()
 endif()
 
