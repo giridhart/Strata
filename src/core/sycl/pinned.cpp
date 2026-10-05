@@ -24,9 +24,9 @@ inline sycl::queue& default_queue() {
 // Loader fix: `fseek`/`ftell` are 32-bit on Windows by default (and the pack is 42.9 GB), and the 64-bit
 // spelling is not the same on the two platforms the engine builds for.
 #ifdef _WIN32
-#define STRATA_FSEEK64(f, o) _fseeki64((f), (long long) (o), SEEK_SET)
+#define STRATA_FSEEK64(f, o) _fseeki64((f), (long long)(o), SEEK_SET)
 #else
-#define STRATA_FSEEK64(f, o) fseeko((f), (off_t) (o), SEEK_SET)
+#define STRATA_FSEEK64(f, o) fseeko((f), (off_t)(o), SEEK_SET)
 #endif
 
 #ifdef _WIN32
@@ -83,8 +83,9 @@ void* reserve(uint64_t bytes, PageBacking& got, std::string& note, const std::st
             tp.PrivilegeCount = 1;
             if (LookupPrivilegeValueW(nullptr, L"SeLockMemoryPrivilege", &tp.Privileges[0].Luid)) {
                 tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
-                if (!AdjustTokenPrivileges(tok, FALSE, &tp, 0, nullptr, nullptr) && GetLastError() != ERROR_NOT_ALL_ASSIGNED)
-                    (void) 0;   // nothing actionable: the large-page attempt below reports the outcome
+                if (!AdjustTokenPrivileges(tok, FALSE, &tp, 0, nullptr, nullptr) &&
+                    GetLastError() != ERROR_NOT_ALL_ASSIGNED)
+                    (void)0;  // nothing actionable: the large-page attempt below reports the outcome
             }
             CloseHandle(tok);
         }
@@ -97,25 +98,24 @@ void* reserve(uint64_t bytes, PageBacking& got, std::string& note, const std::st
         // MEM_LARGE_PAGES requires the allocation size to be an exact multiple of the large page size -
         // anything else is ERROR_INVALID_PARAMETER (87), which reads like a privilege problem but is not.
         // Round up: the slack is under 2 MB and the tail stays unused.
-        const SIZE_T lbytes = (SIZE_T) (((SIZE_T) bytes + large - 1) / large * large);
-        void* p = VirtualAlloc(nullptr, lbytes, MEM_RESERVE | MEM_COMMIT | MEM_LARGE_PAGES,
-                               PAGE_READWRITE);
+        const SIZE_T lbytes = (SIZE_T)(((SIZE_T)bytes + large - 1) / large * large);
+        void* p = VirtualAlloc(nullptr, lbytes, MEM_RESERVE | MEM_COMMIT | MEM_LARGE_PAGES, PAGE_READWRITE);
         if (p) {
             got = PageBacking::LargePages;
-            note = "large pages (" + std::to_string((unsigned long long) large) + " B)";
+            note = "large pages (" + std::to_string((unsigned long long)large) + " B)";
             return p;
         }
         // 1450 (ERROR_NO_SYSTEM_RESOURCES) is the large-page pool saying no, 87 is a size that is not a
         // multiple of the minimum, 1314 is the privilege: without the byte count the three read as one bug.
-        note = "large pages refused for " + std::to_string((unsigned long long) lbytes) + " B (GetLargePageMinimum=" +
-               std::to_string((unsigned long long) large) + ", VirtualAlloc error " +
-               std::to_string((unsigned long long) GetLastError()) + "); using 4 KB pages";
+        note = "large pages refused for " + std::to_string((unsigned long long)lbytes) +
+               " B (GetLargePageMinimum=" + std::to_string((unsigned long long)large) + ", VirtualAlloc error " +
+               std::to_string((unsigned long long)GetLastError()) + "); using 4 KB pages";
     } else if (std::getenv("STRATA_NO_LARGEPAGES") != nullptr) {
         note = "large pages skipped (STRATA_NO_LARGEPAGES); using 4 KB pages";
     } else {
         note = "this system has no large-page minimum; using 4 KB pages";
     }
-    void* p = VirtualAlloc(nullptr, (SIZE_T) bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    void* p = VirtualAlloc(nullptr, (SIZE_T)bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
     got = PageBacking::NormalPages;
     return p;
 #else
@@ -144,7 +144,7 @@ void* reserve(uint64_t bytes, PageBacking& got, std::string& note, const std::st
 
         const bool fresh = st.st_size == 0;
         if (fresh) {
-            if (ftruncate(fd, (off_t) file_bytes) != 0) {
+            if (ftruncate(fd, (off_t)file_bytes) != 0) {
                 const int e = errno;
                 close(fd);
                 note = "cannot size shared arena " + shared_file + ": " + std::strerror(e);
@@ -153,11 +153,11 @@ void* reserve(uint64_t bytes, PageBacking& got, std::string& note, const std::st
             SharedArenaHeader hdr{};
             std::memcpy(hdr.magic, kSharedArenaMagic, sizeof hdr.magic);
             hdr.version = 1;
-            hdr.header_bytes = (uint32_t) kSharedArenaHeaderBytes;
+            hdr.header_bytes = (uint32_t)kSharedArenaHeaderBytes;
             hdr.arena_bytes = bytes;
             hdr.pack_hash = shared_pack_hash;
             const ssize_t written = pwrite(fd, &hdr, sizeof hdr, 0);
-            if (written != (ssize_t) sizeof hdr) {
+            if (written != (ssize_t)sizeof hdr) {
                 const int e = errno;
                 close(fd);
                 note = "cannot write shared arena header " + shared_file + ": " +
@@ -165,17 +165,15 @@ void* reserve(uint64_t bytes, PageBacking& got, std::string& note, const std::st
                 return nullptr;
             }
         } else {
-            if (st.st_size < 0 || (uint64_t) st.st_size != file_bytes) {
+            if (st.st_size < 0 || (uint64_t)st.st_size != file_bytes) {
                 close(fd);
-                note = "shared arena " + shared_file + " is " +
-                       std::to_string((unsigned long long) st.st_size) + " B, expected " +
-                       std::to_string((unsigned long long) file_bytes) + " B including its header";
+                note = "shared arena " + shared_file + " is " + std::to_string((unsigned long long)st.st_size) +
+                       " B, expected " + std::to_string((unsigned long long)file_bytes) + " B including its header";
                 return nullptr;
             }
             SharedArenaHeader hdr{};
             const ssize_t got_header = pread(fd, &hdr, sizeof hdr, 0);
-            if (got_header != (ssize_t) sizeof hdr ||
-                std::memcmp(hdr.magic, kSharedArenaMagic, sizeof hdr.magic) != 0 ||
+            if (got_header != (ssize_t)sizeof hdr || std::memcmp(hdr.magic, kSharedArenaMagic, sizeof hdr.magic) != 0 ||
                 hdr.version != 1 || hdr.header_bytes != kSharedArenaHeaderBytes || hdr.arena_bytes != bytes) {
                 close(fd);
                 note = "shared arena " + shared_file + " has an incompatible or missing header";
@@ -184,16 +182,15 @@ void* reserve(uint64_t bytes, PageBacking& got, std::string& note, const std::st
             if (hdr.pack_hash != shared_pack_hash) {
                 close(fd);
                 char b[256];
-                std::snprintf(b, sizeof b,
-                              "shared arena %s was written for pack hash %016llx, expected %016llx",
-                              shared_file.c_str(), (unsigned long long) hdr.pack_hash,
-                              (unsigned long long) shared_pack_hash);
+                std::snprintf(b, sizeof b, "shared arena %s was written for pack hash %016llx, expected %016llx",
+                              shared_file.c_str(), (unsigned long long)hdr.pack_hash,
+                              (unsigned long long)shared_pack_hash);
                 note = b;
                 return nullptr;
             }
         }
 
-        void* map = mmap(nullptr, (size_t) file_bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        void* map = mmap(nullptr, (size_t)file_bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
         const int e = errno;
         close(fd);
         if (map == MAP_FAILED) {
@@ -204,11 +201,11 @@ void* reserve(uint64_t bytes, PageBacking& got, std::string& note, const std::st
         mapping_bytes = file_bytes;
         got = PageBacking::NormalPages;
         note = "MAP_SHARED file " + shared_file + " (pack hash checked)";
-        return (uint8_t*) map + kSharedArenaHeaderBytes;
+        return (uint8_t*)map + kSharedArenaHeaderBytes;
     }
 
-    void* p = mmap(nullptr, bytes, PROT_READ | PROT_WRITE,
-                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB | MAP_HUGE_2MB, -1, 0);
+    void* p =
+        mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB | MAP_HUGE_2MB, -1, 0);
     if (p != MAP_FAILED) {
         got = PageBacking::LargePages;
         note = "hugetlb 2 MB pages";
@@ -224,7 +221,7 @@ void* reserve(uint64_t bytes, PageBacking& got, std::string& note, const std::st
 void release(void* p, uint64_t bytes) {
     if (!p) return;
 #ifdef _WIN32
-    (void) bytes;
+    (void)bytes;
     VirtualFree(p, 0, MEM_RELEASE);
 #else
     munmap(p, bytes);
@@ -242,12 +239,10 @@ uint64_t fnv1a64(const uint8_t* p, uint64_t n, uint64_t seed) {
     return h;
 }
 
-
-
 int arena_pin_cap_gib() {
     const char* e = std::getenv("STRATA_ARENA_PIN_GIB");
     if (e == nullptr || *e == '\0') return -1;
-    if (std::string(e) == "auto") return -2;   // #243: the Windows shared-memory budget sets the sliced pin's cap
+    if (std::string(e) == "auto") return -2;  // #243: the Windows shared-memory budget sets the sliced pin's cap
     const int v = std::atoi(e);
     return v < 0 ? -1 : v;
 }
@@ -270,15 +265,15 @@ bool sliced_pin_limit(uint64_t& limit, std::string& why) {
         strata::platform::gpu_shared_memory_budget(p.luid, budget, usage, err)) {
         limit = budget > usage + 4 * GiB ? budget - usage - 4 * GiB : 0;
         std::snprintf(buf, sizeof buf, "the GPU's shared-memory budget %.1f GiB - %.1f GiB in use - 4 GiB",
-                      (double) budget / GiB, (double) usage / GiB);
+                      (double)budget / GiB, (double)usage / GiB);
         why = buf;
         return true;
     }
-    (void) cudaGetLastError();
+    (void)cudaGetLastError();
     const uint64_t ram = strata::platform::total_physical_memory();
     if (ram == 0) return false;
     limit = ram / 2 > 8 * GiB ? ram / 2 - 8 * GiB : 0;
-    std::snprintf(buf, sizeof buf, "%s: RAM/2 - 8 GiB of %.1f GiB", err.c_str(), (double) ram / GiB);
+    std::snprintf(buf, sizeof buf, "%s: RAM/2 - 8 GiB of %.1f GiB", err.c_str(), (double)ram / GiB);
     why = buf;
     return true;
 }
@@ -289,20 +284,19 @@ namespace {
 std::vector<uint64_t> uniform_bounds(uint64_t bytes, uint64_t slice) {
     std::vector<uint64_t> b;
     if (slice == 0) return b;
-    for (uint64_t off = 0; off + slice <= bytes; off += slice) b.push_back(off);
+    for (uint64_t off = 0; off + slice <= bytes; off += slice)
+        b.push_back(off);
     if (!b.empty()) b.push_back(b.back() + slice);
     return b;
 }
 }  // namespace
 
 PinnedArena::PinnedArena(uint64_t bytes, uint64_t slice) : PinnedArena(bytes, uniform_bounds(bytes, slice)) {
-    if (slice_bytes) slice_bytes = slice;   // sliced registration: record the uniform size
+    if (slice_bytes) slice_bytes = slice;  // sliced registration: record the uniform size
 }
 
-PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t> &bounds,
-                         uint64_t max_pinned_bytes,
-                         const std::string &shared_file,
-                         uint64_t shared_pack_hash) try
+PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds, uint64_t max_pinned_bytes,
+                         const std::string& shared_file, uint64_t shared_pack_hash) try
     : capacity(bytes) {
     (void)bounds;
     if (bytes == 0) return;
@@ -320,10 +314,11 @@ PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t> &bounds,
         uint64_t cap = max_pinned_bytes;
         std::string cap_why = "by the engine (multi-GPU under WDDM, or remote experts)";
         if (cap == 0 && env_gib > 0) {
-            cap = (uint64_t) env_gib << 30;
+            cap = (uint64_t)env_gib << 30;
             cap_why = "by STRATA_ARENA_PIN_GIB";
         }
-        (void)cap; (void)cap_why;
+        (void)cap;
+        (void)cap_why;
         registered_bytes = bytes;
         note = "SYCL host memory accessible; " + note;
         const char* env = std::getenv("STRATA_ARENA_LOCK");
@@ -335,15 +330,14 @@ PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t> &bounds,
             note = "arena lock disabled (STRATA_ARENA_LOCK=0); " + note;
         }
     }
-}
-catch (const std::exception &exc) {
-  std::cerr << exc.what() << " Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
+} catch (const std::exception& exc) {
+    std::cerr << exc.what() << " Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
 }
 
 PinnedArena::~PinnedArena() {
     if (base) {
-        if (locked_bytes) strata::platform::unlock_resident((uint8_t*) base + (slice_bytes ? registered_bytes : 0), locked_bytes);
+        if (locked_bytes)
+            strata::platform::unlock_resident((uint8_t*)base + (slice_bytes ? registered_bytes : 0), locked_bytes);
         release(mapping_base ? mapping_base : base, mapping_bytes ? mapping_bytes : capacity);
         base = nullptr;
         mapping_base = nullptr;
@@ -353,30 +347,32 @@ PinnedArena::~PinnedArena() {
 
 LoadStats load_experts(const std::string& path, uint8_t* dst, uint64_t blob_bytes, uint64_t blobs_per_layer,
                        uint64_t layers, int threads, uint64_t chunk) {
-    std::vector<uint64_t> off((size_t) layers), n((size_t) layers, blobs_per_layer * blob_bytes);
-    for (uint64_t L = 0; L < layers; ++L) off[(size_t) L] = L * blobs_per_layer * blob_bytes;
+    std::vector<uint64_t> off((size_t)layers), n((size_t)layers, blobs_per_layer * blob_bytes);
+    for (uint64_t L = 0; L < layers; ++L)
+        off[(size_t)L] = L * blobs_per_layer * blob_bytes;
     return load_experts_ranges(path, dst, off, n, threads, chunk);
 }
 
 LoadStats load_experts_ranges(const std::string& path, uint8_t* dst, const std::vector<uint64_t>& layer_off,
                               const std::vector<uint64_t>& layer_bytes, int threads, uint64_t chunk) {
     LoadStats st;
-    const uint64_t layers = (uint64_t) layer_off.size();
+    const uint64_t layers = (uint64_t)layer_off.size();
     st.layers = layers;
     st.bytes = 0;
-    for (uint64_t b : layer_bytes) st.bytes += b;
+    for (uint64_t b : layer_bytes)
+        st.bytes += b;
     if (threads < 1) threads = 1;
 
     const auto t0 = std::chrono::steady_clock::now();
-    std::vector<uint64_t> layer_hash((size_t) layers, 1469598103934665603ull);
+    std::vector<uint64_t> layer_hash((size_t)layers, 1469598103934665603ull);
     std::atomic<uint64_t> next_layer{0};
-    std::atomic<uint64_t> read_ns_sum{0};   // summed over the threads: see LoadStats::read_seconds
+    std::atomic<uint64_t> read_ns_sum{0};  // summed over the threads: see LoadStats::read_seconds
     std::atomic<uint64_t> copy_ns_sum{0};
     std::mutex err_mu;
     std::string err;
 
     auto worker = [&]() {
-        std::vector<uint8_t> buf((size_t) chunk);
+        std::vector<uint8_t> buf((size_t)chunk);
         // One handle per thread, seeked once per layer: a shared handle would need a lock around the seek and
         // would serialise the very thing the threads are here to parallelise.  `fread` on a `FILE*` rather than
         // `std::ifstream`: see the header - MSVC's `basic_filebuf::xsgetn` splits any request larger than
@@ -394,14 +390,16 @@ LoadStats load_experts_ranges(const std::string& path, uint8_t* dst, const std::
         // short-read failures), so the guard is what keeps the closing correct on every path.
         struct Closer {
             FILE* f;
-            ~Closer() { if (f != nullptr) std::fclose(f); }
+            ~Closer() {
+                if (f != nullptr) std::fclose(f);
+            }
         } closer{f};
         uint64_t read_ns = 0, copy_ns = 0;
         for (;;) {
             const uint64_t L = next_layer.fetch_add(1);
             if (L >= layers) break;
-            const uint64_t off = layer_off[(size_t) L];
-            uint64_t remaining = layer_bytes[(size_t) L];
+            const uint64_t off = layer_off[(size_t)L];
+            uint64_t remaining = layer_bytes[(size_t)L];
             uint64_t pos = 0;
             uint64_t h = 1469598103934665603ull;
             // 64-bit seek: the pack is 42.9 GB, so the 32-bit `fseek` would wrap past 4 GiB
@@ -413,36 +411,40 @@ LoadStats load_experts_ranges(const std::string& path, uint8_t* dst, const std::
             while (remaining > 0) {
                 const uint64_t n = remaining < chunk ? remaining : chunk;
                 const auto t_read = std::chrono::steady_clock::now();
-                const size_t got = std::fread(buf.data(), 1, (size_t) n, f);
-                read_ns += (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
-                               std::chrono::steady_clock::now() - t_read).count();
+                const size_t got = std::fread(buf.data(), 1, (size_t)n, f);
+                read_ns += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                               std::chrono::steady_clock::now() - t_read)
+                               .count();
                 // A short read is EOF or an I/O error, never a silent zero fill: say WHERE and HOW SHORT, and
                 // keep going no further - the caller turns this into a refused load, not a wrong answer.
-                if (got != (size_t) n) {
+                if (got != (size_t)n) {
                     std::lock_guard<std::mutex> g(err_mu);
-                    err = "short read in layer " + std::to_string(L) + ": got " + std::to_string(got) + " of "
-                          + std::to_string(n) + " B at offset " + std::to_string(off + pos)
-                          + (std::ferror(f) != 0 ? " (ferror set)" : "");
+                    err = "short read in layer " + std::to_string(L) + ": got " + std::to_string(got) + " of " +
+                          std::to_string(n) + " B at offset " + std::to_string(off + pos) +
+                          (std::ferror(f) != 0 ? " (ferror set)" : "");
                     return;
                 }
                 const auto t_copy = std::chrono::steady_clock::now();
-                std::memcpy(dst + off + pos, buf.data(), (size_t) n);
+                std::memcpy(dst + off + pos, buf.data(), (size_t)n);
                 h = fnv1a64(buf.data(), n, h);
-                copy_ns += (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
-                               std::chrono::steady_clock::now() - t_copy).count();
+                copy_ns += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                               std::chrono::steady_clock::now() - t_copy)
+                               .count();
                 pos += n;
                 remaining -= n;
             }
-            layer_hash[(size_t) L] = h;
+            layer_hash[(size_t)L] = h;
         }
         read_ns_sum.fetch_add(read_ns);
         copy_ns_sum.fetch_add(copy_ns);
     };
 
     std::vector<std::thread> pool;
-    for (int i = 1; i < threads; ++i) pool.emplace_back(worker);
+    for (int i = 1; i < threads; ++i)
+        pool.emplace_back(worker);
     worker();
-    for (auto& t : pool) t.join();
+    for (auto& t : pool)
+        t.join();
 
     if (!err.empty()) {
         std::fprintf(stderr, "load_experts: %s\n", err.c_str());
@@ -451,23 +453,22 @@ LoadStats load_experts_ranges(const std::string& path, uint8_t* dst, const std::
         st.error = err;
         return st;
     }
-    st.read_seconds = (double) read_ns_sum.load() / 1e9;
-    st.copy_seconds = (double) copy_ns_sum.load() / 1e9;
+    st.read_seconds = (double)read_ns_sum.load() / 1e9;
+    st.copy_seconds = (double)copy_ns_sum.load() / 1e9;
     st.layer_checksums = std::move(layer_hash);
     st.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     return st;
 }
 
-StreamStats stream_bandwidth(const uint8_t *src, uint64_t bytes, uint64_t chunk,
-                             int iters) {
+StreamStats stream_bandwidth(const uint8_t* src, uint64_t bytes, uint64_t chunk, int iters) {
     StreamStats st;
-    st.bytes = bytes * (uint64_t) iters;
+    st.bytes = bytes * (uint64_t)iters;
     st.chunk = chunk;
     try {
         auto& q = default_queue();
-        uint8_t* dst = (uint8_t *)sycl::malloc_device((size_t)chunk, q);
+        uint8_t* dst = (uint8_t*)sycl::malloc_device((size_t)chunk, q);
         if (!dst) {
-            std::fprintf(stderr, "stream_bandwidth: malloc_device failed for %llu B\n", (unsigned long long) chunk);
+            std::fprintf(stderr, "stream_bandwidth: malloc_device failed for %llu B\n", (unsigned long long)chunk);
             st.seconds = -1.0;
             return st;
         }
@@ -489,10 +490,8 @@ StreamStats stream_bandwidth(const uint8_t *src, uint64_t bytes, uint64_t chunk,
 
         sycl::free(dst, q);
         return st;
-    }
-    catch (const std::exception &exc) {
-        std::cerr << exc.what() << " Exception caught at file:" << __FILE__
-                  << ", line:" << __LINE__ << std::endl;
+    } catch (const std::exception& exc) {
+        std::cerr << exc.what() << " Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
         st.seconds = -1.0;
         return st;
     }

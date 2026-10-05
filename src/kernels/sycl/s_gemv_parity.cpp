@@ -42,7 +42,7 @@ const uint16_t kScales[] = {0x3E00, 0x3555, 0x3C01, 0x4248, 0x4123, 0x2AAA, 0x4A
 struct Case {
     const char* name;
     strata::kernels::SForm form;
-    int raw_bytes;        // one block
+    int raw_bytes;  // one block
     // Reconstruct the raw GGUF block for one group from the canonical codes/scales, and return the number of
     // elements the block decodes to (which may exceed group_elems: Q8_0's block IS one group, Q2_0's too).
     int (*to_raw)(const uint8_t* codes, size_t code_off, const uint16_t* scale_bits, size_t scale_off, uint8_t* raw);
@@ -53,14 +53,14 @@ struct Case {
 // canonical plane, so this is a straight copy plus the scale.
 int q2_0_to_raw(const uint8_t* codes, size_t co, const uint16_t* scale_bits, size_t so, uint8_t* raw) {
     const uint16_t d = scale_bits[so];
-    raw[0] = (uint8_t) (d & 0xFF);
-    raw[1] = (uint8_t) (d >> 8);
+    raw[0] = (uint8_t)(d & 0xFF);
+    raw[1] = (uint8_t)(d >> 8);
     // `codes` is one code PER ELEMENT (64 of them); a Q2_0 block stores them PACKED, 4 per byte, element i at
     // byte i/4 bits (i%4)*2.  The two coincide as a byte layout only if you confuse them, which is exactly the
     // mistake the first version of this function made by copying 16 bytes verbatim.
     for (int b = 0; b < 16; ++b) {
-        raw[2 + b] = (uint8_t) ((codes[co + 4 * b + 0] & 3) | ((codes[co + 4 * b + 1] & 3) << 2) |
-                                ((codes[co + 4 * b + 2] & 3) << 4) | ((codes[co + 4 * b + 3] & 3) << 6));
+        raw[2 + b] = (uint8_t)((codes[co + 4 * b + 0] & 3) | ((codes[co + 4 * b + 1] & 3) << 2) |
+                               ((codes[co + 4 * b + 2] & 3) << 4) | ((codes[co + 4 * b + 3] & 3) << 6));
     }
     return 64;
 }
@@ -73,9 +73,10 @@ double q2_0_deq(const uint8_t* raw, float* out) {
 // j+16 the HIGH nibble.  The canonical plane stores one code per element, so this re-packs them.
 int q4_0_to_raw(const uint8_t* codes, size_t co, const uint16_t* scale_bits, size_t so, uint8_t* raw) {
     const uint16_t d = scale_bits[so];
-    raw[0] = (uint8_t) (d & 0xFF);
-    raw[1] = (uint8_t) (d >> 8);
-    for (int j = 0; j < 16; ++j) raw[2 + j] = (uint8_t) ((codes[co + j] & 0x0F) | (codes[co + 16 + j] << 4));
+    raw[0] = (uint8_t)(d & 0xFF);
+    raw[1] = (uint8_t)(d >> 8);
+    for (int j = 0; j < 16; ++j)
+        raw[2 + j] = (uint8_t)((codes[co + j] & 0x0F) | (codes[co + 16 + j] << 4));
     return 32;
 }
 double q4_0_deq(const uint8_t* raw, float* out) {
@@ -97,14 +98,15 @@ double iq4_deq(const uint8_t* raw, float* out) {
 // which is why this type is the cheapest one to check and the one whose sign bug was found by the pack.
 int q8_0_to_raw(const uint8_t* codes, size_t co, const uint16_t* scale_bits, size_t so, uint8_t* raw) {
     const uint16_t d = scale_bits[so];
-    raw[0] = (uint8_t) (d & 0xFF);
-    raw[1] = (uint8_t) (d >> 8);
+    raw[0] = (uint8_t)(d & 0xFF);
+    raw[1] = (uint8_t)(d >> 8);
     // NOT a straight copy.  The canonical code plane is UNSIGNED with bias -128, so canonical code c means the
     // value (c - 128); the raw block stores that as an `int8_t`, whose reinterpretation as an unsigned byte is
     // `c ^ 0x80` - a SIGN-BIT FLIP, not the identity.  Assuming identity is the same family of mistake as the
     // round-154 Q8_0 bug that the pack found, and it is why this reconstruction is written out rather than
     // memcpy'd.
-    for (int j = 0; j < 32; ++j) raw[2 + j] = (uint8_t) (codes[co + j] ^ 0x80);
+    for (int j = 0; j < 32; ++j)
+        raw[2 + j] = (uint8_t)(codes[co + j] ^ 0x80);
     return 32;
 }
 double q8_0_deq(const uint8_t* raw, float* out) {
@@ -119,50 +121,52 @@ double q8_0_deq(const uint8_t* raw, float* out) {
 // parameters, not the other way round: the packer computes `scale = d*sc` and `offset = -(dmin*m)`, so this
 // generates d, dmin and the eight (sc, m) pairs, derives the planes exactly as the packer does, and writes a
 // raw block from the SAME parameters.  Inverting those products instead would be ambiguous.
-void test_q4k(long long n_in, long long n_out, double tol, int *total_bad, sycl::queue &q) {
+void test_q4k(long long n_in, long long n_out, double tol, int* total_bad, sycl::queue& q) {
     using strata::kernels::Codebook;
     using strata::kernels::SForm;
     const SForm form{4, 0, 32, Codebook::Affine, true};
 
     std::mt19937 rng(777);
-    const int n_scales = (int) (sizeof(kScales) / sizeof(kScales[0]));
+    const int n_scales = (int)(sizeof(kScales) / sizeof(kScales[0]));
     const long long n_groups = n_in / 32;
     const long long codes_per_row = n_in / 2;
 
-    std::vector<uint16_t> x((size_t) n_in);
-    for (long long i = 0; i < n_in; ++i) x[(size_t) i] = kScales[rng() % n_scales];
+    std::vector<uint16_t> x((size_t)n_in);
+    for (long long i = 0; i < n_in; ++i)
+        x[(size_t)i] = kScales[rng() % n_scales];
 
-    std::vector<uint8_t> codes_el((size_t) n_out * n_in);
-    for (size_t i = 0; i < codes_el.size(); ++i) codes_el[i] = (uint8_t) (rng() & 0x0F);
-    std::vector<uint8_t> codes((size_t) n_out * codes_per_row, 0);
+    std::vector<uint8_t> codes_el((size_t)n_out * n_in);
+    for (size_t i = 0; i < codes_el.size(); ++i)
+        codes_el[i] = (uint8_t)(rng() & 0x0F);
+    std::vector<uint8_t> codes((size_t)n_out * codes_per_row, 0);
     for (size_t i = 0; i < codes_el.size(); ++i) {
-        const size_t o = i / (size_t) n_in, k = i % (size_t) n_in;
-        codes[o * (size_t) codes_per_row + k / 2] |= (uint8_t) (codes_el[i] << ((k % 2) * 4));
+        const size_t o = i / (size_t)n_in, k = i % (size_t)n_in;
+        codes[o * (size_t)codes_per_row + k / 2] |= (uint8_t)(codes_el[i] << ((k % 2) * 4));
     }
-    std::vector<float> scales((size_t) n_out * n_groups), offsets((size_t) n_out * n_groups);
+    std::vector<float> scales((size_t)n_out * n_groups), offsets((size_t)n_out * n_groups);
 
     struct Row {
         uint16_t d, dmin;
         uint8_t sc[8], m[8];
     };
-    std::vector<Row> rows((size_t) n_out);
+    std::vector<Row> rows((size_t)n_out);
     for (long long o = 0; o < n_out; ++o) {
-        Row& r = rows[(size_t) o];
+        Row& r = rows[(size_t)o];
         r.d = kScales[rng() % n_scales];
         r.dmin = kScales[rng() % n_scales];
         for (int g = 0; g < 8; ++g) {
-            r.sc[g] = (uint8_t) (rng() & 0x3F);
-            r.m[g] = (uint8_t) (rng() & 0x3F);
+            r.sc[g] = (uint8_t)(rng() & 0x3F);
+            r.m[g] = (uint8_t)(rng() & 0x3F);
             for (long long sb = 0; sb < n_in / 256; ++sb) {
-                scales[(size_t) (o * n_groups + sb * 8 + g)] = strata::fp16_to_fp32(r.d) * (float) r.sc[g];
-                offsets[(size_t) (o * n_groups + sb * 8 + g)] = -(strata::fp16_to_fp32(r.dmin) * (float) r.m[g]);
+                scales[(size_t)(o * n_groups + sb * 8 + g)] = strata::fp16_to_fp32(r.d) * (float)r.sc[g];
+                offsets[(size_t)(o * n_groups + sb * 8 + g)] = -(strata::fp16_to_fp32(r.dmin) * (float)r.m[g]);
             }
         }
     }
 
-    std::vector<float> ref((size_t) n_out, 0.0f);
-    std::vector<double> cond((size_t) n_out, 0.0);
-    double worst_plane_ref = 0.0;   // max |planes - raw block| over every element, on the CPU alone
+    std::vector<float> ref((size_t)n_out, 0.0f);
+    std::vector<double> cond((size_t)n_out, 0.0);
+    double worst_plane_ref = 0.0;  // max |planes - raw block| over every element, on the CPU alone
     std::vector<uint8_t> blk(144);
     std::vector<float> dec(256);
     // A Q4_K raw block covers 256 elements, so a 2560-element row is TEN superblocks, each with its own
@@ -170,10 +174,10 @@ void test_q4k(long long n_in, long long n_out, double tol, int *total_bad, sycl:
     // elements - while the kernel accumulated all of them, and the resulting 29x relative error was the
     // reference being short, not the kernel being wrong.
     for (long long o = 0; o < n_out; ++o) {
-        const Row& r = rows[(size_t) o];
+        const Row& r = rows[(size_t)o];
         float acc = 0.0f;
-        double sum_abs = 0.0;      // the natural scale of this row's dot product (see the metric below)
-        double plane_ref_diff = 0.0;   // (a) vs (b): planes against the raw block, both on the CPU
+        double sum_abs = 0.0;         // the natural scale of this row's dot product (see the metric below)
+        double plane_ref_diff = 0.0;  // (a) vs (b): planes against the raw block, both on the CPU
         for (long long sb = 0; sb < n_in / 256; ++sb) {
             // ONE 144-byte block per 256-element SUPERBLOCK, with all four steps' qs bytes filled BEFORE the
             // decode.  The previous version decoded a fresh block per STEP and then read all 256 elements
@@ -181,28 +185,27 @@ void test_q4k(long long n_in, long long n_out, double tol, int *total_bad, sycl:
             // quarter-filled block per superblock, which is the whole of the 1.17e4 disagreement.
             // `scripts/probe_q4k_groups.cpp` builds it this way and agrees exactly, group by group.
             blk.assign(144, 0);
-            blk[0] = (uint8_t) (r.d & 0xFF);
-            blk[1] = (uint8_t) (r.d >> 8);
-            blk[2] = (uint8_t) (r.dmin & 0xFF);
-            blk[3] = (uint8_t) (r.dmin >> 8);
-            for (int j = 0; j < 4; ++j) {          // the exact inverse of get_scale_min_k4
-                blk[4 + j] = (uint8_t) ((r.sc[j] & 0x3F) | ((r.sc[j + 4] >> 4) << 6));
-                blk[8 + j] = (uint8_t) ((r.m[j] & 0x3F) | ((r.m[j + 4] >> 4) << 6));
-                blk[12 + j] = (uint8_t) ((r.sc[j + 4] & 0x0F) | ((r.m[j + 4] & 0x0F) << 4));
+            blk[0] = (uint8_t)(r.d & 0xFF);
+            blk[1] = (uint8_t)(r.d >> 8);
+            blk[2] = (uint8_t)(r.dmin & 0xFF);
+            blk[3] = (uint8_t)(r.dmin >> 8);
+            for (int j = 0; j < 4; ++j) {  // the exact inverse of get_scale_min_k4
+                blk[4 + j] = (uint8_t)((r.sc[j] & 0x3F) | ((r.sc[j + 4] >> 4) << 6));
+                blk[8 + j] = (uint8_t)((r.m[j] & 0x3F) | ((r.m[j + 4] >> 4) << 6));
+                blk[12 + j] = (uint8_t)((r.sc[j + 4] & 0x0F) | ((r.m[j + 4] & 0x0F) << 4));
             }
             for (int step = 0; step < 4; ++step) {
-                for (int l = 0; l < 32; ++l) {     // elements 0..31 LOW nibbles, 32..63 HIGH
+                for (int l = 0; l < 32; ++l) {  // elements 0..31 LOW nibbles, 32..63 HIGH
                     const long long e0 = o * n_in + sb * 256 + step * 64 + l;
                     const long long e1 = e0 + 32;
-                    blk[16 + step * 32 + l] =
-                        (uint8_t) ((codes_el[(size_t) e0] & 0x0F) | (codes_el[(size_t) e1] << 4));
+                    blk[16 + step * 32 + l] = (uint8_t)((codes_el[(size_t)e0] & 0x0F) | (codes_el[(size_t)e1] << 4));
                 }
             }
             strata::dequantize_q4_K(blk.data(), dec.data());
             for (int j = 0; j < 256; ++j) {
-                const float term = dec[(size_t) j] * strata::fp16_to_fp32(x[(size_t) (sb * 256 + j)]);
+                const float term = dec[(size_t)j] * strata::fp16_to_fp32(x[(size_t)(sb * 256 + j)]);
                 acc += term;
-                sum_abs += std::fabs((double) term);      // the CONDITION of this dot product
+                sum_abs += std::fabs((double)term);  // the CONDITION of this dot product
 
                 // THE THIRD DECODE.  (a) the raw block through the scalar dequantizer, (b) the canonical
                 // PLANES through `code*scale + offset`, (c) the GPU.  If (a) != (b) then this test built
@@ -210,30 +213,30 @@ void test_q4k(long long n_in, long long n_out, double tol, int *total_bad, sycl:
                 // (c) differs, the kernel is wrong.  Without (b) there is no way to tell which.
                 const long long elem = sb * 256 + j;
                 const long long g = elem / 32;
-                const int code = (int) codes_el[(size_t) (o * n_in + elem)];
-                const float b_dec = (float) code * scales[(size_t) (o * n_groups + g)] +
-                                    offsets[(size_t) (o * n_groups + g)];
-                if (std::fabs((double) (b_dec - dec[(size_t) j])) > plane_ref_diff) {
-                    plane_ref_diff = std::fabs((double) (b_dec - dec[(size_t) j]));
+                const int code = (int)codes_el[(size_t)(o * n_in + elem)];
+                const float b_dec =
+                    (float)code * scales[(size_t)(o * n_groups + g)] + offsets[(size_t)(o * n_groups + g)];
+                if (std::fabs((double)(b_dec - dec[(size_t)j])) > plane_ref_diff) {
+                    plane_ref_diff = std::fabs((double)(b_dec - dec[(size_t)j]));
                 }
             }
         }
-        ref[(size_t) o] = acc;
-        cond[(size_t) o] = sum_abs;
+        ref[(size_t)o] = acc;
+        cond[(size_t)o] = sum_abs;
         if (!(plane_ref_diff <= worst_plane_ref)) worst_plane_ref = plane_ref_diff;
     }
 
     uint16_t* d_x = sycl::malloc_device<uint16_t>(x.size(), q);
     uint8_t* d_codes = sycl::malloc_device<uint8_t>(codes.size(), q);
-    float *d_scales = sycl::malloc_device<float>(scales.size(), q);
-    float *d_offsets = sycl::malloc_device<float>(offsets.size(), q);
-    float *d_y = sycl::malloc_device<float>((size_t)n_out, q);
+    float* d_scales = sycl::malloc_device<float>(scales.size(), q);
+    float* d_offsets = sycl::malloc_device<float>(offsets.size(), q);
+    float* d_y = sycl::malloc_device<float>((size_t)n_out, q);
     q.memcpy(d_x, x.data(), x.size() * sizeof(uint16_t)).wait();
     q.memcpy(d_codes, codes.data(), codes.size()).wait();
     q.memcpy(d_scales, scales.data(), scales.size() * sizeof(float)).wait();
     q.memcpy(d_offsets, offsets.data(), offsets.size() * sizeof(float)).wait();
     strata::kernels::s_gemv(d_x, d_codes, d_scales, d_offsets, d_y, n_in, n_out, form);
-    std::vector<float> got((size_t) n_out);
+    std::vector<float> got((size_t)n_out);
     q.memcpy(got.data(), d_y, got.size() * sizeof(float)).wait();
 
     // THE ERROR IS MEASURED AGAINST sum|term|, NOT AGAINST THE RESULT.  A dot product of 2560 signed terms
@@ -244,8 +247,8 @@ void test_q4k(long long n_in, long long n_out, double tol, int *total_bad, sycl:
     long long bad = 0;
     double worst = 0.0, worst_res = 0.0;
     for (long long o = 0; o < n_out; ++o) {
-        const double a = ref[(size_t) o], b = got[(size_t) o];
-        const double scale = cond[(size_t) o] > 1e-30 ? cond[(size_t) o] : 1e-30;
+        const double a = ref[(size_t)o], b = got[(size_t)o];
+        const double scale = cond[(size_t)o] > 1e-30 ? cond[(size_t)o] : 1e-30;
         const double rel = std::fabs(a - b) / scale;
         const double rel_res = std::fabs(a - b) / (std::fabs(a) > 1e-30 ? std::fabs(a) : 1e-30);
         if (!(rel <= worst)) worst = rel;
@@ -257,8 +260,8 @@ void test_q4k(long long n_in, long long n_out, double tol, int *total_bad, sycl:
         lo = std::fmin(lo, v);
         hi = std::fmax(hi, v);
     }
-    std::printf("  %-10s %lld rows, %lld over tol, worst rel-to-terms %.3e (rel-to-result %.3e)\n",
-                "S4/Q4_K", n_out, bad, worst, worst_res);
+    std::printf("  %-10s %lld rows, %lld over tol, worst rel-to-terms %.3e (rel-to-result %.3e)\n", "S4/Q4_K", n_out,
+                bad, worst, worst_res);
     std::printf("             ref spread [%.4g, %.4g], condition (sum|term|) up to %.4g\n", lo, hi,
                 *std::max_element(cond.begin(), cond.end()));
     std::printf("             CPU planes vs CPU raw block: max |diff| = %.3e -> %s\n", worst_plane_ref,
@@ -269,7 +272,7 @@ void test_q4k(long long n_in, long long n_out, double tol, int *total_bad, sycl:
         std::fprintf(stderr, "VACUOUS: S4/Q4_K reference is constant\n");
         std::exit(1);
     }
-    *total_bad += (int) bad;
+    *total_bad += (int)bad;
     sycl::free(d_x, q);
     sycl::free(d_codes, q);
     sycl::free(d_scales, q);
@@ -279,33 +282,33 @@ void test_q4k(long long n_in, long long n_out, double tol, int *total_bad, sycl:
 
 }  // namespace
 
-
 // ------------------------------------------------------------------ benchmark
 //
 // P2.S10 wants a first measurement and a ledger entry, and the objective is stated in tokens per second, so
 // the useful output is not GiB/s but "milliseconds of expert matvec per token".  Warm-up runs are discarded
 // (the first launch pays module load and page faults) and the MINIMUM is reported alongside the mean, because
 // the minimum is the one not polluted by another process on the machine.
-void bench_s2_gemv(long long n_in, long long n_out, int iters, int *split_bad, sycl::queue &q) {
+void bench_s2_gemv(long long n_in, long long n_out, int iters, int* split_bad, sycl::queue& q) {
     using strata::kernels::Codebook;
     using strata::kernels::SForm;
     const SForm form{2, -1, 64, Codebook::Affine, false};
     const long long n_groups = n_in / 64;
     const long long codes_per_row = n_in / 4;
 
-    std::vector<uint8_t> codes((size_t) n_out * codes_per_row, 0xA5);
-    std::vector<float> scales((size_t) n_out * n_groups, 0.001f);
-    std::vector<uint16_t> x((size_t) n_in, 0x3C00);            // 1.0 in fp16
+    std::vector<uint8_t> codes((size_t)n_out * codes_per_row, 0xA5);
+    std::vector<float> scales((size_t)n_out * n_groups, 0.001f);
+    std::vector<uint16_t> x((size_t)n_in, 0x3C00);  // 1.0 in fp16
 
     uint16_t* d_x = sycl::malloc_device<uint16_t>(x.size(), q);
     uint8_t* d_codes = sycl::malloc_device<uint8_t>(codes.size(), q);
-    float *d_scales = sycl::malloc_device<float>(scales.size(), q);
-    float *d_y = sycl::malloc_device<float>((size_t)n_out, q);
+    float* d_scales = sycl::malloc_device<float>(scales.size(), q);
+    float* d_y = sycl::malloc_device<float>((size_t)n_out, q);
     q.memcpy(d_x, x.data(), x.size() * sizeof(uint16_t)).wait();
     q.memcpy(d_codes, codes.data(), codes.size()).wait();
     q.memcpy(d_scales, scales.data(), scales.size() * sizeof(float)).wait();
 
-    for (int i = 0; i < 3; ++i) strata::kernels::s_gemv(d_x, d_codes, d_scales, nullptr, d_y, n_in, n_out, form);
+    for (int i = 0; i < 3; ++i)
+        strata::kernels::s_gemv(d_x, d_codes, d_scales, nullptr, d_y, n_in, n_out, form);
 
     std::vector<double> ms;
     for (int i = 0; i < iters; ++i) {
@@ -316,11 +319,12 @@ void bench_s2_gemv(long long n_in, long long n_out, int iters, int *split_bad, s
     }
     std::sort(ms.begin(), ms.end());
     double mean = 0;
-    for (double v : ms) mean += v;
-    mean /= (double) ms.size();
+    for (double v : ms)
+        mean += v;
+    mean /= (double)ms.size();
 
-    const double weights = (double) n_in * (double) n_out;
-    const double bytes = (double) n_out * (double) codes_per_row + (double) n_out * n_groups * 4.0;
+    const double weights = (double)n_in * (double)n_out;
+    const double bytes = (double)n_out * (double)codes_per_row + (double)n_out * n_groups * 4.0;
     std::printf("s2_gemv bench  [%lld x %lld]  %d iters\n", n_in, n_out, iters);
     std::printf("  ms per gemv: min %.4f  median %.4f  mean %.4f\n", ms.front(), ms[ms.size() / 2], mean);
     std::printf("  min -> %.1f G weights/s, %.1f GiB/s of S2 streamed\n", weights / ms.front() / 1e6,
@@ -331,16 +335,17 @@ void bench_s2_gemv(long long n_in, long long n_out, int iters, int *split_bad, s
     // the KV/attention work are separate and are NOT included.
     const double roles_per_token = 48.0 * 10.0 * 3.0;
     const double tok_ms = roles_per_token * ms.front();
-    std::printf("  per token: %.0f roles x %.4f ms = %.1f ms  ->  %.1f tok/s (expert matvec only)\n",
-                roles_per_token, ms.front(), tok_ms, tok_ms > 0 ? 1000.0 / tok_ms : 0.0);
-    std::printf("  NOTE: expert matvec ONLY. No attention, no KV, no norm, no router, no sampling, and it\n"
-                "        assumes every expert is already resident in VRAM at zero cost.\n");
+    std::printf("  per token: %.0f roles x %.4f ms = %.1f ms  ->  %.1f tok/s (expert matvec only)\n", roles_per_token,
+                ms.front(), tok_ms, tok_ms > 0 ? 1000.0 / tok_ms : 0.0);
+    std::printf(
+        "  NOTE: expert matvec ONLY. No attention, no KV, no norm, no router, no sampling, and it\n"
+        "        assumes every expert is already resident in VRAM at zero cost.\n");
 
     // The NAIVE kernel's output is the reference for the split one.  `s_gemv` is checked against the scalar
     // dequantizer by this file's parity cases, so its result here is a validated value, and the split kernel
     // sums in a different order - so this is a relative comparison, not bit equality.
     strata::kernels::s_gemv(d_x, d_codes, d_scales, nullptr, d_y, n_in, n_out, form);
-    std::vector<float> ref_naive((size_t) n_out);
+    std::vector<float> ref_naive((size_t)n_out);
     q.memcpy(ref_naive.data(), d_y, ref_naive.size() * sizeof(float)).wait();
 
     // ---- the row-split variant, same planes, same process -------------------
@@ -354,26 +359,25 @@ void bench_s2_gemv(long long n_in, long long n_out, int iters, int *split_bad, s
         for (int i = 0; i < iters; ++i) {
             const auto t0 = std::chrono::steady_clock::now();
             strata::kernels::s_gemv_split(d_x, d_codes, d_scales, nullptr, d_y, n_in, n_out, form, tpr);
-            sms.push_back(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0)
-                              .count());
+            sms.push_back(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
         }
         std::sort(sms.begin(), sms.end());
 
         // correctness of the thing being timed
-        std::vector<float> got((size_t) n_out);
+        std::vector<float> got((size_t)n_out);
         q.memcpy(got.data(), d_y, got.size() * sizeof(float)).wait();
         long long bad = 0;
         double worst = 0.0;
         for (long long o = 0; o < n_out; ++o) {
-            const double a = ref_naive[(size_t) o], b = got[(size_t) o];
+            const double a = ref_naive[(size_t)o], b = got[(size_t)o];
             const double rel = std::fabs(a - b) / (std::fabs(a) > 1e-30 ? std::fabs(a) : 1e-30);
             if (!(rel <= worst)) worst = rel;
             if (!(rel <= 1e-4)) ++bad;
         }
         if (bad) {
-            std::printf("  split tpr=%-4d *** WRONG *** %lld of %lld rows differ, worst rel %.3e\n", tpr,
-                        bad, n_out, worst);
-            *split_bad += (int) bad;
+            std::printf("  split tpr=%-4d *** WRONG *** %lld of %lld rows differ, worst rel %.3e\n", tpr, bad, n_out,
+                        worst);
+            *split_bad += (int)bad;
         }
 
         // ---- the quad-amortised S2 kernel, timed AND checked against the naive reference ----
@@ -387,20 +391,20 @@ void bench_s2_gemv(long long n_in, long long n_out, int iters, int *split_bad, s
                 for (int i = 0; i < iters; ++i) {
                     const auto q0 = std::chrono::steady_clock::now();
                     strata::kernels::s2_gemv_quads(d_x, d_codes, d_scales, d_y, n_in, n_out, t2);
-                    qms.push_back(std::chrono::duration<double, std::milli>(
-                                      std::chrono::steady_clock::now() - q0).count());
+                    qms.push_back(
+                        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - q0).count());
                 }
                 std::sort(qms.begin(), qms.end());
                 q.memcpy(got.data(), d_y, got.size() * sizeof(float)).wait();
                 long long qbad = 0;
                 double qworst = 0.0;
                 for (long long o = 0; o < n_out; ++o) {
-                    const double a = ref_naive[(size_t) o], b = got[(size_t) o];
+                    const double a = ref_naive[(size_t)o], b = got[(size_t)o];
                     const double rel = std::fabs(a - b) / (std::fabs(a) > 1e-30 ? std::fabs(a) : 1e-30);
                     if (rel > qworst) qworst = rel;
                     if (!(rel <= 1e-4)) ++qbad;
                 }
-                if (qbad) *split_bad += (int) qbad;
+                if (qbad) *split_bad += (int)qbad;
                 std::printf("  quads tpr=%-4d min %.4f ms  -> %6.1f G weights/s   vs naive %.2fx   %s\n", t2,
                             qms.front(), weights / qms.front() / 1e6, ms.front() / qms.front(),
                             qbad ? "*** WRONG ***" : "checked ok");
@@ -418,29 +422,28 @@ void bench_s2_gemv(long long n_in, long long n_out, int iters, int *split_bad, s
                     for (int i = 0; i < iters; ++i) {
                         const auto q0 = std::chrono::steady_clock::now();
                         strata::kernels::s2_gemv_fast(d_x, d_codes, d_scales, d_y, n_in, n_out, t3, staged != 0);
-                        fms.push_back(std::chrono::duration<double, std::milli>(
-                                          std::chrono::steady_clock::now() - q0).count());
+                        fms.push_back(
+                            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - q0).count());
                     }
                     std::sort(fms.begin(), fms.end());
                     q.memcpy(got.data(), d_y, got.size() * sizeof(float)).wait();
                     long long fbad = 0;
                     for (long long o = 0; o < n_out; ++o) {
-                        const double a = ref_naive[(size_t) o], b = got[(size_t) o];
+                        const double a = ref_naive[(size_t)o], b = got[(size_t)o];
                         const double rel = std::fabs(a - b) / (std::fabs(a) > 1e-30 ? std::fabs(a) : 1e-30);
                         if (!(rel <= 1e-4)) ++fbad;
                     }
-                    if (fbad) *split_bad += (int) fbad;
+                    if (fbad) *split_bad += (int)fbad;
                     std::printf("  fast %s tpr=%-4d min %.4f ms  -> %6.1f G weights/s   vs naive %.2fx   %s\n",
-                                staged ? "staged" : "global", t3, fms.front(),
-                                weights / fms.front() / 1e6, ms.front() / fms.front(),
-                                fbad ? "*** WRONG ***" : "checked ok");
+                                staged ? "staged" : "global", t3, fms.front(), weights / fms.front() / 1e6,
+                                ms.front() / fms.front(), fbad ? "*** WRONG ***" : "checked ok");
                 }
             }
         }
 
         const double sp = ms.front() / sms.front();
-        std::printf("  split tpr=%-4d min %.4f ms  -> %6.1f G weights/s   speedup vs naive %.2fx\n", tpr,
-                    sms.front(), weights / sms.front() / 1e6, sp);
+        std::printf("  split tpr=%-4d min %.4f ms  -> %6.1f G weights/s   speedup vs naive %.2fx\n", tpr, sms.front(),
+                    weights / sms.front() / 1e6, sp);
     }
 
     sycl::free(d_x, q);
@@ -449,7 +452,7 @@ void bench_s2_gemv(long long n_in, long long n_out, int iters, int *split_bad, s
     sycl::free(d_y, q);
 }
 
-int main(int argc, char **argv) {
+int main(int argc, char** argv) {
     auto gpus = sycl::device::get_devices(sycl::info::device_type::gpu);
     sycl::device dev = gpus.empty() ? sycl::device(sycl::default_selector_v) : gpus.front();
     sycl::queue q(dev, sycl::property::queue::in_order{});
@@ -464,11 +467,16 @@ int main(int argc, char **argv) {
     int iters = 200;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
-        if (a == "--selftest") selftest = true;
-        else if (a == "--bench") bench = true;
-        else if (a == "--iters" && i + 1 < argc) iters = std::atoi(argv[++i]);
-        else if (a == "--n-in" && i + 1 < argc) n_in = std::atoll(argv[++i]);
-        else if (a == "--n-out" && i + 1 < argc) n_out = std::atoll(argv[++i]);
+        if (a == "--selftest")
+            selftest = true;
+        else if (a == "--bench")
+            bench = true;
+        else if (a == "--iters" && i + 1 < argc)
+            iters = std::atoi(argv[++i]);
+        else if (a == "--n-in" && i + 1 < argc)
+            n_in = std::atoll(argv[++i]);
+        else if (a == "--n-out" && i + 1 < argc)
+            n_out = std::atoll(argv[++i]);
         else {
             std::fprintf(stderr, "usage: s_gemv_parity [--selftest] [--n-in N] [--n-out N]\n");
             return 2;
@@ -484,7 +492,7 @@ int main(int argc, char **argv) {
     cases.push_back({"S8/Q8_0", SForm{8, -128, 32, Codebook::Affine, false}, 34, q8_0_to_raw, q8_0_deq});
 
     std::mt19937 rng(4242);
-    const int n_scales = (int) (sizeof(kScales) / sizeof(kScales[0]));
+    const int n_scales = (int)(sizeof(kScales) / sizeof(kScales[0]));
     int total_bad = 0;
 
     for (const Case& tc : cases) {
@@ -495,8 +503,9 @@ int main(int argc, char **argv) {
         const long long codes_per_row = n_in / per_byte;
 
         // activations
-        std::vector<uint16_t> x((size_t) n_in);
-        for (long long i = 0; i < n_in; ++i) x[(size_t) i] = kScales[rng() % n_scales];
+        std::vector<uint16_t> x((size_t)n_in);
+        for (long long i = 0; i < n_in; ++i)
+            x[(size_t)i] = kScales[rng() % n_scales];
 
         // Codes are generated ONE PER ELEMENT and then packed into the plane the kernel reads.
         //
@@ -506,60 +515,60 @@ int main(int argc, char **argv) {
         // element to rebuild a raw GGUF block.  For S2 (per_byte = 4, which IS Q2_0's own raw layout) treating
         // one random array as both happened to agree - and that coincidence is exactly what a test must not
         // depend on.
-        std::vector<uint8_t> codes_el((size_t) n_out * n_in);
-        for (size_t i = 0; i < codes_el.size(); ++i) codes_el[i] = (uint8_t) (rng() & ((1u << bits) - 1));
-        std::vector<uint8_t> codes((size_t) n_out * codes_per_row, 0);
+        std::vector<uint8_t> codes_el((size_t)n_out * n_in);
+        for (size_t i = 0; i < codes_el.size(); ++i)
+            codes_el[i] = (uint8_t)(rng() & ((1u << bits) - 1));
+        std::vector<uint8_t> codes((size_t)n_out * codes_per_row, 0);
         for (long long o = 0; o < n_out; ++o) {
             for (long long i = 0; i < n_in; ++i) {
                 const long long byi = o * codes_per_row + i / per_byte;
-                codes[(size_t) byi] |= (uint8_t) (codes_el[(size_t) (o * n_in + i)]
-                                                  << ((i % per_byte) * bits));
+                codes[(size_t)byi] |= (uint8_t)(codes_el[(size_t)(o * n_in + i)] << ((i % per_byte) * bits));
             }
         }
-        std::vector<float> scales((size_t) n_out * n_groups);
-        std::vector<uint16_t> scale_bits((size_t) n_out * n_groups);
+        std::vector<float> scales((size_t)n_out * n_groups);
+        std::vector<uint16_t> scale_bits((size_t)n_out * n_groups);
         for (size_t i = 0; i < scales.size(); ++i) {
             scale_bits[i] = kScales[rng() % n_scales];
             scales[i] = strata::fp16_to_fp32(scale_bits[i]);
         }
 
         // CPU reference
-        std::vector<float> ref((size_t) n_out, 0.0f);
-        std::vector<uint8_t> raw((size_t) tc.raw_bytes);
-        std::vector<float> dec((size_t) G);
+        std::vector<float> ref((size_t)n_out, 0.0f);
+        std::vector<uint8_t> raw((size_t)tc.raw_bytes);
+        std::vector<float> dec((size_t)G);
         for (long long o = 0; o < n_out; ++o) {
             float acc = 0.0f;
             for (long long g = 0; g < n_groups; ++g) {
-                const size_t co = (size_t) o * n_in + (size_t) g * G;   // the UNPACKED code array
-                const size_t so = (size_t) o * n_groups + (size_t) g;
+                const size_t co = (size_t)o * n_in + (size_t)g * G;  // the UNPACKED code array
+                const size_t so = (size_t)o * n_groups + (size_t)g;
                 // The raw block carries the scale as fp16 and the canonical plane carries it widened, so the
                 // block is rebuilt from the PATTERN the plane came from.  No float-to-fp16 conversion is
                 // needed anywhere, and the decoder therefore sees bit-identically what the kernel reads.
                 const int n = tc.to_raw(codes_el.data(), co, scale_bits.data(), so, raw.data());
                 tc.dequant(raw.data(), dec.data());
-                for (long long j = 0; j < (long long) n; ++j) {
-                    acc += dec[(size_t) j] * strata::fp16_to_fp32(x[(size_t) (g * G + j)]);
+                for (long long j = 0; j < (long long)n; ++j) {
+                    acc += dec[(size_t)j] * strata::fp16_to_fp32(x[(size_t)(g * G + j)]);
                 }
             }
-            ref[(size_t) o] = acc;
+            ref[(size_t)o] = acc;
         }
 
         // GPU
         uint16_t* d_x = sycl::malloc_device<uint16_t>(x.size(), q);
         uint8_t* d_codes = sycl::malloc_device<uint8_t>(codes.size(), q);
-        float *d_scales = sycl::malloc_device<float>(scales.size(), q);
-        float *d_y = sycl::malloc_device<float>((size_t)n_out, q);
+        float* d_scales = sycl::malloc_device<float>(scales.size(), q);
+        float* d_y = sycl::malloc_device<float>((size_t)n_out, q);
         q.memcpy(d_x, x.data(), x.size() * sizeof(uint16_t)).wait();
         q.memcpy(d_codes, codes.data(), codes.size()).wait();
         q.memcpy(d_scales, scales.data(), scales.size() * sizeof(float)).wait();
         strata::kernels::s_gemv(d_x, d_codes, d_scales, nullptr, d_y, n_in, n_out, tc.form);
-        std::vector<float> got((size_t) n_out);
+        std::vector<float> got((size_t)n_out);
         q.memcpy(got.data(), d_y, got.size() * sizeof(float)).wait();
 
         long long bad = 0;
         double worst = 0.0;
         for (long long o = 0; o < n_out; ++o) {
-            const double a = ref[(size_t) o], b = got[(size_t) o];
+            const double a = ref[(size_t)o], b = got[(size_t)o];
             const double rel = std::fabs(a - b) / (std::fabs(a) > 1e-30 ? std::fabs(a) : 1e-30);
             if (!(rel <= worst)) worst = rel;
             if (!(rel <= tol)) ++bad;
@@ -569,13 +578,13 @@ int main(int argc, char **argv) {
             lo = std::fmin(lo, v);
             hi = std::fmax(hi, v);
         }
-        std::printf("  %-10s %lld rows, %lld over tol, worst rel %.3e   ref spread [%.4g, %.4g]\n", tc.name,
-                    n_out, bad, worst, lo, hi);
+        std::printf("  %-10s %lld rows, %lld over tol, worst rel %.3e   ref spread [%.4g, %.4g]\n", tc.name, n_out, bad,
+                    worst, lo, hi);
         if (hi - lo <= 0.0) {
             std::fprintf(stderr, "VACUOUS: %s reference is constant\n", tc.name);
             return 1;
         }
-        total_bad += (int) bad;
+        total_bad += (int)bad;
 
         sycl::free(d_x, q);
         sycl::free(d_codes, q);

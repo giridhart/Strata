@@ -7,22 +7,19 @@
 #include <random>
 #include <vector>
 
-using strata::kernels::fused_gdn_conv_l2;
 using strata::kernels::fused_gdn_ab;
+using strata::kernels::fused_gdn_conv_l2;
 using strata::kernels::fused_gdn_step_norm;
 
 namespace {
 
-float sigmoid_f(float x) {
-    return 1.0f / (1.0f + std::exp(-x));
-}
+float sigmoid_f(float x) { return 1.0f / (1.0f + std::exp(-x)); }
 
-} // namespace
+}  // namespace
 
 int main() {
     sycl::queue q{sycl::property::queue::in_order()};
-    printf("Running fused_gdn SYCL test on device: %s\n",
-           q.get_device().get_info<sycl::info::device::name>().c_str());
+    printf("Running fused_gdn SYCL test on device: %s\n", q.get_device().get_info<sycl::info::device::name>().c_str());
 
     std::mt19937 rng(42);
     std::normal_distribution<float> dist(0.0f, 1.0f);
@@ -30,7 +27,7 @@ int main() {
 
     // 1. Test fused_gdn_conv_l2
     {
-        const int channels = 2560; // 20 heads of 128
+        const int channels = 2560;  // 20 heads of 128
         const int qk_heads = 16;
         const float eps = 1e-5f;
 
@@ -40,9 +37,12 @@ int main() {
         std::vector<float> ref_h(channels);
         std::vector<float> ref_hist(channels * 3);
 
-        for (auto& v : h_hist) v = dist(rng);
-        for (auto& v : h_qkv) v = dist(rng);
-        for (auto& v : h_w) v = dist(rng) * 0.1f;
+        for (auto& v : h_hist)
+            v = dist(rng);
+        for (auto& v : h_qkv)
+            v = dist(rng);
+        for (auto& v : h_w)
+            v = dist(rng) * 0.1f;
 
         // CPU reference
         for (int c = 0; c < channels; ++c) {
@@ -115,9 +115,12 @@ int main() {
         std::vector<float> ref_gate(h_v);
         std::vector<float> ref_beta(h_v);
 
-        for (auto& v : h_x) v = dist(rng) * 0.1f;
-        for (auto& v : h_dt) v = dist(rng) * 0.1f;
-        for (auto& v : h_ssm_a) v = dist(rng) * 0.1f;
+        for (auto& v : h_x)
+            v = dist(rng) * 0.1f;
+        for (auto& v : h_dt)
+            v = dist(rng) * 0.1f;
+        for (auto& v : h_ssm_a)
+            v = dist(rng) * 0.1f;
 
         auto float_to_bf16 = [](float f) -> uint16_t {
             uint32_t u;
@@ -224,14 +227,22 @@ int main() {
         std::vector<float> ref_y(h_v * S);
         std::vector<float> ref_state(h_v * S * S);
 
-        for (auto& v : h_state) v = dist(rng) * 0.05f;
-        for (auto& v : h_q) v = dist(rng);
-        for (auto& v : h_k_vec) v = dist(rng);
-        for (auto& v : h_v_vec) v = dist(rng);
-        for (auto& v : h_gate) v = -0.1f * std::fabs(dist(rng));
-        for (auto& v : h_beta) v = sigmoid_f(dist(rng));
-        for (auto& v : h_z) v = dist(rng);
-        for (auto& v : h_gamma) v = 1.0f + 0.1f * dist(rng);
+        for (auto& v : h_state)
+            v = dist(rng) * 0.05f;
+        for (auto& v : h_q)
+            v = dist(rng);
+        for (auto& v : h_k_vec)
+            v = dist(rng);
+        for (auto& v : h_v_vec)
+            v = dist(rng);
+        for (auto& v : h_gate)
+            v = -0.1f * std::fabs(dist(rng));
+        for (auto& v : h_beta)
+            v = sigmoid_f(dist(rng));
+        for (auto& v : h_z)
+            v = dist(rng);
+        for (auto& v : h_gamma)
+            v = 1.0f + 0.1f * dist(rng);
 
         ref_state = h_state;
 

@@ -8,14 +8,14 @@
 #include <random>
 #include <vector>
 
-using strata::kernels::native_flash_attn_short_step;
 using strata::kernels::kNativeFlashAttnSuccess;
 using strata::kernels::kNativeFlashAttnUnsupportedStep;
-using strata::kernels::kStepPos;
-using strata::kernels::kStepNKv;
-using strata::kernels::kStepNBid;
-using strata::kernels::kStepWidth;
 using strata::kernels::kStepCount;
+using strata::kernels::kStepNBid;
+using strata::kernels::kStepNKv;
+using strata::kernels::kStepPos;
+using strata::kernels::kStepWidth;
+using strata::kernels::native_flash_attn_short_step;
 using strata::kernels::QsaShapes;
 
 namespace {
@@ -30,9 +30,9 @@ float half_bits_to_float(uint16_t b) {
     return float(h);
 }
 
-void cpu_reference_attend(const float* q, const uint16_t* k, const uint16_t* v,
-                          int width, const uint16_t* mask, float* out) {
-    const float scale = 0.0625f; // 1/16
+void cpu_reference_attend(const float* q, const uint16_t* k, const uint16_t* v, int width, const uint16_t* mask,
+                          float* out) {
+    const float scale = 0.0625f;  // 1/16
     for (int h = 0; h < 24; ++h) {
         const int kv = h / 12;
         std::vector<float> scores(width);
@@ -67,7 +67,7 @@ void cpu_reference_attend(const float* q, const uint16_t* k, const uint16_t* v,
     }
 }
 
-} // namespace
+}  // namespace
 
 int main() {
     sycl::queue q{sycl::property::queue::in_order()};
@@ -101,10 +101,14 @@ int main() {
         std::vector<uint16_t> h_mask(256);
         std::vector<int32_t> h_step(kStepCount);
 
-        for (auto& val : h_q) val = dist(rng) * 0.5f;
-        for (auto& val : h_k) val = float_to_half_bits(dist(rng) * 0.5f);
-        for (auto& val : h_v) val = float_to_half_bits(dist(rng) * 0.5f);
-        for (int i = 0; i < 256; ++i) h_mask[i] = float_to_half_bits(0.0f);
+        for (auto& val : h_q)
+            val = dist(rng) * 0.5f;
+        for (auto& val : h_k)
+            val = float_to_half_bits(dist(rng) * 0.5f);
+        for (auto& val : h_v)
+            val = float_to_half_bits(dist(rng) * 0.5f);
+        for (int i = 0; i < 256; ++i)
+            h_mask[i] = float_to_half_bits(0.0f);
 
         h_step[kStepPos] = width - 1;
         h_step[kStepNKv] = width;
@@ -129,8 +133,7 @@ int main() {
         q.memcpy(d_step, h_step.data(), h_step.size() * sizeof(int32_t));
         q.wait();
 
-        native_flash_attn_short_step(d_q, d_k, d_v, d_step, capacity, max_context,
-                                     shapes, d_out, d_status, d_mask, &q);
+        native_flash_attn_short_step(d_q, d_k, d_v, d_step, capacity, max_context, shapes, d_out, d_status, d_mask, &q);
 
         std::vector<float> dev_out(24 * 256);
         int32_t dev_status = -1;
@@ -153,8 +156,7 @@ int main() {
             if (rel > 1e-2f && diff > 1e-3f) bad_elements++;
         }
 
-        printf("  width=%3d: max_rel = %.3e, bad = %d / %zu\n",
-               width, max_rel, bad_elements, dev_out.size());
+        printf("  width=%3d: max_rel = %.3e, bad = %d / %zu\n", width, max_rel, bad_elements, dev_out.size());
         total_bad += bad_elements;
 
         sycl::free(d_q, q);

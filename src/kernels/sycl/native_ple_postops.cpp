@@ -40,8 +40,8 @@ inline float warp_sum(float x, const sycl::sub_group& sg) {
     return x;
 }
 
-void gate_kernel(const float* key, const float* query, float* gate, float scale,
-                 float *partials, const sycl::nd_item<1>& item) {
+void gate_kernel(const float* key, const float* query, float* gate, float scale, float* partials,
+                 const sycl::nd_item<1>& item) {
     const int row = item.get_group(0);
     const int tid = item.get_local_id(0);
     auto sg = item.get_sub_group();
@@ -55,7 +55,8 @@ void gate_kernel(const float* key, const float* query, float* gate, float scale,
     }
     float sum = 0.0f;
 #pragma unroll
-    for (int j = 0; j < 8; ++j) sum += sums[j];
+    for (int j = 0; j < 8; ++j)
+        sum += sums[j];
 
     sum = warp_sum(sum, sg);
     const int lane = tid % 32;
@@ -64,33 +65,28 @@ void gate_kernel(const float* key, const float* query, float* gate, float scale,
     sum = lane < 16 ? partials[lane] : 0.0f;
     sum = warp_sum(sum, sg);
     if (tid == 0) {
-        const float s = sycl::fma(scale, sum, 0.0f); // ggml SCALE's zero bias
+        const float s = sycl::fma(scale, sum, 0.0f);  // ggml SCALE's zero bias
         const float mag = sycl::sqrt(sycl::fmax(sycl::fabs(s), 1e-6f));
         const float sign = float((s > 0.0f) - (s < 0.0f));
         gate[row] = 1.0f / (1.0f + sycl::native::exp(-sign * mag));
     }
 }
 
-void broadcast_kernel(const float* value, const float* gate, float* gated,
-                      const sycl::nd_item<1>& item) {
+void broadcast_kernel(const float* value, const float* gate, float* gated, const sycl::nd_item<1>& item) {
     const size_t i = item.get_global_id(0);
     if (i < D) gated[i] = value[i % N] * gate[i / N];
 }
 
-void conv_residual_kernel(const float* history, const float* normalized,
-                          const uint16_t* weights, const float* hidden,
-                          const float* gated, float* conv, float* result,
-                          const sycl::nd_item<1>& item) {
+void conv_residual_kernel(const float* history, const float* normalized, const uint16_t* weights, const float* hidden,
+                          const float* gated, float* conv, float* result, const sycl::nd_item<1>& item) {
     const size_t c = item.get_global_id(0);
     if (c >= D) return;
     float sum = 0.0f;
 #pragma unroll
     for (int k = 0; k < 4; ++k) {
         const float x = k == 3 ? normalized[c] : history[c * HISTORY + 3 * k];
-        const float w =
-            sycl::vec<sycl::half, 1>(
-                sycl::bit_cast<sycl::half, unsigned short>(weights[c * 4 + k]))
-                .convert<float, sycl::rounding_mode::automatic>()[0];
+        const float w = sycl::vec<sycl::half, 1>(sycl::bit_cast<sycl::half, unsigned short>(weights[c * 4 + k]))
+                            .convert<float, sycl::rounding_mode::automatic>()[0];
         const float term = x * w;
         sum = k == 0 ? term : sum + term;
     }
@@ -102,10 +98,9 @@ void conv_residual_kernel(const float* history, const float* normalized,
 
 // ---- the batch: T tokens, the same arithmetic per element as the kernels above
 // weighted_rms_norm (native_gr_norm.cu) with the gamma row repeating every H rows (one token's H groups)
-void rms_rep_kernel(const float* __restrict__ input, const float* __restrict__ gamma,
-                    float* __restrict__ output, float *sums,
-                    const sycl::nd_item<1>& item) {
-    constexpr int BlockSize = 1024; // native_gr_rms_norm_weighted's choice for 2560 columns
+void rms_rep_kernel(const float* __restrict__ input, const float* __restrict__ gamma, float* __restrict__ output,
+                    float* sums, const sycl::nd_item<1>& item) {
+    constexpr int BlockSize = 1024;  // native_gr_rms_norm_weighted's choice for 2560 columns
     const int tid = item.get_local_id(0);
     const int row = item.get_group(0);
     const size_t row_offset = size_t(row) * N;
@@ -134,8 +129,7 @@ void rms_rep_kernel(const float* __restrict__ input, const float* __restrict__ g
     }
 }
 
-void broadcast_batch_kernel(const float* value, const float* gate, float* gated, int T,
-                            const sycl::nd_item<1>& item) {
+void broadcast_batch_kernel(const float* value, const float* gate, float* gated, int T, const sycl::nd_item<1>& item) {
     const size_t i = item.get_global_id(0);
     if (i >= size_t(T) * D) return;
     const size_t t = i / D, d = i % D;
@@ -143,21 +137,18 @@ void broadcast_batch_kernel(const float* value, const float* gate, float* gated,
 }
 
 // the dilated conv (taps 9, 6, 3 tokens back and this one) and the residual; a tap before the chunk reads the history
-void conv_residual_batch_kernel(const float* history, const float* normalized, const uint16_t* weights,
-                                float* hidden, const float* gated, int T,
-                                const sycl::nd_item<1>& item) {
+void conv_residual_batch_kernel(const float* history, const float* normalized, const uint16_t* weights, float* hidden,
+                                const float* gated, int T, const sycl::nd_item<1>& item) {
     const size_t i = item.get_global_id(0);
     if (i >= size_t(T) * D) return;
     const int t = int(i / D), c = int(i % D);
     float sum = 0.0f;
 #pragma unroll
     for (int k = 0; k < 4; ++k) {
-        const int p = t - 9 + 3 * k;             // the token this tap reads (k == 3: this one)
+        const int p = t - 9 + 3 * k;  // the token this tap reads (k == 3: this one)
         const float x = p >= 0 ? normalized[size_t(p) * D + c] : history[size_t(c) * HISTORY + (9 + p)];
-        const float wk =
-            sycl::vec<sycl::half, 1>(
-                sycl::bit_cast<sycl::half, unsigned short>(weights[c * 4 + k]))
-                .convert<float, sycl::rounding_mode::automatic>()[0];
+        const float wk = sycl::vec<sycl::half, 1>(sycl::bit_cast<sycl::half, unsigned short>(weights[c * 4 + k]))
+                             .convert<float, sycl::rounding_mode::automatic>()[0];
         const float term = x * wk;
         sum = k == 0 ? term : sum + term;
     }
@@ -166,8 +157,7 @@ void conv_residual_batch_kernel(const float* history, const float* normalized, c
 }
 
 // the history after the chunk: the last nine normalized rows (older ones from the history when T < 9)
-void history_batch_kernel(float* history, const float* normalized, int T,
-                          const sycl::nd_item<1>& item) {
+void history_batch_kernel(float* history, const float* normalized, int T, const sycl::nd_item<1>& item) {
     const size_t c = item.get_global_id(0);
     if (c >= D) return;
     float h[HISTORY];
@@ -177,10 +167,15 @@ void history_batch_kernel(float* history, const float* normalized, int T,
         h[r] = p >= 0 ? normalized[size_t(p) * D + c] : history[size_t(c) * HISTORY + (T + r)];
     }
 #pragma unroll
-    for (int r = 0; r < HISTORY; ++r) history[size_t(c) * HISTORY + r] = h[r];
+    for (int r = 0; r < HISTORY; ++r)
+        history[size_t(c) * HISTORY + r] = h[r];
 }
 
-struct Span { const void* p; size_t bytes; size_t alignment; };
+struct Span {
+    const void* p;
+    size_t bytes;
+    size_t alignment;
+};
 bool overlaps(Span a, Span b) {
     const auto x = reinterpret_cast<uintptr_t>(a.p), y = reinterpret_cast<uintptr_t>(b.p);
     return x < y + b.bytes && y < x + a.bytes;
@@ -188,23 +183,23 @@ bool overlaps(Span a, Span b) {
 
 void validate(Span span) {
     const auto p = reinterpret_cast<uintptr_t>(span.p);
-    if (!p || p % span.alignment ||
-        p > std::numeric_limits<uintptr_t>::max() - span.bytes)
+    if (!p || p % span.alignment || p > std::numeric_limits<uintptr_t>::max() - span.bytes)
         throw std::invalid_argument("native PLE postops require nonnull aligned bounded spans");
 }
-} // namespace
+}  // namespace
 
-void native_ple_postops(const float* projected_key, const float* hidden,
-                        const float* value, const float* history,
+void native_ple_postops(const float* projected_key, const float* hidden, const float* value, const float* history,
                         const PleWeights& w, const NativePlePostopsBuffers& b, void* stream) {
     if (!stream) throw std::invalid_argument("native PLE postops require an explicit stream");
-    const Span inputs[] = {{projected_key,D*4,4}, {hidden,D*4,4}, {value,N*4,4},
-        {history,HISTORY*D*4,4}, {w.norm_key,D*4,4}, {w.norm_query,D*4,4},
-        {w.norm_conv,D*4,4}, {w.conv1d_f16,4*D*2,2}};
-    const Span outputs[] = {{b.key,D*4,4}, {b.query,D*4,4}, {b.gate,H*4,4},
-        {b.gated,D*4,4}, {b.normalized,D*4,4}, {b.conv,D*4,4}, {b.result,D*4,4}};
-    for (const auto& span : inputs) validate(span);
-    for (const auto& span : outputs) validate(span);
+    const Span inputs[] = {{projected_key, D * 4, 4},     {hidden, D * 4, 4},          {value, N * 4, 4},
+                           {history, HISTORY * D * 4, 4}, {w.norm_key, D * 4, 4},      {w.norm_query, D * 4, 4},
+                           {w.norm_conv, D * 4, 4},       {w.conv1d_f16, 4 * D * 2, 2}};
+    const Span outputs[] = {{b.key, D * 4, 4},        {b.query, D * 4, 4}, {b.gate, H * 4, 4},  {b.gated, D * 4, 4},
+                            {b.normalized, D * 4, 4}, {b.conv, D * 4, 4},  {b.result, D * 4, 4}};
+    for (const auto& span : inputs)
+        validate(span);
+    for (const auto& span : outputs)
+        validate(span);
     for (size_t i = 0; i < 7; ++i) {
         for (size_t j = 0; j < 8; ++j)
             if (!(i == 6 && j == 1 && b.result == hidden) && overlaps(outputs[i], inputs[j]))
@@ -222,32 +217,24 @@ void native_ple_postops(const float* projected_key, const float* hidden,
 
     const float scale = 1.0f / std::sqrt(float(N));
 
-    q->submit([&](sycl::handler &cgh) {
+    q->submit([&](sycl::handler& cgh) {
         sycl::local_accessor<float, 1> partials_acc(sycl::range<1>(32), cgh);
 
-        cgh.parallel_for(
-            sycl::nd_range<1>(sycl::range<1>(H * 512), sycl::range<1>(512)),
-            [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(32)]] {
-                gate_kernel(b.key, b.query, b.gate, scale,
-                            partials_acc.get_multi_ptr<sycl::access::decorated::no>().get(),
-                            item);
-            });
+        cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(H * 512), sycl::range<1>(512)),
+                         [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(32)]] {
+                             gate_kernel(b.key, b.query, b.gate, scale,
+                                         partials_acc.get_multi_ptr<sycl::access::decorated::no>().get(), item);
+                         });
     });
 
-    q->parallel_for(
-        sycl::nd_range<1>(sycl::range<1>(D), sycl::range<1>(256)),
-        [=](sycl::nd_item<1> item) {
-            broadcast_kernel(value, b.gate, b.gated, item);
-        });
+    q->parallel_for(sycl::nd_range<1>(sycl::range<1>(D), sycl::range<1>(256)),
+                    [=](sycl::nd_item<1> item) { broadcast_kernel(value, b.gate, b.gated, item); });
 
     native_gr_rms_norm_weighted(b.gated, w.norm_conv, b.normalized, N, H, NG_RMS_EPS, stream);
 
-    q->parallel_for(
-        sycl::nd_range<1>(sycl::range<1>(D), sycl::range<1>(256)),
-        [=](sycl::nd_item<1> item) {
-            conv_residual_kernel(history, b.normalized, w.conv1d_f16, hidden, b.gated,
-                                 b.conv, b.result, item);
-        });
+    q->parallel_for(sycl::nd_range<1>(sycl::range<1>(D), sycl::range<1>(256)), [=](sycl::nd_item<1> item) {
+        conv_residual_kernel(history, b.normalized, w.conv1d_f16, hidden, b.gated, b.conv, b.result, item);
+    });
 }
 
 void native_ple_postops_batch(float* key, float* hidden, const float* value, float* history, const PleWeights& w,
@@ -262,72 +249,55 @@ void native_ple_postops_batch(float* key, float* hidden, const float* value, flo
     const size_t blocks = ((size_t(T) * D + 255) / 256) * 256;
     const float scale = 1.0f / std::sqrt(float(N));
 
-    q->submit([&](sycl::handler &cgh) {
+    q->submit([&](sycl::handler& cgh) {
         sycl::local_accessor<float, 1> sums_acc(sycl::range<1>(32), cgh);
 
-        cgh.parallel_for(
-            sycl::nd_range<1>(sycl::range<1>(rows * 1024), sycl::range<1>(1024)),
-            [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(32)]] {
-                rms_rep_kernel(key, w.norm_key, key,
-                               sums_acc.get_multi_ptr<sycl::access::decorated::no>().get(),
-                               item);
-            });
+        cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(rows * 1024), sycl::range<1>(1024)),
+                         [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(32)]] {
+                             rms_rep_kernel(key, w.norm_key, key,
+                                            sums_acc.get_multi_ptr<sycl::access::decorated::no>().get(), item);
+                         });
     });
 
-    q->submit([&](sycl::handler &cgh) {
+    q->submit([&](sycl::handler& cgh) {
         sycl::local_accessor<float, 1> sums_acc(sycl::range<1>(32), cgh);
 
-        cgh.parallel_for(
-            sycl::nd_range<1>(sycl::range<1>(rows * 1024), sycl::range<1>(1024)),
-            [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(32)]] {
-                rms_rep_kernel(hidden, w.norm_query, query_norm,
-                               sums_acc.get_multi_ptr<sycl::access::decorated::no>().get(),
-                               item);
-            });
+        cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(rows * 1024), sycl::range<1>(1024)),
+                         [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(32)]] {
+                             rms_rep_kernel(hidden, w.norm_query, query_norm,
+                                            sums_acc.get_multi_ptr<sycl::access::decorated::no>().get(), item);
+                         });
     });
 
-    q->submit([&](sycl::handler &cgh) {
+    q->submit([&](sycl::handler& cgh) {
         sycl::local_accessor<float, 1> partials_acc(sycl::range<1>(32), cgh);
 
-        cgh.parallel_for(
-            sycl::nd_range<1>(sycl::range<1>(rows * 512), sycl::range<1>(512)),
-            [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(32)]] {
-                gate_kernel(key, query_norm, gate, scale,
-                            partials_acc.get_multi_ptr<sycl::access::decorated::no>().get(),
-                            item);
-            });
+        cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(rows * 512), sycl::range<1>(512)),
+                         [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(32)]] {
+                             gate_kernel(key, query_norm, gate, scale,
+                                         partials_acc.get_multi_ptr<sycl::access::decorated::no>().get(), item);
+                         });
     });
 
-    q->parallel_for(
-        sycl::nd_range<1>(sycl::range<1>(blocks), sycl::range<1>(256)),
-        [=](sycl::nd_item<1> item) {
-            broadcast_batch_kernel(value, gate, gated, T, item);
-        });
+    q->parallel_for(sycl::nd_range<1>(sycl::range<1>(blocks), sycl::range<1>(256)),
+                    [=](sycl::nd_item<1> item) { broadcast_batch_kernel(value, gate, gated, T, item); });
 
-    q->submit([&](sycl::handler &cgh) {
+    q->submit([&](sycl::handler& cgh) {
         sycl::local_accessor<float, 1> sums_acc(sycl::range<1>(32), cgh);
 
-        cgh.parallel_for(
-            sycl::nd_range<1>(sycl::range<1>(rows * 1024), sycl::range<1>(1024)),
-            [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(32)]] {
-                rms_rep_kernel(gated, w.norm_conv, query_norm,
-                               sums_acc.get_multi_ptr<sycl::access::decorated::no>().get(),
-                               item);
-            });
+        cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(rows * 1024), sycl::range<1>(1024)),
+                         [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(32)]] {
+                             rms_rep_kernel(gated, w.norm_conv, query_norm,
+                                            sums_acc.get_multi_ptr<sycl::access::decorated::no>().get(), item);
+                         });
     });
 
-    q->parallel_for(
-        sycl::nd_range<1>(sycl::range<1>(blocks), sycl::range<1>(256)),
-        [=](sycl::nd_item<1> item) {
-            conv_residual_batch_kernel(history, query_norm, w.conv1d_f16, hidden, gated,
-                                       T, item);
-        });
+    q->parallel_for(sycl::nd_range<1>(sycl::range<1>(blocks), sycl::range<1>(256)), [=](sycl::nd_item<1> item) {
+        conv_residual_batch_kernel(history, query_norm, w.conv1d_f16, hidden, gated, T, item);
+    });
 
-    q->parallel_for(
-        sycl::nd_range<1>(sycl::range<1>(D), sycl::range<1>(256)),
-        [=](sycl::nd_item<1> item) {
-            history_batch_kernel(history, query_norm, T, item);
-        });
+    q->parallel_for(sycl::nd_range<1>(sycl::range<1>(D), sycl::range<1>(256)),
+                    [=](sycl::nd_item<1> item) { history_batch_kernel(history, query_norm, T, item); });
 }
 
-} // namespace strata::kernels
+}  // namespace strata::kernels

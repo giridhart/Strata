@@ -45,8 +45,7 @@ static sycl::queue& default_queue() {
 }
 
 template <int SUB_SIZE = SG_SIZE>
-void step(sycl::nd_item<2> item,
-          float* __restrict__ state, const float* __restrict__ q, const float* __restrict__ k,
+void step(sycl::nd_item<2> item, float* __restrict__ state, const float* __restrict__ q, const float* __restrict__ k,
           const float* __restrict__ v, const float* __restrict__ gate, const float* __restrict__ beta,
           float* __restrict__ output, int h_k, int h_v, float scale) {
     constexpr int R_COUNT = S / SUB_SIZE;
@@ -65,7 +64,8 @@ void step(sycl::nd_item<2> item,
     const float g_val = sycl::native::exp(gate[head]);
     float kv_shard = 0.0f;
 #pragma unroll
-    for (int r = 0; r < R_COUNT; ++r) kv_shard += s_shard[r] * k_reg[r];
+    for (int r = 0; r < R_COUNT; ++r)
+        kv_shard += s_shard[r] * k_reg[r];
     auto sg = item.get_sub_group();
     const float kv_col = sycl::reduce_over_group(sg, kv_shard, sycl::plus<float>());
     const float delta_col = (v[head * S + col] - g_val * kv_col) * beta[head];
@@ -92,16 +92,14 @@ bool overlap(const void* a, size_t an, const void* b, size_t bn) {
     const auto ap = reinterpret_cast<uintptr_t>(a), bp = reinterpret_cast<uintptr_t>(b);
     return ap < bp + bn && bp < ap + an;
 }
-} // namespace
+}  // namespace
 
 void native_gdn_set_enabled(bool value) { enabled.store(value, std::memory_order_relaxed); }
 bool native_gdn_enabled() { return enabled.load(std::memory_order_relaxed); }
 
-void native_gdn_step(float* state, const float* q, const float* k, const float* v,
-                     const float* gate, const float* beta, float* output,
-                     const GdnShapes& shape, void* stream) {
-    if (shape.S != S || shape.h_k <= 0 || shape.h_v <= 0 ||
-        shape.h_v > 65535 || shape.h_v % shape.h_k != 0)
+void native_gdn_step(float* state, const float* q, const float* k, const float* v, const float* gate, const float* beta,
+                     float* output, const GdnShapes& shape, void* stream) {
+    if (shape.S != S || shape.h_k <= 0 || shape.h_v <= 0 || shape.h_v > 65535 || shape.h_v % shape.h_k != 0)
         throw std::invalid_argument("native GDN requires S=128 and positive divisible head counts <=65535");
     const size_t state_bytes = size_t(S) * S * size_t(shape.h_v) * sizeof(float);
     const size_t qk_bytes = size_t(S) * size_t(shape.h_k) * sizeof(float);
@@ -119,12 +117,10 @@ void native_gdn_step(float* state, const float* q, const float* k, const float* 
     }
     const float scale = 1.0f / sqrtf(float(S));
     sycl::queue* q_ptr = stream ? static_cast<sycl::queue*>(stream) : &default_queue();
-    q_ptr->parallel_for(
-        sycl::nd_range<2>(sycl::range<2>(shape.h_v * 4, (S / 4) * SG_SIZE),
-                          sycl::range<2>(4, SG_SIZE)),
-        [=](sycl::nd_item<2> item) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
-            step<SG_SIZE>(item, state, q, k, v, gate, beta, output, int(shape.h_k),
-                          int(shape.h_v), scale);
-        });
+    q_ptr->parallel_for(sycl::nd_range<2>(sycl::range<2>(shape.h_v * 4, (S / 4) * SG_SIZE), sycl::range<2>(4, SG_SIZE)),
+                        [=](sycl::nd_item<2> item) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
+                            step<SG_SIZE>(item, state, q, k, v, gate, beta, output, int(shape.h_k), int(shape.h_v),
+                                          scale);
+                        });
 }
-} // namespace strata::kernels
+}  // namespace strata::kernels

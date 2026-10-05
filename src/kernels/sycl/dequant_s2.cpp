@@ -19,38 +19,32 @@
 namespace strata::kernels {
 namespace {
 
-constexpr int QK = 64;             // S2 group = Q2_0 block = 64 elements
+constexpr int QK = 64;  // S2 group = Q2_0 block = 64 elements
 constexpr int CODES_PER_BYTE = 4;
 
-void dequant_s2_kernel(const uint8_t* __restrict__ codes, const float* __restrict__ scales,
-                                  float* __restrict__ out, long long n_blocks, sycl::nd_item<1> item) {
-    const long long b =
-        (long long)item.get_group(0) * item.get_local_range(0) +
-        item.get_local_id(0);
+void dequant_s2_kernel(const uint8_t* __restrict__ codes, const float* __restrict__ scales, float* __restrict__ out,
+                       long long n_blocks, sycl::nd_item<1> item) {
+    const long long b = (long long)item.get_group(0) * item.get_local_range(0) + item.get_local_id(0);
     if (b >= n_blocks) return;
     const float d = scales[b];
     const uint8_t* c = codes + b * (QK / CODES_PER_BYTE);
     float* y = out + b * QK;
     for (int j = 0; j < QK; ++j) {
         const int code = (c[j / CODES_PER_BYTE] >> ((j % CODES_PER_BYTE) * 2)) & 0x03;
-        y[j] = (float)(code - 1) * d;      // the -1 is applied to the CODE, then ONE multiply
+        y[j] = (float)(code - 1) * d;  // the -1 is applied to the CODE, then ONE multiply
     }
 }
 
 }  // namespace
 
-void dequant_s2(const uint8_t *codes, const float *scales, float *out,
-                int64_t n_blocks) {
+void dequant_s2(const uint8_t* codes, const float* scales, float* out, int64_t n_blocks) {
     if (n_blocks <= 0) return;
     const int threads = 256;
     const long long blocks = (n_blocks + threads - 1) / threads;
     sycl::queue q;
-    q.parallel_for(
-        sycl::nd_range<1>(sycl::range<1>((unsigned)blocks * threads),
-                          sycl::range<1>(threads)),
-        [=](sycl::nd_item<1> item) {
-            dequant_s2_kernel(codes, scales, out, n_blocks, item);
-        }).wait();
+    q.parallel_for(sycl::nd_range<1>(sycl::range<1>((unsigned)blocks * threads), sycl::range<1>(threads)),
+                   [=](sycl::nd_item<1> item) { dequant_s2_kernel(codes, scales, out, n_blocks, item); })
+        .wait();
 }
 
 }  // namespace strata::kernels

@@ -23,12 +23,10 @@ inline sycl::queue& default_queue() {
     return q;
 }
 
-[[maybe_unused]] void s2_gemv_kernel(sycl::nd_item<1> item, const uint16_t* __restrict__ x, const uint8_t* __restrict__ codes,
-                    const float* __restrict__ scales, float* __restrict__ y, long long n_in,
-                    long long n_out) {
-    const long long o =
-        (long long)item.get_group(0) * item.get_local_range(0) +
-        item.get_local_id(0);
+[[maybe_unused]] void s2_gemv_kernel(sycl::nd_item<1> item, const uint16_t* __restrict__ x,
+                                     const uint8_t* __restrict__ codes, const float* __restrict__ scales,
+                                     float* __restrict__ y, long long n_in, long long n_out) {
+    const long long o = (long long)item.get_group(0) * item.get_local_range(0) + item.get_local_id(0);
     if (o >= n_out) return;
 
     const long long nb = n_in / QK;
@@ -43,8 +41,7 @@ inline sycl::queue& default_queue() {
         for (int j = 0; j < QK; ++j) {
             const int code = (cb[j >> 2] >> ((j & 3) * 2)) & 0x03;
             acc += (float)(code - 1) * d *
-                   sycl::vec<sycl::half, 1>(
-                       sycl::bit_cast<sycl::half, unsigned short>(xb[j]))
+                   sycl::vec<sycl::half, 1>(sycl::bit_cast<sycl::half, unsigned short>(xb[j]))
                        .convert<float, sycl::rounding_mode::automatic>()[0];
         }
     }
@@ -52,17 +49,11 @@ inline sycl::queue& default_queue() {
 }
 
 template <int SUB_SIZE = SG_SIZE>
-void s2_gemv_subgroup_kernel(sycl::nd_item<1> item,
-                             const uint16_t* __restrict__ x,
-                             const uint8_t* __restrict__ codes,
-                             const float* __restrict__ scales,
-                             float* __restrict__ y,
-                             long long n_in,
-                             long long n_out) {
+void s2_gemv_subgroup_kernel(sycl::nd_item<1> item, const uint16_t* __restrict__ x, const uint8_t* __restrict__ codes,
+                             const float* __restrict__ scales, float* __restrict__ y, long long n_in, long long n_out) {
     const auto sg = item.get_sub_group();
     const int sgs_per_block = (int)(item.get_local_range(0) / SUB_SIZE);
-    const long long o = (long long)item.get_group(0) * sgs_per_block +
-                        (long long)(item.get_local_id(0) / SUB_SIZE);
+    const long long o = (long long)item.get_group(0) * sgs_per_block + (long long)(item.get_local_id(0) / SUB_SIZE);
     if (o >= n_out) return;
 
     const int lane = sg.get_local_linear_id();
@@ -101,22 +92,20 @@ void s2_gemv_subgroup_kernel(sycl::nd_item<1> item,
 
 }  // namespace
 
-void s2_gemv(const uint16_t *x, const uint8_t *codes, const float *scales,
-             float *y, int64_t n_in, int64_t n_out) {
+void s2_gemv(const uint16_t* x, const uint8_t* codes, const float* scales, float* y, int64_t n_in, int64_t n_out) {
     if (n_in <= 0 || n_out <= 0) return;
     if (n_in % QK != 0) {
-        std::fprintf(stderr, "s2_gemv: n_in %lld is not a multiple of %d\n", (long long) n_in, QK);
+        std::fprintf(stderr, "s2_gemv: n_in %lld is not a multiple of %d\n", (long long)n_in, QK);
         std::exit(1);
     }
     auto& q = default_queue();
     constexpr int threads = 256;
     const int sgs = threads / SG_SIZE;
-    const unsigned blocks = (unsigned) ((n_out + sgs - 1) / sgs);
-    q.parallel_for(
-        sycl::nd_range<1>(sycl::range<1>(blocks * threads), sycl::range<1>(threads)),
-        [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
-            s2_gemv_subgroup_kernel<SG_SIZE>(item, x, codes, scales, y, n_in, n_out);
-        });
+    const unsigned blocks = (unsigned)((n_out + sgs - 1) / sgs);
+    q.parallel_for(sycl::nd_range<1>(sycl::range<1>(blocks * threads), sycl::range<1>(threads)),
+                   [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
+                       s2_gemv_subgroup_kernel<SG_SIZE>(item, x, codes, scales, y, n_in, n_out);
+                   });
 }
 
 }  // namespace strata::kernels

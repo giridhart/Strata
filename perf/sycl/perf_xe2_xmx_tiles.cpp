@@ -29,11 +29,8 @@ namespace {
 
 /// Single Systolic Tile Kernel: 8x16x16 (TM=8, TN=16, TK=16)
 template <size_t TM = 8, size_t TN = 16, size_t TK = 16>
-void xmx_gemm_tile8_kernel(sycl::nd_item<2> item,
-                           const sycl::half* __restrict__ in,
-                           const sycl::half* __restrict__ w,
-                           float* __restrict__ out,
-                           size_t M, size_t N, size_t K) {
+void xmx_gemm_tile8_kernel(sycl::nd_item<2> item, const sycl::half* __restrict__ in, const sycl::half* __restrict__ w,
+                           float* __restrict__ out, size_t M, size_t N, size_t K) {
     auto sg = item.get_sub_group();
     const size_t tile_m = item.get_group(0) * TM;
     const size_t tile_n = item.get_group(1) * TN;
@@ -43,30 +40,30 @@ void xmx_gemm_tile8_kernel(sycl::nd_item<2> item,
     joint_matrix<sycl::sub_group, float, use::accumulator, TM, TN> sub_c;
     joint_matrix_fill(sg, sub_c, 0.0f);
 
-    #pragma unroll 4
+#pragma unroll 4
     for (size_t k = 0; k < K; k += TK) {
         joint_matrix<sycl::sub_group, sycl::half, use::a, TM, TK, layout::row_major> sub_a;
         joint_matrix<sycl::sub_group, sycl::half, use::b, TK, TN, layout::row_major> sub_b;
 
-        auto ptr_a = sycl::address_space_cast<sycl::access::address_space::global_space, sycl::access::decorated::no>(in + tile_m * K + k);
-        auto ptr_b = sycl::address_space_cast<sycl::access::address_space::global_space, sycl::access::decorated::no>(w + k * N + tile_n);
+        auto ptr_a = sycl::address_space_cast<sycl::access::address_space::global_space, sycl::access::decorated::no>(
+            in + tile_m * K + k);
+        auto ptr_b = sycl::address_space_cast<sycl::access::address_space::global_space, sycl::access::decorated::no>(
+            w + k * N + tile_n);
 
         joint_matrix_load(sg, sub_a, ptr_a, K);
         joint_matrix_load(sg, sub_b, ptr_b, N);
         joint_matrix_mad(sg, sub_c, sub_a, sub_b, sub_c);
     }
 
-    auto ptr_c = sycl::address_space_cast<sycl::access::address_space::global_space, sycl::access::decorated::no>(out + tile_m * N + tile_n);
+    auto ptr_c = sycl::address_space_cast<sycl::access::address_space::global_space, sycl::access::decorated::no>(
+        out + tile_m * N + tile_n);
     joint_matrix_store(sg, sub_c, ptr_c, N, layout::row_major);
 }
 
 /// 2D Systolic Tile Kernel: 16x16x16 (TM=16, TN=16, TK=16)
 template <size_t TM = 16, size_t TN = 16, size_t TK = 16>
-void xmx_gemm_tile16_kernel(sycl::nd_item<2> item,
-                            const sycl::half* __restrict__ in,
-                            const sycl::half* __restrict__ w,
-                            float* __restrict__ out,
-                            size_t M, size_t N, size_t K) {
+void xmx_gemm_tile16_kernel(sycl::nd_item<2> item, const sycl::half* __restrict__ in, const sycl::half* __restrict__ w,
+                            float* __restrict__ out, size_t M, size_t N, size_t K) {
     auto sg = item.get_sub_group();
     const size_t tile_m = item.get_group(0) * TM;
     const size_t tile_n = item.get_group(1) * TN;
@@ -76,24 +73,27 @@ void xmx_gemm_tile16_kernel(sycl::nd_item<2> item,
     joint_matrix<sycl::sub_group, float, use::accumulator, TM, TN> sub_c;
     joint_matrix_fill(sg, sub_c, 0.0f);
 
-    #pragma unroll 4
+#pragma unroll 4
     for (size_t k = 0; k < K; k += TK) {
         joint_matrix<sycl::sub_group, sycl::half, use::a, TM, TK, layout::row_major> sub_a;
         joint_matrix<sycl::sub_group, sycl::half, use::b, TK, TN, layout::row_major> sub_b;
 
-        auto ptr_a = sycl::address_space_cast<sycl::access::address_space::global_space, sycl::access::decorated::no>(in + tile_m * K + k);
-        auto ptr_b = sycl::address_space_cast<sycl::access::address_space::global_space, sycl::access::decorated::no>(w + k * N + tile_n);
+        auto ptr_a = sycl::address_space_cast<sycl::access::address_space::global_space, sycl::access::decorated::no>(
+            in + tile_m * K + k);
+        auto ptr_b = sycl::address_space_cast<sycl::access::address_space::global_space, sycl::access::decorated::no>(
+            w + k * N + tile_n);
 
         joint_matrix_load(sg, sub_a, ptr_a, K);
         joint_matrix_load(sg, sub_b, ptr_b, N);
         joint_matrix_mad(sg, sub_c, sub_a, sub_b, sub_c);
     }
 
-    auto ptr_c = sycl::address_space_cast<sycl::access::address_space::global_space, sycl::access::decorated::no>(out + tile_m * N + tile_n);
+    auto ptr_c = sycl::address_space_cast<sycl::access::address_space::global_space, sycl::access::decorated::no>(
+        out + tile_m * N + tile_n);
     joint_matrix_store(sg, sub_c, ptr_c, N, layout::row_major);
 }
 
-} // namespace
+}  // namespace
 
 // ============================================================================
 // Benchmark: BM_Xe2_XMX_Tile8 (8x16x16 Systolic Matrix Tile)
@@ -108,7 +108,7 @@ static void BM_Xe2_XMX_Tile8(benchmark::State& state) {
 
     sycl::half* d_A = sycl::malloc_device<sycl::half>(M * K, q);
     sycl::half* d_B = sycl::malloc_device<sycl::half>(K * N, q);
-    float* d_C      = sycl::malloc_device<float>(M * N, q);
+    float* d_C = sycl::malloc_device<float>(M * N, q);
 
     if (!d_A || !d_B || !d_C) {
         state.SkipWithError("Failed to allocate USM memory for XMX benchmark");
@@ -129,11 +129,10 @@ static void BM_Xe2_XMX_Tile8(benchmark::State& state) {
     const size_t grid_n = (N + TN - 1) / TN;
 
     auto launch = [&](sycl::handler& cgh) {
-        cgh.parallel_for(
-            sycl::nd_range<2>(sycl::range<2>(grid_m, grid_n * 16), sycl::range<2>(1, 16)),
-            [=](sycl::nd_item<2> item) [[sycl::reqd_sub_group_size(16)]] {
-                xmx_gemm_tile8_kernel<8, 16, 16>(item, d_A, d_B, d_C, M, N, K);
-            });
+        cgh.parallel_for(sycl::nd_range<2>(sycl::range<2>(grid_m, grid_n * 16), sycl::range<2>(1, 16)),
+                         [=](sycl::nd_item<2> item) [[sycl::reqd_sub_group_size(16)]] {
+                             xmx_gemm_tile8_kernel<8, 16, 16>(item, d_A, d_B, d_C, M, N, K);
+                         });
     };
 
     // Warmup
@@ -149,10 +148,15 @@ static void BM_Xe2_XMX_Tile8(benchmark::State& state) {
         state.SetIterationTime((t1 - t0) * 1e-9);
     }
 
-    const double bytes = static_cast<double>(M * K + K * N) * sizeof(sycl::half) + static_cast<double>(M * N) * sizeof(float);
-    state.counters["Bandwidth_GBps"] = benchmark::Counter(bytes, benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
-    state.counters["TFLOPS"]         = benchmark::Counter(2.0 * static_cast<double>(M * K * N), benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
-    state.counters["tokens_per_sec"] = benchmark::Counter(static_cast<double>(M), benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
+    const double bytes =
+        static_cast<double>(M * K + K * N) * sizeof(sycl::half) + static_cast<double>(M * N) * sizeof(float);
+    state.counters["Bandwidth_GBps"] =
+        benchmark::Counter(bytes, benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
+    state.counters["TFLOPS"] =
+        benchmark::Counter(2.0 * static_cast<double>(M * K * N), benchmark::Counter::kIsIterationInvariantRate,
+                           benchmark::Counter::kIs1000);
+    state.counters["tokens_per_sec"] = benchmark::Counter(
+        static_cast<double>(M), benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
 
     sycl::free(d_A, q);
     sycl::free(d_B, q);
@@ -172,7 +176,7 @@ static void BM_Xe2_XMX_Tile16(benchmark::State& state) {
 
     sycl::half* d_A = sycl::malloc_device<sycl::half>(M * K, q);
     sycl::half* d_B = sycl::malloc_device<sycl::half>(K * N, q);
-    float* d_C      = sycl::malloc_device<float>(M * N, q);
+    float* d_C = sycl::malloc_device<float>(M * N, q);
 
     if (!d_A || !d_B || !d_C) {
         state.SkipWithError("Failed to allocate USM memory for XMX benchmark");
@@ -193,11 +197,10 @@ static void BM_Xe2_XMX_Tile16(benchmark::State& state) {
     const size_t grid_n = (N + TN - 1) / TN;
 
     auto launch = [&](sycl::handler& cgh) {
-        cgh.parallel_for(
-            sycl::nd_range<2>(sycl::range<2>(grid_m, grid_n * 16), sycl::range<2>(1, 16)),
-            [=](sycl::nd_item<2> item) [[sycl::reqd_sub_group_size(16)]] {
-                xmx_gemm_tile16_kernel<16, 16, 16>(item, d_A, d_B, d_C, M, N, K);
-            });
+        cgh.parallel_for(sycl::nd_range<2>(sycl::range<2>(grid_m, grid_n * 16), sycl::range<2>(1, 16)),
+                         [=](sycl::nd_item<2> item) [[sycl::reqd_sub_group_size(16)]] {
+                             xmx_gemm_tile16_kernel<16, 16, 16>(item, d_A, d_B, d_C, M, N, K);
+                         });
     };
 
     // Warmup
@@ -213,10 +216,15 @@ static void BM_Xe2_XMX_Tile16(benchmark::State& state) {
         state.SetIterationTime((t1 - t0) * 1e-9);
     }
 
-    const double bytes = static_cast<double>(M * K + K * N) * sizeof(sycl::half) + static_cast<double>(M * N) * sizeof(float);
-    state.counters["Bandwidth_GBps"] = benchmark::Counter(bytes, benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
-    state.counters["TFLOPS"]         = benchmark::Counter(2.0 * static_cast<double>(M * K * N), benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
-    state.counters["tokens_per_sec"] = benchmark::Counter(static_cast<double>(M), benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
+    const double bytes =
+        static_cast<double>(M * K + K * N) * sizeof(sycl::half) + static_cast<double>(M * N) * sizeof(float);
+    state.counters["Bandwidth_GBps"] =
+        benchmark::Counter(bytes, benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
+    state.counters["TFLOPS"] =
+        benchmark::Counter(2.0 * static_cast<double>(M * K * N), benchmark::Counter::kIsIterationInvariantRate,
+                           benchmark::Counter::kIs1000);
+    state.counters["tokens_per_sec"] = benchmark::Counter(
+        static_cast<double>(M), benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
 
     sycl::free(d_A, q);
     sycl::free(d_B, q);
@@ -228,7 +236,7 @@ static void BM_Xe2_XMX_Tile16(benchmark::State& state) {
 // ============================================================================
 
 // 1. Heavy Attention Projection: attn_qkv [K=2560, N=10240] across token batch sizes
-BENCHMARK(BM_Xe2_XMX_Tile8)->UseManualTime()->Args({8,  2560, 10240});
+BENCHMARK(BM_Xe2_XMX_Tile8)->UseManualTime()->Args({8, 2560, 10240});
 BENCHMARK(BM_Xe2_XMX_Tile8)->UseManualTime()->Args({16, 2560, 10240});
 BENCHMARK(BM_Xe2_XMX_Tile8)->UseManualTime()->Args({32, 2560, 10240});
 
@@ -236,7 +244,7 @@ BENCHMARK(BM_Xe2_XMX_Tile16)->UseManualTime()->Args({16, 2560, 10240});
 BENCHMARK(BM_Xe2_XMX_Tile16)->UseManualTime()->Args({32, 2560, 10240});
 
 // 2. Square Projection: [K=2560, N=2560]
-BENCHMARK(BM_Xe2_XMX_Tile8)->UseManualTime()->Args({8,  2560, 2560});
+BENCHMARK(BM_Xe2_XMX_Tile8)->UseManualTime()->Args({8, 2560, 2560});
 BENCHMARK(BM_Xe2_XMX_Tile8)->UseManualTime()->Args({16, 2560, 2560});
 BENCHMARK(BM_Xe2_XMX_Tile8)->UseManualTime()->Args({32, 2560, 2560});
 
@@ -268,7 +276,8 @@ int main(int argc, char** argv) {
             auto combos = dev.get_info<sycl::ext::oneapi::experimental::info::device::matrix_combinations>();
             if (!combos.empty()) {
                 has_xmx = true;
-                std::printf(" XMX Status:   Hardware XMX systolic matrix engines DETECTED (%zu combos)\n", combos.size());
+                std::printf(" XMX Status:   Hardware XMX systolic matrix engines DETECTED (%zu combos)\n",
+                            combos.size());
             }
         } catch (...) {
             std::printf(" XMX Status:   Matrix combination query unsupported\n");

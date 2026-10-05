@@ -21,12 +21,16 @@
 #include <random>
 #include <vector>
 
-int main(int argc, char **argv) {
+int main(int argc, char** argv) {
     sycl::queue q_ct1{sycl::default_selector_v, sycl::property::queue::in_order()};
     bool selftest = false;
     for (int i = 1; i < argc; ++i) {
-        if (std::string(argv[i]) == "--selftest") selftest = true;
-        else { std::fprintf(stderr, "usage: s2_gemv_q8_parity [--selftest]\n"); return 2; }
+        if (std::string(argv[i]) == "--selftest")
+            selftest = true;
+        else {
+            std::fprintf(stderr, "usage: s2_gemv_q8_parity [--selftest]\n");
+            return 2;
+        }
     }
 
     const long long n_in = 2560, n_out = 64;
@@ -34,17 +38,20 @@ int main(int argc, char **argv) {
     std::mt19937 rng(31);
     std::normal_distribution<float> gauss(0.0f, 1.0f);
 
-    std::vector<float> x((size_t) n_in);
-    for (auto& v : x) v = gauss(rng);
-    std::vector<uint8_t> codes((size_t) n_out * n_in / 4);
-    for (auto& v : codes) v = (uint8_t) (rng() & 0xFF);
-    std::vector<float> scales((size_t) n_out * (n_in / 64));
-    for (auto& v : scales) v = 0.001f + 0.0001f * (float) (rng() % 100);
+    std::vector<float> x((size_t)n_in);
+    for (auto& v : x)
+        v = gauss(rng);
+    std::vector<uint8_t> codes((size_t)n_out * n_in / 4);
+    for (auto& v : codes)
+        v = (uint8_t)(rng() & 0xFF);
+    std::vector<float> scales((size_t)n_out * (n_in / 64));
+    for (auto& v : scales)
+        v = 0.001f + 0.0001f * (float)(rng() % 100);
 
     // ---- device buffers
     float* d_x = sycl::malloc_device<float>((size_t)n_in, q_ct1);
-    uint8_t* d_act = (uint8_t *)sycl::malloc_device((size_t)(n_in / 32) * 34, q_ct1);
-    uint8_t* d_codes = (uint8_t *)sycl::malloc_device(codes.size(), q_ct1);
+    uint8_t* d_act = (uint8_t*)sycl::malloc_device((size_t)(n_in / 32) * 34, q_ct1);
+    uint8_t* d_codes = (uint8_t*)sycl::malloc_device(codes.size(), q_ct1);
     float* d_scales = sycl::malloc_device<float>(scales.size(), q_ct1);
     float* d_y_fp16 = sycl::malloc_device<float>((size_t)n_out, q_ct1);
     float* d_y_q8 = sycl::malloc_device<float>((size_t)n_out, q_ct1);
@@ -55,43 +62,46 @@ int main(int argc, char **argv) {
     strata::kernels::quantize_q8_0(d_x, d_act, n_in, nullptr);
 
     // ---- host reference: quantize the activation with the project's own rule, then dot
-    std::vector<uint8_t> h_act((size_t) (n_in / 32) * 34);
+    std::vector<uint8_t> h_act((size_t)(n_in / 32) * 34);
     q_ct1.memcpy(h_act.data(), d_act, h_act.size()).wait();
     auto act_val = [&](long long i) {
-        const uint8_t* blk = &h_act[(size_t) (i / 32) * 34];
-        const uint16_t dbits = (uint16_t) (blk[0] | (blk[1] << 8));
+        const uint8_t* blk = &h_act[(size_t)(i / 32) * 34];
+        const uint16_t dbits = (uint16_t)(blk[0] | (blk[1] << 8));
         // fp16 -> f32 without a CUDA header: 0x3C00 = 1.0, and the block scales here are normal
         float d;
-        const uint32_t sign = (uint32_t) (dbits & 0x8000) << 16;
+        const uint32_t sign = (uint32_t)(dbits & 0x8000) << 16;
         uint32_t ex = (dbits >> 10) & 0x1F, man = dbits & 0x3FF;
         uint32_t out;
-        if (ex == 0) { out = sign; }
-        else { out = sign | ((ex - 15 + 127) << 23) | (man << 13); }
+        if (ex == 0) {
+            out = sign;
+        } else {
+            out = sign | ((ex - 15 + 127) << 23) | (man << 13);
+        }
         std::memcpy(&d, &out, 4);
-        return (float) ((int8_t) blk[2 + (i % 32)]) * d;
+        return (float)((int8_t)blk[2 + (i % 32)]) * d;
     };
-    std::vector<float> ref((size_t) n_out, 0.0f);
+    std::vector<float> ref((size_t)n_out, 0.0f);
     for (long long o = 0; o < n_out; ++o) {
         float acc = 0.0f;
         for (long long g = 0; g < n_in / 64; ++g) {
-            const float d = scales[(size_t) (o * (n_in / 64) + g)];
+            const float d = scales[(size_t)(o * (n_in / 64) + g)];
             for (int j = 0; j < 64; ++j) {
                 const long long i = g * 64 + j;
-                const uint8_t byte = codes[(size_t) (o * (n_in / 4) + i / 4)];
+                const uint8_t byte = codes[(size_t)(o * (n_in / 4) + i / 4)];
                 const int code = (byte >> ((i % 4) * 2)) & 3;
-                acc += (float) (code - 1) * d * act_val(i);
+                acc += (float)(code - 1) * d * act_val(i);
             }
         }
-        ref[(size_t) o] = acc;
+        ref[(size_t)o] = acc;
     }
     strata::kernels::s2_gemv_q8(d_act, d_codes, d_scales, d_y_q8, n_in, n_out, tpr, nullptr);
-    std::vector<float> got((size_t) n_out);
+    std::vector<float> got((size_t)n_out);
     q_ct1.memcpy(got.data(), d_y_q8, got.size() * sizeof(float)).wait();
 
     int bad = 0;
     double worst = 0.0, sum_abs = 0.0;
     for (long long o = 0; o < n_out; ++o) {
-        const double a = ref[(size_t) o], b = got[(size_t) o];
+        const double a = ref[(size_t)o], b = got[(size_t)o];
         sum_abs += std::fabs(a);
         // relative to the row magnitude is not needed here - these rows are not cancelling - but the metric is
         // stated because round 169 and round 189 both showed the wrong denominator reads as a wrong kernel
@@ -105,7 +115,7 @@ int main(int argc, char **argv) {
     }
     std::printf("  %-38s %s (%d of %lld over 1e-4, worst rel %.3e, mean |ref| %.3f)\n",
                 "q8-activation GEMV vs host reference", bad ? "*** WRONG ***" : "matches", bad, n_out, worst,
-                sum_abs / (double) n_out);
+                sum_abs / (double)n_out);
 
     // ---- CHECK 2: the gap is real.  The SAME weights driven by an fp16 activation must differ.
     // The fp16 path wants fp16 activations, and `x` is f32, so it is converted exactly (the values are normal
@@ -118,35 +128,36 @@ int main(int argc, char **argv) {
         uint32_t b;
         std::memcpy(&b, &f, 4);
         const uint32_t sign = (b >> 16) & 0x8000u;
-        int exp = (int) ((b >> 23) & 0xFF) - 127 + 15;
+        int exp = (int)((b >> 23) & 0xFF) - 127 + 15;
         uint32_t man = b & 0x7FFFFFu;
-        if (exp >= 31) return (uint16_t) (sign | 0x7C00u | (man ? 0x200u : 0u));
+        if (exp >= 31) return (uint16_t)(sign | 0x7C00u | (man ? 0x200u : 0u));
         if (exp <= 0) {
-            if (exp < -10) return (uint16_t) sign;
+            if (exp < -10) return (uint16_t)sign;
             man |= 0x800000u;
-            const uint32_t sh = (uint32_t) (14 - exp);
+            const uint32_t sh = (uint32_t)(14 - exp);
             uint32_t h = (man >> sh) & 0x3FFu;
             const uint32_t rem = man & ((1u << sh) - 1u);
             if (rem > (1u << (sh - 1)) || (rem == (1u << (sh - 1)) && (h & 1u))) ++h;
-            return (uint16_t) (sign | h);
+            return (uint16_t)(sign | h);
         }
-        uint16_t h = (uint16_t) (sign | ((uint32_t) exp << 10) | (man >> 13));
+        uint16_t h = (uint16_t)(sign | ((uint32_t)exp << 10) | (man >> 13));
         const uint32_t rem = man & 0x1FFFu;
         if (rem > 0x1000u || (rem == 0x1000u && (h & 1u))) ++h;
         return h;
     };
-    std::vector<uint16_t> hx((size_t) n_in);
-    for (long long i = 0; i < n_in; ++i) hx[(size_t) i] = f32_to_f16(x[(size_t) i]);
+    std::vector<uint16_t> hx((size_t)n_in);
+    for (long long i = 0; i < n_in; ++i)
+        hx[(size_t)i] = f32_to_f16(x[(size_t)i]);
     uint16_t* d_hx = sycl::malloc_device<uint16_t>(hx.size(), q_ct1);
     q_ct1.memcpy(d_hx, hx.data(), hx.size() * sizeof(uint16_t)).wait();
     strata::kernels::SForm form{2, -1, 64, strata::kernels::Codebook::Affine, false};
     strata::kernels::s_gemv_split(d_hx, d_codes, d_scales, nullptr, d_y_fp16, n_in, n_out, form, tpr);
-    std::vector<float> y16((size_t) n_out);
+    std::vector<float> y16((size_t)n_out);
     q_ct1.memcpy(y16.data(), d_y_fp16, y16.size() * sizeof(float)).wait();
 
     double diff = 0.0;
     for (long long o = 0; o < n_out; ++o) {
-        diff += std::fabs((double) y16[(size_t) o] - (double) got[(size_t) o]);
+        diff += std::fabs((double)y16[(size_t)o] - (double)got[(size_t)o]);
     }
     const double rel_gap = diff / (sum_abs > 1e-30 ? sum_abs : 1e-30);
     std::printf("  %-38s %.4f%% of the reference magnitude\n", "fp16-activation vs q8-activation", rel_gap * 100);

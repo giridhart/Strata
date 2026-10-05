@@ -9,11 +9,9 @@
 
 namespace {
 
-float sigmoid_f(float x) {
-    return 1.0f / (1.0f + std::exp(-x));
-}
+float sigmoid_f(float x) { return 1.0f / (1.0f + std::exp(-x)); }
 
-} // namespace
+}  // namespace
 
 int main() {
     sycl::queue q{sycl::property::queue::in_order()};
@@ -35,18 +33,23 @@ int main() {
         std::vector<float> ref_silu(channels);
         std::vector<float> ref_hist(channels * 3);
 
-        for (auto& v : h_hist) v = dist(rng);
-        for (auto& v : h_inp) v = dist(rng);
-        for (auto& v : h_w) v = dist(rng) * 0.1f;
+        for (auto& v : h_hist)
+            v = dist(rng);
+        for (auto& v : h_inp)
+            v = dist(rng);
+        for (auto& v : h_w)
+            v = dist(rng) * 0.1f;
 
         // CPU reference
         for (int c = 0; c < channels; ++c) {
             float vals[4] = {h_hist[c * 3], h_hist[c * 3 + 1], h_hist[c * 3 + 2], h_inp[c]};
             float sum = 0.0f;
-            for (int tap = 0; tap < 4; ++tap) sum += vals[tap] * h_w[c * 4 + tap];
+            for (int tap = 0; tap < 4; ++tap)
+                sum += vals[tap] * h_w[c * 4 + tap];
             ref_raw[c] = sum;
             ref_silu[c] = sum / (1.0f + std::exp(-sum));
-            for (int tap = 0; tap < 3; ++tap) ref_hist[c * 3 + tap] = vals[tap + 1];
+            for (int tap = 0; tap < 3; ++tap)
+                ref_hist[c * 3 + tap] = vals[tap + 1];
         }
 
         float* d_hist = sycl::malloc_device<float>(h_hist.size(), q);
@@ -94,7 +97,8 @@ int main() {
         std::vector<float> h_inp(rows * cols);
         std::vector<float> ref_inp(rows * cols);
 
-        for (auto& v : h_inp) v = dist(rng);
+        for (auto& v : h_inp)
+            v = dist(rng);
         ref_inp = h_inp;
 
         // CPU reference
@@ -136,8 +140,10 @@ int main() {
         const int64_t heads = 48;
         std::vector<float> h_beta(heads);
         std::vector<float> ref_beta(heads);
-        for (auto& v : h_beta) v = dist(rng);
-        for (int i = 0; i < heads; ++i) ref_beta[i] = sigmoid_f(h_beta[i]);
+        for (auto& v : h_beta)
+            v = dist(rng);
+        for (int i = 0; i < heads; ++i)
+            ref_beta[i] = sigmoid_f(h_beta[i]);
 
         float* d_beta = sycl::malloc_device<float>(heads, q);
         q.memcpy(d_beta, h_beta.data(), heads * sizeof(float)).wait();
@@ -161,9 +167,12 @@ int main() {
     {
         const int64_t heads = 48;
         std::vector<float> h_alpha(heads), h_dt(heads), h_ssm_a(heads), ref_gate(heads);
-        for (auto& v : h_alpha) v = dist(rng);
-        for (auto& v : h_dt) v = dist(rng);
-        for (auto& v : h_ssm_a) v = -std::exp(dist(rng));
+        for (auto& v : h_alpha)
+            v = dist(rng);
+        for (auto& v : h_dt)
+            v = dist(rng);
+        for (auto& v : h_ssm_a)
+            v = -std::exp(dist(rng));
 
         for (int i = 0; i < heads; ++i) {
             float val = h_alpha[i] + h_dt[i];
@@ -207,9 +216,12 @@ int main() {
         const int64_t cols = 128;
         const float eps = 1e-5f;
         std::vector<float> h_out(heads * cols), h_z(heads * cols), h_gamma(cols), ref_dst(heads * cols);
-        for (auto& v : h_out) v = dist(rng);
-        for (auto& v : h_z) v = dist(rng);
-        for (auto& v : h_gamma) v = dist(rng) * 0.5f + 1.0f;
+        for (auto& v : h_out)
+            v = dist(rng);
+        for (auto& v : h_z)
+            v = dist(rng);
+        for (auto& v : h_gamma)
+            v = dist(rng) * 0.5f + 1.0f;
 
         for (int h = 0; h < heads; ++h) {
             float sumsq = 0.0f;

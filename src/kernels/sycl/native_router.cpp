@@ -47,8 +47,8 @@ inline float warp_max(float value, const sycl::sub_group& sg) {
     return value;
 }
 
-void route(const float* __restrict__ logits, int32_t* __restrict__ ids,
-           float* __restrict__ weights, const sycl::nd_item<1>& item) {
+void route(const float* __restrict__ logits, int32_t* __restrict__ ids, float* __restrict__ weights,
+           const sycl::nd_item<1>& item) {
     const size_t tok = item.get_group(0);
     logits += tok * 512;
     ids += tok * 10;
@@ -58,11 +58,13 @@ void route(const float* __restrict__ logits, int32_t* __restrict__ ids,
 
     float values[16];
 #pragma unroll
-    for (int i = 0; i < 16; ++i) values[i] = logits[lane + i * 32];
+    for (int i = 0; i < 16; ++i)
+        values[i] = logits[lane + i * 32];
 
     float maximum = -INFINITY;
 #pragma unroll
-    for (int i = 0; i < 16; ++i) maximum = sycl::fmax(maximum, values[i]);
+    for (int i = 0; i < 16; ++i)
+        maximum = sycl::fmax(maximum, values[i]);
     maximum = warp_max(maximum, sg);
 
     float sum = 0.0f;
@@ -120,39 +122,35 @@ bool overlap(const void* a, size_t an, const void* b, size_t bn) {
     const auto ap = reinterpret_cast<uintptr_t>(a), bp = reinterpret_cast<uintptr_t>(b);
     return ap < bp + bn && bp < ap + an;
 }
-} // namespace
+}  // namespace
 
 void native_router_set_enabled(bool value) { enabled.store(value, std::memory_order_relaxed); }
 bool native_router_enabled() { return enabled.load(std::memory_order_relaxed); }
 
 void native_router_top10(const float* logits, int32_t* ids, float* weights, void* stream) {
-    if (!stream || !valid(logits, 512 * 4) || !valid(ids, 10 * 4) || !valid(weights, 10 * 4)
-        || overlap(logits, 512 * 4, ids, 10 * 4) || overlap(logits, 512 * 4, weights, 10 * 4)
-        || overlap(ids, 10 * 4, weights, 10 * 4))
+    if (!stream || !valid(logits, 512 * 4) || !valid(ids, 10 * 4) || !valid(weights, 10 * 4) ||
+        overlap(logits, 512 * 4, ids, 10 * 4) || overlap(logits, 512 * 4, weights, 10 * 4) ||
+        overlap(ids, 10 * 4, weights, 10 * 4))
         throw std::invalid_argument("native router requires a stream, aligned spans, and disjoint outputs");
 
     static sycl::queue default_queue{sycl::property::queue::in_order()};
     sycl::queue* q = stream ? static_cast<sycl::queue*>(stream) : &default_queue;
 
-    q->parallel_for(
-        sycl::nd_range<1>(sycl::range<1>(32), sycl::range<1>(32)),
-        [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(32)]] {
-            route(logits, ids, weights, item);
-        });
+    q->parallel_for(sycl::nd_range<1>(sycl::range<1>(32), sycl::range<1>(32)),
+                    [=](sycl::nd_item<1> item)
+                        [[sycl::reqd_sub_group_size(32)]] { route(logits, ids, weights, item); });
 }
 
 void native_router_top10_multi(const float* logits, int32_t* ids, float* weights, int n_tok, void* stream) {
-    if (!stream || n_tok < 1 || !valid(logits, (size_t) n_tok * 512 * 4) || !valid(ids, (size_t) n_tok * 10 * 4) ||
-        !valid(weights, (size_t) n_tok * 10 * 4))
+    if (!stream || n_tok < 1 || !valid(logits, (size_t)n_tok * 512 * 4) || !valid(ids, (size_t)n_tok * 10 * 4) ||
+        !valid(weights, (size_t)n_tok * 10 * 4))
         throw std::invalid_argument("native router (multi) requires a stream and aligned [n,512]/[n,10] buffers");
 
     static sycl::queue default_queue{sycl::property::queue::in_order()};
     sycl::queue* q = stream ? static_cast<sycl::queue*>(stream) : &default_queue;
 
-    q->parallel_for(
-        sycl::nd_range<1>(sycl::range<1>((size_t)n_tok * 32), sycl::range<1>(32)),
-        [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(32)]] {
-            route(logits, ids, weights, item);
-        });
+    q->parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t)n_tok * 32), sycl::range<1>(32)),
+                    [=](sycl::nd_item<1> item)
+                        [[sycl::reqd_sub_group_size(32)]] { route(logits, ids, weights, item); });
 }
-} // namespace strata::kernels
+}  // namespace strata::kernels

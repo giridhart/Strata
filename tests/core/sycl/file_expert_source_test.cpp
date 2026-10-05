@@ -48,20 +48,20 @@ void create_pack(const fs::path& dir, uint64_t bytes, const std::vector<std::pai
     const fs::path file = dir / "experts.bin";
     {
         std::ofstream out(file, std::ios::binary | std::ios::trunc);
-        require((bool) out, "could not create synthetic experts.bin");
+        require((bool)out, "could not create synthetic experts.bin");
         if (bytes > 0) {
-            out.seekp((std::streamoff) (bytes - 1));
+            out.seekp((std::streamoff)(bytes - 1));
             out.put('\0');
         }
-        require((bool) out, "could not size synthetic experts.bin");
+        require((bool)out, "could not size synthetic experts.bin");
     }
     for (const auto& [offset, marker] : markers) {
         require(offset < bytes, "synthetic marker lies beyond experts.bin");
         std::fstream file_out(file, std::ios::binary | std::ios::in | std::ios::out);
-        require((bool) file_out, "could not open synthetic experts.bin for markers");
-        file_out.seekp((std::streamoff) offset);
+        require((bool)file_out, "could not open synthetic experts.bin for markers");
+        file_out.seekp((std::streamoff)offset);
         file_out.put(marker);
-        require((bool) file_out, "could not write synthetic expert marker");
+        require((bool)file_out, "could not write synthetic expert marker");
     }
 }
 
@@ -84,15 +84,15 @@ void test_canonical_layout() {
     using namespace strata::kernels::cpu;
     constexpr int64_t layers = 2;
     constexpr int64_t experts = 3;
-    const uint64_t layer_bytes = (uint64_t) experts * BLOB;
-    const uint64_t total = (uint64_t) layers * layer_bytes;
+    const uint64_t layer_bytes = (uint64_t)experts * BLOB;
+    const uint64_t total = (uint64_t)layers * layer_bytes;
     TempDirectory dir;
 
     std::string err;
     const bool layout_ok = expert_layout_load(dir.path.string(), layers, experts, err);
     require(layout_ok, "could not load canonical layout: " + err);
-    create_pack(dir.path, total, {{0, 'a'}, {(uint64_t) BLOB, 'b'}, {layer_bytes, 'c'},
-                                  {layer_bytes + (uint64_t) BLOB, 'd'}});
+    create_pack(dir.path, total,
+                {{0, 'a'}, {(uint64_t)BLOB, 'b'}, {layer_bytes, 'c'}, {layer_bytes + (uint64_t)BLOB, 'd'}});
 
     FileExpertSource source;
     bool opened = source.open(dir.path.string(), layers, experts, err);
@@ -102,12 +102,12 @@ void test_canonical_layout() {
     const uint8_t* second = source.blob(0, 1);
     const uint8_t* next_layer = source.blob(1, 0);
     require(first && second && next_layer, "valid canonical blob lookup failed");
-    require(second - first == (ptrdiff_t) BLOB && next_layer - first == (ptrdiff_t) layer_bytes,
+    require(second - first == (ptrdiff_t)BLOB && next_layer - first == (ptrdiff_t)layer_bytes,
             "canonical expert or layer stride is wrong");
     require(first[0] == 'a' && second[0] == 'b' && next_layer[0] == 'c',
             "canonical blob lookup returned bytes from the wrong expert");
-    require(source.blob(-1, 0) == nullptr && source.blob(0, -1) == nullptr &&
-                source.blob(layers, 0) == nullptr && source.blob(0, experts) == nullptr,
+    require(source.blob(-1, 0) == nullptr && source.blob(0, -1) == nullptr && source.blob(layers, 0) == nullptr &&
+                source.blob(0, experts) == nullptr,
             "canonical bounds check accepted an invalid layer or expert");
     require(source.reads() == 3, "invalid canonical lookups changed the read count");
 
@@ -140,18 +140,21 @@ void test_native_variable_layout() {
     require(second_ok, "IQ2_XS/IQ4_NL synthetic format is unavailable: " + err);
     require(first_fmt.bytes != second_fmt.bytes, "chosen native formats do not exercise variable layer sizes");
 
-    const uint64_t layer0_bytes = (uint64_t) first_fmt.bytes * experts;
-    const uint64_t total = layer0_bytes + (uint64_t) second_fmt.bytes * experts;
+    const uint64_t layer0_bytes = (uint64_t)first_fmt.bytes * experts;
+    const uint64_t total = layer0_bytes + (uint64_t)second_fmt.bytes * experts;
     {
         std::ofstream metadata(dir.path / "native_experts.txt");
-        require((bool) metadata, "could not create synthetic native_experts.txt");
+        require((bool)metadata, "could not create synthetic native_experts.txt");
         metadata << "0 " << GGML_TYPE_IQ3_XXS << ' ' << GGML_TYPE_IQ4_NL << " 0 " << first_fmt.bytes << '\n';
         metadata << "1 " << GGML_TYPE_IQ2_XS << ' ' << GGML_TYPE_IQ4_NL << ' ' << layer0_bytes << ' '
                  << second_fmt.bytes << '\n';
-        require((bool) metadata, "could not write synthetic native_experts.txt");
+        require((bool)metadata, "could not write synthetic native_experts.txt");
     }
-    create_pack(dir.path, total, {{0, 'a'}, {(uint64_t) first_fmt.bytes, 'b'},
-                                  {layer0_bytes, 'c'}, {layer0_bytes + (uint64_t) second_fmt.bytes, 'd'}});
+    create_pack(dir.path, total,
+                {{0, 'a'},
+                 {(uint64_t)first_fmt.bytes, 'b'},
+                 {layer0_bytes, 'c'},
+                 {layer0_bytes + (uint64_t)second_fmt.bytes, 'd'}});
 
     const bool layout_ok = expert_layout_load(dir.path.string(), layers, experts, err);
     require(layout_ok, "could not load synthetic native layout: " + err);
@@ -164,13 +167,13 @@ void test_native_variable_layout() {
     const uint8_t* next_layer = source.blob(1, 0);
     const uint8_t* next_layer_second = source.blob(1, 1);
     require(first && second && next_layer && next_layer_second, "valid native blob lookup failed");
-    require(second - first == (ptrdiff_t) first_fmt.bytes && next_layer - first == (ptrdiff_t) layer0_bytes &&
-                next_layer_second - next_layer == (ptrdiff_t) second_fmt.bytes,
+    require(second - first == (ptrdiff_t)first_fmt.bytes && next_layer - first == (ptrdiff_t)layer0_bytes &&
+                next_layer_second - next_layer == (ptrdiff_t)second_fmt.bytes,
             "native per-layer expert stride is wrong");
     require(first[0] == 'a' && second[0] == 'b' && next_layer[0] == 'c' && next_layer_second[0] == 'd',
             "native blob lookup returned bytes from the wrong expert");
-    require(source.blob(-1, 0) == nullptr && source.blob(0, -1) == nullptr &&
-                source.blob(layers, 0) == nullptr && source.blob(0, experts) == nullptr,
+    require(source.blob(-1, 0) == nullptr && source.blob(0, -1) == nullptr && source.blob(layers, 0) == nullptr &&
+                source.blob(0, experts) == nullptr,
             "native bounds check accepted an invalid layer or expert");
     require(source.reads() == 4, "invalid native lookups changed the read count");
 
@@ -198,8 +201,9 @@ void test_complement_plan() {
             "GPU-resident expert lost mmap fallback");
     require(cache_complement_blob_or_fallback(4, offsets, resident, mapped) == resident + 11,
             "CPU miss did not use resident complement");
-    require(!make_cache_complement_plan(2, 3, {3, 5}, {{0, 1}, {0, 1}}, {}, offsets, bytes, error)
-            && offsets.empty() && bytes == 0, "duplicate pair accepted");
+    require(!make_cache_complement_plan(2, 3, {3, 5}, {{0, 1}, {0, 1}}, {}, offsets, bytes, error) && offsets.empty() &&
+                bytes == 0,
+            "duplicate pair accepted");
     require(!make_cache_complement_plan(2, 3, {3, 5}, {{0, 1}}, {{0, 1}}, offsets, bytes, error),
             "overlapping tiers accepted");
     require(!make_cache_complement_plan(2, 3, {3, 5}, {{2, 0}}, {}, offsets, bytes, error),
@@ -234,11 +238,14 @@ void test_resident_exchange() {
     // (1,0) moves into the GPU, (1,2) leaves it: (1,2) takes (1,0)'s bytes' place
     require(exchange_cache_complement(offsets, 3, 5), "a valid exchange was refused");
     require(offsets[5] == before[3] && offsets[3] == kNoCacheComplement, "the exchange did not move the place");
-    for (size_t i : {0u, 1u, 2u, 4u}) require(offsets[i] == before[i], "an exchange touched another expert");
+    for (size_t i : {0u, 1u, 2u, 4u})
+        require(offsets[i] == before[i], "an exchange touched another expert");
     // the copy's size and its set of places are unchanged
     std::vector<uint64_t> a, b;
-    for (uint64_t o : before) if (o != kNoCacheComplement) a.push_back(o);
-    for (uint64_t o : offsets) if (o != kNoCacheComplement) b.push_back(o);
+    for (uint64_t o : before)
+        if (o != kNoCacheComplement) a.push_back(o);
+    for (uint64_t o : offsets)
+        if (o != kNoCacheComplement) b.push_back(o);
     std::sort(a.begin(), a.end());
     std::sort(b.begin(), b.end());
     require(a == b, "an exchange changed the compact copy's places");
@@ -276,8 +283,7 @@ void test_cgroup_memory_budget() {
     */
     const uint64_t max = std::numeric_limits<uint64_t>::max();
     CgroupMemoryStat large_counters{max, max, max - 1, max, true};
-    require(cgroup_available_bytes(max, large_counters, bytes),
-            "large memory.stat counters were rejected");
+    require(cgroup_available_bytes(max, large_counters, bytes), "large memory.stat counters were rejected");
     require(bytes == 0, "dirty/writeback subtraction overflowed or escaped the usage cap");
 
     CgroupMemoryStat usage_over_limit{60 * GiB, 0, 0, 0, true};

@@ -30,9 +30,10 @@ static sycl::queue& get_test_queue() {
     return q;
 }
 
-template <typename T> T *dalloc(size_t n) {
-    sycl::queue &q_ct1 = get_test_queue();
-    T* p = (T *)sycl::malloc_device(n * sizeof(T) + 64, q_ct1);
+template <typename T>
+T* dalloc(size_t n) {
+    sycl::queue& q_ct1 = get_test_queue();
+    T* p = (T*)sycl::malloc_device(n * sizeof(T) + 64, q_ct1);
     q_ct1.memset(p, 0, n * sizeof(T) + 64).wait();
     return p;
 }
@@ -46,12 +47,12 @@ void fwht256_host_reference(float* x) {
             for (int j = 0; j < s; ++j) {
                 const float u = x[i + j];
                 const float v = x[i + j + s];
-                x[i + j]     = u + v;
+                x[i + j] = u + v;
                 x[i + j + s] = u - v;
             }
         }
     }
-    const float scale = 1.0f / 16.0f; // 1 / sqrt(256)
+    const float scale = 1.0f / 16.0f;  // 1 / sqrt(256)
     for (int i = 0; i < n; ++i) {
         x[i] *= scale;
     }
@@ -75,18 +76,18 @@ void quantize_block_q4_0_host(const float* x, k::block_q4_0& blk) {
     for (int i = 0; i < 16; ++i) {
         const float x0 = x[i] * id;
         const float x1 = x[i + 16] * id;
-        const int q0 = (int) (x0 + 8.5f);
-        const int q1 = (int) (x1 + 8.5f);
-        const uint8_t xi0 = (uint8_t) std::min(15, std::max(0, q0));
-        const uint8_t xi1 = (uint8_t) std::min(15, std::max(0, q1));
+        const int q0 = (int)(x0 + 8.5f);
+        const int q1 = (int)(x1 + 8.5f);
+        const uint8_t xi0 = (uint8_t)std::min(15, std::max(0, q0));
+        const uint8_t xi1 = (uint8_t)std::min(15, std::max(0, q1));
         blk.qs[i] = xi0 | (xi1 << 4);
     }
 }
 
-} // namespace
+}  // namespace
 
 int main() {
-    sycl::queue &q_ct1 = get_test_queue();
+    sycl::queue& q_ct1 = get_test_queue();
     std::printf("=== Running kv_q4_parity test ===\n");
     std::mt19937 rng(42);
     std::normal_distribution<float> nd(0.0f, 1.0f);
@@ -162,8 +163,8 @@ int main() {
         double dot_raw = 0.0;
         double dot_rot = 0.0;
         for (int i = 0; i < 256; ++i) {
-            dot_raw += (double) q[i] * (double) k_vec[i];
-            dot_rot += (double) hq[i] * (double) hk[i];
+            dot_raw += (double)q[i] * (double)k_vec[i];
+            dot_rot += (double)hq[i] * (double)hk[i];
         }
         double d = std::fabs(dot_raw - dot_rot);
         if (d > max_dot_diff) max_dot_diff = d;
@@ -181,18 +182,19 @@ int main() {
     std::printf("[3/4] Verifying Q4_0 KV append and gather against host reference...\n");
     k::QsaShapes s = k::qsa_real_shapes();
     s.page_size = 64;
-    const int H = (int) s.n_head_kv; // 2
-    const int D = (int) s.head_dim;   // 256
-    const int P = (int) s.page_size;  // 64
+    const int H = (int)s.n_head_kv;  // 2
+    const int D = (int)s.head_dim;   // 256
+    const int P = (int)s.page_size;  // 64
     const int pages = 8;
     const int cells = pages * P;
 
     std::vector<int32_t> table(pages);
-    for (int i = 0; i < pages; ++i) table[i] = (i * 3 + 5) % pages; // permutation
+    for (int i = 0; i < pages; ++i)
+        table[i] = (i * 3 + 5) % pages;  // permutation
     int32_t* d_table = dalloc<int32_t>(pages);
     q_ct1.memcpy(d_table, table.data(), pages * sizeof(int32_t)).wait();
 
-    const size_t pool_bytes = (size_t) pages * H * P * k::kv_q4_bytes_per_head(D);
+    const size_t pool_bytes = (size_t)pages * H * P * k::kv_q4_bytes_per_head(D);
     uint8_t* d_k_q4 = dalloc<uint8_t>(pool_bytes);
     uint8_t* d_v_q4 = dalloc<uint8_t>(pool_bytes);
     float* d_kcur = dalloc<float>(H * D);
@@ -201,15 +203,18 @@ int main() {
 
     std::vector<std::vector<float>> host_k(cells), host_v(cells);
     std::vector<int> positions(cells);
-    for (int i = 0; i < cells; ++i) positions[i] = i;
+    for (int i = 0; i < cells; ++i)
+        positions[i] = i;
     std::shuffle(positions.begin(), positions.end(), rng);
 
-    const int n_fill = cells - 25; // leave some cells empty
+    const int n_fill = cells - 25;  // leave some cells empty
     for (int n = 0; n < n_fill; ++n) {
         const int pos = positions[n];
         std::vector<float> kv(H * D), vv(H * D);
-        for (auto& x : kv) x = nd(rng) * 2.0f;
-        for (auto& x : vv) x = nd(rng) * 2.0f;
+        for (auto& x : kv)
+            x = nd(rng) * 2.0f;
+        for (auto& x : vv)
+            x = nd(rng) * 2.0f;
 
         // Apply FWHT before append
         for (int h = 0; h < H; ++h) {
@@ -234,14 +239,14 @@ int main() {
     q_ct1.memcpy(h_v_q4.data(), d_v_q4, pool_bytes).wait();
 
     long bad_blocks = 0;
-    const int blocks_per_head = D / k::QK4_0; // 8
-    const int bytes_per_head = blocks_per_head * sizeof(k::block_q4_0); // 144
+    const int blocks_per_head = D / k::QK4_0;                            // 8
+    const int bytes_per_head = blocks_per_head * sizeof(k::block_q4_0);  // 144
 
     for (int n = 0; n < n_fill; ++n) {
         const int pos = positions[n];
         for (int is_v = 0; is_v < 2; ++is_v) {
             for (int h = 0; h < H; ++h) {
-                const long long page = (long long) table[pos / P];
+                const long long page = (long long)table[pos / P];
                 const long long row = (page * H + h) * P + (pos % P);
                 const uint8_t* pool_ptr = (is_v ? h_v_q4.data() : h_k_q4.data()) + row * bytes_per_head;
                 const float* raw_vec = (is_v ? host_v[pos].data() : host_k[pos].data()) + h * D;
@@ -254,13 +259,14 @@ int main() {
                     if (std::memcmp(&host_blk, gpu_blk, sizeof(k::block_q4_0)) != 0) {
                         if (bad_blocks == 0) {
                             std::printf("MISMATCH at n=%d, pos=%d, is_v=%d, h=%d, b=%d\n", n, pos, is_v, h, b);
-                            std::printf("  host blk.d = 0x%04x (%f), gpu blk.d = 0x%04x (%f)\n",
-                                        host_blk.d, k::f32_from_f16(host_blk.d),
-                                        gpu_blk->d, k::f32_from_f16(gpu_blk->d));
+                            std::printf("  host blk.d = 0x%04x (%f), gpu blk.d = 0x%04x (%f)\n", host_blk.d,
+                                        k::f32_from_f16(host_blk.d), gpu_blk->d, k::f32_from_f16(gpu_blk->d));
                             std::printf("  host qs: ");
-                            for (int i = 0; i < 16; ++i) std::printf("%02x ", host_blk.qs[i]);
+                            for (int i = 0; i < 16; ++i)
+                                std::printf("%02x ", host_blk.qs[i]);
                             std::printf("\n  gpu  qs: ");
-                            for (int i = 0; i < 16; ++i) std::printf("%02x ", gpu_blk->qs[i]);
+                            for (int i = 0; i < 16; ++i)
+                                std::printf("%02x ", gpu_blk->qs[i]);
                             std::printf("\n");
                         }
                         ++bad_blocks;
@@ -282,8 +288,8 @@ int main() {
     std::printf("[4/4] Verifying Q4_0 gather unpacking and dequantization...\n");
     const int max_ids = 128;
     int32_t* d_ids = dalloc<int32_t>(max_ids);
-    uint16_t* d_k_scratch = dalloc<uint16_t>((size_t) max_ids * H * D);
-    uint16_t* d_v_scratch = dalloc<uint16_t>((size_t) max_ids * H * D);
+    uint16_t* d_k_scratch = dalloc<uint16_t>((size_t)max_ids * H * D);
+    uint16_t* d_v_scratch = dalloc<uint16_t>((size_t)max_ids * H * D);
 
     std::vector<int32_t> ids(max_ids);
     for (int i = 0; i < max_ids; ++i) {
@@ -297,8 +303,8 @@ int main() {
     k::kv_gather_q4_step(d_k_q4, d_v_q4, d_table, d_ids, d_step, max_ids, s, d_k_scratch, d_v_scratch, nullptr);
     q_ct1.wait();
 
-    std::vector<uint16_t> h_k_scratch((size_t) max_ids * H * D);
-    std::vector<uint16_t> h_v_scratch((size_t) max_ids * H * D);
+    std::vector<uint16_t> h_k_scratch((size_t)max_ids * H * D);
+    std::vector<uint16_t> h_v_scratch((size_t)max_ids * H * D);
     q_ct1.memcpy(h_k_scratch.data(), d_k_scratch, h_k_scratch.size() * sizeof(uint16_t)).wait();
     q_ct1.memcpy(h_v_scratch.data(), d_v_scratch, h_v_scratch.size() * sizeof(uint16_t)).wait();
 

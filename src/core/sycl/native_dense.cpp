@@ -16,7 +16,7 @@
 namespace strata::core {
 namespace {
 
-int g_layer_lb = -1, g_layer_le = -1;   // set_layer_range; -1: every layer
+int g_layer_lb = -1, g_layer_le = -1;  // set_layer_range; -1: every layer
 bool in_range(const std::string& name) {
     if (g_layer_lb < 0 || name.rfind("blk.", 0) != 0) return true;
     const int l = std::atoi(name.c_str() + 4);
@@ -35,15 +35,16 @@ bool eligible(const strata::TensorInfo& tensor, bool include_ple_key) {
     // fallback.
     if (name == "blk.1.ple_key.weight")
         return include_ple_key && (tensor.type == 42 || tensor.type == 18 || tensor.type == 23 || tensor.type == 8);
-    static const char* suffixes[] = {".attn_qkv.weight", ".attn_gate.weight", ".ssm_out.weight",
-        ".attn_q.weight", ".attn_k.weight", ".attn_v.weight", ".attn_output.weight",
-        ".ffn_gate_shexp.weight", ".ffn_up_shexp.weight", ".ffn_down_shexp.weight"};
-    for (const char* suffix : suffixes) if (name.ends_with(suffix)) return true;
+    static const char* suffixes[] = {".attn_qkv.weight",      ".attn_gate.weight",      ".ssm_out.weight",
+                                     ".attn_q.weight",        ".attn_k.weight",         ".attn_v.weight",
+                                     ".attn_output.weight",   ".ffn_gate_shexp.weight", ".ffn_up_shexp.weight",
+                                     ".ffn_down_shexp.weight"};
+    for (const char* suffix : suffixes)
+        if (name.ends_with(suffix)) return true;
     return false;
 }
 struct DeviceFree {
-    void
-    operator()(void *p) const {
+    void operator()(void* p) const {
         if (p) sycl::free(p, default_queue());
     }
 };
@@ -54,10 +55,10 @@ struct Pending {
     uint64_t bytes;
     DevicePtr data;
 };
-}
+}  // namespace
 
-bool NativeDense::served_names(const std::vector<std::string>& shards, bool include_ple_key,
-                               std::set<std::string>& out, std::string& err) {
+bool NativeDense::served_names(const std::vector<std::string>& shards, bool include_ple_key, std::set<std::string>& out,
+                               std::string& err) {
     try {
         for (const auto& path : shards) {
             strata::GgufFile gguf(path);
@@ -73,10 +74,12 @@ bool NativeDense::served_names(const std::vector<std::string>& shards, bool incl
     }
 }
 
-void NativeDense::set_layer_range(int lb, int le) { g_layer_lb = lb; g_layer_le = le; }
+void NativeDense::set_layer_range(int lb, int le) {
+    g_layer_lb = lb;
+    g_layer_le = le;
+}
 
-bool NativeDense::keep_unquantized_ple_key(const std::string& pack_dir, std::set<std::string>& skip,
-                                           std::string& err) {
+bool NativeDense::keep_unquantized_ple_key(const std::string& pack_dir, std::set<std::string>& skip, std::string& err) {
     const std::string key = "blk.1.ple_key.weight";
     if (!skip.count(key)) return true;
     int code_bits = -1;
@@ -88,20 +91,25 @@ bool NativeDense::keep_unquantized_ple_key(const std::string& pack_dir, std::set
 NativeDense::~NativeDense() {
     auto& q = default_queue();
     if (scratch_) sycl::free(scratch_, q);
-    for (void *p : weights_)
+    for (void* p : weights_)
         if (p) sycl::free(p, q);
 }
 
-bool NativeDense::load(const std::vector<std::string> &shards,
-                       WeightTable &table, std::string &err,
+bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& table, std::string& err,
                        bool include_ple_key, int64_t layer_lo, int64_t layer_hi) try {
-    auto outside = [&](const std::string& name) {   // a blk.<l>. tensor of another stage's layers
+    auto outside = [&](const std::string& name) {  // a blk.<l>. tensor of another stage's layers
         if (layer_hi < 0 || name.rfind("blk.", 0) != 0) return false;
         const long l = std::strtol(name.c_str() + 4, nullptr, 10);
         return l < layer_lo || l >= layer_hi;
     };
-    if (scratch_ || !weights_.empty()) { err = "native dense: already loaded"; return false; }
-    if (shards.empty()) { err = "native dense: at least one GGUF shard is required"; return false; }
+    if (scratch_ || !weights_.empty()) {
+        err = "native dense: already loaded";
+        return false;
+    }
+    if (shards.empty()) {
+        err = "native dense: at least one GGUF shard is required";
+        return false;
+    }
     try {
         std::vector<Pending> pending;
         std::set<std::string> seen;
@@ -123,20 +131,23 @@ bool NativeDense::load(const std::vector<std::string> &shards,
                     split_count = count->u;
                     split_tensors = tensors->u;
                 }
-            } else if (!have_architecture || !split_count || !count || !number || !tensors ||
-                       count->u != split_count || number->u == 0 || number->u >= split_count ||
-                       tensors->u != split_tensors) {
-                err = "native dense: additional shard must match the architecture-validated first shard's split metadata";
+            } else if (!have_architecture || !split_count || !count || !number || !tensors || count->u != split_count ||
+                       number->u == 0 || number->u >= split_count || tensors->u != split_tensors) {
+                err =
+                    "native dense: additional shard must match the architecture-validated first shard's split metadata";
                 return false;
             }
             if (number && !split_numbers.insert(number->u).second) {
-                err = "native dense: duplicate split shard number"; return false;
+                err = "native dense: duplicate split shard number";
+                return false;
             }
             std::vector<uint64_t> offsets;
-            for (const auto& tensor : gguf.tensors()) offsets.push_back(tensor.offset);
+            for (const auto& tensor : gguf.tensors())
+                offsets.push_back(tensor.offset);
             std::sort(offsets.begin(), offsets.end());
             if (std::adjacent_find(offsets.begin(), offsets.end()) != offsets.end()) {
-                err = "native dense: tensor payload offsets overlap"; return false;
+                err = "native dense: tensor payload offsets overlap";
+                return false;
             }
             // Validate every directory span, including tensors we do not upload:
             // an ignored tensor must not overlap the native matrix that follows it.
@@ -145,61 +156,67 @@ bool NativeDense::load(const std::vector<std::string> &shards,
                 int block_elements = 0, block_bytes = 0;
                 uint64_t elements = 1;
                 if (tensor.shape.empty() || !strata::block_geometry(tensor.type, block_elements, block_bytes) ||
-                    tensor.shape[0] % (uint64_t) block_elements != 0) {
-                    err = "native dense: invalid block geometry " + tensor.name; return false;
+                    tensor.shape[0] % (uint64_t)block_elements != 0) {
+                    err = "native dense: invalid block geometry " + tensor.name;
+                    return false;
                 }
                 for (uint64_t dimension : tensor.shape) {
                     /*
                     DPCT1007:250: Migration of std::numeric_limits::max is not
                     supported.
                     */
-                    if (!dimension ||
-                        elements > (std::numeric_limits<uint64_t>::max)() /
-                                       dimension) {
-                        err = "native dense: invalid tensor extent " + tensor.name; return false;
+                    if (!dimension || elements > (std::numeric_limits<uint64_t>::max)() / dimension) {
+                        err = "native dense: invalid tensor extent " + tensor.name;
+                        return false;
                     }
                     elements *= dimension;
                 }
-                const uint64_t blocks = elements / (uint64_t) block_elements;
+                const uint64_t blocks = elements / (uint64_t)block_elements;
                 /*
                 DPCT1007:251: Migration of std::numeric_limits::max is not
                 supported.
                 */
-                if (blocks > (std::numeric_limits<uint64_t>::max)() /
-                                 (uint64_t)block_bytes) {
-                    err = "native dense: tensor byte count overflow " + tensor.name; return false;
+                if (blocks > (std::numeric_limits<uint64_t>::max)() / (uint64_t)block_bytes) {
+                    err = "native dense: tensor byte count overflow " + tensor.name;
+                    return false;
                 }
-                const uint64_t bytes = blocks * (uint64_t) block_bytes;
+                const uint64_t bytes = blocks * (uint64_t)block_bytes;
                 if (tensor.offset > payload || bytes > payload - tensor.offset) {
-                    err = "native dense: truncated payload " + tensor.name; return false;
+                    err = "native dense: truncated payload " + tensor.name;
+                    return false;
                 }
                 const auto next = std::upper_bound(offsets.begin(), offsets.end(), tensor.offset);
                 if (next != offsets.end() && bytes > *next - tensor.offset) {
-                    err = "native dense: overlapping payload " + tensor.name; return false;
+                    err = "native dense: overlapping payload " + tensor.name;
+                    return false;
                 }
             }
             for (const auto& tensor : gguf.tensors()) {
                 if (!eligible(tensor, include_ple_key) || outside(tensor.name)) continue;
                 if (!in_range(tensor.name) && tensor.name.find("ple") == std::string::npos) continue;
                 if (!seen.insert(tensor.name).second) {
-                    err = "native dense: duplicate tensor " + tensor.name; return false;
+                    err = "native dense: duplicate tensor " + tensor.name;
+                    return false;
                 }
                 auto found = table.table_.find(tensor.name);
                 if (found == table.table_.end()) {
-                    err = "native dense: tensor absent from canonical table: " + tensor.name; return false;
+                    err = "native dense: tensor absent from canonical table: " + tensor.name;
+                    return false;
                 }
                 auto& ref = found->second;
-                if (ref.native_data) { err = "native dense: override already attached"; return false; }
+                if (ref.native_data) {
+                    err = "native dense: override already attached";
+                    return false;
+                }
                 if (!strata::kernels::native_mmvq_supported(tensor.type)) continue;
                 // #326: the pack keeps an unquantized (--compat-bf16) key, which the PLE reads from the arena
                 if (tensor.name == "blk.1.ple_key.weight" && !ref.quantized()) continue;
-                if (!ref.quantized() || tensor.shape.size() != 2 ||
-                    ref.ne0 <= 0 || ref.ne0 > INT_MAX || ref.ne1 <= 0 || ref.ne1 > INT_MAX ||
-                    tensor.shape[0] != (uint64_t) ref.ne0 || tensor.shape[1] != (uint64_t) ref.ne1) {
-                    err = "native dense: incompatible matrix " + tensor.name; return false;
+                if (!ref.quantized() || tensor.shape.size() != 2 || ref.ne0 <= 0 || ref.ne0 > INT_MAX || ref.ne1 <= 0 ||
+                    ref.ne1 > INT_MAX || tensor.shape[0] != (uint64_t)ref.ne0 || tensor.shape[1] != (uint64_t)ref.ne1) {
+                    err = "native dense: incompatible matrix " + tensor.name;
+                    return false;
                 }
-                const auto bytes = strata::kernels::native_mmvq_weight_bytes(
-                    tensor.type, (int) ref.ne0, (int) ref.ne1);
+                const auto bytes = strata::kernels::native_mmvq_weight_bytes(tensor.type, (int)ref.ne0, (int)ref.ne1);
                 void* allocation = sycl::malloc_device(bytes, default_queue());
                 if (!allocation) {
                     err = "native dense upload " + tensor.name + ": allocation failed";
@@ -207,12 +224,15 @@ bool NativeDense::load(const std::vector<std::string> &shards,
                 }
                 DevicePtr data(allocation);
                 default_queue().memcpy(data.get(), gguf.tensor_data(tensor), bytes).wait_and_throw();
-                max_in = (std::max)(max_in, (int) ref.ne0);
+                max_in = (std::max)(max_in, (int)ref.ne0);
                 total += bytes;
-                pending.push_back(Pending{&ref, (int) tensor.type, bytes, std::move(data)});
+                pending.push_back(Pending{&ref, (int)tensor.type, bytes, std::move(data)});
             }
         }
-        if (pending.empty()) { err = "native dense: no supported GDN/QSA matrices in supplied shards"; return false; }
+        if (pending.empty()) {
+            err = "native dense: no supported GDN/QSA matrices in supplied shards";
+            return false;
+        }
         void* allocation = sycl::malloc_device(strata::kernels::native_q8_1_bytes(max_in), default_queue());
         if (!allocation) {
             err = "native dense scratch: allocation failed";
@@ -234,9 +254,8 @@ bool NativeDense::load(const std::vector<std::string> &shards,
         err = std::string("native dense: ") + error.what();
         return false;
     }
-}
-catch (const std::exception &exc) {
+} catch (const std::exception& exc) {
     err = std::string("native dense: ") + exc.what();
     return false;
 }
-} // namespace strata::core
+}  // namespace strata::core

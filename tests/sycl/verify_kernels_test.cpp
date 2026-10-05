@@ -11,8 +11,7 @@
 
 int main() {
     sycl::queue q{sycl::default_selector_v, sycl::property::queue::in_order()};
-    std::printf("Running verify_kernels_test on: %s\n",
-                q.get_device().get_info<sycl::info::device::name>().c_str());
+    std::printf("Running verify_kernels_test on: %s\n", q.get_device().get_info<sycl::info::device::name>().c_str());
 
     std::mt19937 rng(42);
     std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
@@ -24,7 +23,8 @@ int main() {
         constexpr int hc = 4;
         constexpr int n_tok = 3;
         std::vector<float> h_x(n_tok * n_embd);
-        for (auto& v : h_x) v = dist(rng);
+        for (auto& v : h_x)
+            v = dist(rng);
 
         float* d_x = sycl::malloc_device<float>(h_x.size(), q);
         float* d_R = sycl::malloc_device<float>(n_tok * hc * n_embd, q);
@@ -60,8 +60,10 @@ int main() {
         constexpr int n_tok = 2;
         std::vector<float> h_h(n_tok * hc * n_embd);
         std::vector<float> h_e(n_tok * n_embd);
-        for (auto& v : h_h) v = dist(rng);
-        for (auto& v : h_e) v = dist(rng);
+        for (auto& v : h_h)
+            v = dist(rng);
+        for (auto& v : h_e)
+            v = dist(rng);
 
         float* d_h = sycl::malloc_device<float>(h_h.size(), q);
         float* d_e = sycl::malloc_device<float>(h_e.size(), q);
@@ -99,7 +101,8 @@ int main() {
         constexpr int64_t n = 256;
         constexpr int rows = 8;
         std::vector<float> h_src(rows * stride);
-        for (auto& v : h_src) v = dist(rng);
+        for (auto& v : h_src)
+            v = dist(rng);
         int32_t index_val = 3;
 
         float* d_src = sycl::malloc_device<float>(h_src.size(), q);
@@ -131,7 +134,8 @@ int main() {
     {
         constexpr int n = 64;
         std::vector<int32_t> h_ids(n);
-        for (int i = 0; i < n; ++i) h_ids[i] = i * 2;
+        for (int i = 0; i < n; ++i)
+            h_ids[i] = i * 2;
 
         int32_t* d_ids = sycl::malloc_device<int32_t>(n, q);
         int32_t* d_slot = sycl::malloc_device<int32_t>(n, q);
@@ -201,9 +205,12 @@ int main() {
         std::vector<float> h_hist(channels * 3);
         std::vector<float> h_qkv(channels);
         std::vector<float> h_w(channels * 4);
-        for (auto& v : h_hist) v = dist(rng);
-        for (auto& v : h_qkv) v = dist(rng);
-        for (auto& v : h_w) v = dist(rng);
+        for (auto& v : h_hist)
+            v = dist(rng);
+        for (auto& v : h_qkv)
+            v = dist(rng);
+        for (auto& v : h_w)
+            v = dist(rng);
 
         float* d_hist1 = sycl::malloc_device<float>(h_hist.size(), q);
         float* d_hist2 = sycl::malloc_device<float>(h_hist.size(), q);
@@ -235,8 +242,8 @@ int main() {
             if (diff > max_diff) max_diff = diff;
             if (diff > 1e-6f) errs++;
         }
-        std::printf("gdn_conv_l2_multi parity: %s (max_diff: %e, mismatches: %d)\n",
-                    errs == 0 ? "PASS" : "FAIL", max_diff, errs);
+        std::printf("gdn_conv_l2_multi parity: %s (max_diff: %e, mismatches: %d)\n", errs == 0 ? "PASS" : "FAIL",
+                    max_diff, errs);
         total_failures += errs;
 
         sycl::free(d_hist1, q);
@@ -255,11 +262,16 @@ int main() {
         std::vector<float> h_x(n_embd);
         std::vector<uint16_t> h_wa(h_v * n_embd), h_wb(h_v * n_embd);
         std::vector<float> h_dt(h_v), h_ssm_a(h_v);
-        for (auto& v : h_x) v = dist(rng);
-        for (auto& v : h_wa) v = (uint16_t)(rng() & 0xFFFF);
-        for (auto& v : h_wb) v = (uint16_t)(rng() & 0xFFFF);
-        for (auto& v : h_dt) v = dist(rng);
-        for (auto& v : h_ssm_a) v = -std::fabs(dist(rng));
+        for (auto& v : h_x)
+            v = dist(rng);
+        for (auto& v : h_wa)
+            v = (uint16_t)(rng() & 0xFFFF);
+        for (auto& v : h_wb)
+            v = (uint16_t)(rng() & 0xFFFF);
+        for (auto& v : h_dt)
+            v = dist(rng);
+        for (auto& v : h_ssm_a)
+            v = -std::fabs(dist(rng));
 
         float* d_x = sycl::malloc_device<float>(n_embd, q);
         uint16_t* d_wa = sycl::malloc_device<uint16_t>(h_wa.size(), q);
@@ -299,8 +311,8 @@ int main() {
             max_diff = std::max(max_diff, std::max(dg, db));
             if (dg > 1e-6f || db > 1e-6f) errs++;
         }
-        std::printf("gdn_ab_multi parity: %s (max_diff: %e, mismatches: %d)\n",
-                    errs == 0 ? "PASS" : "FAIL", max_diff, errs);
+        std::printf("gdn_ab_multi parity: %s (max_diff: %e, mismatches: %d)\n", errs == 0 ? "PASS" : "FAIL", max_diff,
+                    errs);
         total_failures += errs;
 
         sycl::free(d_x, q);
@@ -314,7 +326,7 @@ int main() {
         sycl::free(d_beta_m, q);
     }
 
-    std::printf("\nverify_kernels_test: %s (total failures: %d)\n",
-                total_failures == 0 ? "PASSED" : "FAILED", total_failures);
+    std::printf("\nverify_kernels_test: %s (total failures: %d)\n", total_failures == 0 ? "PASSED" : "FAILED",
+                total_failures);
     return total_failures == 0 ? 0 : 1;
 }

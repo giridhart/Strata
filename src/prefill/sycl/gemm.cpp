@@ -71,13 +71,14 @@ struct HipLtState {
 
     ~HipLtState() {
         if (std::getenv("STRATA_HIPBLASLT_VERBOSE")) {
-            std::fprintf(stderr, "prefill gemm: hipBLASLt summary launches=%llu fallbacks=%llu unique_fallback_shapes=%zu\n",
-                         (unsigned long long) lt_launches, (unsigned long long) fallbacks, fallback_shapes.size());
+            std::fprintf(stderr,
+                         "prefill gemm: hipBLASLt summary launches=%llu fallbacks=%llu unique_fallback_shapes=%zu\n",
+                         (unsigned long long)lt_launches, (unsigned long long)fallbacks, fallback_shapes.size());
             for (const auto& shape : fallback_shapes) {
                 const auto type = std::get<0>(shape);
                 std::fprintf(stderr, "prefill gemm: fallback shape dtype=%s T=%d N=%d K=%d ldy=%d\n",
-                             type == strata::prefill::hipblaslt::InputType::bf16 ? "bf16" : "f16",
-                             std::get<1>(shape), std::get<2>(shape), std::get<3>(shape), std::get<4>(shape));
+                             type == strata::prefill::hipblaslt::InputType::bf16 ? "bf16" : "f16", std::get<1>(shape),
+                             std::get<2>(shape), std::get<3>(shape), std::get<4>(shape));
             }
         }
         if (handle) hipblasLtDestroy(handle);
@@ -151,8 +152,8 @@ std::unique_ptr<HipLtState> create_hipblaslt_state(void* workspace, size_t works
     return state;
 }
 
-HipLtCachedAlgo resolve_hipblaslt_algo(HipLtState& state, strata::prefill::hipblaslt::InputType type, int t,
-                                       int n, int k, int ldy, float beta) {
+HipLtCachedAlgo resolve_hipblaslt_algo(HipLtState& state, strata::prefill::hipblaslt::InputType type, int t, int n,
+                                       int k, int ldy, float beta) {
     uint32_t beta_bits = 0;
     static_assert(sizeof(beta_bits) == sizeof(beta));
     std::memcpy(&beta_bits, &beta, sizeof(beta));
@@ -192,10 +193,11 @@ HipLtCachedAlgo resolve_hipblaslt_algo(HipLtState& state, strata::prefill::hipbl
     const float alpha = 1.0f;
     size_t required_workspace = 0;
     auto algo = candidates.front().algo;
-    if (hipblaslt_ext::matmulIsAlgoSupported(state.handle, desc.op, &alpha, desc.a, desc.b, &beta, desc.c, desc.c,
-                                             algo, required_workspace) != HIPBLAS_STATUS_SUCCESS) {
+    if (hipblaslt_ext::matmulIsAlgoSupported(state.handle, desc.op, &alpha, desc.a, desc.b, &beta, desc.c, desc.c, algo,
+                                             required_workspace) != HIPBLAS_STATUS_SUCCESS) {
         if (verbose) {
-            std::fprintf(stderr, "prefill gemm: Lt fallback; solution %d rejects actual T=%d N=%d K=%d ldy=%d beta=%.9g\n",
+            std::fprintf(stderr,
+                         "prefill gemm: Lt fallback; solution %d rejects actual T=%d N=%d K=%d ldy=%d beta=%.9g\n",
                          row->solution_id, t, n, k, ldy, beta);
         }
         return state.cache.emplace(key, resolved).first->second;
@@ -205,31 +207,28 @@ HipLtCachedAlgo resolve_hipblaslt_algo(HipLtState& state, strata::prefill::hipbl
     resolved.algo = algo;
     resolved.workspace_bytes = required_workspace;
     if (verbose) {
-        std::fprintf(stderr,
-                     "prefill gemm: Lt solution=%d dtype=%s T=%d N=%d K=%d ldy=%d beta=%.9g workspace=%zu\n",
-                     row->solution_id, type == strata::prefill::hipblaslt::InputType::bf16 ? "bf16" : "f16", t, n,
-                     k, ldy, beta, required_workspace);
+        std::fprintf(stderr, "prefill gemm: Lt solution=%d dtype=%s T=%d N=%d K=%d ldy=%d beta=%.9g workspace=%zu\n",
+                     row->solution_id, type == strata::prefill::hipblaslt::InputType::bf16 ? "bf16" : "f16", t, n, k,
+                     ldy, beta, required_workspace);
     }
     return state.cache.emplace(key, resolved).first->second;
 }
 
-bool try_hipblaslt(void* opaque_state, strata::prefill::hipblaslt::InputType type, const uint16_t* x,
-                   const uint16_t* w, float* y, int64_t t, int64_t n, int64_t k, int64_t ldy, float beta,
-                   void* stream) {
+bool try_hipblaslt(void* opaque_state, strata::prefill::hipblaslt::InputType type, const uint16_t* x, const uint16_t* w,
+                   float* y, int64_t t, int64_t n, int64_t k, int64_t ldy, float beta, void* stream) {
     auto* state = static_cast<HipLtState*>(opaque_state);
-    if (!state || t <= 0 || n <= 0 || k <= 0 || t > INT_MAX || n > INT_MAX || k > INT_MAX || ldy > INT_MAX ||
-        ldy < n) {
+    if (!state || t <= 0 || n <= 0 || k <= 0 || t > INT_MAX || n > INT_MAX || k > INT_MAX || ldy > INT_MAX || ldy < n) {
         return false;
     }
-    const auto resolved = resolve_hipblaslt_algo(*state, type, (int) t, (int) n, (int) k, (int) ldy, beta);
+    const auto resolved = resolve_hipblaslt_algo(*state, type, (int)t, (int)n, (int)k, (int)ldy, beta);
     if (!resolved.supported) {
         ++state->fallbacks;
-        state->fallback_shapes.emplace(type, (int) t, (int) n, (int) k, (int) ldy);
+        state->fallback_shapes.emplace(type, (int)t, (int)n, (int)k, (int)ldy);
         return false;
     }
     if (resolved.workspace_bytes > state->workspace_bytes) {
         ++state->fallbacks;
-        state->fallback_shapes.emplace(type, (int) t, (int) n, (int) k, (int) ldy);
+        state->fallback_shapes.emplace(type, (int)t, (int)n, (int)k, (int)ldy);
         if (std::getenv("STRATA_HIPBLASLT_VERBOSE")) {
             std::fprintf(stderr, "prefill gemm: Lt fallback; solution needs %zu workspace bytes, have %zu\n",
                          resolved.workspace_bytes, state->workspace_bytes);
@@ -239,17 +238,17 @@ bool try_hipblaslt(void* opaque_state, strata::prefill::hipblaslt::InputType typ
 
     HipLtDescriptors desc;
     const hipDataType input_type = type == strata::prefill::hipblaslt::InputType::bf16 ? HIP_R_16BF : HIP_R_16F;
-    if (!desc.init(input_type, (int) t, (int) n, (int) k, (int) ldy)) return false;
+    if (!desc.init(input_type, (int)t, (int)n, (int)k, (int)ldy)) return false;
     const float alpha = 1.0f;
-    const hipblasStatus_t status = hipblasLtMatmul(state->handle, desc.op, &alpha, w, desc.a, x, desc.b, &beta, y,
-                                                   desc.c, y, desc.c, &resolved.algo, state->workspace,
-                                                   state->workspace_bytes, (hipStream_t) stream);
+    const hipblasStatus_t status =
+        hipblasLtMatmul(state->handle, desc.op, &alpha, w, desc.a, x, desc.b, &beta, y, desc.c, y, desc.c,
+                        &resolved.algo, state->workspace, state->workspace_bytes, (hipStream_t)stream);
     if (status == HIPBLAS_STATUS_SUCCESS) {
         ++state->lt_launches;
         return true;
     }
 
-    std::fprintf(stderr, "prefill gemm: hipBLASLt launch failed with status %d\n", (int) status);
+    std::fprintf(stderr, "prefill gemm: hipBLASLt launch failed with status %d\n", (int)status);
     if (beta != 0.0f) {
         std::fprintf(stderr, "prefill gemm: refusing a fallback after hipBLASLt failed with nonzero beta\n");
         std::exit(1);
@@ -257,10 +256,10 @@ bool try_hipblaslt(void* opaque_state, strata::prefill::hipblaslt::InputType typ
     auto* mutable_state = static_cast<HipLtState*>(opaque_state);
     uint32_t beta_bits = 0;
     std::memcpy(&beta_bits, &beta, sizeof(beta_bits));
-    auto cached = mutable_state->cache.find(HipLtCallKey{type, (int) t, (int) n, (int) k, (int) ldy, beta_bits});
+    auto cached = mutable_state->cache.find(HipLtCallKey{type, (int)t, (int)n, (int)k, (int)ldy, beta_bits});
     if (cached != mutable_state->cache.end()) cached->second.supported = false;
     ++mutable_state->fallbacks;
-    mutable_state->fallback_shapes.emplace(type, (int) t, (int) n, (int) k, (int) ldy);
+    mutable_state->fallback_shapes.emplace(type, (int)t, (int)n, (int)k, (int)ldy);
     return false;
 }
 #endif
@@ -280,9 +279,8 @@ Gemm::~Gemm() {
     }
 }
 
-bool Gemm::init_external(void *stream, uint16_t *scratch, int64_t scratch_elems,
-                         void *workspace, size_t ws_bytes,
-                         std::string &err) {
+bool Gemm::init_external(void* stream, uint16_t* scratch, int64_t scratch_elems, void* workspace, size_t ws_bytes,
+                         std::string& err) {
     (void)ws_bytes;
     (void)err;
     stream_ = stream;
@@ -311,7 +309,7 @@ void Gemm::rebind(uint16_t* scratch, int64_t scratch_elems, void* workspace, siz
 #endif
 }
 
-bool Gemm::init(void *stream, int64_t scratch_elems, std::string &err) {
+bool Gemm::init(void* stream, int64_t scratch_elems, std::string& err) {
     auto* q = static_cast<sycl::queue*>(stream);
     if (!q) {
         err = "prefill gemm: invalid sycl queue pointer";
@@ -329,8 +327,7 @@ bool Gemm::init(void *stream, int64_t scratch_elems, std::string &err) {
         if (scratch_elems > 0) {
             scratch_ = (uint16_t*)sycl::malloc_device((size_t)scratch_elems * 2, *q);
             if (!scratch_) {
-                err = "prefill gemm: dequant scratch of " +
-                      std::to_string(scratch_elems * 2 >> 20) + " MiB failed";
+                err = "prefill gemm: dequant scratch of " + std::to_string(scratch_elems * 2 >> 20) + " MiB failed";
                 return false;
             }
         }
@@ -346,11 +343,8 @@ bool Gemm::init(void *stream, int64_t scratch_elems, std::string &err) {
 }
 
 template <bool IS_BF16>
-void sycl_prefill_gemm_kernel(const uint16_t* __restrict__ X,
-                              const uint16_t* __restrict__ W,
-                              float* __restrict__ Y,
-                              int64_t T, int64_t N, int64_t K, int64_t ldy,
-                              float alpha, float beta,
+void sycl_prefill_gemm_kernel(const uint16_t* __restrict__ X, const uint16_t* __restrict__ W, float* __restrict__ Y,
+                              int64_t T, int64_t N, int64_t K, int64_t ldy, float alpha, float beta,
                               sycl::nd_item<2> item) {
     const int64_t t = (int64_t)item.get_group(0) * item.get_local_range(0) + item.get_local_id(0);
     const int64_t n = (int64_t)item.get_group(1) * item.get_local_range(1) + item.get_local_id(1);
@@ -361,25 +355,30 @@ void sycl_prefill_gemm_kernel(const uint16_t* __restrict__ X,
 
     float sum = 0.0f;
     int64_t k = 0;
-    #pragma unroll 4
+#pragma unroll 4
     for (; k + 4 <= K; k += 4) {
         if constexpr (IS_BF16) {
-            sum += strata::kernels::f32_from_bf16(x_row[k+0]) * strata::kernels::f32_from_bf16(w_row[k+0])
-                 + strata::kernels::f32_from_bf16(x_row[k+1]) * strata::kernels::f32_from_bf16(w_row[k+1])
-                 + strata::kernels::f32_from_bf16(x_row[k+2]) * strata::kernels::f32_from_bf16(w_row[k+2])
-                 + strata::kernels::f32_from_bf16(x_row[k+3]) * strata::kernels::f32_from_bf16(w_row[k+3]);
+            sum += strata::kernels::f32_from_bf16(x_row[k + 0]) * strata::kernels::f32_from_bf16(w_row[k + 0]) +
+                   strata::kernels::f32_from_bf16(x_row[k + 1]) * strata::kernels::f32_from_bf16(w_row[k + 1]) +
+                   strata::kernels::f32_from_bf16(x_row[k + 2]) * strata::kernels::f32_from_bf16(w_row[k + 2]) +
+                   strata::kernels::f32_from_bf16(x_row[k + 3]) * strata::kernels::f32_from_bf16(w_row[k + 3]);
         } else {
-            sum += static_cast<float>(sycl::bit_cast<sycl::half>(x_row[k+0])) * static_cast<float>(sycl::bit_cast<sycl::half>(w_row[k+0]))
-                 + static_cast<float>(sycl::bit_cast<sycl::half>(x_row[k+1])) * static_cast<float>(sycl::bit_cast<sycl::half>(w_row[k+1]))
-                 + static_cast<float>(sycl::bit_cast<sycl::half>(x_row[k+2])) * static_cast<float>(sycl::bit_cast<sycl::half>(w_row[k+2]))
-                 + static_cast<float>(sycl::bit_cast<sycl::half>(x_row[k+3])) * static_cast<float>(sycl::bit_cast<sycl::half>(w_row[k+3]));
+            sum += static_cast<float>(sycl::bit_cast<sycl::half>(x_row[k + 0])) *
+                       static_cast<float>(sycl::bit_cast<sycl::half>(w_row[k + 0])) +
+                   static_cast<float>(sycl::bit_cast<sycl::half>(x_row[k + 1])) *
+                       static_cast<float>(sycl::bit_cast<sycl::half>(w_row[k + 1])) +
+                   static_cast<float>(sycl::bit_cast<sycl::half>(x_row[k + 2])) *
+                       static_cast<float>(sycl::bit_cast<sycl::half>(w_row[k + 2])) +
+                   static_cast<float>(sycl::bit_cast<sycl::half>(x_row[k + 3])) *
+                       static_cast<float>(sycl::bit_cast<sycl::half>(w_row[k + 3]));
         }
     }
     for (; k < K; ++k) {
         if constexpr (IS_BF16) {
             sum += strata::kernels::f32_from_bf16(x_row[k]) * strata::kernels::f32_from_bf16(w_row[k]);
         } else {
-            sum += static_cast<float>(sycl::bit_cast<sycl::half>(x_row[k])) * static_cast<float>(sycl::bit_cast<sycl::half>(w_row[k]));
+            sum += static_cast<float>(sycl::bit_cast<sycl::half>(x_row[k])) *
+                   static_cast<float>(sycl::bit_cast<sycl::half>(w_row[k]));
         }
     }
 
@@ -407,11 +406,10 @@ void Gemm::bf16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64
     const size_t local_n = 256;
     const size_t global_t = (size_t)T;
     const size_t global_n = ((size_t)N + local_n - 1) / local_n * local_n;
-    q->parallel_for(
-        sycl::nd_range<2>(sycl::range<2>(global_t, global_n), sycl::range<2>(local_t, local_n)),
-        [=](sycl::nd_item<2> item) [[sycl::reqd_sub_group_size(strata::sycl_arch::SUB_GROUP_SIZE)]] {
-            sycl_prefill_gemm_kernel<true>(X, W, Y, T, N, K, ldy, 1.0f, beta, item);
-        });
+    q->parallel_for(sycl::nd_range<2>(sycl::range<2>(global_t, global_n), sycl::range<2>(local_t, local_n)),
+                    [=](sycl::nd_item<2> item) [[sycl::reqd_sub_group_size(strata::sycl_arch::SUB_GROUP_SIZE)]] {
+                        sycl_prefill_gemm_kernel<true>(X, W, Y, T, N, K, ldy, 1.0f, beta, item);
+                    });
 }
 
 void Gemm::f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy,
@@ -425,11 +423,10 @@ void Gemm::f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_
     const size_t local_n = 256;
     const size_t global_t = (size_t)T;
     const size_t global_n = ((size_t)N + local_n - 1) / local_n * local_n;
-    q->parallel_for(
-        sycl::nd_range<2>(sycl::range<2>(global_t, global_n), sycl::range<2>(local_t, local_n)),
-        [=](sycl::nd_item<2> item) [[sycl::reqd_sub_group_size(strata::sycl_arch::SUB_GROUP_SIZE)]] {
-            sycl_prefill_gemm_kernel<false>(X, W, Y, T, N, K, ldy, 1.0f, beta, item);
-        });
+    q->parallel_for(sycl::nd_range<2>(sycl::range<2>(global_t, global_n), sycl::range<2>(local_t, local_n)),
+                    [=](sycl::nd_item<2> item) [[sycl::reqd_sub_group_size(strata::sycl_arch::SUB_GROUP_SIZE)]] {
+                        sycl_prefill_gemm_kernel<false>(X, W, Y, T, N, K, ldy, 1.0f, beta, item);
+                    });
 }
 
 void Gemm::native(const uint16_t* X, int ggml_type, const void* W_blocks, float* Y, int64_t T, int64_t N, int64_t K,
@@ -437,7 +434,10 @@ void Gemm::native(const uint16_t* X, int ggml_type, const void* W_blocks, float*
     if (N * K > scratch_elems_) {
         // Too large for the scratch at once: in row slices.
         const int64_t rows = scratch_elems_ / K;
-        if (rows <= 0) { std::fprintf(stderr, "prefill gemm: scratch too small for K=%lld\n", (long long) K); std::exit(1); }
+        if (rows <= 0) {
+            std::fprintf(stderr, "prefill gemm: scratch too small for K=%lld\n", (long long)K);
+            std::exit(1);
+        }
         if (ldy <= 0) ldy = N;
         for (int64_t r0 = 0; r0 < N; r0 += rows) {
             const int64_t n = (N - r0 < rows) ? N - r0 : rows;

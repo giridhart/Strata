@@ -22,30 +22,30 @@ namespace {
 
 namespace jm = sycl::ext::oneapi::experimental::matrix;
 
-constexpr int HD = 256;           // head_dim
-constexpr int G = 12;             // query heads per KV head
-constexpr int SG = 16;            // Xe2 native SIMD16 sub-group size
-constexpr int NSG = 8;            // 8 sub-groups per workgroup (128 threads)
-constexpr int THREADS = SG * NSG; // 128 threads
-constexpr int QS = HD + 8;        // q row stride in halves (bank-conflict-free)
+constexpr int HD = 256;            // head_dim
+constexpr int G = 12;              // query heads per KV head
+constexpr int SG = 16;             // Xe2 native SIMD16 sub-group size
+constexpr int NSG = 8;             // 8 sub-groups per workgroup (128 threads)
+constexpr int THREADS = SG * NSG;  // 128 threads
+constexpr int QS = HD + 8;         // q row stride in halves (bank-conflict-free)
 
 // Local memory layout for CH cells per chunk; P tiles reuse the K^T region
 template <int CH>
 struct Layout {
-    static constexpr int PS = CH + 8;                        // P / score row stride
-    static constexpr int NT = CH / 16;                       // cell tiles
-    static constexpr int UNITS = NT * 4;                     // (cell tile, scale group) score units
-    static constexpr size_t q = 2 * 16 * QS * 2;             // Q hi, Q lo (halves)
-    static constexpr size_t kp = (size_t) CH * HD * 2;       // packed K^T, then the P tiles
-    static constexpr size_t pv = (size_t) 4 * 2 * 16 * PS * 2;
+    static constexpr int PS = CH + 8;                  // P / score row stride
+    static constexpr int NT = CH / 16;                 // cell tiles
+    static constexpr int UNITS = NT * 4;               // (cell tile, scale group) score units
+    static constexpr size_t q = 2 * 16 * QS * 2;       // Q hi, Q lo (halves)
+    static constexpr size_t kp = (size_t)CH * HD * 2;  // packed K^T, then the P tiles
+    static constexpr size_t pv = (size_t)4 * 2 * 16 * PS * 2;
     static constexpr size_t kp_or_pv = kp > pv ? kp : pv;
-    static constexpr size_t vp = (size_t) CH * HD * 2;       // packed V
-    static constexpr size_t parts = (size_t) (UNITS > 16 ? UNITS : 16) * 256 * 4;   // score units, then P.V tiles
-    static constexpr size_t s = (size_t) 16 * PS * 4;        // probabilities
-    static constexpr size_t acc = (size_t) 16 * HD * 4;
-    static constexpr size_t scal = (size_t) CH * 4 * 4 * 2;  // ks, vs
+    static constexpr size_t vp = (size_t)CH * HD * 2;                             // packed V
+    static constexpr size_t parts = (size_t)(UNITS > 16 ? UNITS : 16) * 256 * 4;  // score units, then P.V tiles
+    static constexpr size_t s = (size_t)16 * PS * 4;                              // probabilities
+    static constexpr size_t acc = (size_t)16 * HD * 4;
+    static constexpr size_t scal = (size_t)CH * 4 * 4 * 2;  // ks, vs
     static constexpr size_t misc = 80 * 4;
-    static constexpr size_t row = (size_t) CH * 8;
+    static constexpr size_t row = (size_t)CH * 8;
     static constexpr size_t bytes = q + kp_or_pv + vp + parts + s + acc + scal + misc + row + 16 * 12;
 };
 
@@ -65,26 +65,28 @@ inline bool has_xmx_matrix(const sycl::device& dev) {
     try {
         auto combos = dev.get_info<sycl::ext::oneapi::experimental::info::device::matrix_combinations>();
         if (!combos.empty()) return true;
-    } catch (...) {}
+    } catch (...) {
+    }
     return false;
 }
 
 template <int KV_MODE, int CH>
-void prompt_attn_xmx_kernel(const float* __restrict__ q, QsaAttnPools p,
-                            const int32_t* __restrict__ ids,
-                            const int32_t* __restrict__ steps, int n_kv_heads,
-                            int page_size, float scale_log2,
-                            float* __restrict__ attn, int cap,
-                            uint8_t* local_mem, sycl::nd_item<2> item) {
+void prompt_attn_xmx_kernel(const float* __restrict__ q, QsaAttnPools p, const int32_t* __restrict__ ids,
+                            const int32_t* __restrict__ steps, int n_kv_heads, int page_size, float scale_log2,
+                            float* __restrict__ attn, int cap, uint8_t* local_mem, sycl::nd_item<2> item) {
     using L = Layout<CH>;
     constexpr int PS = L::PS, UNITS = L::UNITS;
     auto sg = item.get_sub_group();
     uint8_t* at = local_mem;
-    auto take = [&](size_t b) { uint8_t* r = at; at += (b + 15) & ~(size_t) 15; return r; };
+    auto take = [&](size_t b) {
+        uint8_t* r = at;
+        at += (b + 15) & ~(size_t)15;
+        return r;
+    };
     sycl::half* qh = reinterpret_cast<sycl::half*>(take(L::q / 2));
     sycl::half* ql = reinterpret_cast<sycl::half*>(take(L::q / 2));
     sycl::half* kp = reinterpret_cast<sycl::half*>(take(L::kp_or_pv));
-    sycl::half* ptile = kp;                                   // [g][hi/lo][16][PS], after the scores
+    sycl::half* ptile = kp;  // [g][hi/lo][16][PS], after the scores
     sycl::half* vp = reinterpret_cast<sycl::half*>(take(L::vp));
     float* parts = reinterpret_cast<float*>(take(L::parts));
     float* sp = reinterpret_cast<float*>(take(L::s));
@@ -93,20 +95,20 @@ void prompt_attn_xmx_kernel(const float* __restrict__ q, QsaAttnPools p,
     float* vs = reinterpret_cast<float*>(take(L::scal / 2));
     float* misc = reinterpret_cast<float*>(take(L::misc));
     long long* rows = reinterpret_cast<long long*>(take(L::row));
-    float* qmax = misc;            // [8]
-    float* mrow = misc + 8;        // [16]
-    float* lsum = misc + 24;       // [16]
-    float* alpha = misc + 40;      // [16]
-    float* vup = misc + 56;        // [4]
-    float* vdown = misc + 60;      // [4]
+    float* qmax = misc;        // [8]
+    float* mrow = misc + 8;    // [16]
+    float* lsum = misc + 24;   // [16]
+    float* alpha = misc + 40;  // [16]
+    float* vup = misc + 56;    // [4]
+    float* vdown = misc + 60;  // [4]
 
     const int kvh = static_cast<int>(item.get_group(0));
     const int qi = static_cast<int>(item.get_group(1));
     const int n_head = n_kv_heads * G;
-    q += (size_t) qi * n_head * HD + (size_t) kvh * G * HD;
-    attn += (size_t) qi * n_head * HD + (size_t) kvh * G * HD;
-    ids += (size_t) qi * cap;
-    const int n = *(steps + (size_t) qi * kStepCount + kStepWidth);
+    q += (size_t)qi * n_head * HD + (size_t)kvh * G * HD;
+    attn += (size_t)qi * n_head * HD + (size_t)kvh * G * HD;
+    ids += (size_t)qi * cap;
+    const int n = *(steps + (size_t)qi * kStepCount + kStepWidth);
     const int t = static_cast<int>(item.get_local_id(1));
     const int lane = static_cast<int>(sg.get_local_id()[0]);
     const int sgid = static_cast<int>(sg.get_group_id()[0]);
@@ -123,17 +125,21 @@ void prompt_attn_xmx_kernel(const float* __restrict__ q, QsaAttnPools p,
         qm = sycl::fmax(qm, qmax[i]);
     int qe = 0;
     if (qm > 0.0f) sycl::frexp(qm, &qe);
-    const float qup = sycl::ldexp(1.0f, 14 - qe),
-                qdown = sycl::ldexp(scale_log2, qe - 14);
+    const float qup = sycl::ldexp(1.0f, 14 - qe), qdown = sycl::ldexp(scale_log2, qe - 14);
     for (int i = t; i < 16 * HD; i += THREADS) {
         const int h = i / HD, d = i % HD;
-        const float x = h < G ? q[(size_t) h * HD + d] * qup : 0.0f;
+        const float x = h < G ? q[(size_t)h * HD + d] * qup : 0.0f;
         const sycl::half hi = sycl::vec<float, 1>(x).convert<sycl::half, sycl::rounding_mode::rte>()[0];
         qh[h * QS + d] = hi;
-        ql[h * QS + d] = sycl::vec<float, 1>(x - half_as_float_exact(hi)).convert<sycl::half, sycl::rounding_mode::rte>()[0];
+        ql[h * QS + d] =
+            sycl::vec<float, 1>(x - half_as_float_exact(hi)).convert<sycl::half, sycl::rounding_mode::rte>()[0];
     }
-    for (int i = t; i < 16 * HD; i += THREADS) acc[i] = 0.0f;
-    if (t < 16) { mrow[t] = -INFINITY; lsum[t] = 0.0f; }
+    for (int i = t; i < 16 * HD; i += THREADS)
+        acc[i] = 0.0f;
+    if (t < 16) {
+        mrow[t] = -INFINITY;
+        lsum[t] = 0.0f;
+    }
 
     for (int c0 = 0; c0 < n; c0 += CH) {
         const int nh = sycl::min(CH, n - c0);
@@ -142,8 +148,7 @@ void prompt_attn_xmx_kernel(const float* __restrict__ q, QsaAttnPools p,
             if (t < nh) {
                 const int cell = ids[c0 + t];
                 const long long page = static_cast<long long>(p.page_table[cell / page_size]);
-                if (page >= 0)
-                    r = (page * n_kv_heads + kvh) * page_size + (cell % page_size);
+                if (page >= 0) r = (page * n_kv_heads + kvh) * page_size + (cell % page_size);
             }
             rows[t] = r;
         }
@@ -157,7 +162,8 @@ void prompt_attn_xmx_kernel(const float* __restrict__ q, QsaAttnPools p,
             if (r >= 0) {
                 if constexpr (KV_MODE == 0) {
                     const auto v = *reinterpret_cast<const sycl::vec<uint32_t, 4>*>(p.k_pool + r * HD + piece * 8);
-                    for (int j = 0; j < 4; ++j) w[j] = v[j];
+                    for (int j = 0; j < 4; ++j)
+                        w[j] = v[j];
                 } else {
                     const auto v = *reinterpret_cast<const sycl::vec<int8_t, 8>*>(p.k_q + r * HD + piece * 8);
                     for (int j = 0; j < 4; ++j) {
@@ -167,7 +173,8 @@ void prompt_attn_xmx_kernel(const float* __restrict__ q, QsaAttnPools p,
                 }
             }
             uint32_t* dst = reinterpret_cast<uint32_t*>(kp);
-            for (int j = 0; j < 4; ++j) dst[(size_t) (piece * 4 + j) * CH + c] = w[j];
+            for (int j = 0; j < 4; ++j)
+                dst[(size_t)(piece * 4 + j) * CH + c] = w[j];
         }
 
         // V rows -> packed V
@@ -181,7 +188,8 @@ void prompt_attn_xmx_kernel(const float* __restrict__ q, QsaAttnPools p,
                     const long long r = rows[2 * cp + e];
                     float* v = e ? v1 : v0;
                     if (r < 0) {
-                        for (int j = 0; j < QK4_0; ++j) v[j] = 0.0f;
+                        for (int j = 0; j < QK4_0; ++j)
+                            v[j] = 0.0f;
                         continue;
                     }
                     const block_q4_0* blk = reinterpret_cast<const block_q4_0*>(p.v_q4 + r * BYTES) + b;
@@ -191,7 +199,7 @@ void prompt_attn_xmx_kernel(const float* __restrict__ q, QsaAttnPools p,
                         v[j + QK4_0 / 2] = static_cast<float>(static_cast<int>(blk->qs[j] >> 4) - 8) * d;
                     }
                 }
-                uint32_t* dst = reinterpret_cast<uint32_t*>(vp) + (size_t) cp * HD + b * QK4_0;
+                uint32_t* dst = reinterpret_cast<uint32_t*>(vp) + (size_t)cp * HD + b * QK4_0;
                 for (int j = 0; j < QK4_0; j += 8) {
                     sycl::vec<uint32_t, 8> o;
                     for (int u = 0; u < 8; ++u)
@@ -207,21 +215,25 @@ void prompt_attn_xmx_kernel(const float* __restrict__ q, QsaAttnPools p,
                     const long long r = rows[2 * cp + e];
                     sycl::half* h = e ? h1 : h0;
                     if (r < 0) {
-                        for (int j = 0; j < 8; ++j) h[j] = sycl::half(0.0f);
+                        for (int j = 0; j < 8; ++j)
+                            h[j] = sycl::half(0.0f);
                         continue;
                     }
                     if constexpr (KV_MODE == 1) {
                         const auto v = *reinterpret_cast<const sycl::vec<int8_t, 8>*>(p.v_q + r * HD + piece * 8);
-                        for (int j = 0; j < 8; ++j) h[j] = sycl::half(static_cast<float>(v[j]));
+                        for (int j = 0; j < 8; ++j)
+                            h[j] = sycl::half(static_cast<float>(v[j]));
                     } else {
                         const auto v = *reinterpret_cast<const sycl::vec<uint16_t, 8>*>(p.v_pool + r * HD + piece * 8);
-                        for (int j = 0; j < 8; ++j) h[j] = sycl::bit_cast<sycl::half, unsigned short>(v[j]);
+                        for (int j = 0; j < 8; ++j)
+                            h[j] = sycl::bit_cast<sycl::half, unsigned short>(v[j]);
                     }
                 }
                 sycl::vec<uint32_t, 8> o;
                 for (int j = 0; j < 8; ++j)
                     o[j] = sycl::bit_cast<uint32_t>(sycl::half2(h0[j], h1[j]));
-                *reinterpret_cast<sycl::vec<uint32_t, 8>*>(reinterpret_cast<uint32_t*>(vp) + (size_t) cp * HD + piece * 8) = o;
+                *reinterpret_cast<sycl::vec<uint32_t, 8>*>(reinterpret_cast<uint32_t*>(vp) + (size_t)cp * HD +
+                                                           piece * 8) = o;
             }
         }
         for (int i = t; i < CH * 4; i += THREADS) {
@@ -230,10 +242,13 @@ void prompt_attn_xmx_kernel(const float* __restrict__ q, QsaAttnPools p,
             float a = 0.0f, b = 0.0f;
             if (r >= 0) {
                 if constexpr (KV_MODE == 1) {
-                    a = static_cast<float>(sycl::bit_cast<sycl::half, unsigned short>(p.k_scale[r * (HD / KV_Q8_GROUP) + g]));
-                    b = static_cast<float>(sycl::bit_cast<sycl::half, unsigned short>(p.v_scale[r * (HD / KV_Q8_GROUP) + g]));
+                    a = static_cast<float>(
+                        sycl::bit_cast<sycl::half, unsigned short>(p.k_scale[r * (HD / KV_Q8_GROUP) + g]));
+                    b = static_cast<float>(
+                        sycl::bit_cast<sycl::half, unsigned short>(p.v_scale[r * (HD / KV_Q8_GROUP) + g]));
                 } else if constexpr (KV_MODE == 3) {
-                    a = static_cast<float>(sycl::bit_cast<sycl::half, unsigned short>(p.k_scale[r * (HD / KV_Q8_GROUP) + g]));
+                    a = static_cast<float>(
+                        sycl::bit_cast<sycl::half, unsigned short>(p.k_scale[r * (HD / KV_Q8_GROUP) + g]));
                     b = 1.0f;
                 } else {
                     a = b = 1.0f;
@@ -252,19 +267,22 @@ void prompt_attn_xmx_kernel(const float* __restrict__ q, QsaAttnPools p,
             for (int kk = 0; kk < 4; ++kk) {
                 const int k0 = (g * 4 + kk) * 16;
                 jm::joint_matrix<sycl::sub_group, sycl::half, jm::use::b, 16, 16, jm::layout::ext_intel_packed> B;
-                jm::joint_matrix_load(sg, B, lptr(kp + (k0 >> 1) * (CH * 2) + nt * 16 * 2), static_cast<size_t>(CH * 2));
+                jm::joint_matrix_load(sg, B, lptr(kp + (k0 >> 1) * (CH * 2) + nt * 16 * 2),
+                                      static_cast<size_t>(CH * 2));
                 jm::joint_matrix<sycl::sub_group, sycl::half, jm::use::a, 16, 16, jm::layout::row_major> A;
                 jm::joint_matrix_load(sg, A, lptr(qh + k0), static_cast<size_t>(QS));
                 jm::joint_matrix_mad(sg, C, A, B, C);
                 jm::joint_matrix_load(sg, A, lptr(ql + k0), static_cast<size_t>(QS));
                 jm::joint_matrix_mad(sg, C, A, B, C);
             }
-            jm::joint_matrix_store(sg, C, lptr(parts + (size_t) u * 256), static_cast<size_t>(16), jm::layout::row_major);
+            jm::joint_matrix_store(sg, C, lptr(parts + (size_t)u * 256), static_cast<size_t>(16),
+                                   jm::layout::row_major);
         }
 
         if (t < 4) {
             float vmax = 0.0f;
-            for (int c = 0; c < CH; ++c) vmax = sycl::fmax(vmax, sycl::fabs(vs[c * 4 + t]));
+            for (int c = 0; c < CH; ++c)
+                vmax = sycl::fmax(vmax, sycl::fabs(vs[c * 4 + t]));
             vup[t] = vmax > 0.0f ? 16384.0f / vmax : 0.0f;
             vdown[t] = vmax * (1.0f / 16384.0f);
         }
@@ -279,7 +297,7 @@ void prompt_attn_xmx_kernel(const float* __restrict__ q, QsaAttnPools p,
                 const int c = sub * PER + j, nt = c >> 4, cc = c & 15;
                 float v = 0.0f;
                 for (int g = 0; g < 4; ++g)
-                    v += parts[(size_t) (nt * 4 + g) * 256 + r * 16 + cc] * ks[c * 4 + g];
+                    v += parts[(size_t)(nt * 4 + g) * 256 + r * 16 + cc] * ks[c * 4 + g];
                 x[j] = c < nh ? v * qdown : -INFINITY;
                 mx = sycl::fmax(mx, x[j]);
             }
@@ -313,26 +331,27 @@ void prompt_attn_xmx_kernel(const float* __restrict__ q, QsaAttnPools p,
             const float p0 = sp[r * PS + c] * w0, p1 = sp[r * PS + c + 1] * w1;
             const sycl::half h0 = sycl::vec<float, 1>(p0).convert<sycl::half, sycl::rounding_mode::rte>()[0];
             const sycl::half h1 = sycl::vec<float, 1>(p1).convert<sycl::half, sycl::rounding_mode::rte>()[0];
-            *reinterpret_cast<sycl::half2*>(ptile + ((size_t) (g * 2 + 0) * 16 + r) * PS + c) = sycl::half2(h0, h1);
-            *reinterpret_cast<sycl::half2*>(ptile + ((size_t) (g * 2 + 1) * 16 + r) * PS + c) =
-                sycl::half2(sycl::vec<float, 1>(p0 - half_as_float_exact(h0)).convert<sycl::half, sycl::rounding_mode::rte>()[0],
-                            sycl::vec<float, 1>(p1 - half_as_float_exact(h1)).convert<sycl::half, sycl::rounding_mode::rte>()[0]);
+            *reinterpret_cast<sycl::half2*>(ptile + ((size_t)(g * 2 + 0) * 16 + r) * PS + c) = sycl::half2(h0, h1);
+            *reinterpret_cast<sycl::half2*>(ptile + ((size_t)(g * 2 + 1) * 16 + r) * PS + c) = sycl::half2(
+                sycl::vec<float, 1>(p0 - half_as_float_exact(h0)).convert<sycl::half, sycl::rounding_mode::rte>()[0],
+                sycl::vec<float, 1>(p1 - half_as_float_exact(h1)).convert<sycl::half, sycl::rounding_mode::rte>()[0]);
         }
         item.barrier(sycl::access::fence_space::local_space);
 
         // P.V matrix multiply
         {
             const int g = sgid >> 1, gp = KV_MODE == 1 ? g : 0;
-            const sycl::half* ah = ptile + (size_t) (gp * 2 + 0) * 16 * PS;
-            const sycl::half* al = ptile + (size_t) (gp * 2 + 1) * 16 * PS;
-            float* tmp = parts + (size_t) sgid * 512;
+            const sycl::half* ah = ptile + (size_t)(gp * 2 + 0) * 16 * PS;
+            const sycl::half* al = ptile + (size_t)(gp * 2 + 1) * 16 * PS;
+            float* tmp = parts + (size_t)sgid * 512;
             for (int dt = 0; dt < 2; ++dt) {
                 const int d0 = sgid * 32 + dt * 16;
                 jm::joint_matrix<sycl::sub_group, float, jm::use::accumulator, 16, 16> C;
                 jm::joint_matrix_fill(sg, C, 0.0f);
                 for (int ks16 = 0; ks16 < CH; ks16 += 16) {
                     jm::joint_matrix<sycl::sub_group, sycl::half, jm::use::b, 16, 16, jm::layout::ext_intel_packed> B;
-                    jm::joint_matrix_load(sg, B, lptr(vp + (size_t) (ks16 >> 1) * (HD * 2) + d0 * 2), static_cast<size_t>(HD * 2));
+                    jm::joint_matrix_load(sg, B, lptr(vp + (size_t)(ks16 >> 1) * (HD * 2) + d0 * 2),
+                                          static_cast<size_t>(HD * 2));
                     jm::joint_matrix<sycl::sub_group, sycl::half, jm::use::a, 16, 16, jm::layout::row_major> A;
                     jm::joint_matrix_load(sg, A, lptr(ah + ks16), static_cast<size_t>(PS));
                     jm::joint_matrix_mad(sg, C, A, B, C);
@@ -354,7 +373,7 @@ void prompt_attn_xmx_kernel(const float* __restrict__ q, QsaAttnPools p,
     for (int i = t; i < G * HD; i += THREADS) {
         const int h = i / HD, d = i % HD;
         const float l = lsum[h];
-        attn[(size_t) h * HD + d] = l > 0.0f ? acc[h * HD + d] / l : 0.0f;
+        attn[(size_t)h * HD + d] = l > 0.0f ? acc[h * HD + d] / l : 0.0f;
     }
 }
 
@@ -378,9 +397,8 @@ bool launch_xmx(const float* q, const QsaAttnPools& pools, const int32_t* ids, c
                 sycl::nd_range<2>(sycl::range<2>(static_cast<size_t>(nkv), static_cast<size_t>(nb * THREADS)),
                                   sycl::range<2>(1, THREADS)),
                 [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(16)]] {
-                    prompt_attn_xmx_kernel<KV_MODE, CH>(
-                        qq, pools, idq, stq, nkv, ps, scale_log2, aq, capi,
-                        slm.get_multi_ptr<sycl::access::decorated::no>().get(), it);
+                    prompt_attn_xmx_kernel<KV_MODE, CH>(qq, pools, idq, stq, nkv, ps, scale_log2, aq, capi,
+                                                        slm.get_multi_ptr<sycl::access::decorated::no>().get(), it);
                 });
         });
     }
@@ -437,35 +455,39 @@ __device__ __forceinline__ wh8 i8x8_to_h8(uint2 x) {
     wh8 h;
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
-        h[i] = (_Float16) (int) (int8_t) (x.x >> (8 * i));
-        h[4 + i] = (_Float16) (int) (int8_t) (x.y >> (8 * i));
+        h[i] = (_Float16)(int)(int8_t)(x.x >> (8 * i));
+        h[4 + i] = (_Float16)(int)(int8_t)(x.y >> (8 * i));
     }
     return h;
 }
 
-__global__ void __launch_bounds__(THREADS) prompt_attn_wmma_kernel(const float* __restrict__ q, QsaAttnPools p,
-                                                                   const int32_t* __restrict__ ids,
-                                                                   const int32_t* __restrict__ steps, int n_kv_heads,
-                                                                   int page_size, float scale_log2,
-                                                                   float* __restrict__ attn, int cap) {
+__global__ void __launch_bounds__(THREADS)
+    prompt_attn_wmma_kernel(const float* __restrict__ q, QsaAttnPools p, const int32_t* __restrict__ ids,
+                            const int32_t* __restrict__ steps, int n_kv_heads, int page_size, float scale_log2,
+                            float* __restrict__ attn, int cap) {
 #if STRATA_PA_WMMA
     __shared__ SmemW S;
     const int qi = blockIdx.x, kvh = blockIdx.y;
     const int n_head = n_kv_heads * G;
-    q += (size_t) qi * n_head * HD + (size_t) kvh * G * HD;
-    attn += (size_t) qi * n_head * HD + (size_t) kvh * G * HD;
-    ids += (size_t) qi * cap;
-    const int n = __ldg(steps + (size_t) qi * kStepCount + kStepWidth);
+    q += (size_t)qi * n_head * HD + (size_t)kvh * G * HD;
+    attn += (size_t)qi * n_head * HD + (size_t)kvh * G * HD;
+    ids += (size_t)qi * cap;
+    const int n = __ldg(steps + (size_t)qi * kStepCount + kStepWidth);
     const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
     const int col = lane & 15, half = lane >> 4;
     const int dim0 = warp * 64;
 
     float qm = 0.0f;
-    for (int i = t; i < G * HD; i += THREADS) qm = fmaxf(qm, fabsf(q[i]));
+    for (int i = t; i < G * HD; i += THREADS)
+        qm = fmaxf(qm, fabsf(q[i]));
 #pragma unroll
-    for (int o = 16; o > 0; o >>= 1) qm = fmaxf(qm, __shfl_xor_sync(0xffffffffu, qm, o));
+    for (int o = 16; o > 0; o >>= 1)
+        qm = fmaxf(qm, __shfl_xor_sync(0xffffffffu, qm, o));
     if (lane == 0) S.qmax[warp] = qm;
-    if (t < 16) { S.mrow[t] = -INFINITY; S.lsum[t] = 0.0f; }
+    if (t < 16) {
+        S.mrow[t] = -INFINITY;
+        S.lsum[t] = 0.0f;
+    }
     __syncthreads();
     qm = fmaxf(fmaxf(S.qmax[0], S.qmax[1]), fmaxf(S.qmax[2], S.qmax[3]));
     int qe = 0;
@@ -476,25 +498,34 @@ __global__ void __launch_bounds__(THREADS) prompt_attn_wmma_kernel(const float* 
     for (int kk = 0; kk < 4; ++kk) {
         float x[8];
         if (col < G) {
-            const float4* src = reinterpret_cast<const float4*>(q + (size_t) col * HD + dim0 + kk * 16 + half * 8);
+            const float4* src = reinterpret_cast<const float4*>(q + (size_t)col * HD + dim0 + kk * 16 + half * 8);
             const float4 a = src[0], b = src[1];
-            x[0] = a.x; x[1] = a.y; x[2] = a.z; x[3] = a.w; x[4] = b.x; x[5] = b.y; x[6] = b.z; x[7] = b.w;
+            x[0] = a.x;
+            x[1] = a.y;
+            x[2] = a.z;
+            x[3] = a.w;
+            x[4] = b.x;
+            x[5] = b.y;
+            x[6] = b.z;
+            x[7] = b.w;
         } else {
 #pragma unroll
-            for (int i = 0; i < 8; ++i) x[i] = 0.0f;
+            for (int i = 0; i < 8; ++i)
+                x[i] = 0.0f;
         }
 #pragma unroll
         for (int i = 0; i < 8; ++i) {
             const float v = x[i] * qup;
-            const _Float16 hi = (_Float16) v;
+            const _Float16 hi = (_Float16)v;
             qh[kk][i] = hi;
-            ql[kk][i] = (_Float16) (v - (float) hi);
+            ql[kk][i] = (_Float16)(v - (float)hi);
         }
     }
 
     wf8 acc[4];
 #pragma unroll
-    for (int j = 0; j < 4; ++j) acc[j] = wf8{0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+    for (int j = 0; j < 4; ++j)
+        acc[j] = wf8{0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
 
     const int n_chunks = (n + WCH - 1) / WCH;
     for (int ci = 0; ci < n_chunks; ++ci) {
@@ -502,7 +533,7 @@ __global__ void __launch_bounds__(THREADS) prompt_attn_wmma_kernel(const float* 
         long long myrow = -1;
         if (c0 + lane < n) {
             const int cell = __ldg(ids + c0 + lane);
-            const long long page = (long long) __ldg(p.page_table + cell / page_size);
+            const long long page = (long long)__ldg(p.page_table + cell / page_size);
             if (page >= 0) myrow = (page * n_kv_heads + kvh) * page_size + (cell % page_size);
         }
         {
@@ -510,11 +541,17 @@ __global__ void __launch_bounds__(THREADS) prompt_attn_wmma_kernel(const float* 
             float vsc = 0.0f;
             if (myrow >= 0) {
                 const uint4* src = reinterpret_cast<const uint4*>(p.v_q + myrow * HD + dim0);
-                v0 = __ldg(src); v1 = __ldg(src + 1); v2 = __ldg(src + 2); v3 = __ldg(src + 3);
+                v0 = __ldg(src);
+                v1 = __ldg(src + 1);
+                v2 = __ldg(src + 2);
+                v3 = __ldg(src + 3);
                 vsc = __half2float(__ushort_as_half(__ldg(p.v_scale + myrow * (HD / KV_Q8_GROUP) + warp)));
             }
             uint4* dst = reinterpret_cast<uint4*>(&S.v[warp][lane][0]);
-            dst[0] = v0; dst[1] = v1; dst[2] = v2; dst[3] = v3;
+            dst[0] = v0;
+            dst[1] = v1;
+            dst[2] = v2;
+            dst[3] = v3;
             S.vs[warp][lane] = vsc;
             if (warp == 0) S.valid[lane] = myrow >= 0;
         }
@@ -533,7 +570,8 @@ __global__ void __launch_bounds__(THREADS) prompt_attn_wmma_kernel(const float* 
                 s = wmma_f16(ql[kk], b, s);
             }
 #pragma unroll
-            for (int i = 0; i < 8; ++i) S.part[warp][half * 8 + i][nt * 16 + col] = s[i] * ksc;
+            for (int i = 0; i < 8; ++i)
+                S.part[warp][half * 8 + i][nt * 16 + col] = s[i] * ksc;
         }
         __syncthreads();
         {
@@ -547,7 +585,8 @@ __global__ void __launch_bounds__(THREADS) prompt_attn_wmma_kernel(const float* 
                 mx = fmaxf(mx, x[j]);
             }
 #pragma unroll
-            for (int o = 1; o < 8; o <<= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
+            for (int o = 1; o < 8; o <<= 1)
+                mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
             const float m_old = S.mrow[r];
             const float m_new = fmaxf(m_old, mx);
             float sum = 0.0f;
@@ -558,7 +597,8 @@ __global__ void __launch_bounds__(THREADS) prompt_attn_wmma_kernel(const float* 
                 sum += e;
             }
 #pragma unroll
-            for (int o = 1; o < 8; o <<= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
+            for (int o = 1; o < 8; o <<= 1)
+                sum += __shfl_xor_sync(0xffffffffu, sum, o);
             if (sub == 0) {
                 const float a = m_old == -INFINITY ? 0.0f : exp2f(m_old - m_new);
                 S.alpha[r] = a;
@@ -570,11 +610,13 @@ __global__ void __launch_bounds__(THREADS) prompt_attn_wmma_kernel(const float* 
         {
             float vmax = S.vs[warp][lane];
 #pragma unroll
-            for (int o = 16; o > 0; o >>= 1) vmax = fmaxf(vmax, __shfl_xor_sync(0xffffffffu, vmax, o));
+            for (int o = 16; o > 0; o >>= 1)
+                vmax = fmaxf(vmax, __shfl_xor_sync(0xffffffffu, vmax, o));
             const float vup = vmax > 0.0f ? 16384.0f / vmax : 0.0f, vdown = vmax * (1.0f / 16384.0f);
             wf8 tmp[4];
 #pragma unroll
-            for (int j = 0; j < 4; ++j) tmp[j] = wf8{0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+            for (int j = 0; j < 4; ++j)
+                tmp[j] = wf8{0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
 #pragma unroll
             for (int ks = 0; ks < 2; ++ks) {
                 const int cb = ks * 16 + half * 8;
@@ -582,27 +624,30 @@ __global__ void __launch_bounds__(THREADS) prompt_attn_wmma_kernel(const float* 
 #pragma unroll
                 for (int i = 0; i < 8; ++i) {
                     const float pv = S.p[col][cb + i] * (S.vs[warp][cb + i] * vup);
-                    const _Float16 hi = (_Float16) pv;
+                    const _Float16 hi = (_Float16)pv;
                     ah[i] = hi;
-                    al[i] = (_Float16) (pv - (float) hi);
+                    al[i] = (_Float16)(pv - (float)hi);
                 }
 #pragma unroll
                 for (int j = 0; j < 4; ++j) {
                     const int d = j * 16 + col;
                     wh8 b;
 #pragma unroll
-                    for (int i = 0; i < 8; ++i) b[i] = (_Float16) (int) (int8_t) S.v[warp][cb + i][d];
+                    for (int i = 0; i < 8; ++i)
+                        b[i] = (_Float16)(int)(int8_t)S.v[warp][cb + i][d];
                     tmp[j] = wmma_f16(ah, b, tmp[j]);
                     tmp[j] = wmma_f16(al, b, tmp[j]);
                 }
             }
             float a[8];
 #pragma unroll
-            for (int i = 0; i < 8; ++i) a[i] = S.alpha[half * 8 + i];
+            for (int i = 0; i < 8; ++i)
+                a[i] = S.alpha[half * 8 + i];
 #pragma unroll
             for (int j = 0; j < 4; ++j)
 #pragma unroll
-                for (int i = 0; i < 8; ++i) acc[j][i] = fmaf(acc[j][i], a[i], tmp[j][i] * vdown);
+                for (int i = 0; i < 8; ++i)
+                    acc[j][i] = fmaf(acc[j][i], a[i], tmp[j][i] * vdown);
         }
     }
     float inv[8];
@@ -616,7 +661,7 @@ __global__ void __launch_bounds__(THREADS) prompt_attn_wmma_kernel(const float* 
 #pragma unroll
         for (int i = 0; i < 8; ++i) {
             const int row = half * 8 + i;
-            if (row < G) attn[(size_t) row * HD + dim0 + j * 16 + col] = acc[j][i] * inv[i];
+            if (row < G) attn[(size_t)row * HD + dim0 + j * 16 + col] = acc[j][i] * inv[i];
         }
 #else
     __builtin_trap();
@@ -631,10 +676,16 @@ bool hip_wmma_usable() {
     if (!want) return false;
     static int arch[64] = {};
     int dev = 0;
-    if (hipGetDevice(&dev) != hipSuccess || dev < 0 || dev >= 64) { (void) hipGetLastError(); return false; }
+    if (hipGetDevice(&dev) != hipSuccess || dev < 0 || dev >= 64) {
+        (void)hipGetLastError();
+        return false;
+    }
     if (arch[dev] == 0) {
         hipDeviceProp_t prop{};
-        if (hipGetDeviceProperties(&prop, dev) != hipSuccess) { (void) hipGetLastError(); return false; }
+        if (hipGetDeviceProperties(&prop, dev) != hipSuccess) {
+            (void)hipGetLastError();
+            return false;
+        }
         arch[dev] = std::strncmp(prop.gcnArchName, "gfx12", 5) == 0 ? 1 : 2;
         static bool told = false;
         if (!told) {
@@ -648,12 +699,12 @@ bool hip_wmma_usable() {
 
 bool launch_wmma(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps, int64_t cap,
                  const QsaShapes& s, float* attn, int64_t n_q, cudaStream_t st) {
-    const float scale_log2 = 1.4426950408889634f / sqrtf((float) HD);
+    const float scale_log2 = 1.4426950408889634f / sqrtf((float)HD);
     for (int64_t q0 = 0; q0 < n_q; q0 += 65535) {
         const int64_t nb = n_q - q0 < 65535 ? n_q - q0 : 65535;
-        prompt_attn_wmma_kernel<<<dim3((unsigned) nb, (unsigned) s.n_head_kv), THREADS, 0, st>>>(
-            q + q0 * s.n_head * HD, pools, ids + q0 * cap, steps + q0 * kStepCount, (int) s.n_head_kv,
-            (int) s.page_size, scale_log2, attn + q0 * s.n_head * HD, (int) cap);
+        prompt_attn_wmma_kernel<<<dim3((unsigned)nb, (unsigned)s.n_head_kv), THREADS, 0, st>>>(
+            q + q0 * s.n_head * HD, pools, ids + q0 * cap, steps + q0 * kStepCount, (int)s.n_head_kv, (int)s.page_size,
+            scale_log2, attn + q0 * s.n_head * HD, (int)cap);
     }
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
@@ -666,28 +717,25 @@ bool launch_wmma(const float* q, const QsaAttnPools& pools, const int32_t* ids, 
 
 }  // namespace
 
-bool qsa_prompt_attn_batch(const float *q, const QsaAttnPools &pools,
-                           const int32_t *ids, const int32_t *steps,
-                           int64_t cap, const QsaShapes &s, float *attn,
-                           int64_t n_q, void *stream) {
+bool qsa_prompt_attn_batch(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps,
+                           int64_t cap, const QsaShapes& s, float* attn, int64_t n_q, void* stream) {
     if (n_q <= 0) return true;
     static sycl::queue default_queue{sycl::property::queue::in_order()};
     sycl::queue* q_ptr = stream ? static_cast<sycl::queue*>(stream) : &default_queue;
 
 #if defined(__HIPCC__)
     if (pools.k_q != nullptr && pools.v_q != nullptr && pools.k_scale != nullptr && pools.v_scale != nullptr &&
-        pools.k_q4 == nullptr && pools.v_q4 == nullptr && s.head_dim == HD && s.n_head == (int64_t) G * s.n_head_kv &&
+        pools.k_q4 == nullptr && pools.v_q4 == nullptr && s.head_dim == HD && s.n_head == (int64_t)G * s.n_head_kv &&
         cap > 0 && ids && steps && pools.page_table && hip_wmma_usable())
-        return launch_wmma(q, pools, ids, steps, cap, s, attn, n_q, (cudaStream_t) stream);
+        return launch_wmma(q, pools, ids, steps, cap, s, attn, n_q, (cudaStream_t)stream);
     return false;
 #endif
 
-    if (pools.k_q4 != nullptr || s.head_dim != HD || s.n_head != (int64_t) G * s.n_head_kv || cap <= 0 || !ids ||
+    if (pools.k_q4 != nullptr || s.head_dim != HD || s.n_head != (int64_t)G * s.n_head_kv || cap <= 0 || !ids ||
         !steps || !pools.page_table)
         return false;
 
-    if (!has_xmx_matrix(q_ptr->get_device()))
-        return false;
+    if (!has_xmx_matrix(q_ptr->get_device())) return false;
 
     const size_t have = q_ptr->get_device().get_info<sycl::info::device::local_mem_size>();
     static const int chunk_override = [] {

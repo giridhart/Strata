@@ -10,9 +10,9 @@
 #include <cstring>
 
 using strata::kernels::bf16_from_f32;
-using strata::kernels::f32_from_bf16;
 using strata::kernels::bf16_gemv_fp32_mmvf;
 using strata::kernels::bf16_gemv_fp32_mmvf_multi;
+using strata::kernels::f32_from_bf16;
 
 namespace {
 
@@ -27,7 +27,7 @@ void cpu_reference(const float* x, const uint16_t* w, float* y, int64_t n_in, in
     }
 }
 
-} // namespace
+}  // namespace
 
 int main() {
     sycl::queue q{sycl::property::queue::in_order()};
@@ -40,14 +40,12 @@ int main() {
         const char* desc;
     };
 
-    const Shape shapes[] = {
-        {128, 32, "tiny [128, 32]"},
-        {512, 64, "small [512, 64]"},
-        {2560, 48, "ssm_alpha [2560, 48]"},
-        {2560, 128, "indexer.k_proj [2560, 128]"},
-        {2560, 512, "indexer.q_proj [2560, 512]"},
-        {2560, 2560, "ple_value [2560, 2560]"}
-    };
+    const Shape shapes[] = {{128, 32, "tiny [128, 32]"},
+                            {512, 64, "small [512, 64]"},
+                            {2560, 48, "ssm_alpha [2560, 48]"},
+                            {2560, 128, "indexer.k_proj [2560, 128]"},
+                            {2560, 512, "indexer.q_proj [2560, 512]"},
+                            {2560, 2560, "ple_value [2560, 2560]"}};
 
     std::mt19937 rng(1337);
     std::normal_distribution<float> dist(0.0f, 1.0f);
@@ -60,8 +58,10 @@ int main() {
         std::vector<float> h_y_ref(s.n_out);
         std::vector<float> h_y_dev(s.n_out);
 
-        for (auto& val : h_x) val = dist(rng);
-        for (auto& val : h_w) val = bf16_from_f32(dist(rng) * 0.05f);
+        for (auto& val : h_x)
+            val = dist(rng);
+        for (auto& val : h_w)
+            val = bf16_from_f32(dist(rng) * 0.05f);
 
         cpu_reference(h_x.data(), h_w.data(), h_y_ref.data(), s.n_in, s.n_out);
 
@@ -86,8 +86,7 @@ int main() {
             if (rel > max_rel) max_rel = rel;
             if (rel > 5e-3f && diff > 1e-4f) bad_single++;
         }
-        printf("  single %-25s: max_rel = %.3e, bad = %d / %ld\n",
-               s.desc, max_rel, bad_single, (long)s.n_out);
+        printf("  single %-25s: max_rel = %.3e, bad = %d / %ld\n", s.desc, max_rel, bad_single, (long)s.n_out);
         total_bad += bad_single;
 
         // 2. Multi-token test with exact bit-identical parity against single-token
@@ -99,7 +98,8 @@ int main() {
             std::vector<float> h_multi_y((size_t)n_tok * ldy);
             std::vector<float> h_single_ys((size_t)n_tok * ldy);
 
-            for (auto& val : h_multi_x) val = dist(rng);
+            for (auto& val : h_multi_x)
+                val = dist(rng);
 
             float* d_multi_x = sycl::malloc_device<float>((size_t)n_tok * ldx, q);
             float* d_multi_y = sycl::malloc_device<float>((size_t)n_tok * ldy, q);

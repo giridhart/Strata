@@ -36,13 +36,10 @@ namespace {
 /// Direct-to-Register Dequantization + XMX Systolic Tile (8x16x16)
 /// Unpacks 4-bit weights in-register and feeds directly to joint_matrix_mad.
 template <size_t TM = 8, size_t TN = 16, size_t TK = 16>
-void dequant_register_dpas_kernel(sycl::nd_item<2> item,
-                                  const sycl::half* __restrict__ act,
-                                  const uint8_t* __restrict__ qweights, // 4-bit packed weights
-                                  const sycl::half* __restrict__ scales,
-                                  float* __restrict__ out,
-                                  size_t M, size_t N, size_t K,
-                                  sycl::local_accessor<sycl::half, 1> dequant_tile) {
+void dequant_register_dpas_kernel(sycl::nd_item<2> item, const sycl::half* __restrict__ act,
+                                  const uint8_t* __restrict__ qweights,  // 4-bit packed weights
+                                  const sycl::half* __restrict__ scales, float* __restrict__ out, size_t M, size_t N,
+                                  size_t K, sycl::local_accessor<sycl::half, 1> dequant_tile) {
     auto sg = item.get_sub_group();
     const size_t tile_m = item.get_group(0) * TM;
     const size_t tile_n = item.get_group(1) * TN;
@@ -55,14 +52,15 @@ void dequant_register_dpas_kernel(sycl::nd_item<2> item,
     for (size_t k = 0; k < K; k += TK) {
         // Load activation tile
         joint_matrix<sycl::sub_group, sycl::half, use::a, TM, TK, layout::row_major> sub_a;
-        auto ptr_a = sycl::address_space_cast<sycl::access::address_space::global_space, sycl::access::decorated::no>(act + tile_m * K + k);
+        auto ptr_a = sycl::address_space_cast<sycl::access::address_space::global_space, sycl::access::decorated::no>(
+            act + tile_m * K + k);
         joint_matrix_load(sg, sub_a, ptr_a, K);
 
         // Dequantize 4-bit weights into local tile without global barrier
         const int lane = sg.get_local_linear_id();
         const float scale = static_cast<float>(scales[(k / 32) * N + tile_n + lane]);
 
-        #pragma unroll
+#pragma unroll
         for (size_t row = 0; row < TK; ++row) {
             const size_t byte_idx = ((k + row) * N + tile_n + lane) / 2;
             const uint8_t byte_val = qweights[byte_idx];
@@ -71,25 +69,24 @@ void dequant_register_dpas_kernel(sycl::nd_item<2> item,
         }
 
         joint_matrix<sycl::sub_group, sycl::half, use::b, TK, TN, layout::row_major> sub_b;
-        auto ptr_b = sycl::address_space_cast<sycl::access::address_space::local_space, sycl::access::decorated::no>(&dequant_tile[0]);
+        auto ptr_b = sycl::address_space_cast<sycl::access::address_space::local_space, sycl::access::decorated::no>(
+            &dequant_tile[0]);
         joint_matrix_load(sg, sub_b, ptr_b, TN);
 
         joint_matrix_mad(sg, sub_c, sub_a, sub_b, sub_c);
     }
 
-    auto ptr_c = sycl::address_space_cast<sycl::access::address_space::global_space, sycl::access::decorated::no>(out + tile_m * N + tile_n);
+    auto ptr_c = sycl::address_space_cast<sycl::access::address_space::global_space, sycl::access::decorated::no>(
+        out + tile_m * N + tile_n);
     joint_matrix_store(sg, sub_c, ptr_c, N, layout::row_major);
 }
 
 /// SLM-Buffered Dequantization + XMX Systolic Tile
 /// Buffers dequantized FP16 blocks in Shared Local Memory with barriers before XMX consumption.
 template <size_t TM = 8, size_t TN = 16, size_t TK = 16>
-void dequant_slm_dpas_kernel(sycl::nd_item<2> item,
-                             const sycl::half* __restrict__ act,
-                             const uint8_t* __restrict__ qweights,
-                             const sycl::half* __restrict__ scales,
-                             float* __restrict__ out,
-                             size_t M, size_t N, size_t K,
+void dequant_slm_dpas_kernel(sycl::nd_item<2> item, const sycl::half* __restrict__ act,
+                             const uint8_t* __restrict__ qweights, const sycl::half* __restrict__ scales,
+                             float* __restrict__ out, size_t M, size_t N, size_t K,
                              sycl::local_accessor<sycl::half, 1> slm_b) {
     auto sg = item.get_sub_group();
     const size_t tile_m = item.get_group(0) * TM;
@@ -102,14 +99,15 @@ void dequant_slm_dpas_kernel(sycl::nd_item<2> item,
 
     for (size_t k = 0; k < K; k += TK) {
         joint_matrix<sycl::sub_group, sycl::half, use::a, TM, TK, layout::row_major> sub_a;
-        auto ptr_a = sycl::address_space_cast<sycl::access::address_space::global_space, sycl::access::decorated::no>(act + tile_m * K + k);
+        auto ptr_a = sycl::address_space_cast<sycl::access::address_space::global_space, sycl::access::decorated::no>(
+            act + tile_m * K + k);
         joint_matrix_load(sg, sub_a, ptr_a, K);
 
         // Dequantize to SLM buffer
         const int lane = sg.get_local_linear_id();
         const float scale = static_cast<float>(scales[(k / 32) * N + tile_n + lane]);
 
-        #pragma unroll
+#pragma unroll
         for (size_t row = 0; row < TK; ++row) {
             const size_t byte_idx = ((k + row) * N + tile_n + lane) / 2;
             const uint8_t byte_val = qweights[byte_idx];
@@ -119,18 +117,20 @@ void dequant_slm_dpas_kernel(sycl::nd_item<2> item,
         item.barrier(sycl::access::fence_space::local_space);
 
         joint_matrix<sycl::sub_group, sycl::half, use::b, TK, TN, layout::row_major> sub_b;
-        auto ptr_b = sycl::address_space_cast<sycl::access::address_space::local_space, sycl::access::decorated::no>(&slm_b[0]);
+        auto ptr_b =
+            sycl::address_space_cast<sycl::access::address_space::local_space, sycl::access::decorated::no>(&slm_b[0]);
         joint_matrix_load(sg, sub_b, ptr_b, TN);
 
         joint_matrix_mad(sg, sub_c, sub_a, sub_b, sub_c);
         item.barrier(sycl::access::fence_space::local_space);
     }
 
-    auto ptr_c = sycl::address_space_cast<sycl::access::address_space::global_space, sycl::access::decorated::no>(out + tile_m * N + tile_n);
+    auto ptr_c = sycl::address_space_cast<sycl::access::address_space::global_space, sycl::access::decorated::no>(
+        out + tile_m * N + tile_n);
     joint_matrix_store(sg, sub_c, ptr_c, N, layout::row_major);
 }
 
-} // namespace
+}  // namespace
 
 // ============================================================================
 // Benchmarks
@@ -144,21 +144,21 @@ static void BM_Xe2_Dequant_DirectRegister(benchmark::State& state) {
     sycl::queue q{sycl::default_selector_v, {sycl::property::queue::enable_profiling()}};
 
     const size_t act_size = M * K;
-    const size_t qweight_bytes = (K * N) / 2; // 4-bit packed
+    const size_t qweight_bytes = (K * N) / 2;  // 4-bit packed
     const size_t scale_size = (K / 32) * N;
     const size_t out_size = M * N;
 
-    sycl::half* d_act       = sycl::malloc_device<sycl::half>(act_size, q);
-    uint8_t* d_qweights     = sycl::malloc_device<uint8_t>(qweight_bytes, q);
-    sycl::half* d_scales    = sycl::malloc_device<sycl::half>(scale_size, q);
-    float* d_out            = sycl::malloc_device<float>(out_size, q);
+    sycl::half* d_act = sycl::malloc_device<sycl::half>(act_size, q);
+    uint8_t* d_qweights = sycl::malloc_device<uint8_t>(qweight_bytes, q);
+    sycl::half* d_scales = sycl::malloc_device<sycl::half>(scale_size, q);
+    float* d_out = sycl::malloc_device<float>(out_size, q);
 
     if (!d_act || !d_qweights || !d_scales || !d_out) {
         state.SkipWithError("Failed to allocate USM memory for Dequant DPAS benchmark");
-        if (d_act)      sycl::free(d_act, q);
+        if (d_act) sycl::free(d_act, q);
         if (d_qweights) sycl::free(d_qweights, q);
-        if (d_scales)   sycl::free(d_scales, q);
-        if (d_out)      sycl::free(d_out, q);
+        if (d_scales) sycl::free(d_scales, q);
+        if (d_out) sycl::free(d_out, q);
         return;
     }
 
@@ -176,11 +176,11 @@ static void BM_Xe2_Dequant_DirectRegister(benchmark::State& state) {
 
     auto launch = [&](sycl::handler& cgh) {
         sycl::local_accessor<sycl::half, 1> dequant_tile(sycl::range<1>(TK * TN), cgh);
-        cgh.parallel_for(
-            sycl::nd_range<2>(sycl::range<2>(grid_m, grid_n * 16), sycl::range<2>(1, 16)),
-            [=](sycl::nd_item<2> item) [[sycl::reqd_sub_group_size(16)]] {
-                dequant_register_dpas_kernel<8, 16, 16>(item, d_act, d_qweights, d_scales, d_out, M, N, K, dequant_tile);
-            });
+        cgh.parallel_for(sycl::nd_range<2>(sycl::range<2>(grid_m, grid_n * 16), sycl::range<2>(1, 16)),
+                         [=](sycl::nd_item<2> item) [[sycl::reqd_sub_group_size(16)]] {
+                             dequant_register_dpas_kernel<8, 16, 16>(item, d_act, d_qweights, d_scales, d_out, M, N, K,
+                                                                     dequant_tile);
+                         });
     };
 
     // Warmup
@@ -196,14 +196,17 @@ static void BM_Xe2_Dequant_DirectRegister(benchmark::State& state) {
         state.SetIterationTime((t1 - t0) * 1e-9);
     }
 
-    const double bytes = static_cast<double>(act_size) * sizeof(sycl::half) +
-                         static_cast<double>(qweight_bytes) +
+    const double bytes = static_cast<double>(act_size) * sizeof(sycl::half) + static_cast<double>(qweight_bytes) +
                          static_cast<double>(scale_size) * sizeof(sycl::half) +
                          static_cast<double>(out_size) * sizeof(float);
 
-    state.counters["Bandwidth_GBps"] = benchmark::Counter(bytes, benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
-    state.counters["TFLOPS"]         = benchmark::Counter(2.0 * static_cast<double>(M * K * N), benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
-    state.counters["tokens_per_sec"] = benchmark::Counter(static_cast<double>(M), benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
+    state.counters["Bandwidth_GBps"] =
+        benchmark::Counter(bytes, benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
+    state.counters["TFLOPS"] =
+        benchmark::Counter(2.0 * static_cast<double>(M * K * N), benchmark::Counter::kIsIterationInvariantRate,
+                           benchmark::Counter::kIs1000);
+    state.counters["tokens_per_sec"] = benchmark::Counter(
+        static_cast<double>(M), benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
 
     sycl::free(d_act, q);
     sycl::free(d_qweights, q);
@@ -223,17 +226,17 @@ static void BM_Xe2_Dequant_SLMBuffered(benchmark::State& state) {
     const size_t scale_size = (K / 32) * N;
     const size_t out_size = M * N;
 
-    sycl::half* d_act       = sycl::malloc_device<sycl::half>(act_size, q);
-    uint8_t* d_qweights     = sycl::malloc_device<uint8_t>(qweight_bytes, q);
-    sycl::half* d_scales    = sycl::malloc_device<sycl::half>(scale_size, q);
-    float* d_out            = sycl::malloc_device<float>(out_size, q);
+    sycl::half* d_act = sycl::malloc_device<sycl::half>(act_size, q);
+    uint8_t* d_qweights = sycl::malloc_device<uint8_t>(qweight_bytes, q);
+    sycl::half* d_scales = sycl::malloc_device<sycl::half>(scale_size, q);
+    float* d_out = sycl::malloc_device<float>(out_size, q);
 
     if (!d_act || !d_qweights || !d_scales || !d_out) {
         state.SkipWithError("Failed to allocate USM memory for Dequant DPAS benchmark");
-        if (d_act)      sycl::free(d_act, q);
+        if (d_act) sycl::free(d_act, q);
         if (d_qweights) sycl::free(d_qweights, q);
-        if (d_scales)   sycl::free(d_scales, q);
-        if (d_out)      sycl::free(d_out, q);
+        if (d_scales) sycl::free(d_scales, q);
+        if (d_out) sycl::free(d_out, q);
         return;
     }
 
@@ -251,11 +254,11 @@ static void BM_Xe2_Dequant_SLMBuffered(benchmark::State& state) {
 
     auto launch = [&](sycl::handler& cgh) {
         sycl::local_accessor<sycl::half, 1> slm_b(sycl::range<1>(TK * TN), cgh);
-        cgh.parallel_for(
-            sycl::nd_range<2>(sycl::range<2>(grid_m, grid_n * 16), sycl::range<2>(1, 16)),
-            [=](sycl::nd_item<2> item) [[sycl::reqd_sub_group_size(16)]] {
-                dequant_slm_dpas_kernel<8, 16, 16>(item, d_act, d_qweights, d_scales, d_out, M, N, K, slm_b);
-            });
+        cgh.parallel_for(sycl::nd_range<2>(sycl::range<2>(grid_m, grid_n * 16), sycl::range<2>(1, 16)),
+                         [=](sycl::nd_item<2> item) [[sycl::reqd_sub_group_size(16)]] {
+                             dequant_slm_dpas_kernel<8, 16, 16>(item, d_act, d_qweights, d_scales, d_out, M, N, K,
+                                                                slm_b);
+                         });
     };
 
     // Warmup
@@ -271,14 +274,17 @@ static void BM_Xe2_Dequant_SLMBuffered(benchmark::State& state) {
         state.SetIterationTime((t1 - t0) * 1e-9);
     }
 
-    const double bytes = static_cast<double>(act_size) * sizeof(sycl::half) +
-                         static_cast<double>(qweight_bytes) +
+    const double bytes = static_cast<double>(act_size) * sizeof(sycl::half) + static_cast<double>(qweight_bytes) +
                          static_cast<double>(scale_size) * sizeof(sycl::half) +
                          static_cast<double>(out_size) * sizeof(float);
 
-    state.counters["Bandwidth_GBps"] = benchmark::Counter(bytes, benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
-    state.counters["TFLOPS"]         = benchmark::Counter(2.0 * static_cast<double>(M * K * N), benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
-    state.counters["tokens_per_sec"] = benchmark::Counter(static_cast<double>(M), benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
+    state.counters["Bandwidth_GBps"] =
+        benchmark::Counter(bytes, benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
+    state.counters["TFLOPS"] =
+        benchmark::Counter(2.0 * static_cast<double>(M * K * N), benchmark::Counter::kIsIterationInvariantRate,
+                           benchmark::Counter::kIs1000);
+    state.counters["tokens_per_sec"] = benchmark::Counter(
+        static_cast<double>(M), benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
 
     sycl::free(d_act, q);
     sycl::free(d_qweights, q);

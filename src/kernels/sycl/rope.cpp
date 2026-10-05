@@ -31,7 +31,6 @@
 
 #include <cmath>
 
-
 #include <cstdio>
 #include <cstdlib>
 
@@ -51,17 +50,17 @@ void build_rope_table(int n_rot, double theta, int max_pos, float* cos_tab, floa
     for (int p = 0; p < max_pos; ++p) {
         for (int i = 0; i < half; ++i) {
             // float64 throughout, in the reference's order: inv, then ang, then cos/sin
-            const double inv = std::pow(theta, -2.0 * (double) i / (double) n_rot);
-            const double ang = (double) p * inv;
-            cos_tab[(size_t) p * half + i] = (float) std::cos(ang);
-            sin_tab[(size_t) p * half + i] = (float) std::sin(ang);
+            const double inv = std::pow(theta, -2.0 * (double)i / (double)n_rot);
+            const double ang = (double)p * inv;
+            cos_tab[(size_t)p * half + i] = (float)std::cos(ang);
+            sin_tab[(size_t)p * half + i] = (float)std::sin(ang);
         }
     }
 }
 
 void build_rope_table(int n_rot, const RopeScaling& sc, int max_pos, float* cos_tab, float* sin_tab) {
     if (sc.type == RopeScalingType::None) {
-        build_rope_table(n_rot, sc.freq_base, max_pos, cos_tab, sin_tab);   // the original loop, verbatim
+        build_rope_table(n_rot, sc.freq_base, max_pos, cos_tab, sin_tab);  // the original loop, verbatim
         return;
     }
     const int half = n_rot / 2;
@@ -69,19 +68,19 @@ void build_rope_table(int n_rot, const RopeScaling& sc, int max_pos, float* cos_
     const double ms = sc.mscale();
     double cd[2];
     sc.corr_dims(n_rot, cd);
-    const bool correct = sc.ext_factor != 0;   // ggml: the correction rides on ext_factor, not the type
+    const bool correct = sc.ext_factor != 0;  // ggml: the correction rides on ext_factor, not the type
     for (int p = 0; p < max_pos; ++p) {
         for (int i = 0; i < half; ++i) {
-            const double inv = std::pow(sc.freq_base, -2.0 * (double) i / (double) n_rot);
-            const double extrap = (double) p * inv;    // the trained angle, ggml's theta_extrap
-            const double interp = fs * extrap;         // ggml's theta_interp
+            const double inv = std::pow(sc.freq_base, -2.0 * (double)i / (double)n_rot);
+            const double extrap = (double)p * inv;  // the trained angle, ggml's theta_extrap
+            const double interp = fs * extrap;      // ggml's theta_interp
             double ang = interp;
             if (correct) {
-                const double ramp = (double) rope_yarn_ramp((float) cd[0], (float) cd[1], i) * sc.ext_factor;
+                const double ramp = (double)rope_yarn_ramp((float)cd[0], (float)cd[1], i) * sc.ext_factor;
                 ang = interp * (1.0 - ramp) + extrap * ramp;
             }
-            cos_tab[(size_t) p * half + i] = (float) (std::cos(ang) * ms);
-            sin_tab[(size_t) p * half + i] = (float) (std::sin(ang) * ms);
+            cos_tab[(size_t)p * half + i] = (float)(std::cos(ang) * ms);
+            sin_tab[(size_t)p * half + i] = (float)(std::sin(ang) * ms);
         }
     }
 }
@@ -95,21 +94,22 @@ namespace {
 //
 // A row is head_dim floats (256 here) and there are batch x heads of them, so one thread per row is a
 // handful of threads for a token and removes the ordering question entirely rather than synchronising it.
-// 
-// Dimension Mapping: 1D SYCL grid used (item.get_global_id(0) maps precisely to CUDA blockIdx.x * blockDim.x + threadIdx.x)
+//
+// Dimension Mapping: 1D SYCL grid used (item.get_global_id(0) maps precisely to CUDA blockIdx.x * blockDim.x +
+// threadIdx.x)
 void rope_neox_kernel(sycl::nd_item<1> item, const float* __restrict__ x, float* __restrict__ out, long long rows,
-                                 int head_dim, int n_rot, const float* __restrict__ cos_tab,
-                                 const float* __restrict__ sin_tab, const int* __restrict__ pos,
-                                 const int32_t* __restrict__ mtab) {
+                      int head_dim, int n_rot, const float* __restrict__ cos_tab, const float* __restrict__ sin_tab,
+                      const int* __restrict__ pos, const int32_t* __restrict__ mtab) {
     const long long r = item.get_global_id(0);
     if (r >= rows) return;
     const int half = n_rot / 2;
     const float* xr = x + r * head_dim;
     float* orow = out + r * head_dim;
 
-    for (int d = n_rot; d < head_dim; ++d) orow[d] = xr[d];      // the PARTIAL rotation's untouched tail
+    for (int d = n_rot; d < head_dim; ++d)
+        orow[d] = xr[d];  // the PARTIAL rotation's untouched tail
     for (int i = 0; i < half; ++i) {
-        const size_t toff = (size_t) mrope_pos(mtab, pos[r], i) * half;   // the image path's per-pair position
+        const size_t toff = (size_t)mrope_pos(mtab, pos[r], i) * half;  // the image path's per-pair position
         // THE PAIRING AND THE SIGNS COME FROM `rope_neox_pair`, shared with the indexer's pooling kernel.
         rope_neox_pair(xr[i], xr[half + i], cos_tab[toff + i], sin_tab[toff + i], orow[i], orow[half + i]);
     }
@@ -128,18 +128,13 @@ void rope_neox_apply(const float* x, float* out, int64_t rows, int head_dim, int
         std::exit(1);
     }
     const int threads = 128;
-    const unsigned grid = (unsigned) ((rows + threads - 1) / threads);
-    
-    
+    const unsigned grid = (unsigned)((rows + threads - 1) / threads);
 
-    q->submit([&](sycl::handler &cgh) {
+    q->submit([&](sycl::handler& cgh) {
         auto mrope_table_ct8 = mrope_table();
-        cgh.parallel_for(sycl::nd_range<1>(grid * threads, threads),
-                         [=](sycl::nd_item<1> item) {
-                             rope_neox_kernel(item, x, out, rows, head_dim, n_rot,
-                                              cos_tab, sin_tab, pos,
-                                              mrope_table_ct8);
-                         });
+        cgh.parallel_for(sycl::nd_range<1>(grid * threads, threads), [=](sycl::nd_item<1> item) {
+            rope_neox_kernel(item, x, out, rows, head_dim, n_rot, cos_tab, sin_tab, pos, mrope_table_ct8);
+        });
     });
 
     if (stream == nullptr) q->wait();
