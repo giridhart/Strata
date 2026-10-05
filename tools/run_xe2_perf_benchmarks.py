@@ -128,6 +128,31 @@ BENCHMARK_TARGETS = [
         "title": "Paged KV Cache Traffic & Indirection Penalty",
         "description": "Non-contiguous paged gather vs contiguous memory, page size sweep (16..128) and INT8 vs FP16",
     },
+    # Tier 4: Output Layer, Transform & Autoregressive Endpoints
+    {
+        "name": "perf_lmhead_sampler",
+        "tier": 4,
+        "title": "LM Head 248K Vocab & GPU Sampler",
+        "description": "2560 -> 248,320 output projection, parallel softmax reduction, and 4-byte token readback",
+    },
+    {
+        "name": "perf_fwht_kv4",
+        "tier": 4,
+        "title": "Fast Walsh-Hadamard Transform & Q4_0 KV",
+        "description": "8-stage butterfly FWHT256 in-register rotation, Q4_0 block quantize, and rotated decode attention",
+    },
+    {
+        "name": "perf_ple_ngram",
+        "tier": 4,
+        "title": "Layer 1 Per-Layer Embedding & N-gram",
+        "description": "Layer 1 unique block: 1,440 B row upload, Conv1D history shift, projections and gated residual update",
+    },
+    {
+        "name": "perf_embed_overlap",
+        "tier": 4,
+        "title": "Embedding Dequant & Readback Overlap",
+        "description": "Column dequantization (BF16/Q8_0/Q4_K), 4-byte D2H barrier, and on-device autoregressive chaining",
+    },
 ]
 
 
@@ -319,6 +344,23 @@ def generate_markdown_report(
             paged_bw = next((b.get("Bandwidth_GBps", 0) for b in benchmarks if "KV_Paged/4096" in b.get("name", "")), 0) / 1e9
             penalty = ((contig_bw - paged_bw) / contig_bw * 100.0) if contig_bw > 0 else 0
             metric_str = f"Contiguous: **{contig_bw:.2f} GB/s** vs Paged: **{paged_bw:.2f} GB/s** (Penalty: **{penalty:.1f}%**)"
+        elif tname == "perf_lmhead_sampler":
+            head_tflops = next((b.get("TFLOPS", 0) for b in benchmarks if "LMHead_GEMV/65536" in b.get("name", "")), 0) / 1e12
+            samp_bw = next((b.get("Bandwidth_GBps", 0) for b in benchmarks if "Sampler_Reduce" in b.get("name", "")), 0) / 1e9
+            metric_str = f"Head: **{head_tflops:.2f} TFLOPS** (64K) | Sampler: **{samp_bw:.2f} GB/s** (248K)"
+        elif tname == "perf_fwht_kv4":
+            fwht_gflops = next((b.get("GFLOPS", 0) for b in benchmarks if "FWHT256_Compute/64" in b.get("name", "")), 0)
+            comp_x = next((b.get("Compression_x", 0) for b in benchmarks if "KV_Quant_Q4_Rotated" in b.get("name", "")), 0)
+            metric_str = f"FWHT256: **{fwht_gflops:.1f} GFLOPS** | Compression: **{comp_x:.2f}x** (576 B/cell)"
+        elif tname == "perf_ple_ngram":
+            ple_t = next((b.get("real_time", 0) for b in benchmarks if "PLE_GPU_Block" in b.get("name", "")), 0)
+            up_lat = next((b.get("real_time", 0) for b in benchmarks if "PLE_Row_Upload" in b.get("name", "")), 0)
+            metric_str = f"PLE GPU Block: **{ple_t/1e3:.1f} µs** | Row Upload: **{up_lat/1e3:.1f} µs**"
+        elif tname == "perf_embed_overlap":
+            sync_t = next((b.get("real_time", 0) for b in benchmarks if "Autoregressive_Sync" in b.get("name", "")), 0)
+            async_t = next((b.get("real_time", 0) for b in benchmarks if "Autoregressive_Async" in b.get("name", "")), 0)
+            ratio = (sync_t / async_t) if async_t > 0 else 0
+            metric_str = f"Async: **{async_t/1e3:.1f} µs** vs Sync: **{sync_t/1e3:.1f} µs** (**{ratio:.2f}x faster**)"
 
         md.append(f"| **{target['title']}** | {target['description']} | {metric_str} | ✅ PASS |\n")
 
@@ -401,7 +443,7 @@ def generate_markdown_report(
 def main():
     p = argparse.ArgumentParser(description="Intel Xe2 / Arc B580 Benchmark Runner & Reporter")
     p.add_argument("--build-dir", default="build_sycl", help="Path to build directory containing perf binaries")
-    p.add_argument("--suite", choices=["all", "tier1", "tier2", "tier3"], default="all", help="Select benchmark tier")
+    p.add_argument("--suite", choices=["all", "tier1", "tier2", "tier3", "tier4"], default="all", help="Select benchmark tier")
     p.add_argument("--quick", action="store_true", help="Run in fast smoke mode (min_time=0.05s)")
     p.add_argument("--repetitions", type=int, default=1, help="Number of benchmark repetitions per test")
     p.add_argument("--filter", default="", help="Regex filter to pass to Google Benchmark --benchmark_filter")
@@ -437,6 +479,8 @@ def main():
         if args.suite == "tier2" and t["tier"] != 2:
             continue
         if args.suite == "tier3" and t["tier"] != 3:
+            continue
+        if args.suite == "tier4" and t["tier"] != 4:
             continue
         targets_to_run.append(t)
 

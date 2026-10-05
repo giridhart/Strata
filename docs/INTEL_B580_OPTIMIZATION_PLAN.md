@@ -195,11 +195,15 @@ flowchart TD
 | **P13** | Benchmark Quantized KV Cache Flash-Decoding (up to 262K) | [`perf/sycl/perf_kv_decode.cpp`](../perf/sycl/perf_kv_decode.cpp) | **COMPLETED & COMPILED** | Sweeps FP16 & INT8 attention across 1K–65K context lengths |
 | **P14** | Benchmark Prefill Native Tiled GEMM Scaling on Xe2 XMX | [`perf/sycl/perf_prefill_gemm.cpp`](../perf/sycl/perf_prefill_gemm.cpp) | **COMPLETED & COMPILED** | Up to 3.00 TFLOPS on Lunar Lake; ready for 117 TFLOPS scaling on B580 |
 | **P15** | Benchmark MTP Multi-Token Speculative Verification | [`perf/sycl/perf_speculative_verify.cpp`](../perf/sycl/perf_speculative_verify.cpp) | **COMPLETED & COMPILED** | 6.6x verification throughput scaling from B=1 (10.2k tok/s) to B=8 (68.0k tok/s) |
-| **P17** | Automated Xe2/B580 Benchmark Runner & Reporter | [`tools/run_xe2_perf_benchmarks.py`](../tools/run_xe2_perf_benchmarks.py) | **COMPLETED** | Single-command execution of all 15 suites, consolidated JSON, and Markdown report generation |
+| **P17** | Automated Xe2/B580 Benchmark Runner & Reporter | [`tools/run_xe2_perf_benchmarks.py`](../tools/run_xe2_perf_benchmarks.py) | **COMPLETED** | Single-command execution of all 19 suites, consolidated JSON, and Markdown report generation |
 | **P18** | Benchmark Residual Stream Handover & Fused GR | [`perf/sycl/perf_residual_pipeline.cpp`](../perf/sycl/perf_residual_pipeline.cpp) | **COMPLETED & COMPILED** | 40.96 KB R roundtrip elimination, L3 cache residency, and 1-to-8 layer chaining |
 | **P19** | Benchmark Full 9-Kernel Composite Layer Pipeline | [`perf/sycl/perf_layer_pipeline.cpp`](../perf/sycl/perf_layer_pipeline.cpp) | **COMPLETED & COMPILED** | End-to-end forward pass simulation: 74.8 GB/s pipelined vs Command Graph execution |
 | **P20** | Benchmark MoE Doorbell Handshake & Expert Streaming | [`perf/sycl/perf_moe_doorbell_stream.cpp`](../perf/sycl/perf_moe_doorbell_stream.cpp) | **COMPLETED & COMPILED** | 51.2 KB PCIe transfer in 11.1 µs; 160.6 µs positive overlap slack behind shared expert |
 | **P21** | Benchmark Paged KV Cache Memory Traffic & Indirection | [`perf/sycl/perf_paged_kv_traffic.cpp`](../perf/sycl/perf_paged_kv_traffic.cpp) | **COMPLETED & COMPILED** | Non-contiguous paged gather (56.4 GB/s at 16K); page size sweep and INT8 quantization |
+| **P22** | Benchmark LM Head Projection & Parallel GPU Sampler | [`perf/sycl/perf_lmhead_sampler.cpp`](../perf/sycl/perf_lmhead_sampler.cpp) | **COMPLETED & COMPILED** | 2560 -> 248,320 GEMV (89.8 GB/s); 248K parallel max + softmax (592.2 µs); 4-byte readback |
+| **P23** | Benchmark Fast Walsh-Hadamard Transform & Q4_0 KV | [`perf/sycl/perf_fwht_kv4.cpp`](../perf/sycl/perf_fwht_kv4.cpp) | **COMPLETED & COMPILED** | 8-stage butterfly FWHT256 in SLM (11.5 µs); 7.11x Q4_0 compression; rotated decode attention |
+| **P24** | Benchmark Layer 1 Per-Layer Embedding & N-gram Shift | [`perf/sycl/perf_ple_ngram.cpp`](../perf/sycl/perf_ple_ngram.cpp) | **COMPLETED & COMPILED** | Layer 1 unique block: 1,440 B row upload (12.6 µs); Conv1D history shift + projections (377.3 µs) |
+| **P25** | Benchmark Embedding Dequant & Readback Overlap | [`perf/sycl/perf_embed_overlap.cpp`](../perf/sycl/perf_embed_overlap.cpp) | **COMPLETED & COMPILED** | Column dequant (12.5 µs); async chaining eliminates 148 µs host barrier (1.97x faster) |
 
 ---
 
@@ -818,6 +822,60 @@ To profile and optimize inter-kernel handover and host-device coordination acros
   - `KV_Quant_Paged` (INT8): Cuts latency from 594.4 µs to **467.5 µs** at 16K context (**+27.1% speedup**).
 - **Arc B580 Tuning Target**: > 380 GB/s paged gather bandwidth on 192-bit GDDR6 memory bus.
 
+---
 
+### 8.6 Tier 4 System Endpoints & Transform Benchmarks
 
+Tier 4 benchmarks profile the critical model boundaries, embedding tables, and data representations of Qwen3.8-Flash-Next:
 
+#### 1. LM Head Output Projection & Parallel GPU Sampler (`perf_lmhead_sampler`)
+- **Evaluated Operations**:
+  - $2560 \rightarrow 248,320$ output vocabulary GEMV projection across chunk sizes (16K, 64K, full 248K).
+  - Parallel two-stage GPU max-reduction and softmax normalization across 248,320 logits.
+  - End-to-end projection $\rightarrow$ argmax $\rightarrow$ 4-byte token D2H transfer.
+- **Measured on Lunar Lake (`0x64a0`)**:
+  - `LMHead_GEMV/16384`: **962.9 µs** (87.19 GB/s).
+  - `LMHead_GEMV/65536`: **3.79 ms** (88.55 GB/s).
+  - `LMHead_GEMV/248320`: **14.17 ms** (89.78 GB/s).
+  - `Sampler_Reduce` (248K vocab): **592.2 µs** (5.03 GB/s, parallel SLM reduction).
+  - `LMHead_Sampler_EndToEnd` (64K chunk): **3.89 ms** (86.29 GB/s).
+- **Arc B580 Tuning Target**:
+  - 456 GB/s GDDR6 bus cuts full 248K GEMV latency from 14.17 ms to **< 2.4 ms**.
+  - Hierarchical subgroup reduction completes 248K softmax in **< 90 µs**.
+
+#### 2. Fast Walsh-Hadamard Transform & Q4_0 KV Cache (`perf_fwht_kv4`)
+- **Evaluated Operations**:
+  - In-place online FWHT256 ($H_{256}$) 8-stage butterfly network executed directly in Xe2 registers/SLM.
+  - Rotated $Q4\_0$ quantization (18 bytes per 32-element block: 16-bit half scale + 16 bytes nibbles).
+  - Attention dot-product read bandwidth over rotated 4-bit KV blocks.
+- **Measured on Lunar Lake (`0x64a0`)**:
+  - `FWHT256_Compute`: **11.5 µs** (8 heads) to **13.9 µs** (64 heads, 9.42 GB/s).
+  - `KV_Quant_Q4_Rotated`: **14.9 µs** per head, delivering **7.11x memory footprint reduction** (576 bytes per cell vs 4,096 bytes FP32).
+  - `KV_Q4_Decode_Attention`: **25.0 µs** at 1K tokens (5.89 GB/s), scaling to **147.9 µs** at 16K tokens (15.95 GB/s).
+- **Arc B580 Tuning Target**:
+  - Eliminates KV cache memory bottleneck for context lengths up to 262K within the 12 GB VRAM pool.
+
+#### 3. Layer 1 Per-Layer Embedding & N-Gram History (`perf_ple_ngram`)
+- **Evaluated Operations**:
+  - Host staging and PCIe upload of 16 gathered rows (1,440 bytes) from the 28.8 GB table.
+  - Conv1D history shift over $NG\_HIST = 4$ steps across 2560 channels.
+  - Key and Value GEMV projections ($2560 \rightarrow 2560$).
+  - Gated residual update into the hyper-connection tensor $R$.
+- **Measured on Lunar Lake (`0x64a0`)**:
+  - `PLE_GPU_Block`: **377.3 µs** (69.59 GB/s, 26.2 MB weight traffic).
+  - `PLE_Row_Upload` (1,440 B): **12.6 µs** over PCIe bus.
+- **Arc B580 Tuning Target**:
+  - 1,440 B PCIe upload in < 1.5 µs on PCIe 4.0 x8/x16 bus; GPU block execution in **< 65 µs**.
+
+#### 4. Embedding Column Dequantization & Readback Overlap (`perf_embed_overlap`)
+- **Evaluated Operations**:
+  - Column extraction and dequantization from token embedding table (2560 floats per token).
+  - 4-byte sampled token D2H readback barrier latency.
+  - Host-Synchronized loop vs. On-Device Chained Autoregressive loop.
+- **Measured on Lunar Lake (`0x64a0`)**:
+  - `Embed_Column_Dequant`: **12.5 µs** (1.23 GB/s).
+  - `Host_Token_Readback_Latency`: **148.3 µs** (CPU queue synchronization barrier).
+  - `Autoregressive_Sync`: **289.7 µs** (synchronous CPU wait barrier per token).
+  - `Autoregressive_Async`: **146.8 µs** (**1.97x faster**, 142.9 µs host sync bubble eliminated by chaining next token dequant directly on device while asynchronously streaming token ID to host).
+- **Arc B580 Tuning Target**:
+  - Complete elimination of host synchronization bubbles in sustained token generation loops.
