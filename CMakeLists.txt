@@ -2121,6 +2121,25 @@ if(STRATA_BUILD_PERF)
       list(APPEND _strata_perf_targets perf_dequant_dpas)
     endif()
 
+    # Tier 2 Performance Benchmarks for Intel Xe2 / Arc B580
+    set(_strata_tier2_bms
+      perf_fused_gdn
+      perf_pcie_overlap
+      perf_graph_replay
+      perf_kv_decode
+      perf_prefill_gemm
+      perf_speculative_verify
+    )
+
+    foreach(_bm ${_strata_tier2_bms})
+      if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/perf/sycl/${_bm}.cpp")
+        add_executable(${_bm} perf/sycl/${_bm}.cpp)
+        target_include_directories(${_bm} PRIVATE ${_strata_gpu_include_directories})
+        target_link_libraries(${_bm} PRIVATE strata_core strata_kernels benchmark::benchmark)
+        list(APPEND _strata_perf_targets ${_bm})
+      endif()
+    endforeach()
+
     add_custom_target(perf-sycl
       COMMAND perf_xe2_gemv
       DEPENDS ${_strata_perf_targets}
