@@ -208,20 +208,25 @@ bool ExpertCache::open(int64_t n_slots, int64_t n_layers, int64_t n_expert, int6
         return false;
     }
 
-    auto& q = default_queue();
-    base_ = (uint8_t*)sycl::malloc_device((size_t)want, q);
-    if (!base_) {
-        char buf[256];
-        std::snprintf(buf, sizeof buf, "ExpertCache: malloc_device(%.2f GiB) failed", (double)want / 1073741824.0);
-        err = buf;
-        return false;
+    if (seg_req_ > 0) {
+        if (!open_segmented(want, err)) return false;
+    } else {
+        auto& q = default_queue();
+        base_ = (uint8_t*)sycl::malloc_device((size_t)want, q);
+        if (!base_) {
+            char buf[256];
+            std::snprintf(buf, sizeof buf, "ExpertCache: malloc_device(%.2f GiB) failed", (double)want / 1073741824.0);
+            err = buf;
+            return false;
+        }
+        // Zeroed so a slot read before it is filled is a DETERMINISTIC wrong answer rather than whatever the
+        // allocator handed back.  A stale block of a previous process's memory would still sum to finite floats.
+        q.memset(base_, 0, (size_t)want).wait_and_throw();
     }
-    // Zeroed so a slot read before it is filled is a DETERMINISTIC wrong answer rather than whatever the
-    // allocator handed back.  A stale block of a previous process's memory would still sum to finite floats.
-    q.memset(base_, 0, (size_t)want).wait_and_throw();
 
     residency_.assign((size_t)(n_layers * n_expert), kNotResident);
     slots_ = n_slots;
+    live_slots_ = n_slots;
     n_layers_ = n_layers;
     n_expert_ = n_expert;
     blob_ = blob_bytes;
@@ -248,6 +253,56 @@ bool ExpertCache::open(int64_t n_slots, int64_t n_layers, int64_t n_expert, int6
     std::exit(1);
 }
 
+bool ExpertCache::open_segmented(uint64_t want, std::string& err) {
+    (void)want;
+    err = "ExpertCache: --vram-elastic (a segmented expert cache) is CUDA-only for now";
+    return false;
+}
+
+void ExpertCache::release_segmented() {
+    segs_.clear();
+    seg_size_.clear();
+    mapped_segs_ = 0;
+    reserved_ = 0;
+    base_ = nullptr;
+}
+
+int64_t ExpertCache::mapped_bytes() const {
+    if (segs_.empty()) return base_ != nullptr ? full_bytes() : 0;
+    int64_t b = 0;
+    for (int64_t i = 0; i < mapped_segs_; ++i) b += seg_size_[(size_t)i];
+    return b;
+}
+
+int64_t ExpertCache::slots_within(int64_t bytes) const {
+    if (bytes >= full_bytes()) return slots_;
+    if (bytes <= 0) return 0;
+    if (off_.empty()) return blob_ > 0 ? bytes / blob_ : 0;
+    auto it = std::upper_bound(off_.begin(), off_.end(), (uint64_t)bytes);
+    const int64_t idx = (int64_t)std::distance(off_.begin(), it) - 1;
+    return idx < 0 ? 0 : idx > slots_ ? slots_ : idx;
+}
+
+bool ExpertCache::shrink(int64_t keep_bytes, std::string& err) {
+    if (segs_.empty()) {
+        err = "the expert cache is not segmented (the engine needs --vram-elastic)";
+        return false;
+    }
+    (void)keep_bytes;
+    err = "segmented expert cache is not supported in SYCL";
+    return false;
+}
+
+bool ExpertCache::grow(int64_t want_bytes, std::string& err) {
+    if (segs_.empty()) {
+        err = "the expert cache is not segmented (the engine needs --vram-elastic)";
+        return false;
+    }
+    (void)want_bytes;
+    err = "segmented expert cache is not supported in SYCL";
+    return false;
+}
+
 bool ExpertCache::open_sized(const std::vector<int64_t>& slot_bytes, int64_t n_layers, int64_t n_expert,
                              std::string& err) {
     if (slot_bytes.empty()) {
@@ -264,6 +319,7 @@ bool ExpertCache::open_sized(const std::vector<int64_t>& slot_bytes, int64_t n_l
     // one allocation of the summed size, through the uniform path's checks: n "slots" of 1 byte
     if (!open((int64_t)off.back(), n_layers, n_expert, 1, err)) return false;
     slots_ = (int64_t)slot_bytes.size();
+    live_slots_ = (int64_t)slot_bytes.size();
     blob_ = mx;
     off_ = std::move(off);
 #if defined(STRATA_USE_HIP)
@@ -290,12 +346,15 @@ void ExpertCache::close() {
     blocking_staging_bytes_ = 0;
 #endif
     off_.clear();
-    if (base_ != nullptr) {
+    if (!segs_.empty()) {
+        release_segmented();
+    } else if (base_ != nullptr) {
         sycl::free(base_, default_queue());
         base_ = nullptr;
     }
     residency_.clear();
     slots_ = 0;
+    live_slots_ = 0;
     n_layers_ = 0;
     n_expert_ = 0;
     blob_ = 0;

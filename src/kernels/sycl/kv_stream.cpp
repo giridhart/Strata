@@ -218,6 +218,11 @@ void ring_kernel(sycl::nd_item<1> item, int32_t* table, long long n_blocks, long
 
 }  // namespace
 
+inline sycl::queue& default_queue() {
+    static sycl::queue q{sycl::default_selector_v, sycl::property::queue::in_order()};
+    return q;
+}
+
 uint64_t kv_block_bytes(const QsaShapes& s, int fmt) {
     const uint64_t rows = (uint64_t)(s.n_head_kv * s.page_size);
     if (fmt == kKvQ4) return rows * kv_q4_bytes_per_head((int)s.head_dim) * 2;
@@ -226,8 +231,7 @@ uint64_t kv_block_bytes(const QsaShapes& s, int fmt) {
 }
 
 void kv_stream_reset(const KvStreamMap& m, void* stream) {
-    static sycl::queue default_q;
-    sycl::queue* q_ptr = stream ? reinterpret_cast<sycl::queue*>(stream) : &default_q;
+    sycl::queue* q_ptr = stream ? reinterpret_cast<sycl::queue*>(stream) : &default_queue();
     q_ptr->parallel_for(sycl::nd_range<1>(128 * 256, 256), [=](sycl::nd_item<1> item) { reset_kernel(item, m); });
     if (stream == nullptr) q_ptr->wait();
 }
@@ -245,10 +249,9 @@ void kv_stream_resolve(const KvStreamMap& m, const QsaAttnPools& slots, const Kv
         std::exit(1);
     }
 
-    static sycl::queue default_q;
-    sycl::queue* q_ptr = stream ? reinterpret_cast<sycl::queue*>(stream) : &default_q;
+    sycl::queue* q_ptr = stream ? reinterpret_cast<sycl::queue*>(stream) : &default_queue();
 
-    q_ptr->submit([&](sycl::handler& cgh) {
+    sycl::event ev1 = q_ptr->submit([&](sycl::handler& cgh) {
         sycl::local_accessor<int, 1> s_nmiss_acc(sycl::range<1>(1), cgh);
         sycl::local_accessor<int, 1> s_lookups_acc(sycl::range<1>(1), cgh);
         sycl::local_accessor<int, 1> s_cut_acc(sycl::range<1>(1), cgh);
@@ -261,6 +264,7 @@ void kv_stream_resolve(const KvStreamMap& m, const QsaAttnPools& slots, const Kv
     });
 
     q_ptr->submit([&](sycl::handler& cgh) {
+        cgh.depends_on(ev1);
         auto runs = runs_of(slots, host, fmt, s);
         cgh.parallel_for(sycl::nd_range<1>(96 * 128, 128), [=](sycl::nd_item<1> item) { copy_kernel(item, m, runs); });
     });
@@ -268,8 +272,7 @@ void kv_stream_resolve(const KvStreamMap& m, const QsaAttnPools& slots, const Kv
 }
 
 void kv_ring_table(int32_t* page_table, int64_t n_blocks, int64_t n_slots, void* stream) {
-    static sycl::queue default_q;
-    sycl::queue* q_ptr = stream ? reinterpret_cast<sycl::queue*>(stream) : &default_q;
+    sycl::queue* q_ptr = stream ? reinterpret_cast<sycl::queue*>(stream) : &default_queue();
     q_ptr->parallel_for(sycl::nd_range<1>(64 * 256, 256),
                         [=](sycl::nd_item<1> item) { ring_kernel(item, page_table, n_blocks, n_slots); });
     if (stream == nullptr) q_ptr->wait();
@@ -278,8 +281,7 @@ void kv_ring_table(int32_t* page_table, int64_t n_blocks, int64_t n_slots, void*
 void kv_ring_restore(const QsaAttnPools& slots, const KvHostPools& host, int fmt, int64_t b0, int64_t b1,
                      int64_t n_slots, const QsaShapes& s, void* stream) {
     const Runs r = runs_of(slots, host, fmt, s);
-    static sycl::queue default_q;
-    sycl::queue* q_ptr = stream ? reinterpret_cast<sycl::queue*>(stream) : &default_q;
+    sycl::queue* q_ptr = stream ? reinterpret_cast<sycl::queue*>(stream) : &default_queue();
     for (int64_t b = b0; b < b1;) {
         const int64_t sl = b % n_slots, run = std::min<int64_t>(b1 - b, n_slots - sl);
         for (int a = 0; a < r.n; ++a) {
@@ -294,8 +296,7 @@ void kv_stage_from_host(const QsaAttnPools& stage, const KvHostPools& host, int 
                         const QsaShapes& s, void* stream) {
     if (n_blocks <= 0) return;
     const Runs r = runs_of(stage, host, fmt, s);
-    static sycl::queue default_q;
-    sycl::queue* q_ptr = stream ? reinterpret_cast<sycl::queue*>(stream) : &default_q;
+    sycl::queue* q_ptr = stream ? reinterpret_cast<sycl::queue*>(stream) : &default_queue();
     for (int a = 0; a < r.n; ++a) {
         q_ptr->memcpy(r.dst[a], r.src[a], (size_t)(n_blocks * r.len[a]));
     }
@@ -307,8 +308,7 @@ KvStreamCounters kv_stream_counters(const KvStreamMap& m) {
     KvStreamCounters r;
     if (m.ctl == nullptr) return r;
 
-    static sycl::queue default_q;
-    sycl::queue* q_ptr = &default_q;  // Synchronous memcpy requires default_q or blocking wait
+    sycl::queue* q_ptr = &default_queue();  // Synchronous memcpy requires in-order default_queue
 
     q_ptr->memcpy(c, m.ctl, sizeof(c)).wait();
 

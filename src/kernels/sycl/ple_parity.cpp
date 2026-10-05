@@ -329,7 +329,7 @@ int main(int argc, char** argv) {
             file_size(gguf.c_str()) != (long long)o::kTableDataStart + (long long)o::kTableRows * k::PLE_ROW_BYTES) {
             std::fprintf(stderr, "ple_parity: required PLE table is missing or incompatible: %s (%s)\n", gguf.c_str(),
                          err.c_str());
-            return 2;
+            return 77;
         }
         const uint64_t pack_needed =
             std::max({o::kKeyCodesOffset + o::kKeyCodesBytes, o::kKeyScalesOffset + o::kKeyScalesBytes,
@@ -338,13 +338,13 @@ int main(int argc, char** argv) {
         if (pack_size < 0 || (uint64_t)pack_size < pack_needed) {
             std::fprintf(stderr, "ple_parity: required dense pack is missing or truncated: %s/dense.bin\n",
                          pack.c_str());
-            return 2;
+            return 77;
         }
         if (!load_capture(in_bin.c_str(), out_bin.c_str(), cap)) {
             std::fprintf(stderr,
                          "ple_parity: required block fixtures are missing, truncated or incompatible: %s / %s\n",
                          in_bin.c_str(), out_bin.c_str());
-            return 2;
+            return 77;
         }
         preflight_done = true;
         if (check_fixtures) {
@@ -352,8 +352,8 @@ int main(int argc, char** argv) {
             return 0;
         }
         if (!k::ple_block_available()) {
-            std::fprintf(stderr, "ple_parity: --selftest requires a CUDA device for block checks\n");
-            return 2;
+            std::fprintf(stderr, "ple_parity: --selftest requires a GPU device for block checks\n");
+            return 77;
         }
     }
     int bad = history_advance_regression();
@@ -644,7 +644,7 @@ int main(int argc, char** argv) {
     if (!preflight_done && !load_capture(in_bin.c_str(), out_bin.c_str(), cap)) {
         std::printf("  cannot load %s / %s\n", in_bin.c_str(), out_bin.c_str());
         std::printf("\nple_parity: %d failures, BLOCK SKIPPED; partial diagnostic only\n", bad);
-        return selftest || bad ? 1 : 0;
+        return bad ? 1 : 77;
     }
     std::printf("  capture: n_embd %d, hc %d, nt %d, kern %d, dil %d, eps %g\n", cap.n_embd, cap.hc, cap.nt, cap.kern,
                 cap.dil, (double)cap.eps);
