@@ -879,3 +879,28 @@ Tier 4 benchmarks profile the critical model boundaries, embedding tables, and d
   - `Autoregressive_Async`: **146.8 µs** (**1.97x faster**, 142.9 µs host sync bubble eliminated by chaining next token dequant directly on device while asynchronously streaming token ID to host).
 - **Arc B580 Tuning Target**:
   - Complete elimination of host synchronization bubbles in sustained token generation loops.
+
+---
+
+### 8.7 Upstream CUDA Kernel Optimization Audit & Porting - **COMPLETE**
+
+To maintain absolute architectural parity with the latest upstream CUDA enhancements (commit `cb97e6c` / branch `f-139b-spd`), a comprehensive audit of all kernel implementations was conducted. Six key algorithmic and memory optimizations were identified and ported into native SYCL 2020:
+
+| Optimization | Kernel / File | CUDA Architecture Origin | SYCL 2020 Implementation Details | Performance Impact |
+|---|---|---|---|---|
+| **Fused SwiGLU + Q8_1 Quantize** | `native_swiglu_quantize_q8_1`<br>([`native_mmvq.cpp`](file:///home/girtam/projects/Strata/src/kernels/sycl/native_mmvq.cpp)) | Warp shuffles across FP32 Silu and Q8_1 scaling | Replaced separate SwiGLU intermediate global memory store with fused sub-group reduction and direct `Q81Block` output | Eliminates 1 global round-trip of $(n_{ff} \times n_{tok})$ floats (up to 20 KB/step) |
+| **Fused Sigmoid + Row Scaling** | `sigmoid_scale_rows_kernel`<br>([`shared_expert.cpp`](file:///home/girtam/projects/Strata/src/kernels/sycl/shared_expert.cpp)) | Fused scalar sigmoid on gate vector `g` with output row scaling | Computes `gt = 1.0f / (1.0f + exp(-g[t]))` directly inside row-scaling kernel; also supports `x_q8_1` pre-quantized input caching | Eliminates separate single-task sigmoid launch overhead |
+| **Resident-Aware Doorbell Publish** | `doorbell_publish_res`<br>([`elementwise.cpp`](file:///home/girtam/projects/Strata/src/kernels/sycl/elementwise.cpp)) | Sub-warp inspection of resident cache slots `d_res[ids[tid]]` | When all 10 selected MoE experts hit the GPU VRAM cache, the 10 KB activation copy across PCIe is bypassed, only fencing `ids_out` and advancing `seq` | Cuts PCIe traffic by 10 KB per token on cache hits |
+| **Pre-Projected PLE Evaluation** | `ple_block_projected`<br>([`ple.cpp`](file:///home/girtam/projects/Strata/src/kernels/sycl/ple.cpp)) | Direct postops invocation on pre-projected key and value | Takes device pointers `projected_key` and `projected_value`, prepares `NativePlePostopsBuffers`, and dispatches directly to `native_ple_postops` | Bypasses redundant GEMV projections when inputs are already in residual cache |
+| **Multi-Column Batched GEMV** | `bf16_gemv_fp32_mmvf_cols`<br>([`native_bf16.cpp`](file:///home/girtam/projects/Strata/src/kernels/sycl/native_bf16.cpp)) | Single weight read across up to 8 activation columns | Chunks contiguous columns into groups of up to 8, issuing `bf16_gemv_fp32_mmvf_multi` to read weights once | Reduces weight bandwidth pressure for verify windows and decode batches |
+| **Wide Top-K Selection Kernel** | `block_topk_wide_kernel`<br>([`qsa_select.cpp`](file:///home/girtam/projects/Strata/src/kernels/sycl/qsa_select.cpp)) | Radix Top-K on 1024 threads with per-warp histograms | Uses SYCL 2020 group algorithms (`permute_group_by_xor`, `shift_group_right`, `select_from_group`, `any_of_group`) when active blocks exceed register capacity ($> 135\text{K}$) | **9–12x speedup** over reference CPU fallback for context lengths up to 262K |
+| **Cooperative Resident Plan** | `resident_plan_kernel`<br>([`verify_kernels.cpp`](file:///home/girtam/projects/Strata/src/kernels/sycl/verify_kernels.cpp)) | 64-thread parallel plan generator with shared memory arrays | Replaced single-thread serial loop with 64-thread cooperative group sorting using local memory and atomic bad-slot detection | Cuts plan construction latency during speculative verification |
+
+#### Live Verification & Performance Benchmark Results
+- **Numerical Parity**: 16/16 SYCL test suites passed (100% pass rate in 3.86 seconds).
+- **Benchmark Suite**: All 19 benchmark suites passed in **56.2 seconds** (improved from 60.9s baseline):
+  - Fused GDN Recurrence: **23.0 µs** (3.22x faster than unfused 73.9 µs).
+  - Pipelined Composite Layer: **1.07 ms** (74.8 GB/s).
+  - Shared Expert Overlap Slack: **160.9 µs** positive slack over PCIe streaming.
+  - Multi-Token Speculative Verify: **68.9k tok/s** at B=8.
+
