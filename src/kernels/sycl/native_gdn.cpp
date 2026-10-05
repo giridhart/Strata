@@ -23,6 +23,7 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
+#include "strata/core/sycl_arch.hpp"
 #include "strata/kernels/native_gdn.hpp"
 
 #include <sycl/sycl.hpp>
@@ -36,31 +37,27 @@ namespace strata::kernels {
 namespace {
 std::atomic<bool> enabled{false};
 constexpr int S = 128;
+constexpr int SG_SIZE = strata::sycl_arch::SUB_GROUP_SIZE;
 
 static sycl::queue& default_queue() {
     static sycl::queue q{sycl::property::queue::in_order()};
     return q;
 }
 
-inline float warp_sum(sycl::sub_group sg, float value) {
-#pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1)
-        value += sycl::permute_group_by_xor(sg, value, offset);
-    return value;
-}
-
+template <int SUB_SIZE = SG_SIZE>
 void step(sycl::nd_item<2> item,
           float* __restrict__ state, const float* __restrict__ q, const float* __restrict__ k,
           const float* __restrict__ v, const float* __restrict__ gate, const float* __restrict__ beta,
           float* __restrict__ output, int h_k, int h_v, float scale) {
+    constexpr int R_COUNT = S / SUB_SIZE;
     const int head = item.get_group(0);
     const int lane = item.get_local_id(1);
     const int col = item.get_group(1) * 4 + item.get_local_id(0);
     const int q_head = head % h_k;
-    float s_shard[4], k_reg[4], q_reg[4];
+    float s_shard[R_COUNT], k_reg[R_COUNT], q_reg[R_COUNT];
 #pragma unroll
-    for (int r = 0; r < 4; ++r) {
-        const int i = r * 32 + lane;
+    for (int r = 0; r < R_COUNT; ++r) {
+        const int i = r * SUB_SIZE + lane;
         s_shard[r] = state[(size_t(i) * h_v + head) * S + col];
         k_reg[r] = k[q_head * S + i];
         q_reg[r] = q[q_head * S + i];
@@ -68,21 +65,21 @@ void step(sycl::nd_item<2> item,
     const float g_val = sycl::native::exp(gate[head]);
     float kv_shard = 0.0f;
 #pragma unroll
-    for (int r = 0; r < 4; ++r) kv_shard += s_shard[r] * k_reg[r];
+    for (int r = 0; r < R_COUNT; ++r) kv_shard += s_shard[r] * k_reg[r];
     auto sg = item.get_sub_group();
-    const float kv_col = warp_sum(sg, kv_shard);
+    const float kv_col = sycl::reduce_over_group(sg, kv_shard, sycl::plus<float>());
     const float delta_col = (v[head * S + col] - g_val * kv_col) * beta[head];
     float attn_partial = 0.0f;
 #pragma unroll
-    for (int r = 0; r < 4; ++r) {
+    for (int r = 0; r < R_COUNT; ++r) {
         s_shard[r] = g_val * s_shard[r] + k_reg[r] * delta_col;
         attn_partial += s_shard[r] * q_reg[r];
     }
-    const float attn_col = warp_sum(sg, attn_partial);
+    const float attn_col = sycl::reduce_over_group(sg, attn_partial, sycl::plus<float>());
     if (lane == 0) output[head * S + col] = attn_col * scale;
 #pragma unroll
-    for (int r = 0; r < 4; ++r) {
-        const int i = r * 32 + lane;
+    for (int r = 0; r < R_COUNT; ++r) {
+        const int i = r * SUB_SIZE + lane;
         state[(size_t(i) * h_v + head) * S + col] = s_shard[r];
     }
 }
@@ -123,11 +120,11 @@ void native_gdn_step(float* state, const float* q, const float* k, const float* 
     const float scale = 1.0f / sqrtf(float(S));
     sycl::queue* q_ptr = stream ? static_cast<sycl::queue*>(stream) : &default_queue();
     q_ptr->parallel_for(
-        sycl::nd_range<2>(sycl::range<2>(shape.h_v * 4, (S / 4) * 32),
-                          sycl::range<2>(4, 32)),
-        [=](sycl::nd_item<2> item) [[sycl::reqd_sub_group_size(32)]] {
-            step(item, state, q, k, v, gate, beta, output, int(shape.h_k),
-                 int(shape.h_v), scale);
+        sycl::nd_range<2>(sycl::range<2>(shape.h_v * 4, (S / 4) * SG_SIZE),
+                          sycl::range<2>(4, SG_SIZE)),
+        [=](sycl::nd_item<2> item) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
+            step<SG_SIZE>(item, state, q, k, v, gate, beta, output, int(shape.h_k),
+                          int(shape.h_v), scale);
         });
 }
 } // namespace strata::kernels

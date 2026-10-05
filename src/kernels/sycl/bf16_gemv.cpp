@@ -23,7 +23,7 @@ inline sycl::queue& default_queue() {
 
 /// One thread per output row, walking it contiguously. Kept as the naive reference the split version is
 /// checked against, and used directly for the shapes where the output width is already large.
-void bf16_gemv_naive_kernel(sycl::nd_item<1> item, const uint16_t* __restrict__ x, const uint16_t* __restrict__ w,
+[[maybe_unused]] void bf16_gemv_naive_kernel(sycl::nd_item<1> item, const uint16_t* __restrict__ x, const uint16_t* __restrict__ w,
                             float* __restrict__ y, long long n_in, long long n_out) {
     const long long o =
         (long long)item.get_group(0) * item.get_local_range(0) +
@@ -56,25 +56,38 @@ void bf16_gemv_subgroup_kernel(sycl::nd_item<1> item, const uint16_t* __restrict
 }
 
 /// TPR lanes cooperate on ONE row's reduction: `threads_per_row` threads each take a strided slice and the
-/// block reduces through shared memory. Used when the output width is too small to fill the machine.
+/// block reduces through shared memory. On Xe2, we first reduce within each SIMD16 subgroup via
+/// single-cycle hardware reduction, then reduce the subgroup sums in local memory.
+template <int SUB_SIZE = SG_SIZE>
 void bf16_gemv_split_kernel(sycl::nd_item<1> item, const uint16_t* __restrict__ x, const uint16_t* __restrict__ w,
                             float* __restrict__ y, long long n_in, long long n_out, int tpr,
                             sycl::local_accessor<float, 1> scratch) {
     const long long o = item.get_group(0);
     if (o >= n_out) return;
+    const auto sg = item.get_sub_group();
+    const int lane = sg.get_local_linear_id();
     const int t = item.get_local_id(0); // 0 .. tpr-1
+    const int sg_id = t / SUB_SIZE;
+    const int num_sgs = (tpr + SUB_SIZE - 1) / SUB_SIZE;
+
     const uint16_t* row = w + o * n_in;
     float acc = 0.0f;
     for (long long i = t; i < n_in; i += tpr)
         acc += f32_from_bf16(x[i]) * f32_from_bf16(row[i]);
-    // block reduction; `tpr` is at most a few hundred, so a tree in shared is enough
-    scratch[t] = acc;
+
+    // Subgroup reduction first (single-cycle hardware reduction on Xe2)
+    acc = sycl::reduce_over_group(sg, acc, sycl::plus<float>());
+    if (lane == 0) scratch[sg_id] = acc;
     item.barrier(sycl::access::fence_space::local_space);
-    for (int off = tpr >> 1; off > 0; off >>= 1) {
-        if (t < off) scratch[t] += scratch[t + off];
-        item.barrier(sycl::access::fence_space::local_space);
+
+    // First subgroup reduces the per-subgroup partials
+    if (sg_id == 0) {
+        float final_acc = 0.0f;
+        for (int k = lane; k < num_sgs; k += SUB_SIZE)
+            final_acc += scratch[k];
+        final_acc = sycl::reduce_over_group(sg, final_acc, sycl::plus<float>());
+        if (lane == 0) y[o] = final_acc;
     }
-    if (t == 0) y[o] = scratch[0];
 }
 
 }  // namespace
@@ -92,12 +105,9 @@ void bf16_gemv(const uint16_t* x, const uint16_t* w, float* y, int64_t n_in, int
             });
         return;
     }
-    const unsigned grid = (unsigned) ((n_out + THREADS - 1) / THREADS);
-    q->parallel_for(
-        sycl::nd_range<1>(sycl::range<1>((grid) * (THREADS)), sycl::range<1>(THREADS)),
-        [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
-            bf16_gemv_naive_kernel(item, x, w, y, n_in, n_out);
-        });
+    // For narrow shapes (n_out < 64, e.g. ssm_alpha [2560, 48]), dispatch the SLM split reduction
+    // with 128 threads per row to fully saturate Xe2 Vector Engines (160 engines).
+    bf16_gemv_split(x, w, y, n_in, n_out, 128, stream);
 }
 
 void bf16_gemv_split(const uint16_t* x, const uint16_t* w, float* y, int64_t n_in, int64_t n_out,
@@ -125,7 +135,7 @@ void bf16_gemv_split(const uint16_t* x, const uint16_t* w, float* y, int64_t n_i
         cgh.parallel_for(
             sycl::nd_range<1>(sycl::range<1>((grid) * (threads_per_row)), sycl::range<1>(threads_per_row)),
             [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
-                bf16_gemv_split_kernel(
+                bf16_gemv_split_kernel<SG_SIZE>(
                     item, x, w, y, n_in, n_out, threads_per_row,
                     scratch_acc);
             });

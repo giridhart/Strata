@@ -2,6 +2,7 @@
 #include <sycl/sycl.hpp>
 #include <cstdint>
 #include <algorithm>
+#include "strata/core/sycl_arch.hpp"
 #include "strata/kernels/s2_gemv_q8.hpp"
 
 #include <cstdio>
@@ -12,6 +13,7 @@ namespace {
 
 constexpr int QK_S2 = 64;
 constexpr int QK8_0 = 32;
+constexpr int SG_SIZE = strata::sycl_arch::SUB_GROUP_SIZE;
 
 inline sycl::queue& default_queue() {
     static sycl::queue q{sycl::default_selector_v, sycl::property::queue::in_order()};
@@ -54,13 +56,24 @@ void s2_gemv_q8_kernel(sycl::nd_item<1> item,
         a2 += w2 * ((float) xq[off + 2] * dx);
         a3 += w3 * ((float) xq[off + 3] * dx);
     }
-    partial[tid] = (a0 + a1) + (a2 + a3);
-    item.barrier(sycl::access::fence_space::local_space);
-    for (int step = threads_per_row / 2; step > 0; step >>= 1) {
-        if (tid < step) partial[tid] += partial[tid + step];
+    float acc_sum = (a0 + a1) + (a2 + a3);
+    const auto sg = item.get_sub_group();
+    if (threads_per_row <= SG_SIZE) {
+        acc_sum = sycl::reduce_over_group(sg, acc_sum, sycl::plus<float>());
+        if (tid == 0) y[o] = acc_sum;
+    } else {
+        acc_sum = sycl::reduce_over_group(sg, acc_sum, sycl::plus<float>());
+        if (sg.get_local_linear_id() == 0) {
+            partial[tid / SG_SIZE] = acc_sum;
+        }
         item.barrier(sycl::access::fence_space::local_space);
+        const int num_sgs = threads_per_row / SG_SIZE;
+        if (tid < num_sgs) {
+            float p_val = partial[tid];
+            p_val = sycl::reduce_over_group(sg, p_val, sycl::plus<float>());
+            if (tid == 0) y[o] = p_val;
+        }
     }
-    if (tid == 0) y[o] = partial[0];
 }
 
 }  // namespace
@@ -80,7 +93,7 @@ void s2_gemv_q8(const uint8_t* act, const uint8_t* codes, const float* scales, f
 
         cgh.parallel_for(
             sycl::nd_range<1>(sycl::range<1>(((unsigned)n_out) * (threads_per_row)), sycl::range<1>(threads_per_row)),
-            [=](sycl::nd_item<1> item) {
+            [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
                 s2_gemv_q8_kernel(
                     item, act, codes, scales, y, n_in, n_out, threads_per_row,
                     partial_acc);
