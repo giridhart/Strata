@@ -44,7 +44,7 @@ The target model for these optimizations is **Qwen3.8-Flash-Next** (as well as `
 
 ---
 
-## 3. Performance Test Suite (`perf/sycl/` & `tools/`) - All 12 Completed & Verified
+## 3. Performance Test Suite (`perf/sycl/` & `tools/`) - All 19 Completed & Verified
 
 ### Tier 1 Core Microbenchmarks
 1. **`perf_xe2_gemv.cpp` (Done)**: BF16 decode/prefill sweeps, SIMD16 vs SIMD32, and SLM split reduction (+25.3% speedup on `ssm_alpha`).
@@ -68,6 +68,12 @@ The target model for these optimizations is **Qwen3.8-Flash-Next** (as well as `
 15. **`perf_layer_pipeline.cpp` (Done)**: Full 9-Kernel Composite Layer Pipeline: measures end-to-end forward pass (1.06 ms pipelined vs 1.03 ms CapturedGraph execution).
 16. **`perf_moe_doorbell_stream.cpp` (Done)**: MoE Doorbell Handshake & Expert Streaming: 51.2 KB PCIe transfer in 11.1 µs; 160.6 µs positive overlap slack behind shared expert compute.
 17. **`perf_paged_kv_traffic.cpp` (Done)**: Paged KV Cache Traffic & Indirection Penalty: 56.45 GB/s paged gather at 16K context; INT8 quantization cuts latency by 27.1%.
+
+### Tier 4 System Endpoints & Transform Benchmarks
+18. **`perf_lmhead_sampler.cpp` (Done)**: LM Head Output Projection & GPU Sampler: 2560 -> 248,320 GEMV (89.8 GB/s), parallel max + softmax (592.2 µs), 4-byte readback.
+19. **`perf_fwht_kv4.cpp` (Done)**: Fast Walsh-Hadamard Transform & Q4_0 KV Cache: 8-stage butterfly FWHT256 in SLM (11.5 µs), 7.11x Q4_0 compression, rotated decode attention (15.95 GB/s).
+20. **`perf_ple_ngram.cpp` (Done)**: Layer 1 Per-Layer Embedding & N-gram Shift: 1,440 B row upload (12.6 µs); Conv1D history shift + projections (377.3 µs).
+21. **`perf_embed_overlap.cpp` (Done)**: Embedding Column Dequant & Readback Overlap: Column dequant (12.5 µs); async chaining eliminates 148 µs host barrier (1.97x faster).
 
 ---
 
