@@ -46,31 +46,30 @@ int main() {
         sycl::buffer<float, 2> bufC(C.data(), sycl::range<2>(TM, TN));
 
         q.submit([&](sycl::handler& cgh) {
-            auto accA = bufA.get_access<sycl::access::mode::read>(cgh);
-            auto accB = bufB.get_access<sycl::access::mode::read>(cgh);
-            auto accC = bufC.get_access<sycl::access::mode::read_write>(cgh);
+             auto accA = bufA.get_access<sycl::access::mode::read>(cgh);
+             auto accB = bufB.get_access<sycl::access::mode::read>(cgh);
+             auto accC = bufC.get_access<sycl::access::mode::read_write>(cgh);
 
-            cgh.parallel_for(
-                sycl::nd_range<2>(sycl::range<2>(1, 16), sycl::range<2>(1, 16)),
-                [=](sycl::nd_item<2> item) [[sycl::reqd_sub_group_size(16)]] {
-                    auto sg = item.get_sub_group();
-                    joint_matrix<sycl::sub_group, sycl::half, use::a, TM, TK, layout::row_major> sub_a;
-                    joint_matrix<sycl::sub_group, sycl::half, use::b, TK, TN, layout::row_major> sub_b;
-                    joint_matrix<sycl::sub_group, float, use::accumulator, TM, TN> sub_c;
+             cgh.parallel_for(sycl::nd_range<2>(sycl::range<2>(1, 16), sycl::range<2>(1, 16)),
+                              [=](sycl::nd_item<2> item) [[sycl::reqd_sub_group_size(16)]] {
+                                  auto sg = item.get_sub_group();
+                                  joint_matrix<sycl::sub_group, sycl::half, use::a, TM, TK, layout::row_major> sub_a;
+                                  joint_matrix<sycl::sub_group, sycl::half, use::b, TK, TN, layout::row_major> sub_b;
+                                  joint_matrix<sycl::sub_group, float, use::accumulator, TM, TN> sub_c;
 
-                    joint_matrix_fill(sg, sub_c, 0.0f);
-                    joint_matrix_load(sg, sub_a, accA.get_multi_ptr<sycl::access::decorated::no>(), TK);
-                    joint_matrix_load(sg, sub_b, accB.get_multi_ptr<sycl::access::decorated::no>(), TN);
-                    joint_matrix_mad(sg, sub_c, sub_a, sub_b, sub_c);
-                    joint_matrix_store(sg, sub_c, accC.get_multi_ptr<sycl::access::decorated::no>(), TN, layout::row_major);
-                });
-        }).wait();
+                                  joint_matrix_fill(sg, sub_c, 0.0f);
+                                  joint_matrix_load(sg, sub_a, accA.get_multi_ptr<sycl::access::decorated::no>(), TK);
+                                  joint_matrix_load(sg, sub_b, accB.get_multi_ptr<sycl::access::decorated::no>(), TN);
+                                  joint_matrix_mad(sg, sub_c, sub_a, sub_b, sub_c);
+                                  joint_matrix_store(sg, sub_c, accC.get_multi_ptr<sycl::access::decorated::no>(), TN,
+                                                     layout::row_major);
+                              });
+         }).wait();
 
         auto hostC = bufC.get_host_access();
-        const float expected = (float)TK * 1.5f * 2.0f; // 16 * 3.0 = 48.0
+        const float expected = (float)TK * 1.5f * 2.0f;  // 16 * 3.0 = 48.0
         float diff = std::abs(hostC[0][0] - expected);
-        printf("  Tile [8x16x16]: C[0][0] = %.1f (expected %.1f, diff=%.2e)\n",
-               hostC[0][0], expected, diff);
+        printf("  Tile [8x16x16]: C[0][0] = %.1f (expected %.1f, diff=%.2e)\n", hostC[0][0], expected, diff);
 
         if (diff > 1e-3f) {
             printf("XMX Joint Matrix test FAILED on single tile!\n");
@@ -89,8 +88,10 @@ int main() {
         std::vector<float> C(M * N, 0.0f);
         std::vector<float> ref(M * N, 0.0f);
 
-        for (size_t i = 0; i < M * K; ++i) A[i] = sycl::half((float)((i % 7) - 3) * 0.25f);
-        for (size_t i = 0; i < K * N; ++i) B[i] = sycl::half((float)((i % 5) - 2) * 0.25f);
+        for (size_t i = 0; i < M * K; ++i)
+            A[i] = sycl::half((float)((i % 7) - 3) * 0.25f);
+        for (size_t i = 0; i < K * N; ++i)
+            B[i] = sycl::half((float)((i % 5) - 2) * 0.25f);
 
         // CPU reference
         for (size_t m = 0; m < M; ++m) {
@@ -116,31 +117,34 @@ int main() {
         const size_t grid_n = N / TN;
 
         q.submit([&](sycl::handler& cgh) {
-            cgh.parallel_for(
-                sycl::nd_range<2>(sycl::range<2>(grid_m, grid_n * 16), sycl::range<2>(1, 16)),
-                [=](sycl::nd_item<2> item) [[sycl::reqd_sub_group_size(16)]] {
-                    auto sg = item.get_sub_group();
-                    const size_t tile_m = item.get_group(0) * TM;
-                    const size_t tile_n = item.get_group(1) * TN;
+             cgh.parallel_for(
+                 sycl::nd_range<2>(sycl::range<2>(grid_m, grid_n * 16), sycl::range<2>(1, 16)),
+                 [=](sycl::nd_item<2> item) [[sycl::reqd_sub_group_size(16)]] {
+                     auto sg = item.get_sub_group();
+                     const size_t tile_m = item.get_group(0) * TM;
+                     const size_t tile_n = item.get_group(1) * TN;
 
-                    joint_matrix<sycl::sub_group, float, use::accumulator, TM, TN> sub_c;
-                    joint_matrix_fill(sg, sub_c, 0.0f);
+                     joint_matrix<sycl::sub_group, float, use::accumulator, TM, TN> sub_c;
+                     joint_matrix_fill(sg, sub_c, 0.0f);
 
-                    for (size_t k = 0; k < K; k += TK) {
-                        joint_matrix<sycl::sub_group, sycl::half, use::a, TM, TK, layout::row_major> sub_a;
-                        joint_matrix<sycl::sub_group, sycl::half, use::b, TK, TN, layout::row_major> sub_b;
+                     for (size_t k = 0; k < K; k += TK) {
+                         joint_matrix<sycl::sub_group, sycl::half, use::a, TM, TK, layout::row_major> sub_a;
+                         joint_matrix<sycl::sub_group, sycl::half, use::b, TK, TN, layout::row_major> sub_b;
 
-                        auto ptr_a = sycl::address_space_cast<sycl::access::address_space::global_space, sycl::access::decorated::no>(d_A + tile_m * K + k);
-                        auto ptr_b = sycl::address_space_cast<sycl::access::address_space::global_space, sycl::access::decorated::no>(d_B + k * N + tile_n);
-                        joint_matrix_load(sg, sub_a, ptr_a, K);
-                        joint_matrix_load(sg, sub_b, ptr_b, N);
-                        joint_matrix_mad(sg, sub_c, sub_a, sub_b, sub_c);
-                    }
+                         auto ptr_a = sycl::address_space_cast<sycl::access::address_space::global_space,
+                                                               sycl::access::decorated::no>(d_A + tile_m * K + k);
+                         auto ptr_b = sycl::address_space_cast<sycl::access::address_space::global_space,
+                                                               sycl::access::decorated::no>(d_B + k * N + tile_n);
+                         joint_matrix_load(sg, sub_a, ptr_a, K);
+                         joint_matrix_load(sg, sub_b, ptr_b, N);
+                         joint_matrix_mad(sg, sub_c, sub_a, sub_b, sub_c);
+                     }
 
-                    auto ptr_c = sycl::address_space_cast<sycl::access::address_space::global_space, sycl::access::decorated::no>(d_C + tile_m * N + tile_n);
-                    joint_matrix_store(sg, sub_c, ptr_c, N, layout::row_major);
-                });
-        }).wait();
+                     auto ptr_c = sycl::address_space_cast<sycl::access::address_space::global_space,
+                                                           sycl::access::decorated::no>(d_C + tile_m * N + tile_n);
+                     joint_matrix_store(sg, sub_c, ptr_c, N, layout::row_major);
+                 });
+         }).wait();
 
         q.memcpy(C.data(), d_C, M * N * sizeof(float)).wait();
 
@@ -152,8 +156,7 @@ int main() {
             if (diff > 1e-2) ++bad;
         }
 
-        printf("  Tiled [32x64x64]: max_diff = %.3e, bad = %d / %zu\n",
-               max_diff, bad, M * N);
+        printf("  Tiled [32x64x64]: max_diff = %.3e, bad = %d / %zu\n", max_diff, bad, M * N);
 
         sycl::free(d_A, q);
         sycl::free(d_B, q);

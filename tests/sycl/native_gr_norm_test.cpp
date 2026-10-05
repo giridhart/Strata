@@ -27,12 +27,11 @@ void cpu_rmsnorm(const float* x, const float* gamma, float* y, int n_cols, int n
     }
 }
 
-} // namespace
+}  // namespace
 
 int main() {
     sycl::queue q{sycl::default_selector_v, sycl::property::queue::in_order()};
-    printf("Running native_gr_norm SYCL test on: %s\n",
-           q.get_device().get_info<sycl::info::device::name>().c_str());
+    printf("Running native_gr_norm SYCL test on: %s\n", q.get_device().get_info<sycl::info::device::name>().c_str());
 
     // Exact model dimensions for Qwen3.8-Flash-Next:
     // hc_attn_norm, hc_ffn_norm: 10240 cols
@@ -44,15 +43,10 @@ int main() {
         const char* name;
     };
 
-    const Case cases[] = {
-        {320, 1, "hc_lr [320, 1]"},
-        {320, 4, "hc_lr [320, 4]"},
-        {2560, 1, "n_embd [2560, 1]"},
-        {2560, 8, "n_embd [2560, 8]"},
-        {10240, 1, "hc_dim [10240, 1]"},
-        {10240, 4, "hc_dim [10240, 4]"},
-        {10240, 16, "hc_dim [10240, 16]"}
-    };
+    const Case cases[] = {{320, 1, "hc_lr [320, 1]"},       {320, 4, "hc_lr [320, 4]"},
+                          {2560, 1, "n_embd [2560, 1]"},    {2560, 8, "n_embd [2560, 8]"},
+                          {10240, 1, "hc_dim [10240, 1]"},  {10240, 4, "hc_dim [10240, 4]"},
+                          {10240, 16, "hc_dim [10240, 16]"}};
 
     std::mt19937 rng(42);
     std::normal_distribution<float> dist(0.0f, 1.0f);
@@ -95,8 +89,7 @@ int main() {
             if (rel > 1e-4) ++bad;
         }
 
-        printf("  %-24s: max_rel = %.3e, bad = %d / %zu\n",
-               c.name, max_err, bad, total_elems);
+        printf("  %-24s: max_rel = %.3e, bad = %d / %zu\n", c.name, max_err, bad, total_elems);
 
         if (bad > 0) total_failures += bad;
 

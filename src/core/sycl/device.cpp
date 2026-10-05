@@ -95,11 +95,9 @@ const char* compiled_gpu_archs() {
 #endif
 }
 
-int device_count() {
-    return static_cast<int>(get_devices_list().size());
-}
+int device_count() { return static_cast<int>(get_devices_list().size()); }
 
-bool device_summary(int ordinal, std::string &name, std::string &detail) {
+bool device_summary(int ordinal, std::string& name, std::string& detail) {
     auto devs = get_devices_list();
     if (ordinal < 0 || ordinal >= static_cast<int>(devs.size())) {
         return false;
@@ -132,14 +130,12 @@ std::string gpu_arch_problem(int ordinal) {
     }
     return arch_problem(p, ordinal);
 #else
-    (void) ordinal;
+    (void)ordinal;
     return "";
 #endif
 }
 
-std::string device_code_error() {
-    return "";
-}
+std::string device_code_error() { return ""; }
 
 DeviceInfo device_info(int ordinal) {
     auto devs = get_devices_list();
@@ -165,7 +161,8 @@ DeviceInfo device_info(int ordinal) {
         if (dev.has(sycl::aspect::ext_intel_free_memory)) {
             d.free_bytes = dev.get_info<sycl::ext::intel::info::device::free_memory>();
         }
-    } catch (...) {}
+    } catch (...) {
+    }
 #endif
     if (d.free_bytes == 0) {
         // Fallback for iGPU / unified memory: allow budget up to total VRAM
@@ -198,10 +195,9 @@ DeviceArena::DeviceArena(uint64_t bytes, int ordinal, bool poison)
             const uint64_t chunk = (blocks - b < max_blocks) ? (blocks - b) : max_blocks;
             float* float_base = (float*)base_ + b * threads;
             const uint64_t n_chunk = n - b * threads;
-            q.submit([&](sycl::handler &cgh) {
+            q.submit([&](sycl::handler& cgh) {
                 cgh.parallel_for(
-                    sycl::nd_range<3>(sycl::range<3>(1, 1, (unsigned)chunk * threads),
-                                      sycl::range<3>(1, 1, threads)),
+                    sycl::nd_range<3>(sycl::range<3>(1, 1, (unsigned)chunk * threads), sycl::range<3>(1, 1, threads)),
                     [=](sycl::nd_item<3> item) {
                         const uint64_t i = (uint64_t)item.get_group(2) * item.get_local_range(2) + item.get_local_id(2);
                         if (i < n_chunk) float_base[i] = sycl::bit_cast<float>(0x7fc00000);
@@ -233,12 +229,12 @@ void* DeviceArena::alloc(uint64_t bytes, uint64_t align) {
         std::snprintf(msg, sizeof(msg),
                       "DeviceArena out of memory: asked for %llu B at offset %llu (align %llu) in a %llu B "
                       "region - the plan from P1.S9 did not close",
-                      (unsigned long long) bytes, (unsigned long long) start, (unsigned long long) align,
-                      (unsigned long long) capacity_);
+                      (unsigned long long)bytes, (unsigned long long)start, (unsigned long long)align,
+                      (unsigned long long)capacity_);
         throw CudaError(msg, -1);
     }
     used_ = start + bytes;
-    return (char*) base_ + start;
+    return (char*)base_ + start;
 }
 
 }  // namespace strata::core

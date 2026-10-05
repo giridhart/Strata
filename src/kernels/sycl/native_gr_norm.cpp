@@ -39,12 +39,9 @@ namespace {
 static sycl::queue default_queue{sycl::property::queue::in_order()};
 constexpr int SG_SZ = strata::sycl_arch::SUB_GROUP_SIZE;
 
-template<int BlockSize>
-void weighted_rms_norm(sycl::nd_item<1> item,
-                       const float* __restrict__ input,
-                       const float* __restrict__ gamma,
-                       float* __restrict__ output, int n_cols, float epsilon,
-                       float *sums) {
+template <int BlockSize>
+void weighted_rms_norm(sycl::nd_item<1> item, const float* __restrict__ input, const float* __restrict__ gamma,
+                       float* __restrict__ output, int n_cols, float epsilon, float* sums) {
     auto sg = item.get_sub_group();
     const int tid = item.get_local_id(0);
     const std::size_t row_offset = std::size_t(item.get_group(0)) * n_cols;
@@ -83,10 +80,10 @@ void check_pointer(const void* p) {
         throw std::invalid_argument("native GR RMSNorm requires non-null four-byte aligned pointers");
 }
 
-} // namespace
+}  // namespace
 
-void native_gr_rms_norm_weighted(const float* input, const float* gamma, float* output,
-                                 int n_cols, int n_rows, float epsilon, void* stream) {
+void native_gr_rms_norm_weighted(const float* input, const float* gamma, float* output, int n_cols, int n_rows,
+                                 float epsilon, void* stream) {
     if (n_cols <= 0 || n_rows <= 0 || !std::isfinite(epsilon) || epsilon < 0.0f)
         throw std::invalid_argument("native GR RMSNorm requires positive dimensions and finite nonnegative epsilon");
     check_pointer(input);
@@ -94,29 +91,25 @@ void native_gr_rms_norm_weighted(const float* input, const float* gamma, float* 
     check_pointer(output);
     sycl::queue* q = stream ? static_cast<sycl::queue*>(stream) : &default_queue;
     if (n_cols < 1024) {
-        q->submit([&](sycl::handler &cgh) {
+        q->submit([&](sycl::handler& cgh) {
             sycl::local_accessor<float, 1> sums(sycl::range<1>(256 / SG_SZ), cgh);
-            cgh.parallel_for(
-                sycl::nd_range<1>(sycl::range<1>((size_t)n_rows * 256), sycl::range<1>(256)),
-                [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(SG_SZ)]] {
-                    weighted_rms_norm<256>(
-                        item, input, gamma, output, n_cols, epsilon,
-                        sums.get_multi_ptr<sycl::access::decorated::no>().get());
-                });
+            cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t)n_rows * 256), sycl::range<1>(256)),
+                             [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(SG_SZ)]] {
+                                 weighted_rms_norm<256>(item, input, gamma, output, n_cols, epsilon,
+                                                        sums.get_multi_ptr<sycl::access::decorated::no>().get());
+                             });
         });
     } else {
-        q->submit([&](sycl::handler &cgh) {
+        q->submit([&](sycl::handler& cgh) {
             sycl::local_accessor<float, 1> sums(sycl::range<1>(1024 / SG_SZ), cgh);
-            cgh.parallel_for(
-                sycl::nd_range<1>(sycl::range<1>((size_t)n_rows * 1024), sycl::range<1>(1024)),
-                [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(SG_SZ)]] {
-                    weighted_rms_norm<1024>(
-                        item, input, gamma, output, n_cols, epsilon,
-                        sums.get_multi_ptr<sycl::access::decorated::no>().get());
-                });
+            cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t)n_rows * 1024), sycl::range<1>(1024)),
+                             [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(SG_SZ)]] {
+                                 weighted_rms_norm<1024>(item, input, gamma, output, n_cols, epsilon,
+                                                         sums.get_multi_ptr<sycl::access::decorated::no>().get());
+                             });
         });
     }
     if (!stream) default_queue.wait();
 }
 
-} // namespace strata::kernels
+}  // namespace strata::kernels

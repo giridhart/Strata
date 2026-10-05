@@ -26,13 +26,12 @@ void cpu_ref_gemv(const uint16_t* x, const uint16_t* w, float* y, int64_t n_in, 
     }
 }
 
-} // namespace
+}  // namespace
 
 int main() {
     sycl::queue q{sycl::default_selector_v, sycl::property::queue::in_order()};
     printf("Running Xe2 Subgroup GEMV test on: %s (SUB_GROUP_SIZE=%d)\n",
-           q.get_device().get_info<sycl::info::device::name>().c_str(),
-           strata::sycl_arch::SUB_GROUP_SIZE);
+           q.get_device().get_info<sycl::info::device::name>().c_str(), strata::sycl_arch::SUB_GROUP_SIZE);
 
     // Exact model projection shapes from Qwen3.8-Flash-Next layout:
     struct GemvShape {
@@ -42,15 +41,10 @@ int main() {
     };
 
     const GemvShape shapes[] = {
-        {2560, 48,   "ssm_alpha / ssm_beta [2560, 48]"},
-        {2560, 128,  "indexer.k_proj [2560, 128]"},
-        {2560, 512,  "indexer.q_proj [2560, 512]"},
-        {2560, 640,  "ffn_gate_shexp [2560, 640]"},
-        {640,  2560, "ffn_down_shexp [640, 2560]"},
-        {10240, 320, "hc_attn_down [10240, 320]"},
-        {320, 10240, "hc_attn_up [320, 10240]"},
-        {2560, 2560, "ple_value / ffn [2560, 2560]"}
-    };
+        {2560, 48, "ssm_alpha / ssm_beta [2560, 48]"}, {2560, 128, "indexer.k_proj [2560, 128]"},
+        {2560, 512, "indexer.q_proj [2560, 512]"},     {2560, 640, "ffn_gate_shexp [2560, 640]"},
+        {640, 2560, "ffn_down_shexp [640, 2560]"},     {10240, 320, "hc_attn_down [10240, 320]"},
+        {320, 10240, "hc_attn_up [320, 10240]"},       {2560, 2560, "ple_value / ffn [2560, 2560]"}};
 
     std::mt19937 rng(2026);
     std::normal_distribution<float> dist(0.0f, 1.0f);
@@ -63,8 +57,10 @@ int main() {
         std::vector<float> h_out_warp(s.n_out, 0.0f);
         std::vector<float> h_out_split(s.n_out, 0.0f);
 
-        for (int64_t i = 0; i < s.n_in; ++i) h_x[i] = bf16_from_f32(dist(rng) * 0.1f);
-        for (int64_t i = 0; i < s.n_in * s.n_out; ++i) h_w[i] = bf16_from_f32(dist(rng) * 0.1f);
+        for (int64_t i = 0; i < s.n_in; ++i)
+            h_x[i] = bf16_from_f32(dist(rng) * 0.1f);
+        for (int64_t i = 0; i < s.n_in * s.n_out; ++i)
+            h_w[i] = bf16_from_f32(dist(rng) * 0.1f);
 
         cpu_ref_gemv(h_x.data(), h_w.data(), h_ref.data(), s.n_in, s.n_out);
 
@@ -99,8 +95,8 @@ int main() {
             if (err_s > 5e-4) ++bad_split;
         }
 
-        printf("  %-36s : warp err=%.2e (%d bad) | split256 err=%.2e (%d bad)\n",
-               s.name, max_err_warp, bad_warp, max_err_split, bad_split);
+        printf("  %-36s : warp err=%.2e (%d bad) | split256 err=%.2e (%d bad)\n", s.name, max_err_warp, bad_warp,
+               max_err_split, bad_split);
 
         if (bad_warp > 0 || bad_split > 0) total_bad += (bad_warp + bad_split);
 

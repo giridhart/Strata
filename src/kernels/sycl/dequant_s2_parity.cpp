@@ -28,50 +28,56 @@ const uint16_t kScales[] = {0x3C00, 0x3800, 0x3400, 0x3000, 0x2C00, 0x2800, 0x20
 
 }  // namespace
 
-int main(int argc, char **argv) {
+int main(int argc, char** argv) {
     sycl::queue q_ct1{sycl::default_selector_v, sycl::property::queue::in_order()};
     long long n_blocks = 200000;
     bool selftest = false;
     for (int i = 1; i < argc; ++i) {
-        if (std::strcmp(argv[i], "--selftest") == 0) selftest = true;
-        else if (std::strcmp(argv[i], "--blocks") == 0 && i + 1 < argc) n_blocks = std::atoll(argv[++i]);
+        if (std::strcmp(argv[i], "--selftest") == 0)
+            selftest = true;
+        else if (std::strcmp(argv[i], "--blocks") == 0 && i + 1 < argc)
+            n_blocks = std::atoll(argv[++i]);
         else {
             std::fprintf(stderr, "usage: dequant_s2_parity [--selftest] [--blocks N]\n");
             return 2;
         }
     }
-    if (n_blocks <= 0) { std::fprintf(stderr, "--blocks must be positive\n"); return 2; }
+    if (n_blocks <= 0) {
+        std::fprintf(stderr, "--blocks must be positive\n");
+        return 2;
+    }
 
     std::mt19937 rng(12345);
-    const int n_scales = (int) (sizeof(kScales) / sizeof(kScales[0]));
+    const int n_scales = (int)(sizeof(kScales) / sizeof(kScales[0]));
 
     // raw Q2_0 blocks: { fp16 d ; uint8 qs[16] } - what ggml produced and what the artifact stores
-    std::vector<uint8_t> raw((size_t) n_blocks * 18);
+    std::vector<uint8_t> raw((size_t)n_blocks * 18);
     for (long long b = 0; b < n_blocks; ++b) {
         const uint16_t d = kScales[rng() % n_scales];
-        raw[(size_t) b * 18 + 0] = (uint8_t) (d & 0xFF);
-        raw[(size_t) b * 18 + 1] = (uint8_t) (d >> 8);
-        for (int t = 0; t < 16; ++t) raw[(size_t) b * 18 + 2 + t] = (uint8_t) (rng() & 0xFF);
+        raw[(size_t)b * 18 + 0] = (uint8_t)(d & 0xFF);
+        raw[(size_t)b * 18 + 1] = (uint8_t)(d >> 8);
+        for (int t = 0; t < 16; ++t)
+            raw[(size_t)b * 18 + 2 + t] = (uint8_t)(rng() & 0xFF);
     }
 
     // the CPU reference, over the RAW blocks
-    std::vector<float> cpu((size_t) n_blocks * QK);
+    std::vector<float> cpu((size_t)n_blocks * QK);
     for (long long b = 0; b < n_blocks; ++b) {
-        strata::dequantize_q2_0(&raw[(size_t) b * 18], &cpu[(size_t) b * QK]);
+        strata::dequantize_q2_0(&raw[(size_t)b * 18], &cpu[(size_t)b * QK]);
     }
 
     // canonical planes: S2 packs 4 codes per byte exactly as Q2_0 stores them, so the codes plane is the raw
     // qs bytes; the scales plane is the fp16 `d` widened.  Copied into planes of their own rather than
     // aliased, because that is what the kernel will read in the engine.
-    std::vector<uint8_t> codes((size_t) n_blocks * 16);
-    std::vector<float> scales((size_t) n_blocks);
+    std::vector<uint8_t> codes((size_t)n_blocks * 16);
+    std::vector<float> scales((size_t)n_blocks);
     for (long long b = 0; b < n_blocks; ++b) {
-        std::memcpy(&codes[(size_t) b * 16], &raw[(size_t) b * 18 + 2], 16);
-        const uint16_t d = (uint16_t) (raw[(size_t) b * 18] | (raw[(size_t) b * 18 + 1] << 8));
-        scales[(size_t) b] = strata::fp16_to_fp32(d);
+        std::memcpy(&codes[(size_t)b * 16], &raw[(size_t)b * 18 + 2], 16);
+        const uint16_t d = (uint16_t)(raw[(size_t)b * 18] | (raw[(size_t)b * 18 + 1] << 8));
+        scales[(size_t)b] = strata::fp16_to_fp32(d);
     }
 
-    uint8_t* d_codes = (uint8_t *)sycl::malloc_device(codes.size(), q_ct1);
+    uint8_t* d_codes = (uint8_t*)sycl::malloc_device(codes.size(), q_ct1);
     float* d_scales = sycl::malloc_device<float>(scales.size(), q_ct1);
     float* d_out = sycl::malloc_device<float>(cpu.size(), q_ct1);
     q_ct1.memcpy(d_codes, codes.data(), codes.size()).wait();
@@ -87,7 +93,7 @@ int main(int argc, char **argv) {
         // bit comparison, not a tolerance: S2's decode is exact integer-to-float arithmetic, so ANY
         // difference is a bug and a tolerance would only hide which one
         if (std::memcmp(&cpu[i], &gpu[i], sizeof(float)) != 0) {
-            if (first_bad < 0) first_bad = (long long) i;
+            if (first_bad < 0) first_bad = (long long)i;
             ++bad;
         }
     }
@@ -98,14 +104,17 @@ int main(int argc, char **argv) {
     // an S2 decode that only ever saw one code would agree while being unable to tell -1 from +2.
     bool seen[4] = {false, false, false, false};
     for (size_t i = 0; i < codes.size(); ++i) {
-        for (int t = 0; t < 4; ++t) seen[(codes[i] >> (2 * t)) & 3] = true;
+        for (int t = 0; t < 4; ++t)
+            seen[(codes[i] >> (2 * t)) & 3] = true;
     }
     int distinct = 0;
-    for (bool s : seen) distinct += s ? 1 : 0;
+    for (bool s : seen)
+        distinct += s ? 1 : 0;
     long long distinct_vals = 0;
     for (size_t i = 0; i < cpu.size() && distinct_vals < 8; ++i) {
         bool dup = false;
-        for (size_t j = 0; j < i && !dup; ++j) dup = (cpu[j] == cpu[i]);
+        for (size_t j = 0; j < i && !dup; ++j)
+            dup = (cpu[j] == cpu[i]);
         if (!dup) ++distinct_vals;
     }
     std::printf("  non-vacuity: %d of 4 codes present, %lld distinct values in the first elements\n", distinct,
@@ -115,12 +124,11 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    std::printf("dequant_s2: %lld blocks, %lld elements, %lld mismatched\n", n_blocks, (long long) cpu.size(),
-                bad);
+    std::printf("dequant_s2: %lld blocks, %lld elements, %lld mismatched\n", n_blocks, (long long)cpu.size(), bad);
     if (bad) {
         std::printf("  first mismatch at element %lld (block %lld, offset %d): cpu %.9g gpu %.9g\n",
-                    (long long) first_bad, (long long) (first_bad / QK), (int) (first_bad % QK),
-                    (double) cpu[(size_t) first_bad], (double) gpu[(size_t) first_bad]);
+                    (long long)first_bad, (long long)(first_bad / QK), (int)(first_bad % QK),
+                    (double)cpu[(size_t)first_bad], (double)gpu[(size_t)first_bad]);
         return 1;
     }
     std::printf("  bit-exact against the scalar dequantizer that dequant_xcheck proved equal to ggml\n");

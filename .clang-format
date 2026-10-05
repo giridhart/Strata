@@ -1,0 +1,61 @@
+# .clang-format - Code formatting configuration for Strata (C++20 / SYCL)
+# Designed to match the existing codebase conventions in src/, include/, and perf/.
+
+---
+Language: Cpp
+BasedOnStyle: Google
+Standard: c++20
+
+# Indentation and Spacing
+IndentWidth: 4
+TabWidth: 4
+UseTab: Never
+AccessModifierOffset: -4
+NamespaceIndentation: None
+FixNamespaceComments: true
+CompactNamespaces: false
+
+# Line Length and Wrapping
+ColumnLimit: 120
+BreakBeforeBraces: Attach
+BreakBeforeTernaryOperators: true
+BreakBeforeBinaryOperators: None
+BreakConstructorInitializers: BeforeColon
+BreakInheritanceList: BeforeColon
+
+# Pointers and References
+PointerAlignment: Left
+ReferenceAlignment: Left
+DerivePointerAlignment: false
+
+# Short statements & lambdas
+AllowShortFunctionsOnASingleLine: All
+AllowShortIfStatementsOnASingleLine: WithoutElse
+AllowShortLoopsOnASingleLine: false
+AllowShortBlocksOnASingleLine: Never
+AllowShortLambdasOnASingleLine: All
+
+# Braces and Lists
+Cpp11BracedListStyle: true
+SpacesInAngles: Never
+SpacesInSquareBrackets: false
+SpaceBeforeRangeBasedForLoopColon: true
+SpaceBeforeParens: ControlStatements
+SpaceAfterCStyleCast: false
+
+# Include sorting
+# Disabled to preserve deliberate SYCL/HIP macro guards and include orders
+SortIncludes: false
+IncludeBlocks: Preserve
+
+# Alignment
+AlignOperands: Align
+AlignTrailingComments: true
+AlignConsecutiveAssignments: None
+AlignConsecutiveDeclarations: None
+
+# Penalties
+PenaltyExcessCharacter: 100
+PenaltyBreakBeforeFirstCallParameter: 19
+PenaltyBreakComment: 300
+PenaltyBreakString: 1000

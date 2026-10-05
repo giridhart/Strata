@@ -5,12 +5,11 @@
 
 namespace {
 inline sycl::queue& get_default_queue() {
-    static sycl::queue q{sycl::default_selector_v,
-                         sycl::property_list{sycl::property::queue::in_order{},
-                                            sycl::property::queue::enable_profiling{}}};
+    static sycl::queue q{sycl::default_selector_v, sycl::property_list{sycl::property::queue::in_order{},
+                                                                       sycl::property::queue::enable_profiling{}}};
     return q;
 }
-} // namespace
+}  // namespace
 #include "strata/kernels/mrope.hpp"
 #include "strata/core/progress.hpp"
 
@@ -36,7 +35,7 @@ inline sycl::queue& get_default_queue() {
 
 #define STRATA_SPIN_PAUSE() _mm_pause()
 #else
-#define STRATA_SPIN_PAUSE() ((void) 0)
+#define STRATA_SPIN_PAUSE() ((void)0)
 #endif
 
 namespace strata::core {
@@ -50,8 +49,8 @@ uint64_t align_up(uint64_t n, uint64_t a) { return (n + a - 1) / a * a; }
 /// `GdnBuffers::state`/`conv_state` point INTO that carve, so a session with 36 GDN layers has to give each one
 /// its own - they cannot share, because the recurrence is the whole point.
 uint64_t gdn_state_floats(const ModelGeometry& g) {
-    return (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size +
-           (uint64_t) g.ssm_conv_channels * (g.ssm_d_conv - 1);
+    return (uint64_t)g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size +
+           (uint64_t)g.ssm_conv_channels * (g.ssm_d_conv - 1);
 }
 
 }  // namespace
@@ -59,7 +58,7 @@ uint64_t gdn_state_floats(const ModelGeometry& g) {
 /// `NG_HIST` rows of `hc_dim` floats: the PLE conv's history, which is the ONLY PLE state that lives in the
 /// session arena.  The table and the weights are model-level and the caller owns them.
 static uint64_t ple_hist_bytes() {
-    return (uint64_t) strata::kernels::NG_HIST * strata::kernels::NG_HC_DIM * sizeof(float);
+    return (uint64_t)strata::kernels::NG_HIST * strata::kernels::NG_HC_DIM * sizeof(float);
 }
 
 uint64_t session_bytes(const ModelGeometry& g, int64_t max_cells, int64_t k, int64_t layer_lo, int64_t layer_hi) {
@@ -72,14 +71,14 @@ uint64_t session_bytes(const ModelGeometry& g, int64_t max_cells, int64_t k, int
     const int64_t gdn_n = std::max<int64_t>((layer_hi - layer_lo) - std::max<int64_t>(q_hi - q_lo, 0), 0);
     uint64_t n = 0;
     n += gdn_buffers_bytes(g);
-    n += (uint64_t) gdn_n * gdn_state_floats(g) * 4;
+    n += (uint64_t)gdn_n * gdn_state_floats(g) * 4;
     // One QSA state carries the RoPE table; the others borrow it (P7: 64 MiB per layer at 262K).
     if (g.n_qsa_layers() > 0)
-        n += qsa_state_bytes(g, max_cells, true) + (uint64_t) (q_n - 1) * qsa_state_bytes(g, max_cells, false);
+        n += qsa_state_bytes(g, max_cells, true) + (uint64_t)(q_n - 1) * qsa_state_bytes(g, max_cells, false);
     n += qsa_buffers_bytes(g, max_cells);
     n += moe_buffers_bytes(g, k);
     n += block_buffers_bytes(g);
-    n += ple_hist_bytes();                       // the PLE's NG_HIST normalized history rows
+    n += ple_hist_bytes();  // the PLE's NG_HIST normalized history rows
     return align_up(n, SESSION_STATE_ALIGN) + 4096;
 }
 
@@ -87,7 +86,7 @@ uint64_t session_init(const ModelGeometry& g, int64_t max_cells, int64_t k, void
                       int64_t layer_lo, int64_t layer_hi) {
     if (layer_hi < 0 || layer_hi > g.n_layers) layer_hi = g.n_layers;
     if (layer_lo < 0) layer_lo = 0;
-    uint8_t* p = (uint8_t*) base;
+    uint8_t* p = (uint8_t*)base;
     uint64_t used = 0;
     auto take = [&](uint64_t bytes) {
         uint8_t* r = p + used;
@@ -107,7 +106,7 @@ uint64_t session_init(const ModelGeometry& g, int64_t max_cells, int64_t k, void
     s.gdn_alloc = std::max<int64_t>((layer_hi - layer_lo) - q_n_range, 0);
 
     gdn_buffers_init(g, take(gdn_buffers_bytes(g)), s.gdn);
-    s.gdn_state = (float*) take((uint64_t) s.gdn_alloc * gdn_state_floats(g) * 4);
+    s.gdn_state = (float*)take((uint64_t)s.gdn_alloc * gdn_state_floats(g) * 4);
 
     // the QSA states are separate allocations carved from one arena, because `QsaState` is a struct of
     // pointers and `qsa_state_init` writes them - a contiguous array would need the arena to be laid out the
@@ -115,15 +114,15 @@ uint64_t session_init(const ModelGeometry& g, int64_t max_cells, int64_t k, void
     // rest stay value-initialized nulls.  The FIRST ALLOCATED one (the session's primary, ordinal qsa_ord0)
     // owns the RoPE table that the others - and the prefill staging identity, and the MTP drafter - borrow.
     const uint64_t first = qsa_state_bytes(g, max_cells, true), rest = qsa_state_bytes(g, max_cells, false);
-    s.qsa_state_arena = take(g.n_qsa_layers() > 0 ? first + (uint64_t) (s.qsa_alloc - 1) * rest : 0);
-    s.qsa_states = new QsaState[(size_t) g.n_qsa_layers()]();
+    s.qsa_state_arena = take(g.n_qsa_layers() > 0 ? first + (uint64_t)(s.qsa_alloc - 1) * rest : 0);
+    s.qsa_states = new QsaState[(size_t)g.n_qsa_layers()]();
     s.qsa_buf_arena = take(qsa_buffers_bytes(g, max_cells));
 
-    uint8_t* qp = (uint8_t*) s.qsa_state_arena;
+    uint8_t* qp = (uint8_t*)s.qsa_state_arena;
     // a layer whose pinned RAM could not be had (KV streaming's host copy) is half-built: going on would have the
     // attention read null host pointers at the first request ("illegal memory access"), so the session fails here
     for (int64_t j = 0; j < s.qsa_alloc; ++j)
-        if (qsa_state_init(g, max_cells, qp + (j == 0 ? 0 : first + (uint64_t) (j - 1) * rest),
+        if (qsa_state_init(g, max_cells, qp + (j == 0 ? 0 : first + (uint64_t)(j - 1) * rest),
                            s.qsa_states[s.qsa_ord0 + j], j == 0 ? nullptr : &s.qsa_states[s.qsa_ord0]) == 0)
             return 0;
     qsa_buffers_init(g, max_cells, s.qsa_buf_arena, s.qsa_bufs);
@@ -134,7 +133,7 @@ uint64_t session_init(const ModelGeometry& g, int64_t max_cells, int64_t k, void
     block_buffers_init(g, s.block_arena, s.block);
     // THE PLE HISTORY: NG_HIST rows of hc_dim floats, row-fastest.  Sequence state, carved here and zeroed by
     // `session_zero`; it survives every token, which is the whole point of a conv history.
-    s.ple_hist = (float*) take(ple_hist_bytes());
+    s.ple_hist = (float*)take(ple_hist_bytes());
     s.R = s.block.R;
     return used;
 }
@@ -153,15 +152,15 @@ void session_zero(SessionState& s, const ModelGeometry& g, const float* R_init, 
     // embedding broadcast to every stream, which is the reference's own initial condition.
     if (R_init != nullptr) {
         for (int64_t c = 0; c < g.hc; ++c)
-            cs->memcpy(s.block.R + (size_t)c * g.n_embd, R_init,
-                       (size_t)g.n_embd * 4);
+            cs->memcpy(s.block.R + (size_t)c * g.n_embd, R_init, (size_t)g.n_embd * 4);
     } else {
         cs->memset(s.block.R, 0, (size_t)g.hc * g.n_embd * 4);
     }
     // every owned GDN layer's recurrence and conv history
     cs->memset(s.gdn_state, 0, (size_t)s.gdn_alloc * gdn_state_floats(g) * 4);
     // and every owned QSA layer's cache and indexer
-    for (int64_t j = 0; j < s.qsa_alloc; ++j) qsa_state_zero(s.qsa_states[s.qsa_ord0 + j], g, stream);
+    for (int64_t j = 0; j < s.qsa_alloc; ++j)
+        qsa_state_zero(s.qsa_states[s.qsa_ord0 + j], g, stream);
     // **AND THE PLE'S CONV HISTORY AND TOKEN WINDOW.**  A sequence that started with a warm history would
     // convolve over rows belonging to a different sequence - the conv reads NG_HIST previous NORMALIZED rows,
     // so a stale one is a real contribution and not a zero.  The token window resets to `NG_HIST`-many nulls
@@ -178,9 +177,10 @@ void session_zero(SessionState& s, const ModelGeometry& g, const float* R_init, 
 void gdn_point_at(const ModelGeometry& g, int64_t layer, SessionState& s) {
     if (is_qsa_layer(g, layer)) return;
     int64_t gdn_index = 0;
-    for (int64_t l = 0; l < layer; ++l) if (!is_qsa_layer(g, l)) ++gdn_index;
-    s.gdn.state = s.gdn_state + (size_t) (gdn_index - s.gdn_ord0) * gdn_state_floats(g);
-    s.gdn.conv_state = s.gdn.state + (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size;
+    for (int64_t l = 0; l < layer; ++l)
+        if (!is_qsa_layer(g, l)) ++gdn_index;
+    s.gdn.state = s.gdn_state + (size_t)(gdn_index - s.gdn_ord0) * gdn_state_floats(g);
+    s.gdn.conv_state = s.gdn.state + (uint64_t)g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size;
 }
 
 /// The per-token staging every QSA layer's captured H2D reads FROM.  Must run before each replay: the graphs
@@ -195,14 +195,13 @@ void stage_token(const ModelGeometry& g, int64_t pos, int32_t pos_base, SessionS
     for (int64_t j = 0; j < s.qsa_alloc; ++j) {
         QsaState& q = s.qsa_states[s.qsa_ord0 + j];
         qsa_step_fill(q.host_step, pos, sh);
-        for (int64_t h = 0; h < g.n_head; ++h) q.host_pos[h] = (int32_t) (pos_base + pos);
+        for (int64_t h = 0; h < g.n_head; ++h)
+            q.host_pos[h] = (int32_t)(pos_base + pos);
     }
 }
 
-bool session_capture(const WeightTable &tables, const ModelGeometry &g,
-                     SessionState &s, const float *parts, SessionGraphs &gr,
-                     std::string &err, bool split, int64_t layer_lo,
-                     int64_t layer_hi) try {
+bool session_capture(const WeightTable& tables, const ModelGeometry& g, SessionState& s, const float* parts,
+                     SessionGraphs& gr, std::string& err, bool split, int64_t layer_lo, int64_t layer_hi) try {
     if (gr.captured) return true;
     if (layer_hi < 0 || layer_hi > g.n_layers) layer_hi = g.n_layers;
     if (layer_lo < 0) layer_lo = 0;
@@ -216,7 +215,8 @@ bool session_capture(const WeightTable &tables, const ModelGeometry &g,
     remigrate with option: --use-experimental-features=graph.
     */
     gr.posts = new cudaGraphExec_t[(size_t)g.n_layers]();
-    for (int64_t i = 0; i < g.n_layers; ++i) gr.posts[i] = nullptr;
+    for (int64_t i = 0; i < g.n_layers; ++i)
+        gr.posts[i] = nullptr;
     if (split) {
         /*
         DPCT1119:286: Migration of cudaGraphExec_t is not supported, please try
@@ -228,14 +228,18 @@ bool session_capture(const WeightTable &tables, const ModelGeometry &g,
         to remigrate with option: --use-experimental-features=graph.
         */
         gr.preB = new cudaGraphExec_t[(size_t)g.n_layers]();
-        for (int64_t i = 0; i < g.n_layers; ++i) { gr.preA[i] = nullptr; gr.preB[i] = nullptr; }
+        for (int64_t i = 0; i < g.n_layers; ++i) {
+            gr.preA[i] = nullptr;
+            gr.preB[i] = nullptr;
+        }
         for (int k = 0; k < 5; ++k) {
             /*
             DPCT1119:288: Migration of cudaGraphExec_t is not supported, please
             try to remigrate with option: --use-experimental-features=graph.
             */
             gr.preP[k] = new cudaGraphExec_t[(size_t)g.n_layers]();
-            for (int64_t i = 0; i < g.n_layers; ++i) gr.preP[k][i] = nullptr;
+            for (int64_t i = 0; i < g.n_layers; ++i)
+                gr.preP[k][i] = nullptr;
         }
     }
     gr.split_captured = split;
@@ -255,12 +259,10 @@ bool session_capture(const WeightTable &tables, const ModelGeometry &g,
         DPCT1119:289: Migration of cudaGraphExec_t is not supported, please try
         to remigrate with option: --use-experimental-features=graph.
         */
-        auto capture = [&](bool post, void** out, const char *what,
-                           int half = 0, int stage_prefix = 0) -> bool {
+        auto capture = [&](bool post, void** out, const char* what, int half = 0, int stage_prefix = 0) -> bool {
             sycl::queue* cs = nullptr;
             try {
-                cs = new sycl::queue(sycl::default_selector_v,
-                                     sycl::property_list{sycl::property::queue::in_order{}});
+                cs = new sycl::queue(sycl::default_selector_v, sycl::property_list{sycl::property::queue::in_order{}});
             } catch (const sycl::exception& e) {
                 err = std::string("session_capture: stream create failed: ") + e.what();
                 return false;
@@ -273,11 +275,10 @@ bool session_capture(const WeightTable &tables, const ModelGeometry &g,
             err.clear();
             // R0.9: `half` is 0 for every mode except the split capture, where it selects a prefix of the
             // stages so the mixer and the FFN-front-plus-router can be timed separately.
-            const bool ok = post
-                                ? block_layer_post(tables, g, l, s.k, s.moe, s.block, parts, (void*) cs, err)
-                                : block_layer_pre(tables, g, l, 0, 0, s.gdn, qst, s.qsa_bufs, s.moe, s.k,
-                                                  s.block, (void*) cs, err, s.db, s.ple.ready() ? &s.ple : nullptr,
-                                                  half, stage_prefix);
+            const bool ok =
+                post ? block_layer_post(tables, g, l, s.k, s.moe, s.block, parts, (void*)cs, err)
+                     : block_layer_pre(tables, g, l, 0, 0, s.gdn, qst, s.qsa_bufs, s.moe, s.k, s.block, (void*)cs, err,
+                                       s.db, s.ple.ready() ? &s.ple : nullptr, half, stage_prefix);
             if (!ok) {
                 cudaGraph_t discard = nullptr;
                 cudaStreamEndCapture(cs, &discard);
@@ -290,9 +291,8 @@ bool session_capture(const WeightTable &tables, const ModelGeometry &g,
             const int ce = cudaStreamEndCapture(cs, &graph);
             delete cs;
             if (ce != 0) {
-                err = "session_capture: " + std::string(what) + " layer " +
-                      std::to_string(l) + ": error " + std::to_string(ce) +
-                      " (a synchronous call in the layer?)";
+                err = "session_capture: " + std::string(what) + " layer " + std::to_string(l) + ": error " +
+                      std::to_string(ce) + " (a synchronous call in the layer?)";
                 return false;
             }
             if (cudaGraphInstantiate(out, graph, 0) != 0) {
@@ -311,26 +311,25 @@ bool session_capture(const WeightTable &tables, const ModelGeometry &g,
             // Prefixes 1..5, ALL through the new parameter - including the fifth, so that it and the fourth
             // differ only in the one stage between them and not in how many nodes their graphs carry.
             for (int k = 1; k <= 5; ++k)
-                if (!capture(/*post=*/false, &gr.preP[k - 1][l], "preP", /*half=*/0, /*stage_prefix=*/k))
-                    return false;
+                if (!capture(/*post=*/false, &gr.preP[k - 1][l], "preP", /*half=*/0, /*stage_prefix=*/k)) return false;
         }
         ++gr.n;
         if (qsa) ++qsa_index;
     }
     gr.captured = true;
-    gr.parts_dev = const_cast<float*>(parts);   // the address the graphs baked in; the loop copies here
+    gr.parts_dev = const_cast<float*>(parts);  // the address the graphs baked in; the loop copies here
     return true;
-}
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
+} catch (sycl::exception const& exc) {
+    std::cerr << exc.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
+    std::exit(1);
 }
 
-bool session_replay(const ModelGeometry &g, int64_t pos, int32_t pos_base,
-                    SessionState &s, SessionGraphs &gr, void *stream,
-                    std::string &err) try {
-    if (!gr.captured || gr.n != g.n_layers) { err = "session_replay: not captured"; return false; }
+bool session_replay(const ModelGeometry& g, int64_t pos, int32_t pos_base, SessionState& s, SessionGraphs& gr,
+                    void* stream, std::string& err) try {
+    if (!gr.captured || gr.n != g.n_layers) {
+        err = "session_replay: not captured";
+        return false;
+    }
     sycl::queue* cs = stream ? static_cast<sycl::queue*>(stream) : &get_default_queue();
     stage_token(g, pos, pos_base, s);
     for (int64_t l = 0; l < g.n_layers; ++l) {
@@ -341,16 +340,13 @@ bool session_replay(const ModelGeometry &g, int64_t pos, int32_t pos_base,
         }
     }
     return true;
-}
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
+} catch (sycl::exception const& exc) {
+    std::cerr << exc.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
+    std::exit(1);
 }
 
-bool session_replay_full(const ModelGeometry &g, int64_t pos, int32_t pos_base,
-                         SessionState &s, SessionGraphs &gr, void *stream,
-                         std::string &err) try {
+bool session_replay_full(const ModelGeometry& g, int64_t pos, int32_t pos_base, SessionState& s, SessionGraphs& gr,
+                         void* stream, std::string& err) try {
     if (!gr.captured || gr.n != g.n_layers || gr.posts == nullptr) {
         err = "session_replay_full: not captured with post graphs";
         return false;
@@ -362,23 +358,19 @@ bool session_replay_full(const ModelGeometry &g, int64_t pos, int32_t pos_base,
         // `post[l]` reads what `pre[l]` wrote, so they cannot be reordered or run concurrently.
         int e = cudaGraphLaunch_mock(gr.execs[l], cs);
         if (e != 0) {
-            err = "session_replay_full: pre[" + std::to_string(l) +
-                  "]: error " + std::to_string(e);
+            err = "session_replay_full: pre[" + std::to_string(l) + "]: error " + std::to_string(e);
             return false;
         }
         e = cudaGraphLaunch_mock(gr.posts[l], cs);
         if (e != 0) {
-            err = "session_replay_full: post[" + std::to_string(l) +
-                  "]: error " + std::to_string(e);
+            err = "session_replay_full: post[" + std::to_string(l) + "]: error " + std::to_string(e);
             return false;
         }
     }
     return true;
-}
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
+} catch (sycl::exception const& exc) {
+    std::cerr << exc.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
+    std::exit(1);
 }
 
 bool session_replay_stages_per_layer(const ModelGeometry& g, int64_t pos, int32_t pos_base, SessionState& s,
@@ -400,82 +392,79 @@ bool session_replay_stages_per_layer(const ModelGeometry& g, int64_t pos, int32_
         e = new sycl::event();
     }
     struct Free {
-        std::vector<sycl::event*> *v;
-        ~Free() { for (auto &e : *v) delete e; }
+        std::vector<sycl::event*>* v;
+        ~Free() {
+            for (auto& e : *v)
+                delete e;
+        }
     } frees{&ev};
 
     for (int64_t l = 0; l < n; ++l) {
         *ev[(size_t)(l * 4 + 0)] = cs->ext_oneapi_submit_barrier();
         if (cudaGraphLaunch_mock(gr.preA[l], cs) != 0) {
-            err = "stages: preA"; return false;
+            err = "stages: preA";
+            return false;
         }
         *ev[(size_t)(l * 4 + 1)] = cs->ext_oneapi_submit_barrier();
         if (cudaGraphLaunch_mock(gr.preB[l], cs) != 0) {
-            err = "stages: preB"; return false;
+            err = "stages: preB";
+            return false;
         }
         *ev[(size_t)(l * 4 + 2)] = cs->ext_oneapi_submit_barrier();
         if (cudaGraphLaunch_mock(gr.posts[l], cs) != 0) {
-            err = "stages: post"; return false;
+            err = "stages: post";
+            return false;
         }
         *ev[(size_t)(l * 4 + 3)] = cs->ext_oneapi_submit_barrier();
     }
     cs->wait();
 
-    mixer_per_layer.assign((size_t) n, 0.0);
-    ms_ffn = 0; ms_post = 0;
+    mixer_per_layer.assign((size_t)n, 0.0);
+    ms_ffn = 0;
+    ms_post = 0;
     for (int64_t l = 0; l < n; ++l) {
         float a = 0, b = 0, c = 0;
-        a = (ev[(size_t)(l * 4 + 1)]
-                 ->get_profiling_info<
-                     sycl::info::event_profiling::command_end>() -
-             ev[(size_t)(l * 4 + 0)]
-                 ->get_profiling_info<
-                     sycl::info::event_profiling::command_start>()) /
+        a = (ev[(size_t)(l * 4 + 1)]->get_profiling_info<sycl::info::event_profiling::command_end>() -
+             ev[(size_t)(l * 4 + 0)]->get_profiling_info<sycl::info::event_profiling::command_start>()) /
             1000000.0f;
-        b = (ev[(size_t)(l * 4 + 2)]
-                 ->get_profiling_info<
-                     sycl::info::event_profiling::command_end>() -
-             ev[(size_t)(l * 4 + 1)]
-                 ->get_profiling_info<
-                     sycl::info::event_profiling::command_start>()) /
+        b = (ev[(size_t)(l * 4 + 2)]->get_profiling_info<sycl::info::event_profiling::command_end>() -
+             ev[(size_t)(l * 4 + 1)]->get_profiling_info<sycl::info::event_profiling::command_start>()) /
             1000000.0f;
-        c = (ev[(size_t)(l * 4 + 3)]
-                 ->get_profiling_info<
-                     sycl::info::event_profiling::command_end>() -
-             ev[(size_t)(l * 4 + 2)]
-                 ->get_profiling_info<
-                     sycl::info::event_profiling::command_start>()) /
+        c = (ev[(size_t)(l * 4 + 3)]->get_profiling_info<sycl::info::event_profiling::command_end>() -
+             ev[(size_t)(l * 4 + 2)]->get_profiling_info<sycl::info::event_profiling::command_start>()) /
             1000000.0f;
-        mixer_per_layer[(size_t) l] = (double) a;
-        ms_ffn += b; ms_post += c;
+        mixer_per_layer[(size_t)l] = (double)a;
+        ms_ffn += b;
+        ms_post += c;
     }
     return true;
 }
 
-bool session_replay_stages(const ModelGeometry& g, int64_t pos, int32_t pos_base, SessionState& s,
-                           SessionGraphs& gr, void* stream, double& ms_mixer, double& ms_ffn, double& ms_post,
-                           std::string& err) {
+bool session_replay_stages(const ModelGeometry& g, int64_t pos, int32_t pos_base, SessionState& s, SessionGraphs& gr,
+                           void* stream, double& ms_mixer, double& ms_ffn, double& ms_post, std::string& err) {
     std::vector<double> per;
     if (!session_replay_stages_per_layer(g, pos, pos_base, s, gr, stream, per, ms_ffn, ms_post, err)) return false;
     ms_mixer = 0;
-    for (double v : per) ms_mixer += v;
+    for (double v : per)
+        ms_mixer += v;
     return true;
 }
 
-bool session_replay_stage_sweep(const ModelGeometry &g, int64_t pos,
-                                int32_t pos_base, SessionState &s,
-                                SessionGraphs &gr, void *stream, int k,
-                                double &ms, std::string &err) try {
+bool session_replay_stage_sweep(const ModelGeometry& g, int64_t pos, int32_t pos_base, SessionState& s,
+                                SessionGraphs& gr, void* stream, int k, double& ms, std::string& err) try {
     if (!gr.split_captured || gr.preP[0] == nullptr) {
         err = "session_replay_stage_sweep: not captured with the split";
         return false;
     }
-    if (k < 1 || k > 5) { err = "session_replay_stage_sweep: k must be 1..5"; return false; }
+    if (k < 1 || k > 5) {
+        err = "session_replay_stage_sweep: k must be 1..5";
+        return false;
+    }
     sycl::queue* cs = stream ? static_cast<sycl::queue*>(stream) : &get_default_queue();
     stage_token(g, pos, pos_base, s);
 
-    sycl::event *a = new sycl::event();
-    sycl::event *b = new sycl::event();
+    sycl::event* a = new sycl::event();
+    sycl::event* b = new sycl::event();
     *a = cs->ext_oneapi_submit_barrier();
     for (int64_t l = 0; l < g.n_layers; ++l) {
         const int e = cudaGraphLaunch_mock(gr.preP[k - 1][l], cs);
@@ -494,21 +483,16 @@ bool session_replay_stage_sweep(const ModelGeometry &g, int64_t pos,
         1000000.0f;
     delete a;
     delete b;
-    ms = (double) v;
+    ms = (double)v;
     return true;
-}
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
+} catch (sycl::exception const& exc) {
+    std::cerr << exc.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
+    std::exit(1);
 }
 
-bool session_replay_stage_prefixes(const ModelGeometry &g, int64_t pos,
-                                   int32_t pos_base, SessionState &s,
-                                   SessionGraphs &gr, void *stream,
-                                   std::vector<double> &stage_ms,
-                                   std::vector<double> &mixer_per_layer,
-                                   std::string &err) try {
+bool session_replay_stage_prefixes(const ModelGeometry& g, int64_t pos, int32_t pos_base, SessionState& s,
+                                   SessionGraphs& gr, void* stream, std::vector<double>& stage_ms,
+                                   std::vector<double>& mixer_per_layer, std::string& err) try {
     if (!gr.split_captured || gr.preP[0] == nullptr) {
         err = "session_replay_stage_prefixes: not captured with the split";
         return false;
@@ -516,7 +500,7 @@ bool session_replay_stage_prefixes(const ModelGeometry &g, int64_t pos,
     sycl::queue* cs = stream ? static_cast<sycl::queue*>(stream) : &get_default_queue();
     stage_token(g, pos, pos_base, s);
     const int64_t n = g.n_layers;
-    const size_t r_floats = (size_t) g.hc * (size_t) g.n_embd;
+    const size_t r_floats = (size_t)g.hc * (size_t)g.n_embd;
 
     float* saved = sycl::malloc_device<float>(r_floats, *cs);
     if (!saved) {
@@ -524,32 +508,32 @@ bool session_replay_stage_prefixes(const ModelGeometry &g, int64_t pos,
         return false;
     }
     std::vector<sycl::event*> ev((size_t)(n * 6));
-    for (auto &e : ev) e = new sycl::event();
+    for (auto& e : ev)
+        e = new sycl::event();
     struct Cleanup {
-        std::vector<sycl::event*> *v;
+        std::vector<sycl::event*>* v;
         float* p;
         sycl::queue* q;
         ~Cleanup() {
-            for (auto &e : *v) delete e;
+            for (auto& e : *v)
+                delete e;
             if (p) sycl::free(p, *q);
         }
     } cleanup{&ev, saved, cs};
 
     double t[5] = {0, 0, 0, 0, 0};
-    mixer_per_layer.assign((size_t) n, 0.0);
+    mixer_per_layer.assign((size_t)n, 0.0);
     for (int64_t l = 0; l < n; ++l) {
         // The residual as this layer receives it, before any prefix has advanced it.
         cs->memcpy(saved, s.block.R, r_floats * sizeof(float));
         for (int k = 1; k <= 5; ++k) {
             if (k > 1) cs->memcpy(s.block.R, saved, r_floats * sizeof(float));
             *ev[(size_t)(l * 6 + k - 1)] = cs->ext_oneapi_submit_barrier();
-            const cudaGraphExec_t ge =
-                (k == 5) ? gr.execs[l] : gr.preP[k - 1][l];
+            const cudaGraphExec_t ge = (k == 5) ? gr.execs[l] : gr.preP[k - 1][l];
             const int e = cudaGraphLaunch_mock(ge, cs);
             if (e != 0) {
-                err = std::string(
-                          "session_replay_stage_prefixes: launch prefix ") +
-                      std::to_string(k) + ": " + std::to_string(e);
+                err = std::string("session_replay_stage_prefixes: launch prefix ") + std::to_string(k) + ": " +
+                      std::to_string(e);
                 return false;
             }
         }
@@ -560,43 +544,27 @@ bool session_replay_stage_prefixes(const ModelGeometry &g, int64_t pos,
     float t1 = 0, t2 = 0, t3 = 0, t4 = 0, t5 = 0;
     for (int64_t l = 0; l < n; ++l) {
         float a = 0, b = 0, c = 0, d = 0, e = 0;
-        a = (ev[(size_t)(l * 6 + 1)]
-                 ->get_profiling_info<
-                     sycl::info::event_profiling::command_end>() -
-             ev[(size_t)(l * 6 + 0)]
-                 ->get_profiling_info<
-                     sycl::info::event_profiling::command_start>()) /
+        a = (ev[(size_t)(l * 6 + 1)]->get_profiling_info<sycl::info::event_profiling::command_end>() -
+             ev[(size_t)(l * 6 + 0)]->get_profiling_info<sycl::info::event_profiling::command_start>()) /
             1000000.0f;
-        b = (ev[(size_t)(l * 6 + 2)]
-                 ->get_profiling_info<
-                     sycl::info::event_profiling::command_end>() -
-             ev[(size_t)(l * 6 + 1)]
-                 ->get_profiling_info<
-                     sycl::info::event_profiling::command_start>()) /
+        b = (ev[(size_t)(l * 6 + 2)]->get_profiling_info<sycl::info::event_profiling::command_end>() -
+             ev[(size_t)(l * 6 + 1)]->get_profiling_info<sycl::info::event_profiling::command_start>()) /
             1000000.0f;
-        c = (ev[(size_t)(l * 6 + 3)]
-                 ->get_profiling_info<
-                     sycl::info::event_profiling::command_end>() -
-             ev[(size_t)(l * 6 + 2)]
-                 ->get_profiling_info<
-                     sycl::info::event_profiling::command_start>()) /
+        c = (ev[(size_t)(l * 6 + 3)]->get_profiling_info<sycl::info::event_profiling::command_end>() -
+             ev[(size_t)(l * 6 + 2)]->get_profiling_info<sycl::info::event_profiling::command_start>()) /
             1000000.0f;
-        d = (ev[(size_t)(l * 6 + 4)]
-                 ->get_profiling_info<
-                     sycl::info::event_profiling::command_end>() -
-             ev[(size_t)(l * 6 + 3)]
-                 ->get_profiling_info<
-                     sycl::info::event_profiling::command_start>()) /
+        d = (ev[(size_t)(l * 6 + 4)]->get_profiling_info<sycl::info::event_profiling::command_end>() -
+             ev[(size_t)(l * 6 + 3)]->get_profiling_info<sycl::info::event_profiling::command_start>()) /
             1000000.0f;
-        e = (ev[(size_t)(l * 6 + 5)]
-                 ->get_profiling_info<
-                     sycl::info::event_profiling::command_end>() -
-             ev[(size_t)(l * 6 + 4)]
-                 ->get_profiling_info<
-                     sycl::info::event_profiling::command_start>()) /
+        e = (ev[(size_t)(l * 6 + 5)]->get_profiling_info<sycl::info::event_profiling::command_end>() -
+             ev[(size_t)(l * 6 + 4)]->get_profiling_info<sycl::info::event_profiling::command_start>()) /
             1000000.0f;
-        t1 += a; t2 += b; t3 += c; t4 += d; t5 += e;
-        mixer_per_layer[(size_t) l] = (double) c;   // prefix 3 IS the mixer: stages 0..2
+        t1 += a;
+        t2 += b;
+        t3 += c;
+        t4 += d;
+        t5 += e;
+        mixer_per_layer[(size_t)l] = (double)c;  // prefix 3 IS the mixer: stages 0..2
     }
     t[0] = t1;
     t[1] = t2 - t1;
@@ -605,11 +573,9 @@ bool session_replay_stage_prefixes(const ModelGeometry &g, int64_t pos,
     t[4] = t5 - t4;
     stage_ms.assign(t, t + 5);
     return true;
-}
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
+} catch (sycl::exception const& exc) {
+    std::cerr << exc.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
+    std::exit(1);
 }
 
 void session_graphs_free(SessionGraphs& gr) {
@@ -618,7 +584,8 @@ void session_graphs_free(SessionGraphs& gr) {
         DPCT1119:324: Migration of cudaGraphExecDestroy_mock is not supported, please
         try to remigrate with option: --use-experimental-features=graph.
         */
-        for (int64_t i = 0; i < gr.n; ++i) cudaGraphExecDestroy_mock(gr.execs[i]);
+        for (int64_t i = 0; i < gr.n; ++i)
+            cudaGraphExecDestroy_mock(gr.execs[i]);
         delete[] gr.execs;
     }
     if (gr.posts) {
@@ -673,7 +640,7 @@ void session_graphs_free(SessionGraphs& gr) {
     gr.captured = false;
 }
 
-bool SessionLoopScratch::init(size_t parts_bytes_in, std::string &err) try {
+bool SessionLoopScratch::init(size_t parts_bytes_in, std::string& err) try {
     if (y_miss != nullptr || probe != nullptr) {
         err = "SessionLoopScratch::init: already initialised";
         return false;
@@ -710,11 +677,9 @@ bool SessionLoopScratch::init(size_t parts_bytes_in, std::string &err) try {
         pinned = pinned_core.valid;
     }
     return true;
-}
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
+} catch (sycl::exception const& exc) {
+    std::cerr << exc.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
+    std::exit(1);
 }
 
 void SessionLoopScratch::free() {
@@ -725,24 +690,36 @@ void SessionLoopScratch::free() {
         pinned = false;
         pinned_core = {};
     }
-    if (probe != nullptr) { delete probe; probe = nullptr; }
+    if (probe != nullptr) {
+        delete probe;
+        probe = nullptr;
+    }
     if (y_miss != nullptr) {
-        sycl::free(y_miss, get_default_queue()); y_miss = nullptr;
+        sycl::free(y_miss, get_default_queue());
+        y_miss = nullptr;
     }
     parts_bytes = 0;
 }
 
-bool session_loop(const ModelGeometry &g, int64_t pos, int32_t pos_base,
-                  SessionState &s, SessionGraphs &gr, PoolFn pool, HitFn hits,
-                  void *user, bool overlap, void *stream, std::string &err,
-                  float *dump_layers, SessionLoopScratch *scratch) try {
-    if (!gr.captured || gr.n != g.n_layers) { err = "session_loop: not captured"; return false; }
-    if (gr.parts_dev == nullptr) { err = "session_loop: the graphs were captured without a parts buffer"; return false; }
-    if (s.db == nullptr) { err = "session_loop: no doorbell; the loop has nothing to poll"; return false; }
+bool session_loop(const ModelGeometry& g, int64_t pos, int32_t pos_base, SessionState& s, SessionGraphs& gr,
+                  PoolFn pool, HitFn hits, void* user, bool overlap, void* stream, std::string& err, float* dump_layers,
+                  SessionLoopScratch* scratch) try {
+    if (!gr.captured || gr.n != g.n_layers) {
+        err = "session_loop: not captured";
+        return false;
+    }
+    if (gr.parts_dev == nullptr) {
+        err = "session_loop: the graphs were captured without a parts buffer";
+        return false;
+    }
+    if (s.db == nullptr) {
+        err = "session_loop: no doorbell; the loop has nothing to poll";
+        return false;
+    }
 
     sycl::queue* cs = stream ? static_cast<sycl::queue*>(stream) : &get_default_queue();
     const int64_t k = s.k;
-    const size_t parts_bytes = (size_t) k * g.n_embd * 4;
+    const size_t parts_bytes = (size_t)k * g.n_embd * 4;
     ++gr.calls_total;
 
     // ================================ THE POSITION, WHICH THIS LOOP NEVER STAGED ================================
@@ -776,7 +753,9 @@ bool session_loop(const ModelGeometry &g, int64_t pos, int32_t pos_base,
     }
     struct LocalFree {
         SessionLoopScratch* p;
-        ~LocalFree() { if (p != nullptr) p->free(); }
+        ~LocalFree() {
+            if (p != nullptr) p->free();
+        }
     } local_free{scratch == &local ? &local : nullptr};
     if (scratch->parts_bytes != parts_bytes) {
         err = "session_loop: the scratch was sized for a different k or n_embd";
@@ -809,7 +788,7 @@ bool session_loop(const ModelGeometry &g, int64_t pos, int32_t pos_base,
     // when this function is entered, which is the reference's `hc_init` node - so dumping it here is what splits
     // "the input to layer 0 is already wrong" from "layer 0 is wrong".
     if (dump_layers != nullptr) {
-        const size_t n = (size_t) g.hc * (size_t) g.n_embd;
+        const size_t n = (size_t)g.hc * (size_t)g.n_embd;
         cs->memcpy(dump_layers, s.R, n * sizeof(float));
     }
     {
@@ -820,7 +799,7 @@ bool session_loop(const ModelGeometry &g, int64_t pos, int32_t pos_base,
             return false;
         }
         *probe = cs->ext_oneapi_submit_barrier();
-        (void) t0;
+        (void)t0;
     }
 
     for (int64_t l = 0; l < g.n_layers; ++l) {
@@ -848,8 +827,8 @@ bool session_loop(const ModelGeometry &g, int64_t pos, int32_t pos_base,
                 rang = true;
                 mid_graph = !complete;
             }
-            if (complete) break; // the graph has ended
-            if (rang) break;     // rung, and the graph is still running: the overlap
+            if (complete) break;  // the graph has ended
+            if (rang) break;      // rung, and the graph is still running: the overlap
             STRATA_SPIN_PAUSE();
         }
         if (mid_graph) ++gr.rings_mid_graph;
@@ -896,7 +875,7 @@ bool session_loop(const ModelGeometry &g, int64_t pos, int32_t pos_base,
         // Nothing is synchronised: the loop's existing final sync is what completes these.  See the note on
         // `dump_layers` in session.hpp for why this is an enqueue and not a read.
         if (dump_layers != nullptr) {
-            const size_t n = (size_t) g.hc * (size_t) g.n_embd;
+            const size_t n = (size_t)g.hc * (size_t)g.n_embd;
             cs->memcpy(dump_layers + (size_t)(l + 1) * n, s.R, n * sizeof(float));
         }
         if (!overlap) {
@@ -928,17 +907,13 @@ bool session_loop(const ModelGeometry &g, int64_t pos, int32_t pos_base,
     }
     cs->wait();
     return true;
-}
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
+} catch (sycl::exception const& exc) {
+    std::cerr << exc.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
+    std::exit(1);
 }
 
-bool session_token(const WeightTable &tables, const ModelGeometry &g,
-                   int64_t pos, int32_t pos_base, SessionState &s,
-                   const float *parts, void *stream, bool sync_every_layer,
-                   std::string &err) try {
+bool session_token(const WeightTable& tables, const ModelGeometry& g, int64_t pos, int32_t pos_base, SessionState& s,
+                   const float* parts, void* stream, bool sync_every_layer, std::string& err) try {
     sycl::queue* cs = stream ? static_cast<sycl::queue*>(stream) : &get_default_queue();
     int64_t qsa_index = 0;
     int64_t gdn_index = 0;
@@ -948,17 +923,18 @@ bool session_token(const WeightTable &tables, const ModelGeometry &g,
         // shared scratch at the right slice before each call.  Sharing one state across 36 layers would make
         // every layer start from the previous layer's recurrence, which produces a perfectly finite answer.
         if (!is_qsa_layer(g, l)) {
-            s.gdn.state = s.gdn_state + (size_t) gdn_index * gdn_state_floats(g);
-            s.gdn.conv_state = s.gdn.state + (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size;
+            s.gdn.state = s.gdn_state + (size_t)gdn_index * gdn_state_floats(g);
+            s.gdn.conv_state = s.gdn.state + (uint64_t)g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size;
             ++gdn_index;
         }
 
         err.clear();
-        const bool ok = is_qsa_layer(g, l)
-            ? block_layer(tables, g, l, pos, pos_base, s.gdn, s.qsa_states[qsa_index], s.qsa_bufs, s.moe, s.k,
-                          s.block, parts, stream, err, nullptr, s.ple.ready() ? &s.ple : nullptr)
-            : block_layer(tables, g, l, pos, pos_base, s.gdn, s.qsa_states[0], s.qsa_bufs, s.moe, s.k,
-                          s.block, parts, stream, err, nullptr, s.ple.ready() ? &s.ple : nullptr);
+        const bool ok =
+            is_qsa_layer(g, l)
+                ? block_layer(tables, g, l, pos, pos_base, s.gdn, s.qsa_states[qsa_index], s.qsa_bufs, s.moe, s.k,
+                              s.block, parts, stream, err, nullptr, s.ple.ready() ? &s.ple : nullptr)
+                : block_layer(tables, g, l, pos, pos_base, s.gdn, s.qsa_states[0], s.qsa_bufs, s.moe, s.k, s.block,
+                              parts, stream, err, nullptr, s.ple.ready() ? &s.ple : nullptr);
         if (!ok) {
             err = "layer " + std::to_string(l) + ": " + err;
             return false;
@@ -974,23 +950,22 @@ bool session_token(const WeightTable &tables, const ModelGeometry &g,
         }
     }
     return true;
-}
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
+} catch (sycl::exception const& exc) {
+    std::cerr << exc.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
+    std::exit(1);
 }
 
 }  // namespace strata::core
 
 namespace strata::core {
 
-bool session_capture_token(const WeightTable &tables, const ModelGeometry &g,
-                           SessionState &s, float *parts_dev,
-                           const float *y_miss_host, size_t parts_bytes,
-                           TokenGraph &tg, std::string &err,
-                           const TokenHits *hits) try {
-    if (hits != nullptr && !hits->on()) { err = "session_capture_token: incomplete hit configuration"; return false; }
+bool session_capture_token(const WeightTable& tables, const ModelGeometry& g, SessionState& s, float* parts_dev,
+                           const float* y_miss_host, size_t parts_bytes, TokenGraph& tg, std::string& err,
+                           const TokenHits* hits) try {
+    if (hits != nullptr && !hits->on()) {
+        err = "session_capture_token: incomplete hit configuration";
+        return false;
+    }
     if (tg.captured) return true;
     if (s.db == nullptr || s.db->d_flag == nullptr || s.db->d_seq == nullptr) {
         err = "session_capture_token: the doorbell has no flag";
@@ -1003,8 +978,7 @@ bool session_capture_token(const WeightTable &tables, const ModelGeometry &g,
     float* y_dev = const_cast<float*>(y_miss_host);
     sycl::queue* cs = nullptr;
     try {
-        cs = new sycl::queue(sycl::default_selector_v,
-                             sycl::property_list{sycl::property::queue::in_order{}});
+        cs = new sycl::queue(sycl::default_selector_v, sycl::property_list{sycl::property::queue::in_order{}});
     } catch (const sycl::exception& e) {
         err = std::string("session_capture_token: stream create failed: ") + e.what();
         return false;
@@ -1021,31 +995,41 @@ bool session_capture_token(const WeightTable &tables, const ModelGeometry &g,
         const bool qsa = is_qsa_layer(g, l);
         QsaState& qst = qsa ? s.qsa_states[qsa_index] : s.qsa_states[0];
         err.clear();
-        ok = block_layer_pre(tables, g, l, 0, 0, s.gdn, qst, s.qsa_bufs, s.moe, s.k, s.block, (void*) cs, err, s.db,
+        ok = block_layer_pre(tables, g, l, 0, 0, s.gdn, qst, s.qsa_bufs, s.moe, s.k, s.block, (void*)cs, err, s.db,
                              s.ple.ready() ? &s.ple : nullptr);
-        if (!ok) { err = "session_capture_token: pre layer " + std::to_string(l) + ": " + err; break; }
+        if (!ok) {
+            err = "session_capture_token: pre layer " + std::to_string(l) + ": " + err;
+            break;
+        }
         if (hits != nullptr) {
             // After the ring (and the shared expert): the GPU's experts run while the CPU computes the misses.
-            strata::kernels::moe_hit_select(s.moe.ids, hits->d_res + l * hits->n_expert, (int) s.k,
-                                            (int) hits->n_expert, hits->d_slot, hits->d_dst, hits->d_count, (void*) cs);
-            strata::kernels::quantize_q8_0_scaled(s.block.mixed, hits->x_q8, hits->x_scale, g.n_embd, (void*) cs);
+            strata::kernels::moe_hit_select(s.moe.ids, hits->d_res + l * hits->n_expert, (int)s.k, (int)hits->n_expert,
+                                            hits->d_slot, hits->d_dst, hits->d_count, (void*)cs);
+            strata::kernels::quantize_q8_0_scaled(s.block.mixed, hits->x_q8, hits->x_scale, g.n_embd, (void*)cs);
             strata::kernels::moe_hit_grouped_s2_dev(hits->cache_base, hits->d_slot, hits->d_dst, hits->d_count, s.k,
-                                                    hits->blob, hits->x_q8, hits->scratch, hits->hit_out, (void*) cs,
+                                                    hits->blob, hits->x_q8, hits->scratch, hits->hit_out, (void*)cs,
                                                     hits->x_scale);
         }
-        strata::kernels::doorbell_wait(s.db->d_flag, s.db->d_seq, (void*) cs);
+        strata::kernels::doorbell_wait(s.db->d_flag, s.db->d_seq, (void*)cs);
         // A kernel, not a memcpy node: a copy-engine node splits the WDDM submission (measured 67 flushes/token).
-        strata::kernels::copy_from_mapped(parts_dev, y_dev, (int64_t) (parts_bytes / sizeof(float)), (void*) cs);
+        strata::kernels::copy_from_mapped(parts_dev, y_dev, (int64_t)(parts_bytes / sizeof(float)), (void*)cs);
         if (hits != nullptr)
-            strata::kernels::moe_hit_add(parts_dev, hits->hit_out, hits->d_dst, hits->d_count, s.k, g.n_embd, (void*) cs);
-        ok = block_layer_post(tables, g, l, s.k, s.moe, s.block, parts_dev, (void*) cs, err);
-        if (!ok) { err = "session_capture_token: post layer " + std::to_string(l) + ": " + err; break; }
+            strata::kernels::moe_hit_add(parts_dev, hits->hit_out, hits->d_dst, hits->d_count, s.k, g.n_embd,
+                                         (void*)cs);
+        ok = block_layer_post(tables, g, l, s.k, s.moe, s.block, parts_dev, (void*)cs, err);
+        if (!ok) {
+            err = "session_capture_token: post layer " + std::to_string(l) + ": " + err;
+            break;
+        }
         if (qsa) ++qsa_index;
     }
     cudaGraph_t graph = nullptr;
     const int ce = cudaStreamEndCapture(cs, &graph);
     delete cs;
-    if (!ok) { if (graph) cudaGraphDestroy(graph); return false; }
+    if (!ok) {
+        if (graph) cudaGraphDestroy(graph);
+        return false;
+    }
     if (ce != 0) {
         err = "session_capture_token: end capture error: " + std::to_string(ce);
         return false;
@@ -1061,18 +1045,21 @@ bool session_capture_token(const WeightTable &tables, const ModelGeometry &g,
     tg.y_src = y_miss_host;
     tg.parts_bytes = parts_bytes;
     return true;
-}
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
+} catch (sycl::exception const& exc) {
+    std::cerr << exc.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
+    std::exit(1);
 }
 
-bool session_run_token(const ModelGeometry &g, int64_t pos, int32_t pos_base,
-                       SessionState &s, TokenGraph &tg, PoolFn pool, void *user,
-                       float *y_miss_host, void *stream, std::string &err) try {
-    if (!tg.captured) { err = "session_run_token: not captured"; return false; }
-    if (y_miss_host != tg.y_src) { err = "session_run_token: the staging buffer is not the captured one"; return false; }
+bool session_run_token(const ModelGeometry& g, int64_t pos, int32_t pos_base, SessionState& s, TokenGraph& tg,
+                       PoolFn pool, void* user, float* y_miss_host, void* stream, std::string& err) try {
+    if (!tg.captured) {
+        err = "session_run_token: not captured";
+        return false;
+    }
+    if (y_miss_host != tg.y_src) {
+        err = "session_run_token: the staging buffer is not the captured one";
+        return false;
+    }
     sycl::queue* cs = stream ? static_cast<sycl::queue*>(stream) : &get_default_queue();
     ++tg.calls;
     stage_token(g, pos, pos_base, s);
@@ -1082,16 +1069,19 @@ bool session_run_token(const ModelGeometry &g, int64_t pos, int32_t pos_base,
         err = "session_run_token: launch error: " + std::to_string(le);
         return false;
     }
-    try { (void)cs->ext_oneapi_empty(); } catch (...) {}
+    try {
+        (void)cs->ext_oneapi_empty();
+    } catch (...) {
+    }
     static const int flush_us = [] {
         const char* e = std::getenv("STRATA_TG_FLUSH_US");
-        return e ? std::atoi(e) : 2000;   // 24 Sep: 0 flushes run as fast as 5 us ones; this only notices faults
+        return e ? std::atoi(e) : 2000;  // 24 Sep: 0 flushes run as fast as 5 us ones; this only notices faults
     }();
     volatile uint32_t* const seq = s.db->h_seq;
     volatile uint32_t* const flag = s.db->h_flag;
     using Clock = std::chrono::steady_clock;
     for (int64_t l = 0; l < g.n_layers; ++l) {
-        const uint32_t want = (uint32_t) (l + 1);
+        const uint32_t want = (uint32_t)(l + 1);
         const auto t0 = Clock::now();
         auto last_flush = t0;
         uint32_t spins = 0;
@@ -1107,7 +1097,8 @@ bool session_run_token(const ModelGeometry &g, int64_t pos, int32_t pos_base,
                 bool is_empty = false;
                 try {
                     is_empty = cs->ext_oneapi_empty();
-                } catch (...) {}
+                } catch (...) {
+                }
                 if (!is_empty && *seq < want) {
                     err = "session_run_token: layer " + std::to_string(l) + " never rang";
                     return false;
@@ -1133,11 +1124,9 @@ bool session_run_token(const ModelGeometry &g, int64_t pos, int32_t pos_base,
     progress_at("decode");
     progress_beat();
     return true;
-}
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
+} catch (sycl::exception const& exc) {
+    std::cerr << exc.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
+    std::exit(1);
 }
 
 void token_graph_free(TokenGraph& tg) {

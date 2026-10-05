@@ -50,11 +50,11 @@ bool native_bf16 = false;
 
 // silu(x) = x / (1 + exp(-x)), written as `ref/moe.py` writes it, in DOUBLE then cast - the reference works in
 // float64 and a float32 exp differs in the last bits.  The multiplication by `up` is the reference's order.
-void swiglu_kernel(const float* __restrict__ gate, const float* __restrict__ up,
-                   float* __restrict__ out, int n, const sycl::nd_item<1>& item) {
+void swiglu_kernel(const float* __restrict__ gate, const float* __restrict__ up, float* __restrict__ out, int n,
+                   const sycl::nd_item<1>& item) {
     const int i = item.get_global_id(0);
     if (i >= n) return;
-    const double x = (double) gate[i];
+    const double x = (double)gate[i];
     out[i] = (float)(x / (1.0 + sycl::exp(-x))) * up[i];
 }
 
@@ -67,7 +67,8 @@ void native_swiglu_kernel(const float* gate, const float* up, float* out, int n,
     out[i] = gate[i] / (1.0f + sycl::native::exp(-gate[i])) * up[i];
 }
 
-[[maybe_unused]] void to_f16_kernel(const float* __restrict__ in, uint16_t* __restrict__ out, int n, const sycl::nd_item<1>& item) {
+[[maybe_unused]] void to_f16_kernel(const float* __restrict__ in, uint16_t* __restrict__ out, int n,
+                                    const sycl::nd_item<1>& item) {
     const int i = item.get_global_id(0);
     if (i < n) out[i] = f16_from_f32(in[i]);
 }
@@ -80,28 +81,22 @@ inline double warp_sum_d(sycl::sub_group sg, double v) {
 }
 
 void scalar_gate_kernel(const uint16_t* __restrict__ x_bf16, const uint16_t* __restrict__ w_bf16,
-                        float* __restrict__ out, int n_embd,
-                        double *scratch, const sycl::nd_item<1>& item) {
+                        float* __restrict__ out, int n_embd, double* scratch, const sycl::nd_item<1>& item) {
     auto sg = item.get_sub_group();
     // 8 warps: the launch is <<<1, 256>>>
     double acc = 0.0;
-    for (int i = item.get_local_id(0); i < n_embd;
-         i += item.get_local_range(0))
-        acc += (double) f32_from_bf16(x_bf16[i]) * (double) f32_from_bf16(w_bf16[i]);
+    for (int i = item.get_local_id(0); i < n_embd; i += item.get_local_range(0))
+        acc += (double)f32_from_bf16(x_bf16[i]) * (double)f32_from_bf16(w_bf16[i]);
     item.barrier(sycl::access::fence_space::local_space);
-    const int lane = item.get_local_id(0) & 31,
-              warp = item.get_local_id(0) >> 5;
+    const int lane = item.get_local_id(0) & 31, warp = item.get_local_id(0) >> 5;
     acc = warp_sum_d(sg, acc);
     if (lane == 0) scratch[warp] = acc;
     item.barrier(sycl::access::fence_space::local_space);
     const int nw = ((int)item.get_local_range(0) + 31) >> 5;
     if (warp == 0) {
-        acc = (int(item.get_local_id(0)) < nw)
-                  ? scratch[item.get_local_id(0)]
-                  : 0.0;
+        acc = (int(item.get_local_id(0)) < nw) ? scratch[item.get_local_id(0)] : 0.0;
         acc = warp_sum_d(sg, acc);
-        if (item.get_local_id(0) == 0) out[0] =
-            (float)(1.0 / (1.0 + sycl::exp(-acc)));
+        if (item.get_local_id(0) == 0) out[0] = (float)(1.0 / (1.0 + sycl::exp(-acc)));
     }
 }
 
@@ -116,30 +111,32 @@ void native_scalar_sigmoid_kernel(float* gate) {
     gate[0] = 1.0f / (1.0f + sycl::native::exp(-gate[0]));
 }
 
-void native_scalar_sigmoid_multi_kernel(float* gate, const sycl::nd_item<1>& item) {   // thread t = token t, same expression
+void native_scalar_sigmoid_multi_kernel(float* gate,
+                                        const sycl::nd_item<1>& item) {  // thread t = token t, same expression
     const int idx = item.get_local_id(0);
     gate[idx] = 1.0f / (1.0f + sycl::native::exp(-gate[idx]));
 }
 
 /// The MoE block's final combination.  See the header for the two readings it exists to pin.
 void moe_combine_kernel(const float* __restrict__ parts, const float* __restrict__ weights,
-                        const float* __restrict__ shared, float* __restrict__ y, int n_embd,
-                        int k, int has_shared, const sycl::nd_item<1>& item) {
+                        const float* __restrict__ shared, float* __restrict__ y, int n_embd, int k, int has_shared,
+                        const sycl::nd_item<1>& item) {
     const int j = item.get_global_id(0);
     if (j >= n_embd) return;
     // Accumulate in DOUBLE, in the reference's own order (`for i in range(k): out[t] += w[t,i] * g[0]`).
     // f32 would be defensible for ten terms, but the reference is float64 and this is one line.
     double acc = 0.0;
-    for (int e = 0; e < k; ++e) acc += (double) weights[e] * (double) parts[(size_t) e * n_embd + j];
+    for (int e = 0; e < k; ++e)
+        acc += (double)weights[e] * (double)parts[(size_t)e * n_embd + j];
     // The SHARED output is added PLAIN - not router-weighted, not renormalised against the routed sum.
-    if (has_shared) acc += (double) shared[j];
-    y[j] = (float) acc;
+    if (has_shared) acc += (double)shared[j];
+    y[j] = (float)acc;
 }
 
 void scale_rows_kernel(float* __restrict__ out, const float* __restrict__ g, int n, const sycl::nd_item<2>& item) {
     const int t = item.get_group(0);
     const int i = item.get_global_id(1);
-    if (i < n) out[(size_t) t * n + i] *= g[t];
+    if (i < n) out[(size_t)t * n + i] *= g[t];
 }
 
 }  // namespace
@@ -153,80 +150,66 @@ void shared_expert_multi(int n_tok, const float* x, const uint16_t* x_bf16, cons
         throw std::invalid_argument("shared_expert_multi: needs 1..8 tokens, native weights, scratch and a stream");
     static sycl::queue default_queue;
     sycl::queue* q = stream ? static_cast<sycl::queue*>(stream) : &default_queue;
-    native_quantize_q8_1(x, nw.q8_1, (int) n_embd, n_tok, stream);
-    native_mmvq(nw.gate_type, nw.gate_data, nw.q8_1, gate, (int) n_embd, (int) n_ff, n_tok, stream);
-    native_mmvq(nw.up_type, nw.up_data, nw.q8_1, up, (int) n_embd, (int) n_ff, n_tok, stream);
-    const int n = (int) (n_ff * n_tok);
+    native_quantize_q8_1(x, nw.q8_1, (int)n_embd, n_tok, stream);
+    native_mmvq(nw.gate_type, nw.gate_data, nw.q8_1, gate, (int)n_embd, (int)n_ff, n_tok, stream);
+    native_mmvq(nw.up_type, nw.up_data, nw.q8_1, up, (int)n_embd, (int)n_ff, n_tok, stream);
+    const int n = (int)(n_ff * n_tok);
     const unsigned grid_swiglu = (unsigned)((n + THREADS - 1) / THREADS);
-    q->parallel_for(
-        sycl::nd_range<1>(sycl::range<1>(grid_swiglu * THREADS), sycl::range<1>(THREADS)),
-        [=](sycl::nd_item<1> item) {
-            native_swiglu_kernel(gate, up, gate, n, item);
-        });
-    native_quantize_q8_1(gate, nw.q8_1, (int) n_ff, n_tok, stream);
-    native_mmvq(nw.down_type, nw.down_data, nw.q8_1, out, (int) n_ff, (int) n_embd, n_tok, stream);
-    static const bool batch = [] { const char* v = std::getenv("STRATA_DEC_BATCH"); return v == nullptr || std::atoi(v) != 0; }();
-    if (native_bf16 && batch && n_tok > 1) {   // one gemv for all rows (outputs identical), one sigmoid launch
+    q->parallel_for(sycl::nd_range<1>(sycl::range<1>(grid_swiglu * THREADS), sycl::range<1>(THREADS)),
+                    [=](sycl::nd_item<1> item) { native_swiglu_kernel(gate, up, gate, n, item); });
+    native_quantize_q8_1(gate, nw.q8_1, (int)n_ff, n_tok, stream);
+    native_mmvq(nw.down_type, nw.down_data, nw.q8_1, out, (int)n_ff, (int)n_embd, n_tok, stream);
+    static const bool batch = [] {
+        const char* v = std::getenv("STRATA_DEC_BATCH");
+        return v == nullptr || std::atoi(v) != 0;
+    }();
+    if (native_bf16 && batch && n_tok > 1) {  // one gemv for all rows (outputs identical), one sigmoid launch
         bf16_gemv_fp32_mmvf_multi(x, n_embd, gate_inp_bf16, g, 1, n_embd, 1, n_tok, stream);
         q->parallel_for(sycl::nd_range<1>(sycl::range<1>(n_tok), sycl::range<1>(n_tok)),
-                        [=](sycl::nd_item<1> item) {
-                            native_scalar_sigmoid_multi_kernel(g, item);
-                        });
+                        [=](sycl::nd_item<1> item) { native_scalar_sigmoid_multi_kernel(g, item); });
     } else {
         for (int t = 0; t < n_tok; ++t) {
             if (native_bf16) {
-                bf16_gemv_fp32_mmvf(x + (size_t) t * n_embd, gate_inp_bf16, g + t, n_embd, 1, stream);
+                bf16_gemv_fp32_mmvf(x + (size_t)t * n_embd, gate_inp_bf16, g + t, n_embd, 1, stream);
                 auto g_t = g + t;
-                q->single_task([=]() {
-                    native_scalar_sigmoid_kernel(g_t);
-                });
+                q->single_task([=]() { native_scalar_sigmoid_kernel(g_t); });
             } else {
-                q->submit([&](sycl::handler &cgh) {
+                q->submit([&](sycl::handler& cgh) {
                     sycl::local_accessor<double, 1> scratch_acc(sycl::range<1>(8), cgh);
                     auto x_t = x_bf16 + (size_t)t * n_embd;
                     auto g_t = g + t;
 
-                    cgh.parallel_for(
-                        sycl::nd_range<1>(sycl::range<1>(256), sycl::range<1>(256)),
-                        [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(32)]] {
-                            scalar_gate_kernel(x_t, gate_inp_bf16, g_t, (int)n_embd,
-                                               scratch_acc.get_multi_ptr<sycl::access::decorated::no>().get(),
-                                               item);
-                        });
+                    cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(256), sycl::range<1>(256)),
+                                     [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(32)]] {
+                                         scalar_gate_kernel(
+                                             x_t, gate_inp_bf16, g_t, (int)n_embd,
+                                             scratch_acc.get_multi_ptr<sycl::access::decorated::no>().get(), item);
+                                     });
                 });
             }
         }
     }
     const unsigned grid_scale = (unsigned)((n_embd + THREADS - 1) / THREADS);
     q->parallel_for(
-        sycl::nd_range<2>(
-            sycl::range<2>((unsigned)n_tok, grid_scale * THREADS),
-            sycl::range<2>(1, THREADS)),
-        [=](sycl::nd_item<2> item) {
-            scale_rows_kernel(out, g, (int)n_embd, item);
-        });
+        sycl::nd_range<2>(sycl::range<2>((unsigned)n_tok, grid_scale * THREADS), sycl::range<2>(1, THREADS)),
+        [=](sycl::nd_item<2> item) { scale_rows_kernel(out, g, (int)n_embd, item); });
     if (!stream) default_queue.wait();
 }
 
 uint64_t shared_expert_scratch_bytes(int64_t n_ff) {
     // gate (n_ff f32) | up (n_ff f32) | q8_0 (n_ff/32*34) | q8k (n_ff/256*292) | g (1 f32), 16-byte aligned
-    const uint64_t a = ((uint64_t) n_ff * 4 + 15) & ~15ull;
-    const uint64_t q0 = ((uint64_t) (n_ff / 32) * 34 + 15) & ~15ull;
-    const uint64_t qk = ((uint64_t) (n_ff / 256) * 292 + 15) & ~15ull;
+    const uint64_t a = ((uint64_t)n_ff * 4 + 15) & ~15ull;
+    const uint64_t q0 = ((uint64_t)(n_ff / 32) * 34 + 15) & ~15ull;
+    const uint64_t qk = ((uint64_t)(n_ff / 256) * 292 + 15) & ~15ull;
     return a * 2 + q0 + qk + 32;
 }
 
-void shared_expert(const uint8_t *x_q8_0, const uint8_t *x_q8k,
-                   const uint16_t *x_bf16, const SForm &gate_form,
-                   const uint8_t *gate_codes, const float *gate_scales,
-                   const float *gate_off, const SForm &up_form,
-                   const uint8_t *up_codes, const float *up_scales,
-                   const float *up_off, const SForm &down_form,
-                   const uint8_t *down_codes, const float *down_scales,
-                   const float *down_off, const uint16_t *gate_inp_bf16,
-                   float *scratch, float *out, int64_t n_embd, int64_t n_ff,
-                   int tpr, void *stream, const float *x_f32,
-                   const NativeSharedWeights *native) {
+void shared_expert(const uint8_t* x_q8_0, const uint8_t* x_q8k, const uint16_t* x_bf16, const SForm& gate_form,
+                   const uint8_t* gate_codes, const float* gate_scales, const float* gate_off, const SForm& up_form,
+                   const uint8_t* up_codes, const float* up_scales, const float* up_off, const SForm& down_form,
+                   const uint8_t* down_codes, const float* down_scales, const float* down_off,
+                   const uint16_t* gate_inp_bf16, float* scratch, float* out, int64_t n_embd, int64_t n_ff, int tpr,
+                   void* stream, const float* x_f32, const NativeSharedWeights* native) {
     if (n_embd <= 0 || n_ff <= 0) return;
     const bool use_native = native_bf16;
     const bool native_gate = native && native->gate_data && native_mmvq_supported(native->gate_type);
@@ -237,33 +220,35 @@ void shared_expert(const uint8_t *x_q8_0, const uint8_t *x_q8k,
         throw std::invalid_argument("shared_expert native input projection requires unrounded x_f32");
     if (native_projection) {
         if (!native->q8_1 || !stream || n_embd > INT_MAX || n_ff > INT_MAX)
-            throw std::invalid_argument("shared_expert native projections require scratch, stream and int32 dimensions");
+            throw std::invalid_argument(
+                "shared_expert native projections require scratch, stream and int32 dimensions");
         // Validate every active shape before any kernel is enqueued.
-        if (native_gate) native_mmvq_weight_bytes(native->gate_type, (int) n_embd, (int) n_ff);
-        if (native_up) native_mmvq_weight_bytes(native->up_type, (int) n_embd, (int) n_ff);
-        if (native_down) native_mmvq_weight_bytes(native->down_type, (int) n_ff, (int) n_embd);
+        if (native_gate) native_mmvq_weight_bytes(native->gate_type, (int)n_embd, (int)n_ff);
+        if (native_up) native_mmvq_weight_bytes(native->up_type, (int)n_embd, (int)n_ff);
+        if (native_down) native_mmvq_weight_bytes(native->down_type, (int)n_ff, (int)n_embd);
     }
     if (scratch == nullptr) {
-        std::fprintf(stderr, "shared_expert: scratch is null; the caller owns it "
-                             "(see shared_expert_scratch_bytes)\n");
+        std::fprintf(stderr,
+                     "shared_expert: scratch is null; the caller owns it "
+                     "(see shared_expert_scratch_bytes)\n");
         std::exit(1);
     }
     // CARVED FROM THE CALLER'S SCRATCH.  This used to be four `cudaMalloc`s and four `cudaFree`s per call, which
     // is illegal during stream capture AND a token-path allocation - P2.T10 forbids both.
-    uint8_t* p = (uint8_t*) scratch;
-    const uint64_t a = ((uint64_t) n_ff * 4 + 15) & ~15ull;
-    const uint64_t q0 = ((uint64_t) (n_ff / 32) * 34 + 15) & ~15ull;
-    const uint64_t qk = ((uint64_t) (n_ff / 256) * 292 + 15) & ~15ull;
-    float* gate = (float*) p;
-    float* up = (float*) (p + a);
-    uint8_t* h_q8_0 = (uint8_t*) (p + a * 2);
-    uint8_t* h_q8k = (uint8_t*) (p + a * 2 + q0);
-    float* g = (float*) (p + a * 2 + q0 + qk);
+    uint8_t* p = (uint8_t*)scratch;
+    const uint64_t a = ((uint64_t)n_ff * 4 + 15) & ~15ull;
+    const uint64_t q0 = ((uint64_t)(n_ff / 32) * 34 + 15) & ~15ull;
+    const uint64_t qk = ((uint64_t)(n_ff / 256) * 292 + 15) & ~15ull;
+    float* gate = (float*)p;
+    float* up = (float*)(p + a);
+    uint8_t* h_q8_0 = (uint8_t*)(p + a * 2);
+    uint8_t* h_q8k = (uint8_t*)(p + a * 2 + q0);
+    float* g = (float*)(p + a * 2 + q0 + qk);
 
     // WHICH ACTIVATION THIS PROJECTION WANTS, READ FROM ITS OWN FORM.  See `SForm::act_kind`: the three
     // families cannot be told apart by the other fields, so the kind is carried rather than derived.
-    auto gemv = [&](const SForm& f, const uint8_t* codes, const float* scales, const float* off,
-                    const uint8_t* act80, const uint8_t* actq8k, float* y, int64_t nin, int64_t nout) {
+    auto gemv = [&](const SForm& f, const uint8_t* codes, const float* scales, const float* off, const uint8_t* act80,
+                    const uint8_t* actq8k, float* y, int64_t nin, int64_t nout) {
         if (f.code_bits == 2) {
             s2_gemv_q8(act80, codes, scales, y, nin, nout, tpr, stream);
         } else if (f.act_kind == 1) {
@@ -276,42 +261,39 @@ void shared_expert(const uint8_t *x_q8_0, const uint8_t *x_q8k,
     static sycl::queue default_queue;
     sycl::queue* q = stream ? static_cast<sycl::queue*>(stream) : &default_queue;
 
-    const unsigned g_ff = (unsigned) ((n_ff + THREADS - 1) / THREADS);
-    const unsigned g_embd = (unsigned) ((n_embd + THREADS - 1) / THREADS);
+    const unsigned g_ff = (unsigned)((n_ff + THREADS - 1) / THREADS);
+    const unsigned g_embd = (unsigned)((n_embd + THREADS - 1) / THREADS);
 
     // gate and up projections, then silu(gate) * up in place in `gate`
-    if (native_gate || native_up)
-        native_quantize_q8_1(x_f32, native->q8_1, (int) n_embd, 1, stream);
+    if (native_gate || native_up) native_quantize_q8_1(x_f32, native->q8_1, (int)n_embd, 1, stream);
     if (native_gate)
-        native_mmvq(native->gate_type, native->gate_data, native->q8_1, gate, (int) n_embd, (int) n_ff, 1, stream);
+        native_mmvq(native->gate_type, native->gate_data, native->q8_1, gate, (int)n_embd, (int)n_ff, 1, stream);
     else
         gemv(gate_form, gate_codes, gate_scales, gate_off, x_q8_0, x_q8k, gate, n_embd, n_ff);
     if (native_up)
-        native_mmvq(native->up_type, native->up_data, native->q8_1, up, (int) n_embd, (int) n_ff, 1, stream);
+        native_mmvq(native->up_type, native->up_data, native->q8_1, up, (int)n_embd, (int)n_ff, 1, stream);
     else
         gemv(up_form, up_codes, up_scales, up_off, x_q8_0, x_q8k, up, n_embd, n_ff);
     if (native_projection)
         q->parallel_for(sycl::nd_range<1>(sycl::range<1>(g_ff * THREADS), sycl::range<1>(THREADS)),
-                        [=](sycl::nd_item<1> item) {
-                            native_swiglu_kernel(gate, up, gate, (int)n_ff, item);
-                        });
+                        [=](sycl::nd_item<1> item) { native_swiglu_kernel(gate, up, gate, (int)n_ff, item); });
     else {
         q->parallel_for(sycl::nd_range<1>(sycl::range<1>(g_ff * THREADS), sycl::range<1>(THREADS)),
-                        [=](sycl::nd_item<1> item) {
-                            swiglu_kernel(gate, up, gate, (int)n_ff, item);
-                        });
+                        [=](sycl::nd_item<1> item) { swiglu_kernel(gate, up, gate, (int)n_ff, item); });
     }
 
     // down: (n_ff) -> (n_embd), and THE INTERMEDIATE IS QUANTIZED TO THE DOWN WEIGHT'S OWN CONTRACT - which is
     // what `ggml_mul_mat` does for every matmul in the model.  It used to be rounded to fp16 with no
     // justification beyond "the kernel takes fp16".
     if (native_down) {
-        native_quantize_q8_1(gate, native->q8_1, (int) n_ff, 1, stream);
-        native_mmvq(native->down_type, native->down_data, native->q8_1, out, (int) n_ff, (int) n_embd, 1, stream);
+        native_quantize_q8_1(gate, native->q8_1, (int)n_ff, 1, stream);
+        native_mmvq(native->down_type, native->down_data, native->q8_1, out, (int)n_ff, (int)n_embd, 1, stream);
     } else if (down_form.act_kind == 1) {
         if (n_ff % 256 != 0) {
-            std::fprintf(stderr, "shared_expert: the down weight wants Q8_K but n_ff %lld is not a multiple "
-                                 "of 256; Q8_K is structurally impossible here\n", (long long) n_ff);
+            std::fprintf(stderr,
+                         "shared_expert: the down weight wants Q8_K but n_ff %lld is not a multiple "
+                         "of 256; Q8_K is structurally impossible here\n",
+                         (long long)n_ff);
             std::exit(1);
         }
         quantize_q8_K(gate, h_q8k, n_ff, stream);
@@ -331,52 +313,43 @@ void shared_expert(const uint8_t *x_q8_0, const uint8_t *x_q8k,
     // round trip.  256 threads is the reduction's width, not the problem's size.
     if (use_native) {
         bf16_gemv_fp32_mmvf(x_f32, gate_inp_bf16, g, n_embd, 1, stream);
-        q->single_task([=]() {
-            native_scalar_sigmoid_kernel(g);
-        });
+        q->single_task([=]() { native_scalar_sigmoid_kernel(g); });
     } else {
-        q->submit([&](sycl::handler &cgh) {
+        q->submit([&](sycl::handler& cgh) {
             sycl::local_accessor<double, 1> scratch_acc(sycl::range<1>(8), cgh);
 
-            cgh.parallel_for(
-                sycl::nd_range<1>(sycl::range<1>(256), sycl::range<1>(256)),
-                [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(32)]] {
-                    scalar_gate_kernel(
-                        x_bf16, gate_inp_bf16, g, (int)n_embd,
-                        scratch_acc.get_multi_ptr<sycl::access::decorated::no>().get(),
-                        item);
-                });
+            cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(256), sycl::range<1>(256)),
+                             [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(32)]] {
+                                 scalar_gate_kernel(x_bf16, gate_inp_bf16, g, (int)n_embd,
+                                                    scratch_acc.get_multi_ptr<sycl::access::decorated::no>().get(),
+                                                    item);
+                             });
         });
     }
     q->parallel_for(sycl::nd_range<1>(sycl::range<1>(g_embd * THREADS), sycl::range<1>(THREADS)),
-                    [=](sycl::nd_item<1> item) {
-                        scale_kernel(out, g, (int)n_embd, item);
-                    });
+                    [=](sycl::nd_item<1> item) { scale_kernel(out, g, (int)n_embd, item); });
 
     if (!stream) default_queue.wait();
 }
 
-void moe_combine(const float *parts, const float *weights, const float *shared,
-                 float *y, int64_t n_embd, int64_t k, void *stream) {
+void moe_combine(const float* parts, const float* weights, const float* shared, float* y, int64_t n_embd, int64_t k,
+                 void* stream) {
     if (n_embd <= 0 || k <= 0) return;
     // k > 64 is refused rather than truncated: silently summing the first 64 of a longer list would be a
     // wrong answer that looks like a right one, and no geometry in this artifact comes close to it.
     if (k > 64) {
-        std::fprintf(stderr, "moe_combine: k = %lld exceeds 64\n", (long long) k);
+        std::fprintf(stderr, "moe_combine: k = %lld exceeds 64\n", (long long)k);
         std::exit(1);
     }
     static sycl::queue default_queue;
     sycl::queue* q = stream ? static_cast<sycl::queue*>(stream) : &default_queue;
-    const unsigned grid = (unsigned) ((n_embd + THREADS - 1) / THREADS);
+    const unsigned grid = (unsigned)((n_embd + THREADS - 1) / THREADS);
     const int shared_nullptr = shared != nullptr;
 
-    q->parallel_for(
-        sycl::nd_range<1>(sycl::range<1>(grid * THREADS), sycl::range<1>(THREADS)),
-        [=](sycl::nd_item<1> item) {
-            moe_combine_kernel(parts, weights, shared, y,
-                               (int)n_embd, (int)k,
-                               shared_nullptr, item);
-        });
+    q->parallel_for(sycl::nd_range<1>(sycl::range<1>(grid * THREADS), sycl::range<1>(THREADS)),
+                    [=](sycl::nd_item<1> item) {
+                        moe_combine_kernel(parts, weights, shared, y, (int)n_embd, (int)k, shared_nullptr, item);
+                    });
 
     if (!stream) default_queue.wait();
 }

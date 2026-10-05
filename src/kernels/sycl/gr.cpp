@@ -54,24 +54,16 @@ inline uint16_t f32_to_bf16_bits(float f) { return bf16_from_f32(f); }
 inline float bf16_bits_to_f32(uint16_t h) { return f32_from_bf16(h); }
 inline float activation_f32(float x) { return x; }
 inline float activation_f32(uint16_t x) { return bf16_bits_to_f32(x); }
-inline void store_activation(float *dst, int i, float x) {
-  dst[i] = x;
-}
-inline void store_activation(uint16_t *dst, int i, float x) {
-    dst[i] = f32_to_bf16_bits(x);
-}
+inline void store_activation(float* dst, int i, float x) { dst[i] = x; }
+inline void store_activation(uint16_t* dst, int i, float x) { dst[i] = f32_to_bf16_bits(x); }
 
 /// silu and sigmoid exactly as `ref/gr.py` writes them - in FLOAT, not double.
 ///
 /// This is the opposite of `shared_expert.cu`, which uses double, and the difference is not stylistic:
 /// `ref/gr.py`'s arrays are float32, so `x / (1.0 + np.exp(-x))` evaluates in float32 under NEP 50, while
 /// `ref/moe.py` works in float64.  Matching the reference's PRECISION is part of transcribing it.
-inline float silu_f(float x) {
-  return x / (1.0f + sycl::native::exp(-x));
-}
-inline float sigmoid_f(float x) {
-  return 1.0f / (1.0f + sycl::native::exp(-x));
-}
+inline float silu_f(float x) { return x / (1.0f + sycl::native::exp(-x)); }
+inline float sigmoid_f(float x) { return 1.0f / (1.0f + sycl::native::exp(-x)); }
 
 inline double warp_sum(sycl::sub_group sg, double v) {
 #pragma unroll
@@ -96,7 +88,7 @@ inline float warp_sumf(sycl::sub_group sg, float v) {
 /// arrays, because `double scratch[8]` is 64 bytes and so is at least as large as the `float[8]` this needs -
 /// the cast cannot overrun, and it keeps the change to one function instead of one per caller.
 inline float block_sumf(sycl::nd_item<1> item, float v, double* scratch_raw) {
-    float *scratch = (float *)scratch_raw;
+    float* scratch = (float*)scratch_raw;
     sycl::group_barrier(item.get_group());
     auto sg = item.get_sub_group();
     const int tid = item.get_local_id(0);
@@ -141,12 +133,11 @@ inline float block_sumf(sycl::nd_item<1> item, float v, double* scratch_raw) {
 /// and it is what `gr_parity`'s `mixed vs reference` caught at 2.0e+01 in round 196.
 template <bool FP32_ACT>
 void gr_norm_kernel(sycl::nd_item<1> item, const float* __restrict__ R, const float* __restrict__ w_norm, float eps,
-                               int n_embd, float* __restrict__ xn, uint16_t* __restrict__ xq,
-                               double *scratch) {
+                    int n_embd, float* __restrict__ xn, uint16_t* __restrict__ xq, double* scratch) {
     const int c = item.get_group(0);
-    const float* Rc = R + (size_t) c * n_embd;
-    float* xnc = xn + (size_t) c * n_embd;
-    uint16_t* xqc = xq + (size_t) c * n_embd;
+    const float* Rc = R + (size_t)c * n_embd;
+    float* xnc = xn + (size_t)c * n_embd;
+    uint16_t* xqc = xq + (size_t)c * n_embd;
 
     // FP32, for the same reason as `gr_down_kernel` and `gr_inject_kernel`: this is a GeForce part, FP64 runs
     // at a small fraction of FP32, and the sum of squares is a pure reduction.  It was the last `double` on the
@@ -154,16 +145,14 @@ void gr_norm_kernel(sycl::nd_item<1> item, const float* __restrict__ R, const fl
     // 12 of the FP64 sites the review's G5 counted in this file, and the rule it states ("no FP64 on any decode
     // or prefill path") is worth being able to check mechanically rather than case by case.
     float ss = 0.0f;
-    for (int d = item.get_local_id(0); d < n_embd;
-         d += item.get_local_range(0)) {
+    for (int d = item.get_local_id(0); d < n_embd; d += item.get_local_range(0)) {
         const float v = Rc[d];
         ss += v * v;
     }
-    const float ms = block_sumf(item, ss, scratch) / (float) n_embd;
+    const float ms = block_sumf(item, ss, scratch) / (float)n_embd;
     const float rs = sycl::rsqrt(ms + eps);
-    for (int d = item.get_local_id(0); d < n_embd;
-         d += item.get_local_range(0)) {
-        const float x = Rc[d] * rs * w_norm[(size_t) c * n_embd + d];
+    for (int d = item.get_local_id(0); d < n_embd; d += item.get_local_range(0)) {
+        const float x = Rc[d] * rs * w_norm[(size_t)c * n_embd + d];
         xnc[d] = x;
         if constexpr (!FP32_ACT) xqc[d] = f32_to_bf16_bits(x);
     }
@@ -171,16 +160,14 @@ void gr_norm_kernel(sycl::nd_item<1> item, const float* __restrict__ R, const fl
 
 /// `lo = silu((bf16(xn) @ w_down.T) / hc)`, ONE BLOCK PER OUTPUT ROW with its warps splitting the reduction.
 template <typename Activation>
-void gr_down_kernel(sycl::nd_item<1> item, const Activation* __restrict__ xq, const uint16_t* __restrict__ w_down, int hc_dim,
-                               int hc_lr, int hc, Activation* __restrict__ lq,
-                               float *part) {
+void gr_down_kernel(sycl::nd_item<1> item, const Activation* __restrict__ xq, const uint16_t* __restrict__ w_down,
+                    int hc_dim, int hc_lr, int hc, Activation* __restrict__ lq, float* part) {
     const int k = item.get_group(0);
     if (k >= hc_lr) return;
     const int lane = item.get_local_id(0) & 31;
     const int warp = item.get_local_id(0) >> 5;
-    const int nw = (int)(item.get_local_range(0) >>
-                         5); // warps per row == warps per block
-    const uint16_t* row = w_down + (size_t) k * hc_dim;
+    const int nw = (int)(item.get_local_range(0) >> 5);  // warps per row == warps per block
+    const uint16_t* row = w_down + (size_t)k * hc_dim;
     // **THE OCCUPANCY HERE IS 10% AND IT IS REAL, BUT FIXING IT DOES NOT PAY.**  `hc_lr` is 320, one warp per
     // row, 8 warps per block, so this launches 40 blocks = 320 warps: **6.7 warps per SM out of the 64 a
     // Blackwell SM holds**, each lane walking 10,240 elements in 320 dependent steps.
@@ -235,7 +222,7 @@ void gr_down_kernel(sycl::nd_item<1> item, const Activation* __restrict__ xq, co
         // NOTE: the reduction order differs from the one-warp version, so this is a NUMERICS CHANGE.  C1 is the
         // gate that judges it - not this comment, and not `gr_parity`, which compares against the reference on
         // a fixture that a changed summation order can still pass.
-        if (lane == 0) store_activation(lq, k, silu_f(t / (float) hc));
+        if (lane == 0) store_activation(lq, k, silu_f(t / (float)hc));
     }
 }
 
@@ -246,7 +233,7 @@ void gr_gate_kernel(sycl::nd_item<1> item, const Activation* __restrict__ lq, co
     const int i = item.get_group(0) * WARPS + (item.get_local_id(0) >> 5);
     if (i >= hc_dim) return;
     const int lane = item.get_local_id(0) & 31;
-    const uint16_t* row = w_up + (size_t) i * hc_lr;
+    const uint16_t* row = w_up + (size_t)i * hc_lr;
     float acc = 0.0f;
     for (int k = lane; k < hc_lr; k += 32)
         acc += activation_f32(lq[k]) * bf16_bits_to_f32(row[k]);
@@ -258,12 +245,14 @@ void gr_gate_kernel(sycl::nd_item<1> item, const Activation* __restrict__ lq, co
 
 /// `mixed[d] = mean over c of gated[c][d]`.  Flat elementwise: the mean is over the streams, which are
 /// strided by n_embd, so no cross-thread reduction is needed at all.
-void gr_mean_kernel(sycl::nd_item<1> item, const float* __restrict__ gated, int n_embd, int hc, float* __restrict__ mixed) {
+void gr_mean_kernel(sycl::nd_item<1> item, const float* __restrict__ gated, int n_embd, int hc,
+                    float* __restrict__ mixed) {
     const int d = item.get_global_id(0);
     if (d >= n_embd) return;
     float m = 0.0f;
-    for (int c = 0; c < hc; ++c) m += gated[(size_t) c * n_embd + d];
-    mixed[d] = m / (float) hc;
+    for (int c = 0; c < hc; ++c)
+        m += gated[(size_t)c * n_embd + d];
+    mixed[d] = m / (float)hc;
 }
 
 /// `inject[c] = bf16(xn) @ w_inject[c]`, one value per stream: ONE WARP PER STREAM, lanes striding hc_dim.
@@ -278,7 +267,7 @@ void gr_inject_kernel(sycl::nd_item<1> item, const Activation* __restrict__ xq, 
     const int c = item.get_local_id(0) >> 5;
     if (c >= hc) return;
     const int lane = item.get_local_id(0) & 31;
-    const uint16_t* row = w_inject + (size_t) c * hc_dim;
+    const uint16_t* row = w_inject + (size_t)c * hc_dim;
     float acc = 0.0f;
     for (int i = lane; i < hc_dim; i += 32)
         acc += activation_f32(xq[i]) * bf16_bits_to_f32(row[i]);
@@ -287,16 +276,15 @@ void gr_inject_kernel(sycl::nd_item<1> item, const Activation* __restrict__ xq, 
 }
 
 void gr_write_kernel(sycl::nd_item<1> item, const float* __restrict__ R, const float* __restrict__ block_out,
-                     const float* __restrict__ inject, int n_embd, int hc, float* __restrict__ out,
-                     float* w) {
+                     const float* __restrict__ inject, int n_embd, int hc, float* __restrict__ out, float* w) {
     // w = 2*sigmoid(inject/hc), computed once per stream in shared rather than per element.
     if ((int)item.get_local_id(0) < hc) {
         w[item.get_local_id(0)] = 2.0f * sigmoid_f(inject[item.get_local_id(0)] / (float)hc);
     }
     sycl::group_barrier(item.get_group());
-    const long long n = (long long) hc * n_embd;
+    const long long n = (long long)hc * n_embd;
     for (long long i = item.get_global_id(0); i < n; i += item.get_group_range(0) * item.get_local_range(0)) {
-        const int c = (int) (i / n_embd), d = (int) (i % n_embd);
+        const int c = (int)(i / n_embd), d = (int)(i % n_embd);
         out[i] = R[i] + block_out[d] * w[c];
     }
 }
@@ -307,7 +295,7 @@ void gr_set_fp32_activations(bool enabled) { fp32_activations = enabled; }
 void gr_set_native_mmvf(bool enabled) { native_mmvf = enabled; }
 
 size_t gr_workspace_init(const GrShapes& s, void* base, GrWorkspace& out) {
-    const size_t hc_dim = (size_t) s.hc * (size_t) s.n_embd;
+    const size_t hc_dim = (size_t)s.hc * (size_t)s.n_embd;
     // ONE table, indexed by the same `k` that assigns the pointers below.  The first version of this function
     // sized three locals named `xn`, `xq`, `lq` in a DIFFERENT order from the pointer assignments - `xq` got
     // hc_lr*2 while `lq` got hc_dim*4 - so for the real geometry xq was given 640 bytes where it needed
@@ -318,50 +306,49 @@ size_t gr_workspace_init(const GrShapes& s, void* base, GrWorkspace& out) {
     // exactly is not a coincidence to investigate - it means the reduction is not where the bug is, and the
     // inputs are.  Chasing the reduction instead cost most of a round.
     const size_t sz[5] = {
-        hc_dim * sizeof(float),                // 0: xn
-        hc_dim * sizeof(uint16_t),             // 1: xq
-        (size_t) s.hc_lr * sizeof(uint16_t),   // 2: lq
-        hc_dim * sizeof(float),                // 3: gated
-        (size_t) s.hc_lr * sizeof(float),        // 4: lo (FP32 activation experiment)
+        hc_dim * sizeof(float),              // 0: xn
+        hc_dim * sizeof(uint16_t),           // 1: xq
+        (size_t)s.hc_lr * sizeof(uint16_t),  // 2: lq
+        hc_dim * sizeof(float),              // 3: gated
+        (size_t)s.hc_lr * sizeof(float),     // 4: lo (FP32 activation experiment)
     };
     size_t al[5], bytes = 0;
     for (int k = 0; k < 5; ++k) {
-        al[k] = (sz[k] + 15) & ~(size_t) 15;
+        al[k] = (sz[k] + 15) & ~(size_t)15;
         bytes += al[k];
     }
     out.bytes = bytes;
     if (base != nullptr) {
-        unsigned char* p = (unsigned char*) base;
+        unsigned char* p = (unsigned char*)base;
         void* ptr[5];
         for (int k = 0; k < 5; ++k) {
             ptr[k] = p;
             p += al[k];
         }
-        out.xn = (float*) ptr[0];
-        out.xq = (uint16_t*) ptr[1];
-        out.lq = (uint16_t*) ptr[2];
-        out.gated = (float*) ptr[3];
-        out.lo = (float*) ptr[4];
+        out.xn = (float*)ptr[0];
+        out.xq = (uint16_t*)ptr[1];
+        out.lq = (uint16_t*)ptr[2];
+        out.gated = (float*)ptr[3];
+        out.lo = (float*)ptr[4];
     }
     return bytes;
 }
 
-void gr_read(const float *R, const float *w_norm, const uint16_t *w_down,
-             const uint16_t *w_up, const uint16_t *w_inject, float eps,
-             const GrShapes &s, const GrWorkspace &ws, float *mixed,
-             float *inject, void *stream) try {
+void gr_read(const float* R, const float* w_norm, const uint16_t* w_down, const uint16_t* w_up,
+             const uint16_t* w_inject, float eps, const GrShapes& s, const GrWorkspace& ws, float* mixed, float* inject,
+             void* stream) try {
     if (s.n_embd <= 0 || s.hc <= 0 || s.hc_lr <= 0) return;
     if (ws.xn == nullptr || ws.xq == nullptr || ws.lq == nullptr || ws.gated == nullptr || ws.lo == nullptr) {
         std::fprintf(stderr, "gr_read: GrWorkspace is not initialised (see gr_workspace_init)\n");
         std::exit(1);
     }
     if (ws.bytes < gr_workspace_bytes(s)) {
-        std::fprintf(stderr, "gr_read: GrWorkspace is %zu bytes but this geometry needs %zu\n",
-                     ws.bytes, gr_workspace_bytes(s));
+        std::fprintf(stderr, "gr_read: GrWorkspace is %zu bytes but this geometry needs %zu\n", ws.bytes,
+                     gr_workspace_bytes(s));
         std::exit(1);
     }
-    const int n_embd = (int) s.n_embd, hc = (int) s.hc, hc_lr = (int) s.hc_lr;
-    const int hc_dim = (int) (s.hc * s.n_embd);
+    const int n_embd = (int)s.n_embd, hc = (int)s.hc, hc_lr = (int)s.hc_lr;
+    const int hc_dim = (int)(s.hc * s.n_embd);
     sycl::queue* st = stream ? static_cast<sycl::queue*>(stream) : &default_queue;
 
     // One setting selects every projection in this call. Captured graphs retain these kernel variants.
@@ -379,59 +366,64 @@ void gr_read(const float *R, const float *w_norm, const uint16_t *w_down,
         native_gr_pre_gated(ws.xn, ws.gated, mixed, n_embd, hc, w_inject != nullptr, st);
     } else if (use_fp32) {
         {
-            st->submit([&](sycl::handler &cgh) {
-                sycl::local_accessor<double, 1> scratch_acc_ct1(
-                    sycl::range<1>(8), cgh);
+            st->submit([&](sycl::handler& cgh) {
+                sycl::local_accessor<double, 1> scratch_acc_ct1(sycl::range<1>(8), cgh);
 
-                cgh.parallel_for(
-                    sycl::nd_range<1>(sycl::range<1>((size_t)hc * THREADS),
-                                      sycl::range<1>(THREADS)),
-                    [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(32)]] { gr_norm_kernel<true>(item, R, w_norm, eps, n_embd, ws.xn, ws.xq, scratch_acc_ct1.get_multi_ptr<sycl::access::decorated::no>().get()); });
+                cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t)hc * THREADS), sycl::range<1>(THREADS)),
+                                 [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(32)]] {
+                                     gr_norm_kernel<true>(
+                                         item, R, w_norm, eps, n_embd, ws.xn, ws.xq,
+                                         scratch_acc_ct1.get_multi_ptr<sycl::access::decorated::no>().get());
+                                 });
             });
         }
-        st->submit([&](sycl::handler &cgh) {
-            sycl::local_accessor<float, 1> part_acc_ct1(
-                sycl::range<1>(8 /*WARPS*/), cgh);
+        st->submit([&](sycl::handler& cgh) {
+            sycl::local_accessor<float, 1> part_acc_ct1(sycl::range<1>(8 /*WARPS*/), cgh);
 
-            cgh.parallel_for(
-                sycl::nd_range<1>(sycl::range<1>((size_t)hc_lr * THREADS),
-                                  sycl::range<1>(THREADS)),
-                [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(32)]] { gr_down_kernel<float>(item, ws.xn, w_down, hc_dim, hc_lr, hc, ws.lo, part_acc_ct1.get_multi_ptr<sycl::access::decorated::no>().get()); });
+            cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t)hc_lr * THREADS), sycl::range<1>(THREADS)),
+                             [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(32)]] {
+                                 gr_down_kernel<float>(item, ws.xn, w_down, hc_dim, hc_lr, hc, ws.lo,
+                                                       part_acc_ct1.get_multi_ptr<sycl::access::decorated::no>().get());
+                             });
         });
-        st->parallel_for(
-            sycl::nd_range<1>(sycl::range<1>((size_t)((hc_dim + WARPS - 1) / WARPS) * THREADS), sycl::range<1>(THREADS)),
-            [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(32)]] { gr_gate_kernel<float>(item, ws.lo, w_up, ws.xn, hc_dim, hc_lr,
-                                      ws.gated); });
+        st->parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t)((hc_dim + WARPS - 1) / WARPS) * THREADS),
+                                           sycl::range<1>(THREADS)),
+                         [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(32)]] {
+                             gr_gate_kernel<float>(item, ws.lo, w_up, ws.xn, hc_dim, hc_lr, ws.gated);
+                         });
     } else {
         {
-            st->submit([&](sycl::handler &cgh) {
-                sycl::local_accessor<double, 1> scratch_acc_ct1(
-                    sycl::range<1>(8), cgh);
+            st->submit([&](sycl::handler& cgh) {
+                sycl::local_accessor<double, 1> scratch_acc_ct1(sycl::range<1>(8), cgh);
 
-                cgh.parallel_for(
-                    sycl::nd_range<1>(sycl::range<1>((size_t)hc * THREADS),
-                                      sycl::range<1>(THREADS)),
-                    [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(32)]] { gr_norm_kernel<false>(item, R, w_norm, eps, n_embd, ws.xn, ws.xq, scratch_acc_ct1.get_multi_ptr<sycl::access::decorated::no>().get()); });
+                cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t)hc * THREADS), sycl::range<1>(THREADS)),
+                                 [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(32)]] {
+                                     gr_norm_kernel<false>(
+                                         item, R, w_norm, eps, n_embd, ws.xn, ws.xq,
+                                         scratch_acc_ct1.get_multi_ptr<sycl::access::decorated::no>().get());
+                                 });
             });
         }
-        st->submit([&](sycl::handler &cgh) {
-            sycl::local_accessor<float, 1> part_acc_ct1(
-                sycl::range<1>(8 /*WARPS*/), cgh);
+        st->submit([&](sycl::handler& cgh) {
+            sycl::local_accessor<float, 1> part_acc_ct1(sycl::range<1>(8 /*WARPS*/), cgh);
 
-            cgh.parallel_for(
-                sycl::nd_range<1>(sycl::range<1>((size_t)hc_lr * THREADS),
-                                  sycl::range<1>(THREADS)),
-                [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(32)]] { gr_down_kernel<uint16_t>(item, ws.xq, w_down, hc_dim, hc_lr, hc, ws.lq, part_acc_ct1.get_multi_ptr<sycl::access::decorated::no>().get()); });
+            cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t)hc_lr * THREADS), sycl::range<1>(THREADS)),
+                             [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(32)]] {
+                                 gr_down_kernel<uint16_t>(
+                                     item, ws.xq, w_down, hc_dim, hc_lr, hc, ws.lq,
+                                     part_acc_ct1.get_multi_ptr<sycl::access::decorated::no>().get());
+                             });
         });
-        st->parallel_for(
-            sycl::nd_range<1>(sycl::range<1>((size_t)((hc_dim + WARPS - 1) / WARPS) * THREADS), sycl::range<1>(THREADS)),
-            [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(32)]] { gr_gate_kernel<uint16_t>(item, ws.lq, w_up, ws.xn, hc_dim, hc_lr,
-                                         ws.gated); });
+        st->parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t)((hc_dim + WARPS - 1) / WARPS) * THREADS),
+                                           sycl::range<1>(THREADS)),
+                         [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(32)]] {
+                             gr_gate_kernel<uint16_t>(item, ws.lq, w_up, ws.xn, hc_dim, hc_lr, ws.gated);
+                         });
     }
     if (!use_native)
-        st->parallel_for(
-            sycl::nd_range<1>(sycl::range<1>((size_t)((n_embd + THREADS - 1) / THREADS) * THREADS), sycl::range<1>(THREADS)),
-            [=](sycl::nd_item<1> item) { gr_mean_kernel(item, ws.gated, n_embd, hc, mixed); });
+        st->parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t)((n_embd + THREADS - 1) / THREADS) * THREADS),
+                                           sycl::range<1>(THREADS)),
+                         [=](sycl::nd_item<1> item) { gr_mean_kernel(item, ws.gated, n_embd, hc, mixed); });
     // Absent for the final mixer, and then nothing is written - computing an injection nobody reads would be
     // a claim, not a convenience.
     if (w_inject != nullptr) {
@@ -439,52 +431,49 @@ void gr_read(const float *R, const float *w_norm, const uint16_t *w_down,
         if (use_native)
             bf16_gemv_fp32_mmvf(ws.xn, w_inject, inject, hc_dim, hc, st);
         else if (use_fp32)
-            st->parallel_for(sycl::nd_range<1>(sycl::range<1>(nthreads),
-                                               sycl::range<1>(nthreads)),
-                             [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(32)]] { gr_inject_kernel<float>(item, 
-                                         ws.xn, w_inject, hc_dim, hc, inject); });
+            st->parallel_for(sycl::nd_range<1>(sycl::range<1>(nthreads), sycl::range<1>(nthreads)),
+                             [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(32)]] {
+                                 gr_inject_kernel<float>(item, ws.xn, w_inject, hc_dim, hc, inject);
+                             });
         else
-            st->parallel_for(sycl::nd_range<1>(sycl::range<1>(nthreads),
-                                               sycl::range<1>(nthreads)),
-                             [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(32)]] { gr_inject_kernel<uint16_t>(item, 
-                                         ws.xq, w_inject, hc_dim, hc, inject); });
+            st->parallel_for(sycl::nd_range<1>(sycl::range<1>(nthreads), sycl::range<1>(nthreads)),
+                             [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(32)]] {
+                                 gr_inject_kernel<uint16_t>(item, ws.xq, w_inject, hc_dim, hc, inject);
+                             });
     }
 
     if (!stream) default_queue.wait();
-}
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
+} catch (sycl::exception const& exc) {
+    std::cerr << exc.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
+    std::exit(1);
 }
 
-void gr_write(const float *R, const float *block_out, const float *inject,
-              const GrShapes &s, float *R_out, void *stream) try {
+void gr_write(const float* R, const float* block_out, const float* inject, const GrShapes& s, float* R_out,
+              void* stream) try {
     if (s.n_embd <= 0 || s.hc <= 0) return;
-    const long long n = (long long) s.hc * s.n_embd;
-    const int blocks = (int) ((n + THREADS - 1) / THREADS);
+    const long long n = (long long)s.hc * s.n_embd;
+    const int blocks = (int)((n + THREADS - 1) / THREADS);
     if (native_mmvf)
-        native_gr_post(R, block_out, inject, R_out, (int) s.n_embd, (int) s.hc, stream);
+        native_gr_post(R, block_out, inject, R_out, (int)s.n_embd, (int)s.hc, stream);
     else
-        (stream ? static_cast<sycl::queue*>(stream) : &default_queue)
-            ->submit([&](sycl::handler &cgh) {
-                /*
-                DPCT1083:929: The size of local memory in the migrated code may
-                be different from the original code. Check that the allocated
-                memory size in the migrated code is correct.
-                */
-                sycl::local_accessor<float, 1> w_acc(sycl::range<1>((size_t)s.hc), cgh);
+        (stream ? static_cast<sycl::queue*>(stream) : &default_queue)->submit([&](sycl::handler& cgh) {
+            /*
+            DPCT1083:929: The size of local memory in the migrated code may
+            be different from the original code. Check that the allocated
+            memory size in the migrated code is correct.
+            */
+            sycl::local_accessor<float, 1> w_acc(sycl::range<1>((size_t)s.hc), cgh);
 
-                cgh.parallel_for(
-                    sycl::nd_range<1>(sycl::range<1>((size_t)blocks * THREADS), sycl::range<1>(THREADS)),
-                    [=](sycl::nd_item<1> item) { gr_write_kernel(item, R, block_out, inject, (int)s.n_embd, (int)s.hc, R_out, w_acc.get_multi_ptr<sycl::access::decorated::no>().get()); });
-            });
+            cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t)blocks * THREADS), sycl::range<1>(THREADS)),
+                             [=](sycl::nd_item<1> item) {
+                                 gr_write_kernel(item, R, block_out, inject, (int)s.n_embd, (int)s.hc, R_out,
+                                                 w_acc.get_multi_ptr<sycl::access::decorated::no>().get());
+                             });
+        });
     if (!stream) default_queue.wait();
-}
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
+} catch (sycl::exception const& exc) {
+    std::cerr << exc.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
+    std::exit(1);
 }
 
 }  // namespace strata::kernels

@@ -8,8 +8,7 @@
 
 int main() {
     sycl::queue q{sycl::default_selector_v, sycl::property::queue::in_order()};
-    std::printf("Running graph_test on: %s\n",
-                q.get_device().get_info<sycl::info::device::name>().c_str());
+    std::printf("Running graph_test on: %s\n", q.get_device().get_info<sycl::info::device::name>().c_str());
 
     int total_failures = 0;
 
@@ -17,7 +16,8 @@ int main() {
     {
         constexpr size_t N = 1024;
         int* data = sycl::malloc_shared<int>(N, q);
-        for (size_t i = 0; i < N; ++i) data[i] = 1;
+        for (size_t i = 0; i < N; ++i)
+            data[i] = 1;
 
         strata::core::CapturedGraph g;
         std::string err;
@@ -28,12 +28,8 @@ int main() {
         }
 
         // Submit 2 parallel_for kernels during recording
-        q.parallel_for(sycl::range<1>(N), [=](sycl::id<1> idx) {
-            data[idx] += 10;
-        });
-        q.parallel_for(sycl::range<1>(N), [=](sycl::id<1> idx) {
-            data[idx] *= 2;
-        });
+        q.parallel_for(sycl::range<1>(N), [=](sycl::id<1> idx) { data[idx] += 10; });
+        q.parallel_for(sycl::range<1>(N), [=](sycl::id<1> idx) { data[idx] *= 2; });
 
         if (!g.end(&q, err)) {
             std::printf("FAIL: CapturedGraph::end failed: %s\n", err.c_str());
@@ -56,7 +52,8 @@ int main() {
         // In SYCL queue recording, data may still be initial 1.
         // Let's launch the graph for execution!
         // Initial state before replay:
-        for (size_t i = 0; i < N; ++i) data[i] = 1;
+        for (size_t i = 0; i < N; ++i)
+            data[i] = 1;
 
         // Replay 1: (1 + 10) * 2 = 22
         if (!g.launch(&q, err)) {
@@ -98,14 +95,13 @@ int main() {
 
         constexpr size_t N = 512;
         int* val = sycl::malloc_shared<int>(N, q);
-        for (size_t i = 0; i < N; ++i) val[i] = 5;
+        for (size_t i = 0; i < N; ++i)
+            val[i] = 5;
 
         int body_invocations = 0;
         auto body = [&]() {
             body_invocations++;
-            q.parallel_for(sycl::range<1>(N), [=](sycl::id<1> idx) {
-                val[idx] += 100;
-            });
+            q.parallel_for(sycl::range<1>(N), [=](sycl::id<1> idx) { val[idx] += 100; });
         };
 
         // First record: body should be called
@@ -131,13 +127,13 @@ int main() {
         }
 
         if (reg.size() != 1 || reg.captures() != 1) {
-            std::printf("FAIL: Expected size=1, captures=1, got size=%zu, captures=%zu\n",
-                        reg.size(), reg.captures());
+            std::printf("FAIL: Expected size=1, captures=1, got size=%zu, captures=%zu\n", reg.size(), reg.captures());
             total_failures++;
         }
 
         // Launch from registry
-        for (size_t i = 0; i < N; ++i) val[i] = 5;
+        for (size_t i = 0; i < N; ++i)
+            val[i] = 5;
 
         if (!reg.launch(strata::core::LayerType::GDN, 1, 1000, err)) {
             std::printf("FAIL: GraphRegistry::launch failed: %s\n", err.c_str());
@@ -152,9 +148,7 @@ int main() {
         // Record a second key (QSA)
         auto qsa_body = [&]() {
             body_invocations++;
-            q.parallel_for(sycl::range<1>(N), [=](sycl::id<1> idx) {
-                val[idx] *= 2;
-            });
+            q.parallel_for(sycl::range<1>(N), [=](sycl::id<1> idx) { val[idx] *= 2; });
         };
 
         if (!reg.record(strata::core::LayerType::QSA, 1, qsa_body, err)) {
@@ -163,8 +157,7 @@ int main() {
         }
 
         if (reg.size() != 2 || reg.captures() != 2) {
-            std::printf("FAIL: Expected size=2, captures=2, got size=%zu, captures=%zu\n",
-                        reg.size(), reg.captures());
+            std::printf("FAIL: Expected size=2, captures=2, got size=%zu, captures=%zu\n", reg.size(), reg.captures());
             total_failures++;
         }
 
@@ -183,7 +176,6 @@ int main() {
         sycl::free(val, q);
     }
 
-    std::printf("\ngraph_test: %s (total failures: %d)\n",
-                total_failures == 0 ? "PASSED" : "FAILED", total_failures);
+    std::printf("\ngraph_test: %s (total failures: %d)\n", total_failures == 0 ? "PASSED" : "FAILED", total_failures);
     return total_failures == 0 ? 0 : 1;
 }

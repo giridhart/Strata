@@ -24,35 +24,34 @@
 
 namespace {
 
-using strata::kernels::SForm;
 using strata::kernels::Codebook;
+using strata::kernels::SForm;
 
 /// The host decode, transcribed from `docs/pack-format.md`'s rule: `value = cb[code] * scale + offset`, with
 /// the integer bias applied INSIDE the integer domain before the one multiply.
 const signed char kIq4Nl[16] = {-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
 
-double weight_at(const std::vector<uint8_t>& codes, const std::vector<float>& scales,
-                 const std::vector<float>& offset, const SForm& f, long long n_in, long long o, long long i) {
+double weight_at(const std::vector<uint8_t>& codes, const std::vector<float>& scales, const std::vector<float>& offset,
+                 const SForm& f, long long n_in, long long o, long long i) {
     const int per_byte = 8 / f.code_bits;
     const long long codes_per_row = n_in / per_byte;
     const long long n_groups = n_in / f.group_elems;
     const uint8_t* c = codes.data() + o * codes_per_row;
-    const int code = (c[i / per_byte] >> ((int) (i % per_byte) * f.code_bits)) & ((1 << f.code_bits) - 1);
-    const double v = (f.codebook == Codebook::Iq4Nl) ? (double) kIq4Nl[code & 0x0F]
-                                                     : (double) (code + f.code_bias);
+    const int code = (c[i / per_byte] >> ((int)(i % per_byte) * f.code_bits)) & ((1 << f.code_bits) - 1);
+    const double v = (f.codebook == Codebook::Iq4Nl) ? (double)kIq4Nl[code & 0x0F] : (double)(code + f.code_bias);
     const long long g = i / f.group_elems;
-    double w = v * (double) scales[(size_t) (o * n_groups + g)];
-    if (f.has_offset) w += (double) offset[(size_t) (o * n_groups + g)];
+    double w = v * (double)scales[(size_t)(o * n_groups + g)];
+    if (f.has_offset) w += (double)offset[(size_t)(o * n_groups + g)];
     return w;
 }
 
 /// Dequantize a block_q8_K buffer on the host: 292 bytes per 256 elements.
 double q8k_at(const std::vector<uint8_t>& x, long long i) {
-    const uint8_t* blk = x.data() + (size_t) (i / 256) * 292;
+    const uint8_t* blk = x.data() + (size_t)(i / 256) * 292;
     float d;
     std::memcpy(&d, blk, 4);
-    const int8_t q = ((const int8_t*) (blk + 4))[i % 256];
-    return (double) d * (double) q;
+    const int8_t q = ((const int8_t*)(blk + 4))[i % 256];
+    return (double)d * (double)q;
 }
 
 struct Case {
@@ -70,13 +69,14 @@ struct Case {
 /// deliberately ragged, every row is checked against the host reference over the same bytes, and a guard
 /// band past `n_out` must come back untouched: a warp without a row must neither hang the block nor write.
 /// (`compute-sanitizer --tool synccheck` on this binary is the direct check of the barrier itself.)
-int ragged_rows(const Case &cs, long long n_out, sycl::queue &q) {
+int ragged_rows(const Case& cs, long long n_out, sycl::queue& q) {
     const long long n_in = 512;
     const long long guard = 64;
-    std::mt19937 rng(77 + (unsigned) n_out);
+    std::mt19937 rng(77 + (unsigned)n_out);
     std::normal_distribution<float> g(0.0f, 1.0f);
-    std::vector<float> xf((size_t) n_in);
-    for (auto& v : xf) v = g(rng);
+    std::vector<float> xf((size_t)n_in);
+    for (auto& v : xf)
+        v = g(rng);
     SForm f;
     f.code_bits = cs.bits;
     f.code_bias = cs.bias;
@@ -84,21 +84,24 @@ int ragged_rows(const Case &cs, long long n_out, sycl::queue &q) {
     f.codebook = cs.cb;
     f.has_offset = cs.has_offset;
     const int per_byte = 8 / cs.bits;
-    std::vector<uint8_t> codes((size_t) (n_out * n_in / per_byte));
-    for (auto& v : codes) v = (uint8_t) (rng() & 0xFF);
+    std::vector<uint8_t> codes((size_t)(n_out * n_in / per_byte));
+    for (auto& v : codes)
+        v = (uint8_t)(rng() & 0xFF);
     const long long n_groups = n_in / cs.group;
-    std::vector<float> scales((size_t) (n_out * n_groups)), offs((size_t) (n_out * n_groups));
-    for (auto& v : scales) v = 0.01f + 0.001f * (float) (rng() % 20);
-    for (auto& v : offs) v = 0.2f * g(rng);
+    std::vector<float> scales((size_t)(n_out * n_groups)), offs((size_t)(n_out * n_groups));
+    for (auto& v : scales)
+        v = 0.01f + 0.001f * (float)(rng() % 20);
+    for (auto& v : offs)
+        v = 0.2f * g(rng);
 
-    std::vector<uint8_t> xk((size_t) (n_in / 256) * 292), x0((size_t) (n_in / 32) * 34);
+    std::vector<uint8_t> xk((size_t)(n_in / 256) * 292), x0((size_t)(n_in / 32) * 34);
     float* d_xf = sycl::malloc_device<float>((size_t)n_in, q);
-    uint8_t *d_xk = sycl::malloc_device<uint8_t>(xk.size(), q);
-    uint8_t *d_x0 = sycl::malloc_device<uint8_t>(x0.size(), q);
-    uint8_t *d_codes = sycl::malloc_device<uint8_t>(codes.size(), q);
-    float *d_scales = sycl::malloc_device<float>(scales.size(), q);
-    float *d_offs = sycl::malloc_device<float>(offs.size(), q);
-    float *d_y = sycl::malloc_device<float>((size_t)(n_out + guard), q);
+    uint8_t* d_xk = sycl::malloc_device<uint8_t>(xk.size(), q);
+    uint8_t* d_x0 = sycl::malloc_device<uint8_t>(x0.size(), q);
+    uint8_t* d_codes = sycl::malloc_device<uint8_t>(codes.size(), q);
+    float* d_scales = sycl::malloc_device<float>(scales.size(), q);
+    float* d_offs = sycl::malloc_device<float>(offs.size(), q);
+    float* d_y = sycl::malloc_device<float>((size_t)(n_out + guard), q);
 
     q.memcpy(d_xf, xf.data(), (size_t)n_in * sizeof(float)).wait();
     q.memcpy(d_codes, codes.data(), codes.size()).wait();
@@ -110,30 +113,30 @@ int ragged_rows(const Case &cs, long long n_out, sycl::queue &q) {
     q.memcpy(x0.data(), d_x0, x0.size()).wait();
 
     int bad = 0;
-    for (int kind = 0; kind < 2; ++kind) {           // 0: Q8_K activation, 1: Q8_0 activation
-        std::vector<float> want((size_t) n_out);
-        std::vector<double> mag((size_t) n_out);   // sum |w_i a_i| per row: a row whose sum cancels near 0
-        for (long long o = 0; o < n_out; ++o) {    // must not turn f32 rounding into a relative failure
+    for (int kind = 0; kind < 2; ++kind) {  // 0: Q8_K activation, 1: Q8_0 activation
+        std::vector<float> want((size_t)n_out);
+        std::vector<double> mag((size_t)n_out);  // sum |w_i a_i| per row: a row whose sum cancels near 0
+        for (long long o = 0; o < n_out; ++o) {  // must not turn f32 rounding into a relative failure
             double acc = 0, am = 0;
             for (long long i = 0; i < n_in; ++i) {
                 double a;
                 if (kind == 0) {
                     a = q8k_at(xk, i);
                 } else {
-                    const uint8_t* blk = x0.data() + (size_t) (i / 32) * 34;
+                    const uint8_t* blk = x0.data() + (size_t)(i / 32) * 34;
                     uint16_t dbits;
                     std::memcpy(&dbits, blk, 2);
-                    a = (double) strata::kernels::f32_from_f16(dbits) * (double) ((const int8_t*) (blk + 2))[i % 32];
+                    a = (double)strata::kernels::f32_from_f16(dbits) * (double)((const int8_t*)(blk + 2))[i % 32];
                 }
                 const double wa = weight_at(codes, scales, offs, f, n_in, o, i) * a;
                 acc += wa;
                 am += std::fabs(wa);
             }
-            want[(size_t) o] = (float) acc;
-            mag[(size_t) o] = am;
+            want[(size_t)o] = (float)acc;
+            mag[(size_t)o] = am;
         }
         // the guard band holds a NaN pattern; any write there shows up as a changed bit
-        std::vector<uint32_t> sentinel((size_t) (n_out + guard), 0x7FC0DEADu);
+        std::vector<uint32_t> sentinel((size_t)(n_out + guard), 0x7FC0DEADu);
         q.memcpy(d_y, sentinel.data(), sentinel.size() * sizeof(uint32_t)).wait();
         if (kind == 0)
             strata::kernels::s_gemv_q8k_split(d_xk, d_codes, d_scales, cs.has_offset ? d_offs : nullptr, d_y, n_in,
@@ -147,35 +150,43 @@ int ragged_rows(const Case &cs, long long n_out, sycl::queue &q) {
         double m = 0, d = 0;
         for (long long o = 0; o < n_out; ++o) {
             float v;
-            std::memcpy(&v, &got_bits[(size_t) o], 4);
-            m += mag[(size_t) o];
-            d += std::fabs((double) want[(size_t) o] - (double) v);
+            std::memcpy(&v, &got_bits[(size_t)o], 4);
+            m += mag[(size_t)o];
+            d += std::fabs((double)want[(size_t)o] - (double)v);
         }
         long long touched = 0;
-        for (long long o = n_out; o < n_out + guard; ++o) touched += got_bits[(size_t) o] != 0x7FC0DEADu;
+        for (long long o = n_out; o < n_out + guard; ++o)
+            touched += got_bits[(size_t)o] != 0x7FC0DEADu;
         const double rel = d / (m > 1e-30 ? m : 1e-30);
         const bool ok = rel <= 1e-5 && touched == 0;
         std::printf("  %-28s %s n_out %3lld: rel %.3e, guard words written %lld  %s\n", cs.what,
                     kind == 0 ? "Q8_K" : "Q8_0", n_out, rel, touched, ok ? "ok" : "*** WRONG ***");
         if (!ok) ++bad;
     }
-    sycl::free(d_xf, q); sycl::free(d_xk, q);
-    sycl::free(d_x0, q); sycl::free(d_codes, q);
-    sycl::free(d_scales, q); sycl::free(d_offs, q);
+    sycl::free(d_xf, q);
+    sycl::free(d_xk, q);
+    sycl::free(d_x0, q);
+    sycl::free(d_codes, q);
+    sycl::free(d_scales, q);
+    sycl::free(d_offs, q);
     sycl::free(d_y, q);
     return bad;
 }
 
 }  // namespace
 
-int main(int argc, char **argv) {
+int main(int argc, char** argv) {
     auto gpus = sycl::device::get_devices(sycl::info::device_type::gpu);
     sycl::device dev = gpus.empty() ? sycl::device(sycl::default_selector_v) : gpus.front();
     sycl::queue q(dev, sycl::property::queue::in_order{});
     bool selftest = false;
     for (int i = 1; i < argc; ++i) {
-        if (std::string(argv[i]) == "--selftest") selftest = true;
-        else { std::fprintf(stderr, "usage: s_gemv_q8k_parity [--selftest]\n"); return 2; }
+        if (std::string(argv[i]) == "--selftest")
+            selftest = true;
+        else {
+            std::fprintf(stderr, "usage: s_gemv_q8k_parity [--selftest]\n");
+            return 2;
+        }
     }
     int bad = 0;
 
@@ -190,11 +201,12 @@ int main(int argc, char **argv) {
     };
 
     for (const Case& cs : cases) {
-        const long long n_in = 512, n_out = 64;   // 2 Q8_K blocks wide, small enough for a host reference
+        const long long n_in = 512, n_out = 64;  // 2 Q8_K blocks wide, small enough for a host reference
         std::mt19937 rng(2024);
         std::normal_distribution<float> g(0.0f, 1.0f);
-        std::vector<float> xf((size_t) n_in);
-        for (auto& v : xf) v = g(rng);
+        std::vector<float> xf((size_t)n_in);
+        for (auto& v : xf)
+            v = g(rng);
 
         SForm f;
         f.code_bits = cs.bits;
@@ -204,15 +216,18 @@ int main(int argc, char **argv) {
         f.has_offset = cs.has_offset;
 
         const int per_byte = 8 / cs.bits;
-        std::vector<uint8_t> codes((size_t) (n_out * n_in / per_byte));
-        for (auto& v : codes) v = (uint8_t) (rng() & 0xFF);
+        std::vector<uint8_t> codes((size_t)(n_out * n_in / per_byte));
+        for (auto& v : codes)
+            v = (uint8_t)(rng() & 0xFF);
         const long long n_groups = n_in / cs.group;
-        std::vector<float> scales((size_t) (n_out * n_groups)), offs((size_t) (n_out * n_groups));
-        for (auto& v : scales) v = 0.01f + 0.001f * (float) (rng() % 20);
-        for (auto& v : offs) v = 0.2f * g(rng);
+        std::vector<float> scales((size_t)(n_out * n_groups)), offs((size_t)(n_out * n_groups));
+        for (auto& v : scales)
+            v = 0.01f + 0.001f * (float)(rng() % 20);
+        for (auto& v : offs)
+            v = 0.2f * g(rng);
 
         // ---- the activation, from the REAL quantizer
-        std::vector<uint8_t> xq8k((size_t) (n_in / 256) * 292);
+        std::vector<uint8_t> xq8k((size_t)(n_in / 256) * 292);
         float* d_xf = sycl::malloc_device<float>((size_t)n_in, q);
         uint8_t* d_xq = sycl::malloc_device<uint8_t>(xq8k.size(), q);
         q.memcpy(d_xf, xf.data(), (size_t)n_in * sizeof(float)).wait();
@@ -220,12 +235,12 @@ int main(int argc, char **argv) {
         q.memcpy(xq8k.data(), d_xq, xq8k.size()).wait();
 
         // ---- host reference in double, over the same bytes
-        std::vector<float> want((size_t) n_out, 0.0f);
+        std::vector<float> want((size_t)n_out, 0.0f);
         for (long long o = 0; o < n_out; ++o) {
             double acc = 0;
             for (long long i = 0; i < n_in; ++i)
                 acc += weight_at(codes, scales, offs, f, n_in, o, i) * q8k_at(xq8k, i);
-            want[(size_t) o] = (float) acc;
+            want[(size_t)o] = (float)acc;
         }
 
         // ---- device
@@ -237,57 +252,59 @@ int main(int argc, char **argv) {
         q.memcpy(d_scales, scales.data(), scales.size() * sizeof(float)).wait();
         q.memcpy(d_offs, offs.data(), offs.size() * sizeof(float)).wait();
 
-        std::vector<float> naive((size_t) n_out), warp((size_t) n_out);
-        strata::kernels::s_gemv_q8k(d_xq, d_codes, d_scales, cs.has_offset ? d_offs : nullptr, d_y, n_in, n_out,
-                                    f, &q);
+        std::vector<float> naive((size_t)n_out), warp((size_t)n_out);
+        strata::kernels::s_gemv_q8k(d_xq, d_codes, d_scales, cs.has_offset ? d_offs : nullptr, d_y, n_in, n_out, f, &q);
         q.memcpy(naive.data(), d_y, (size_t)n_out * sizeof(float)).wait();
-        strata::kernels::s_gemv_q8k_split(d_xq, d_codes, d_scales, cs.has_offset ? d_offs : nullptr, d_y, n_in,
-                                          n_out, f, &q);
+        strata::kernels::s_gemv_q8k_split(d_xq, d_codes, d_scales, cs.has_offset ? d_offs : nullptr, d_y, n_in, n_out,
+                                          f, &q);
         q.memcpy(warp.data(), d_y, (size_t)n_out * sizeof(float)).wait();
 
         double mag = 0, d1 = 0, d2 = 0;
         for (long long o = 0; o < n_out; ++o) {
-            mag += std::fabs((double) want[(size_t) o]);
-            d1 += std::fabs((double) want[(size_t) o] - (double) naive[(size_t) o]);
-            d2 += std::fabs((double) want[(size_t) o] - (double) warp[(size_t) o]);
+            mag += std::fabs((double)want[(size_t)o]);
+            d1 += std::fabs((double)want[(size_t)o] - (double)naive[(size_t)o]);
+            d2 += std::fabs((double)want[(size_t)o] - (double)warp[(size_t)o]);
         }
         std::printf("  %-28s naive %.3e   warp %.3e\n", cs.what, d1 / mag, d2 / mag);
         // The kernel accumulates in f32, the reference in f64, over 512 terms with values of similar size.
         // 1e-5 is the arithmetic's floor, not a structural allowance.
-        if (!(d1 / mag <= 1e-5 && d2 / mag <= 1e-5)) { std::printf("    *** over 1e-5 ***\n"); ++bad; }
+        if (!(d1 / mag <= 1e-5 && d2 / mag <= 1e-5)) {
+            std::printf("    *** over 1e-5 ***\n");
+            ++bad;
+        }
 
         // ---- 2b. THE Q8_0 ACTIVATION, on the SAME weight planes.  `s_gemv_q8_0_split` exists because the
         // legacy block formats want Q8_0 and `ffn_down_shexp` cannot use Q8_K at all (n_in = 640 is not a
         // multiple of 256).  It shares every line with the Q8_K kernel except the activation loader, so what
         // this checks is the LOADER - the 34-byte block, the fp16 `d`, and the element index inside it.
         {
-            std::vector<uint8_t> xq0((size_t) (n_in / 32) * 34);
+            std::vector<uint8_t> xq0((size_t)(n_in / 32) * 34);
             uint8_t* d_x0 = sycl::malloc_device<uint8_t>(xq0.size(), q);
             strata::kernels::quantize_q8_0(d_xf, d_x0, n_in, &q);
             q.memcpy(xq0.data(), d_x0, xq0.size()).wait();
 
             // the host reference over the SAME Q8_0 bytes, with the same weight decode
-            std::vector<float> want0((size_t) n_out, 0.0f);
+            std::vector<float> want0((size_t)n_out, 0.0f);
             for (long long o = 0; o < n_out; ++o) {
                 double acc = 0;
                 for (long long i = 0; i < n_in; ++i) {
-                    const uint8_t* blk = xq0.data() + (size_t) (i / 32) * 34;
+                    const uint8_t* blk = xq0.data() + (size_t)(i / 32) * 34;
                     uint16_t dbits;
                     std::memcpy(&dbits, blk, 2);
-                    const double d = (double) strata::kernels::f32_from_f16(dbits);
-                    const int8_t qval = ((const int8_t*) (blk + 2))[i % 32];
-                    acc += weight_at(codes, scales, offs, f, n_in, o, i) * d * (double) qval;
+                    const double d = (double)strata::kernels::f32_from_f16(dbits);
+                    const int8_t qval = ((const int8_t*)(blk + 2))[i % 32];
+                    acc += weight_at(codes, scales, offs, f, n_in, o, i) * d * (double)qval;
                 }
-                want0[(size_t) o] = (float) acc;
+                want0[(size_t)o] = (float)acc;
             }
-            strata::kernels::s_gemv_q8_0_split(d_x0, d_codes, d_scales, cs.has_offset ? d_offs : nullptr, d_y,
-                                               n_in, n_out, f, &q);
-            std::vector<float> got0((size_t) n_out);
+            strata::kernels::s_gemv_q8_0_split(d_x0, d_codes, d_scales, cs.has_offset ? d_offs : nullptr, d_y, n_in,
+                                               n_out, f, &q);
+            std::vector<float> got0((size_t)n_out);
             q.memcpy(got0.data(), d_y, (size_t)n_out * sizeof(float)).wait();
             double m0 = 0, dd0 = 0;
             for (long long o = 0; o < n_out; ++o) {
-                m0 += std::fabs((double) want0[(size_t) o]);
-                dd0 += std::fabs((double) want0[(size_t) o] - (double) got0[(size_t) o]);
+                m0 += std::fabs((double)want0[(size_t)o]);
+                dd0 += std::fabs((double)want0[(size_t)o] - (double)got0[(size_t)o]);
             }
             std::printf("  %-28s Q8_0 act %.3e\n", cs.what, dd0 / (m0 > 1e-30 ? m0 : 1e-30));
             if (!(dd0 / (m0 > 1e-30 ? m0 : 1e-30) <= 1e-5)) {
@@ -299,17 +316,17 @@ int main(int argc, char **argv) {
 
         // ---- 3. THE Q8_K vs FP16 GAP, on a K-quant weight - the case the contract decision needs
         {
-            std::vector<uint16_t> x16((size_t) n_in);
-            for (long long i = 0; i < n_in; ++i) x16[(size_t) i] = strata::kernels::f16_from_f32(xf[(size_t) i]);
+            std::vector<uint16_t> x16((size_t)n_in);
+            for (long long i = 0; i < n_in; ++i)
+                x16[(size_t)i] = strata::kernels::f16_from_f32(xf[(size_t)i]);
             uint16_t* d_x16 = sycl::malloc_device<uint16_t>((size_t)n_in, q);
             q.memcpy(d_x16, x16.data(), (size_t)n_in * sizeof(uint16_t)).wait();
-            std::vector<float> fp16out((size_t) n_out);
-            strata::kernels::s_gemv(d_x16, d_codes, d_scales, cs.has_offset ? d_offs : nullptr, d_y, n_in, n_out,
-                                    f);
+            std::vector<float> fp16out((size_t)n_out);
+            strata::kernels::s_gemv(d_x16, d_codes, d_scales, cs.has_offset ? d_offs : nullptr, d_y, n_in, n_out, f);
             q.memcpy(fp16out.data(), d_y, (size_t)n_out * sizeof(float)).wait();
             double dd = 0;
             for (long long o = 0; o < n_out; ++o)
-                dd += std::fabs((double) naive[(size_t) o] - (double) fp16out[(size_t) o]);
+                dd += std::fabs((double)naive[(size_t)o] - (double)fp16out[(size_t)o]);
             const double rel = dd / mag;
             const bool visible = rel > 1e-3;
             std::printf("      %-24s %s (%.4f%% apart, tolerance 0.1%%)\n", "Q8_K vs fp16 activation",
@@ -317,15 +334,19 @@ int main(int argc, char **argv) {
             if (!visible) ++bad;
             sycl::free(d_x16, q);
         }
-        sycl::free(d_xf, q); sycl::free(d_xq, q);
-        sycl::free(d_codes, q); sycl::free(d_scales, q);
-        sycl::free(d_offs, q); sycl::free(d_y, q);
+        sycl::free(d_xf, q);
+        sycl::free(d_xq, q);
+        sycl::free(d_codes, q);
+        sycl::free(d_scales, q);
+        sycl::free(d_offs, q);
+        sycl::free(d_y, q);
     }
 
     // ---- 4. output widths that are NOT a multiple of the eight rows per block
     std::printf("\n");
     for (const Case& cs : cases)
-        for (long long n_out : {1LL, 7LL, 9LL, 61LL}) bad += ragged_rows(cs, n_out, q);
+        for (long long n_out : {1LL, 7LL, 9LL, 61LL})
+            bad += ragged_rows(cs, n_out, q);
 
     std::printf("\ns_gemv_q8k: %d failures\n", bad);
     if (bad) return 1;

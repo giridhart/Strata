@@ -31,29 +31,33 @@ namespace {
 double rel_l1(const std::vector<float>& a, const std::vector<float>& b) {
     double d = 0, m = 0;
     for (size_t i = 0; i < a.size(); ++i) {
-        d += std::fabs((double) a[i] - (double) b[i]);
-        m += std::fabs((double) a[i]);
+        d += std::fabs((double)a[i] - (double)b[i]);
+        m += std::fabs((double)a[i]);
     }
     return d / (m > 1e-30 ? m : 1e-30);
 }
 
 }  // namespace
 
-int main(int argc, char **argv) {
+int main(int argc, char** argv) {
     auto gpus = sycl::device::get_devices(sycl::info::device_type::gpu);
     sycl::device dev = gpus.empty() ? sycl::device(sycl::default_selector_v) : gpus.front();
     sycl::queue q_main(dev, sycl::property::queue::in_order{});
     bool selftest = false;
     for (int i = 1; i < argc; ++i) {
-        if (std::string(argv[i]) == "--selftest") selftest = true;
-        else { std::fprintf(stderr, "usage: elementwise_parity [--selftest]\n"); return 2; }
+        if (std::string(argv[i]) == "--selftest")
+            selftest = true;
+        else {
+            std::fprintf(stderr, "usage: elementwise_parity [--selftest]\n");
+            return 2;
+        }
     }
     int bad = 0;
     const int64_t H_V = 48;
 
     // ---- 1. gdn_gate, with the reference's own softplus
     {
-        const int n = (int) H_V;
+        const int n = (int)H_V;
         std::mt19937 rng(11);
         std::normal_distribution<float> g(0.0f, 1.0f);
         std::vector<float> alpha(n), dt(n), a(n), want(n);
@@ -67,19 +71,19 @@ int main(int argc, char **argv) {
             // at 88 would show the branch as unobservable and would be right: `log1pf(expf(x))` equals `x` to
             // f32 precision for the whole range 20..88, so ggml's threshold of 20 is CONSERVATIVE and the
             // behaviour only actually changes where `expf` overflows.
-            alpha[i] = large ? (22.0f + 6.0f * (float) (i % 17)) : g(rng) * 3.0f;
+            alpha[i] = large ? (22.0f + 6.0f * (float)(i % 17)) : g(rng) * 3.0f;
             dt[i] = g(rng) * 0.5f;
             // NEGATIVE, as the artifact's `ssm_a = -exp(A_log)` is.  Checked below as a property.
             a[i] = -(std::fabs(g(rng)) + 0.1f);
-            const double x = (double) alpha[i] + (double) dt[i];
+            const double x = (double)alpha[i] + (double)dt[i];
             const double sp = x > 20.0 ? x : std::log1p(std::exp(x));
-            want[(size_t) i] = (float) (sp * (double) a[i]);
+            want[(size_t)i] = (float)(sp * (double)a[i]);
         }
         // the fixture must EXERCISE the branch, or check 1 below measures nothing
         {
             int over = 0, past_overflow = 0;
             for (int i = 0; i < n; ++i) {
-                const float x = alpha[(size_t) i] + dt[(size_t) i];
+                const float x = alpha[(size_t)i] + dt[(size_t)i];
                 if (x > 20.0f) ++over;
                 if (x > 88.0f) ++past_overflow;
             }
@@ -89,26 +93,30 @@ int main(int argc, char **argv) {
         }
         // the sign property, asserted rather than assumed
         int positive = 0;
-        for (int i = 0; i < n; ++i) if (a[(size_t) i] >= 0.0f) ++positive;
+        for (int i = 0; i < n; ++i)
+            if (a[(size_t)i] >= 0.0f) ++positive;
         std::printf("  %-44s %s (%d of %d non-negative)\n", "the fixture's ssm_a is negative",
                     positive ? "*** NO ***" : "yes", positive, n);
         if (positive) ++bad;
 
-        float *d_a = sycl::malloc_device<float>(n, q_main);
-        float *d_dt = sycl::malloc_device<float>(n, q_main);
-        float *d_sa = sycl::malloc_device<float>(n, q_main);
-        float *d_g = sycl::malloc_device<float>(n, q_main);
+        float* d_a = sycl::malloc_device<float>(n, q_main);
+        float* d_dt = sycl::malloc_device<float>(n, q_main);
+        float* d_sa = sycl::malloc_device<float>(n, q_main);
+        float* d_g = sycl::malloc_device<float>(n, q_main);
         q_main.memcpy(d_a, alpha.data(), n * sizeof(float)).wait();
         q_main.memcpy(d_dt, dt.data(), n * sizeof(float)).wait();
         q_main.memcpy(d_sa, a.data(), n * sizeof(float)).wait();
         strata::kernels::gdn_gate(d_a, d_dt, d_sa, d_g, 1, H_V, &q_main);
-        std::vector<float> got((size_t) n);
+        std::vector<float> got((size_t)n);
         q_main.memcpy(got.data(), d_g, n * sizeof(float)).wait();
 
         const double rel = rel_l1(want, got);
         std::printf("  %-44s rel %.3e\n", "gdn_gate vs the reference", rel);
         // double softplus and double multiply on both sides, then one cast
-        if (!(rel <= 1e-6)) { std::printf("    *** over 1e-6 ***\n"); ++bad; }
+        if (!(rel <= 1e-6)) {
+            std::printf("    *** over 1e-6 ***\n");
+            ++bad;
+        }
 
         // TRAP: no large-x branch.  `log1p(exp(x))` in f32, with no `x > 20` path.
         //
@@ -120,11 +128,11 @@ int main(int argc, char **argv) {
         {
             int wrong = 0, differing = 0;
             float first_differ = -1.0f;
-            std::vector<float> rival((size_t) n);
+            std::vector<float> rival((size_t)n);
             for (int i = 0; i < n; ++i) {
-                const float x = alpha[(size_t) i] + dt[(size_t) i];
-                const float sp = std::log1p(std::exp(x));       // no branch, f32
-                rival[(size_t) i] = sp * a[(size_t) i];
+                const float x = alpha[(size_t)i] + dt[(size_t)i];
+                const float sp = std::log1p(std::exp(x));  // no branch, f32
+                rival[(size_t)i] = sp * a[(size_t)i];
                 if (!std::isfinite(sp)) ++wrong;
                 const float branched = x > 20.0f ? x : std::log1pf(std::exp(x));
                 if (sp != branched) {
@@ -135,20 +143,23 @@ int main(int argc, char **argv) {
             const double r = rel_l1(want, rival);
             const bool visible = r > 0.05 || wrong > 0;
             std::printf("  %-44s %s (%.2f%% apart, %d non-finite, %d heads differ, first at x = %.1f)\n",
-                        "the softplus large-x branch is observable", visible ? "yes" : "*** NO ***",
-                        r * 100, wrong, differing, (double) first_differ);
+                        "the softplus large-x branch is observable", visible ? "yes" : "*** NO ***", r * 100, wrong,
+                        differing, (double)first_differ);
             if (!visible) ++bad;
         }
         // PROPERTY: exp(gate) < 1 for every element, which is what makes the state decay
         {
             int over = 0;
-            for (float v : got) if (!(std::exp(v) < 1.0f)) ++over;
-            std::printf("  %-44s %s (%d of %d not < 1)\n", "exp(gate) < 1 for every head",
-                        over ? "*** NO ***" : "yes", over, n);
+            for (float v : got)
+                if (!(std::exp(v) < 1.0f)) ++over;
+            std::printf("  %-44s %s (%d of %d not < 1)\n", "exp(gate) < 1 for every head", over ? "*** NO ***" : "yes",
+                        over, n);
             if (over) ++bad;
         }
-        sycl::free(d_a, q_main); sycl::free(d_dt, q_main);
-        sycl::free(d_sa, q_main); sycl::free(d_g, q_main);
+        sycl::free(d_a, q_main);
+        sycl::free(d_dt, q_main);
+        sycl::free(d_sa, q_main);
+        sycl::free(d_g, q_main);
     }
 
     // ---- 2. silu, in double then cast
@@ -156,55 +167,61 @@ int main(int argc, char **argv) {
         const int n = 4096;
         std::mt19937 rng(22);
         std::normal_distribution<float> g(0.0f, 3.0f);
-        std::vector<float> x((size_t) n), want((size_t) n);
+        std::vector<float> x((size_t)n), want((size_t)n);
         for (int i = 0; i < n; ++i) {
-            x[(size_t) i] = g(rng);
-            const double v = (double) x[(size_t) i];
-            want[(size_t) i] = (float) (v / (1.0 + std::exp(-v)));
+            x[(size_t)i] = g(rng);
+            const double v = (double)x[(size_t)i];
+            want[(size_t)i] = (float)(v / (1.0 + std::exp(-v)));
         }
         float* d_x = sycl::malloc_device<float>(n, q_main);
         q_main.memcpy(d_x, x.data(), n * sizeof(float)).wait();
         strata::kernels::silu_inplace(d_x, n, &q_main);
-        std::vector<float> got((size_t) n);
+        std::vector<float> got((size_t)n);
         q_main.memcpy(got.data(), d_x, n * sizeof(float)).wait();
         const double rel = rel_l1(want, got);
         std::printf("\n  %-44s rel %.3e\n", "silu (double) vs the reference", rel);
-        if (!(rel <= 1e-7)) { std::printf("    *** over 1e-7 ***\n"); ++bad; }
+        if (!(rel <= 1e-7)) {
+            std::printf("    *** over 1e-7 ***\n");
+            ++bad;
+        }
         sycl::free(d_x, q_main);
     }
 
     // ---- 3. scale and the f32->f16 bridge
     {
         const int n = 1024;
-        std::vector<float> x((size_t) n), want((size_t) n);
-        for (int i = 0; i < n; ++i) x[(size_t) i] = (float) (i - n / 2) * 0.013f;
+        std::vector<float> x((size_t)n), want((size_t)n);
+        for (int i = 0; i < n; ++i)
+            x[(size_t)i] = (float)(i - n / 2) * 0.013f;
         const float s = 1.0f / std::sqrt(128.0f);
         for (int i = 0; i < n; ++i) {
-            volatile float vi = x[(size_t) i];
+            volatile float vi = x[(size_t)i];
             volatile float vs = s;
-            want[(size_t) i] = (float)(vi * vs);
+            want[(size_t)i] = (float)(vi * vs);
         }
 
         float* d_x = sycl::malloc_device<float>(n, q_main);
         uint16_t* d_h = sycl::malloc_device<uint16_t>(n, q_main);
         q_main.memcpy(d_x, x.data(), n * sizeof(float)).wait();
         strata::kernels::scale_inplace(d_x, n, s, &q_main);
-        std::vector<float> got((size_t) n);
+        std::vector<float> got((size_t)n);
         q_main.memcpy(got.data(), d_x, n * sizeof(float)).wait();
         int diff = 0;
-        for (int i = 0; i < n; ++i) if (got[(size_t) i] != want[(size_t) i]) ++diff;
+        for (int i = 0; i < n; ++i)
+            if (got[(size_t)i] != want[(size_t)i]) ++diff;
         std::printf("  %-44s %d of %d differ\n", "scale_inplace is exact", diff, n);
         if (diff) ++bad;
 
         strata::kernels::f32_to_f16_bulk(d_x, d_h, n, &q_main);
-        std::vector<uint16_t> h((size_t) n);
+        std::vector<uint16_t> h((size_t)n);
         q_main.memcpy(h.data(), d_h, n * sizeof(uint16_t)).wait();
         int hbad = 0;
         for (int i = 0; i < n; ++i)
-            if (h[(size_t) i] != strata::kernels::f16_from_f32(got[(size_t) i])) ++hbad;
+            if (h[(size_t)i] != strata::kernels::f16_from_f32(got[(size_t)i])) ++hbad;
         std::printf("  %-44s %d of %d differ\n", "f32_to_f16_bulk uses the shared conversion", hbad, n);
         if (hbad) ++bad;
-        sycl::free(d_x, q_main); sycl::free(d_h, q_main);
+        sycl::free(d_x, q_main);
+        sycl::free(d_h, q_main);
     }
 
     // ---- 4. rms_norm_weighted, and the TWO RIVAL READINGS it exists to be told apart from.
@@ -214,41 +231,44 @@ int main(int argc, char **argv) {
     // readings and requires each to differ from the right one by more than the tolerance before it judges the
     // kernel - the same discipline the shared-expert test uses for silu-on-gate.
     {
-        const int64_t rows = 24, cols = 256;          // the real `attn_q`-norm shape
+        const int64_t rows = 24, cols = 256;  // the real `attn_q`-norm shape
         const float eps = 1e-6f;
-        std::vector<float> x((size_t) (rows * cols));
-        for (size_t i = 0; i < x.size(); ++i) x[i] = (float) std::sin((double) i * 0.017) * 1.7f + 0.4f;
-        std::vector<float> w((size_t) cols);
-        for (int64_t c = 0; c < cols; ++c) w[(size_t) c] = 0.5f + 0.002f * (float) (c % 97);
+        std::vector<float> x((size_t)(rows * cols));
+        for (size_t i = 0; i < x.size(); ++i)
+            x[i] = (float)std::sin((double)i * 0.017) * 1.7f + 0.4f;
+        std::vector<float> w((size_t)cols);
+        for (int64_t c = 0; c < cols; ++c)
+            w[(size_t)c] = 0.5f + 0.002f * (float)(c % 97);
 
         // the oracle: f64, mean, times w
         auto ref = [&](bool use_sum, bool use_w) {
-            std::vector<double> y((size_t) (rows * cols));
+            std::vector<double> y((size_t)(rows * cols));
             for (int64_t r = 0; r < rows; ++r) {
                 double ss = 0;
                 for (int64_t c = 0; c < cols; ++c) {
-                    const double v = x[(size_t) (r * cols + c)];
+                    const double v = x[(size_t)(r * cols + c)];
                     ss += v * v;
                 }
-                const double den = std::sqrt((use_sum ? ss : ss / (double) cols) + (double) eps);
+                const double den = std::sqrt((use_sum ? ss : ss / (double)cols) + (double)eps);
                 for (int64_t c = 0; c < cols; ++c) {
-                    const double v = x[(size_t) (r * cols + c)];
-                    y[(size_t) (r * cols + c)] = (v / den) * (use_w ? (double) w[(size_t) c] : 1.0);
+                    const double v = x[(size_t)(r * cols + c)];
+                    y[(size_t)(r * cols + c)] = (v / den) * (use_w ? (double)w[(size_t)c] : 1.0);
                 }
             }
-            std::vector<float> out((size_t) (rows * cols));
-            for (size_t i = 0; i < out.size(); ++i) out[i] = (float) y[i];
+            std::vector<float> out((size_t)(rows * cols));
+            for (size_t i = 0; i < out.size(); ++i)
+                out[i] = (float)y[i];
             return out;
         };
         const std::vector<float> want = ref(false, true);
-        const std::vector<float> rival_sum = ref(true, false);    // what gdn_l2_norm computes
-        const std::vector<float> rival_now = ref(false, false);   // the (1+w)-vs-w / no-weight confusion
+        const std::vector<float> rival_sum = ref(true, false);   // what gdn_l2_norm computes
+        const std::vector<float> rival_now = ref(false, false);  // the (1+w)-vs-w / no-weight confusion
 
         auto rel = [&](const std::vector<float>& a, const std::vector<float>& b) {
             double d = 0, m = 0;
             for (size_t i = 0; i < a.size(); ++i) {
-                d += std::fabs((double) a[i] - (double) b[i]);
-                m += std::fabs((double) a[i]);
+                d += std::fabs((double)a[i] - (double)b[i]);
+                m += std::fabs((double)a[i]);
             }
             return d / (m > 1e-30 ? m : 1e-30);
         };
@@ -257,32 +277,42 @@ int main(int argc, char **argv) {
         std::printf("  %-44s %.2f%% apart\n", "with-w-vs-without-w is observable", r_now * 100);
         // `sqrt(cols)` = 16 for the first and the weight's own spread for the second; a fixture that cannot
         // separate them is not testing the kernel that was written.
-        if (!(r_sum > 0.5)) { std::printf("  *** the sum reading is NOT observable ***\n"); ++bad; }
-        if (!(r_now > 0.5)) { std::printf("  *** the no-weight reading is NOT observable ***\n"); ++bad; }
+        if (!(r_sum > 0.5)) {
+            std::printf("  *** the sum reading is NOT observable ***\n");
+            ++bad;
+        }
+        if (!(r_now > 0.5)) {
+            std::printf("  *** the no-weight reading is NOT observable ***\n");
+            ++bad;
+        }
 
         float* d_x = sycl::malloc_device<float>(x.size(), q_main);
         float* d_w = sycl::malloc_device<float>(w.size(), q_main);
         q_main.memcpy(d_x, x.data(), x.size() * sizeof(float)).wait();
         q_main.memcpy(d_w, w.data(), w.size() * sizeof(float)).wait();
         strata::kernels::rms_norm_weighted(d_x, d_w, rows, cols, eps, &q_main);
-        std::vector<float> got((size_t) (rows * cols));
+        std::vector<float> got((size_t)(rows * cols));
         q_main.memcpy(got.data(), d_x, got.size() * sizeof(float)).wait();
 
         const double r_got = rel(want, got);
         double worst = 0;
         for (size_t i = 0; i < got.size(); ++i) {
-            const double m = std::fabs((double) want[i]);
-            const double e = std::fabs((double) got[i] - (double) want[i]) / (m > 1e-30 ? m : 1e-30);
+            const double m = std::fabs((double)want[i]);
+            const double e = std::fabs((double)got[i] - (double)want[i]) / (m > 1e-30 ? m : 1e-30);
             if (e > worst) worst = e;
         }
         int nonfinite = 0;
-        for (float v : got) if (!std::isfinite(v)) ++nonfinite;
-        std::printf("  %-44s rel %.3e  worst %.3e  nonfinite %d\n", "rms_norm_weighted vs f64 oracle", r_got,
-                    worst, nonfinite);
+        for (float v : got)
+            if (!std::isfinite(v)) ++nonfinite;
+        std::printf("  %-44s rel %.3e  worst %.3e  nonfinite %d\n", "rms_norm_weighted vs f64 oracle", r_got, worst,
+                    nonfinite);
         if (nonfinite) ++bad;
         // The kernel accumulates in f32 over 256 terms; 1e-6 is loose enough for that and far tighter than the
         // 16x the rival readings are off by.
-        if (!(r_got < 1e-6)) { std::printf("  *** rms_norm_weighted is WRONG ***\n"); ++bad; }
+        if (!(r_got < 1e-6)) {
+            std::printf("  *** rms_norm_weighted is WRONG ***\n");
+            ++bad;
+        }
         // and a null `w` must be legal, because `ref/qsa.py` allows it.
         //
         // THE INPUT HAS TO BE RE-UPLOADED FIRST.  The kernel is IN PLACE, so `d_x` currently holds the
@@ -296,7 +326,7 @@ int main(int argc, char **argv) {
         q_main.memcpy(got.data(), d_x, got.size() * sizeof(float)).wait();
         int null_bad = 0;
         for (size_t i = 0; i < got.size(); ++i)
-            if (std::fabs((double) got[i] - (double) want_null[i]) > 1e-6) ++null_bad;
+            if (std::fabs((double)got[i] - (double)want_null[i]) > 1e-6) ++null_bad;
         std::printf("  %-44s %d of %zu differ\n", "a null weight is legal", null_bad, got.size());
         if (null_bad) ++bad;
         sycl::free(d_x, q_main);
@@ -318,13 +348,13 @@ int main(int argc, char **argv) {
             for (const int group : {16, 32, 64}) {
                 for (const int n : {320, 2560}) {
                     const int row_bytes = n / per_byte, row_groups = n / group;
-                    std::vector<uint8_t> codes((size_t) 3 * row_bytes, 0);
-                    std::vector<float> scales((size_t) 3 * row_groups), offsets(scales.size());
-                    std::vector<int> unpacked((size_t) 3 * n);
+                    std::vector<uint8_t> codes((size_t)3 * row_bytes, 0);
+                    std::vector<float> scales((size_t)3 * row_groups), offsets(scales.size());
+                    std::vector<int> unpacked((size_t)3 * n);
                     for (size_t i = 0; i < unpacked.size(); ++i) {
-                        const unsigned code = (unsigned) (i * 13 + i / n * 7) & mask;
-                        unpacked[i] = (int) code;
-                        codes[i / per_byte] |= (uint8_t) (code << ((i % per_byte) * bits));
+                        const unsigned code = (unsigned)(i * 13 + i / n * 7) & mask;
+                        unpacked[i] = (int)code;
+                        codes[i / per_byte] |= (uint8_t)(code << ((i % per_byte) * bits));
                     }
                     for (size_t i = 0; i < scales.size(); ++i) {
                         scales[i] = values(rng);
@@ -333,9 +363,9 @@ int main(int argc, char **argv) {
                     scales[0] = -0.0f;
                     offsets[0] = 0.0f;
                     uint8_t* dc = sycl::malloc_device<uint8_t>(codes.size(), q_main);
-                    float *ds = sycl::malloc_device<float>(scales.size(), q_main);
-                    float *dof = sycl::malloc_device<float>(offsets.size(), q_main);
-                    float *out = sycl::malloc_device<float>(((size_t)n + 2), q_main);
+                    float* ds = sycl::malloc_device<float>(scales.size(), q_main);
+                    float* dof = sycl::malloc_device<float>(offsets.size(), q_main);
+                    float* out = sycl::malloc_device<float>(((size_t)n + 2), q_main);
                     stream.memcpy(dc, codes.data(), codes.size());
                     stream.memcpy(ds, scales.data(), scales.size() * sizeof(float));
                     stream.memcpy(dof, offsets.data(), offsets.size() * sizeof(float));
@@ -343,25 +373,26 @@ int main(int argc, char **argv) {
 
                     for (const bool with_offset : {false, true}) {
                         for (int row = 0; row < 3; ++row) {
-                            std::vector<float> want((size_t) n), got((size_t) n + 2, -12345.0f);
+                            std::vector<float> want((size_t)n), got((size_t)n + 2, -12345.0f);
                             for (int i = 0; i < n; ++i) {
-                                const size_t gi = (size_t) row * row_groups + i / group;
-                                const float code = (float) (unpacked[(size_t) row * n + i] + bias);
+                                const size_t gi = (size_t)row * row_groups + i / group;
+                                const float code = (float)(unpacked[(size_t)row * n + i] + bias);
                                 volatile float product = code * scales[gi];
                                 const float offset = with_offset ? offsets[gi] : 0.0f;
-                                want[(size_t) i] = product + offset;
+                                want[(size_t)i] = product + offset;
                                 const float fused = std::fma(code, scales[gi], offset);
-                                if (std::memcmp(&fused, &want[(size_t) i], sizeof(float)) != 0) ++fma_diff;
+                                if (std::memcmp(&fused, &want[(size_t)i], sizeof(float)) != 0) ++fma_diff;
                             }
                             stream.memcpy(out, got.data(), got.size() * sizeof(float));
-                            strata::kernels::embedding_gather(dc + (size_t) row * row_bytes,
-                                ds + (size_t) row * row_groups,
-                                with_offset ? dof + (size_t) row * row_groups : nullptr,
-                                n, bits, bias, group, out + 1, &stream);
+                            strata::kernels::embedding_gather(dc + (size_t)row * row_bytes,
+                                                              ds + (size_t)row * row_groups,
+                                                              with_offset ? dof + (size_t)row * row_groups : nullptr, n,
+                                                              bits, bias, group, out + 1, &stream);
                             stream.memcpy(got.data(), out, got.size() * sizeof(float));
                             stream.wait();
                             for (int i = 0; i < n; ++i) {
-                                if (std::memcmp(&want[(size_t) i], &got[(size_t) i + 1], sizeof(float)) != 0) ++mismatches;
+                                if (std::memcmp(&want[(size_t)i], &got[(size_t)i + 1], sizeof(float)) != 0)
+                                    ++mismatches;
                             }
                             if (got.front() != -12345.0f || got.back() != -12345.0f) ++guards;
                             ++cases;
@@ -372,10 +403,10 @@ int main(int argc, char **argv) {
                                 cudaGraph_t graph;
                                 cudaGraphExec_t exec;
                                 cudaStreamBeginCapture(&stream, cudaStreamCaptureModeThreadLocal);
-                                strata::kernels::embedding_gather(dc + (size_t) row * row_bytes,
-                                    ds + (size_t) row * row_groups,
-                                    with_offset ? dof + (size_t) row * row_groups : nullptr,
-                                    n, bits, bias, group, out + 1, &stream);
+                                strata::kernels::embedding_gather(
+                                    dc + (size_t)row * row_bytes, ds + (size_t)row * row_groups,
+                                    with_offset ? dof + (size_t)row * row_groups : nullptr, n, bits, bias, group,
+                                    out + 1, &stream);
                                 strata::kernels::scale_inplace(out + 1, n, 2.0f, &stream);
                                 cudaStreamEndCapture(&stream, &graph);
                                 cudaGraphInstantiate(&exec, graph, 0);
@@ -383,8 +414,8 @@ int main(int argc, char **argv) {
                                 stream.memcpy(got.data(), out, got.size() * sizeof(float));
                                 stream.wait();
                                 for (int i = 0; i < n; ++i) {
-                                    const float expected = want[(size_t) i] * 2.0f;
-                                    if (std::memcmp(&expected, &got[(size_t) i + 1], sizeof(float)) != 0) ++mismatches;
+                                    const float expected = want[(size_t)i] * 2.0f;
+                                    if (std::memcmp(&expected, &got[(size_t)i + 1], sizeof(float)) != 0) ++mismatches;
                                 }
                                 if (got.front() != -12345.0f || got.back() != -12345.0f) ++guards;
                                 cudaGraphExecDestroy(exec);
@@ -392,7 +423,8 @@ int main(int argc, char **argv) {
                             }
                         }
                     }
-                    sycl::free(dc, q_main); sycl::free(ds, q_main);
+                    sycl::free(dc, q_main);
+                    sycl::free(ds, q_main);
                     sycl::free(dof, q_main);
                     sycl::free(out, q_main);
                 }
@@ -400,7 +432,7 @@ int main(int argc, char **argv) {
         }
         std::printf("  embedding gather: %d row cases, %d bit mismatches, %d guard failures, %d FMA differences\n",
                     cases, mismatches, guards, fma_diff);
-        if (mismatches || guards ) ++bad;
+        if (mismatches || guards) ++bad;
     }
 
     // ---- THE f32 -> bf16 CONVERSIONS KEEP A NaN A NaN.  `f32_to_bf16_bulk` (the header's `bf16_from_f32`
@@ -409,32 +441,36 @@ int main(int argc, char **argv) {
     // the host; this is the same header compiled by nvcc, plus the second copy in dequant_bf16.cu.
     {
         auto ggml_bf16 = [](uint32_t u) -> uint16_t {
-            if ((u & 0x7fffffffu) > 0x7f800000u) return (uint16_t) ((u >> 16) | 64);
-            return (uint16_t) ((u + (0x7fffu + ((u >> 16) & 1u))) >> 16);
+            if ((u & 0x7fffffffu) > 0x7f800000u) return (uint16_t)((u >> 16) | 64);
+            return (uint16_t)((u + (0x7fffu + ((u >> 16) & 1u))) >> 16);
         };
-        std::vector<uint32_t> bits = {0x7FFFFFFFu, 0xFFFFFFFFu, 0x7F800001u, 0xFF800001u, 0x7FC00000u, 0x7FBFFFFFu,
-                                      0x7F800000u, 0xFF800000u, 0x7F7FFFFFu, 0x00000000u, 0x80000000u, 0x3F808000u,
-                                      0x3F818000u, 0x00008000u, 0x7F7F8000u};
+        std::vector<uint32_t> bits = {0x7FFFFFFFu, 0xFFFFFFFFu, 0x7F800001u, 0xFF800001u, 0x7FC00000u,
+                                      0x7FBFFFFFu, 0x7F800000u, 0xFF800000u, 0x7F7FFFFFu, 0x00000000u,
+                                      0x80000000u, 0x3F808000u, 0x3F818000u, 0x00008000u, 0x7F7F8000u};
         std::mt19937 rng(13);
-        while (bits.size() < 4096) bits.push_back((uint32_t) rng());
+        while (bits.size() < 4096)
+            bits.push_back((uint32_t)rng());
         const size_t n = bits.size();
         float* dx = sycl::malloc_device<float>(n, q_main);
         uint16_t* dy = sycl::malloc_device<uint16_t>(n, q_main);
         q_main.memcpy(dx, bits.data(), n * sizeof(float)).wait();
-        strata::kernels::f32_to_bf16_bulk(dx, dy, (int64_t) n, &q_main);
+        strata::kernels::f32_to_bf16_bulk(dx, dy, (int64_t)n, &q_main);
         std::vector<uint16_t> got(n);
         q_main.memcpy(got.data(), dy, n * sizeof(uint16_t)).wait();
         int wrong = 0;
-        for (size_t i = 0; i < n; ++i) wrong += got[i] != ggml_bf16(bits[i]);
+        for (size_t i = 0; i < n; ++i)
+            wrong += got[i] != ggml_bf16(bits[i]);
 
         // A Q8_0 block (type 8) whose fp16 scale is a NaN: every dequantized value is NaN * q, a NaN, and it must
         // still be one in BF16.  A second block with an ordinary scale checks the finite path did not move.
         std::vector<uint8_t> blk(2 * 34, 0);
-        blk[0] = 0x00; blk[1] = 0x7E;                        // fp16 quiet NaN
-        blk[34] = 0x00; blk[35] = 0x3C;                      // fp16 1.0
+        blk[0] = 0x00;
+        blk[1] = 0x7E;  // fp16 quiet NaN
+        blk[34] = 0x00;
+        blk[35] = 0x3C;  // fp16 1.0
         for (int j = 0; j < 32; ++j) {
-            blk[(size_t) (2 + j)] = (uint8_t) (int8_t) (j - 16);
-            blk[(size_t) (36 + j)] = (uint8_t) (int8_t) (3 * j - 50);
+            blk[(size_t)(2 + j)] = (uint8_t)(int8_t)(j - 16);
+            blk[(size_t)(36 + j)] = (uint8_t)(int8_t)(3 * j - 50);
         }
         uint8_t* db = sycl::malloc_device<uint8_t>(blk.size(), q_main);
         uint16_t* dq = sycl::malloc_device<uint16_t>(64, q_main);
@@ -445,17 +481,19 @@ int main(int argc, char **argv) {
         q_main.memcpy(q_blk.data(), dq, 64 * sizeof(uint16_t)).wait();
         int dq_wrong = 0;
         for (int j = 0; j < 32; ++j) {
-            if (!((q_blk[(size_t) j] & 0x7FFFu) > 0x7F80u)) ++dq_wrong;           // row 0: NaN scale -> NaN
-            const float v = (float) (3 * j - 50);                                // row 1: d = 1.0 -> the integer
+            if (!((q_blk[(size_t)j] & 0x7FFFu) > 0x7F80u)) ++dq_wrong;  // row 0: NaN scale -> NaN
+            const float v = (float)(3 * j - 50);                        // row 1: d = 1.0 -> the integer
             uint32_t vb;
             std::memcpy(&vb, &v, 4);
-            if (q_blk[(size_t) (32 + j)] != ggml_bf16(vb)) ++dq_wrong;
+            if (q_blk[(size_t)(32 + j)] != ggml_bf16(vb)) ++dq_wrong;
         }
-        std::printf("  f32 -> bf16 (NaN kept): bulk %d of %zu differ from ggml, dequant_bf16 %d of 64 wrong\n",
-                    wrong, n, dq_wrong);
+        std::printf("  f32 -> bf16 (NaN kept): bulk %d of %zu differ from ggml, dequant_bf16 %d of 64 wrong\n", wrong,
+                    n, dq_wrong);
         if (wrong || dq_wrong) ++bad;
-        sycl::free(dx, q_main); sycl::free(dy, q_main);
-        sycl::free(db, q_main); sycl::free(dq, q_main);
+        sycl::free(dx, q_main);
+        sycl::free(dy, q_main);
+        sycl::free(db, q_main);
+        sycl::free(dq, q_main);
     }
 
     std::printf("\nelementwise: %d failures\n", bad);

@@ -17,18 +17,18 @@ namespace {
 int checks = 0;
 void check(bool ok, const char* label) {
     ++checks;
-    if (!ok) { std::fprintf(stderr, "FAIL: %s\n", label); std::exit(1); }
+    if (!ok) {
+        std::fprintf(stderr, "FAIL: %s\n", label);
+        std::exit(1);
+    }
 }
-}
+}  // namespace
 
 int main() {
-    for (const char* text : {"", "MemFree: 100 kB\n", "MemAvailable: -1 kB\n",
-                            "MemAvailable: +1 kB\n", "MemAvailable: 1 MB\n",
-                            "MemAvailable: 1\n", "MemAvailable: 1x kB\n",
-                            "MemAvailable: 18446744073709551615 kB\n",
-                            "MemAvailable: 18446744073709551616 kB\n",
-                            "MemAvailable: 1 kB trailing\n",
-                            "MemAvailable: 1 kB\nMemAvailable: 2 kB\n"}) {
+    for (const char* text : {"", "MemFree: 100 kB\n", "MemAvailable: -1 kB\n", "MemAvailable: +1 kB\n",
+                             "MemAvailable: 1 MB\n", "MemAvailable: 1\n", "MemAvailable: 1x kB\n",
+                             "MemAvailable: 18446744073709551615 kB\n", "MemAvailable: 18446744073709551616 kB\n",
+                             "MemAvailable: 1 kB trailing\n", "MemAvailable: 1 kB\nMemAvailable: 2 kB\n"}) {
         std::istringstream input(text);
         check(!conversation_mem_available(input), "missing/malformed telemetry is unknown");
     }
@@ -47,31 +47,26 @@ int main() {
     /*
     DPCT1007:91: Migration of std::numeric_limits::max is not supported.
     */
-    check(!conversation_memory_admit(100, std::numeric_limits<uint64_t>::max(),
-                                     1),
+    check(!conversation_memory_admit(100, std::numeric_limits<uint64_t>::max(), 1),
           "allocation arithmetic cannot overflow");
     /*
     DPCT1007:93: Migration of std::numeric_limits::max is not supported.
     */
-    check(
-        conversation_memory_admit(
-            std::numeric_limits<uint64_t>::max(),
-            /*
-            DPCT1007:92: Migration of std::numeric_limits::max is not supported.
-            */
-            std::numeric_limits<uint64_t>::max(), 0),
-        "maximal exact bound");
+    check(conversation_memory_admit(std::numeric_limits<uint64_t>::max(),
+                                    /*
+                                    DPCT1007:92: Migration of std::numeric_limits::max is not supported.
+                                    */
+                                    std::numeric_limits<uint64_t>::max(), 0),
+          "maximal exact bound");
     /*
     DPCT1007:95: Migration of std::numeric_limits::max is not supported.
     */
-    check(
-        !conversation_memory_admit(
-            std::numeric_limits<uint64_t>::max(),
-            /*
-            DPCT1007:94: Migration of std::numeric_limits::max is not supported.
-            */
-            std::numeric_limits<uint64_t>::max(), 1),
-        "maximal sum overflow rejected");
+    check(!conversation_memory_admit(std::numeric_limits<uint64_t>::max(),
+                                     /*
+                                     DPCT1007:94: Migration of std::numeric_limits::max is not supported.
+                                     */
+                                     std::numeric_limits<uint64_t>::max(), 1),
+          "maximal sum overflow rejected");
     // Test the real provider without assuming any particular amount of free RAM.
     const auto available = conversation_available_memory();
     check(!available || conversation_memory_admit(available, 0, 0), "provider returns bytes or unknown");

@@ -11,10 +11,10 @@
 
 using strata::kernels::f16_from_f32;
 using strata::kernels::f32_from_f16;
+using strata::kernels::native_q4_0_f32;
+using strata::kernels::native_q8_0_f32;
 using strata::kernels::native_q8_1_bytes;
 using strata::kernels::native_quantize_q8_1;
-using strata::kernels::native_q8_0_f32;
-using strata::kernels::native_q4_0_f32;
 
 struct Q80TestBlock {
     uint16_t d;
@@ -36,7 +36,8 @@ static std::vector<float> dequantize_q8_1(const std::vector<float>& x) {
     std::vector<float> result(x.size());
     for (size_t offset = 0; offset < x.size(); offset += 32) {
         float amax = 0.0f;
-        for (int i = 0; i < 32; ++i) amax = std::max(amax, std::fabs(x[offset + i]));
+        for (int i = 0; i < 32; ++i)
+            amax = std::max(amax, std::fabs(x[offset + i]));
         if (amax == 0.0f) {
             std::fill(result.begin() + offset, result.begin() + offset + 32, 0.0f);
             continue;
@@ -85,7 +86,8 @@ int main() {
         const int n_in = 2560;
         const int ncols = 2;
         std::vector<float> h_x(n_in * ncols);
-        for (auto& val : h_x) val = dist(rng);
+        for (auto& val : h_x)
+            val = dist(rng);
 
         size_t q8_bytes = native_q8_1_bytes(n_in, ncols);
         std::vector<Q81TestBlock> h_q8(q8_bytes / sizeof(Q81TestBlock));
@@ -128,7 +130,6 @@ int main() {
         sycl::free(d_q8, q);
     }
 
-
     // 2. Test native_q8_0_f32
     {
         const int n_in = 256;
@@ -139,7 +140,8 @@ int main() {
         std::vector<float> h_x(n_in);
         std::vector<float> ref_y(n_out, 0.0f);
 
-        for (auto& val : h_x) val = dist(rng);
+        for (auto& val : h_x)
+            val = dist(rng);
         for (int r = 0; r < n_out; ++r) {
             for (int b = 0; b < n_in / 32; ++b) {
                 auto& blk = h_w[r * (n_in / 32) + b];
@@ -195,7 +197,8 @@ int main() {
         // 3. Multi-token exact parity check (ncols = 3)
         const int multi_cols = 3;
         std::vector<float> h_multi_x(n_in * multi_cols);
-        for (auto& val : h_multi_x) val = dist(rng);
+        for (auto& val : h_multi_x)
+            val = dist(rng);
 
         float* d_multi_x = sycl::malloc_device<float>(h_multi_x.size(), q);
         float* d_multi_y = sycl::malloc_device<float>(n_out * multi_cols, q);
@@ -223,8 +226,7 @@ int main() {
                 if (mb != sb) multi_mismatches++;
             }
         }
-        printf("  q8_0_f32 (multi_exact, ncols=3): bit mismatches = %d / %d\n",
-               multi_mismatches, n_out * multi_cols);
+        printf("  q8_0_f32 (multi_exact, ncols=3): bit mismatches = %d / %d\n", multi_mismatches, n_out * multi_cols);
         total_bad += multi_mismatches;
 
         sycl::free(d_w, q);
@@ -246,7 +248,8 @@ int main() {
         std::vector<float> h_x(n_in);
         std::vector<float> ref_y(n_out, 0.0f);
 
-        for (auto& val : h_x) val = dist(rng);
+        for (auto& val : h_x)
+            val = dist(rng);
         for (int r = 0; r < n_out; ++r) {
             for (int b = 0; b < n_in / 32; ++b) {
                 auto& blk = h_w[r * (n_in / 32) + b];

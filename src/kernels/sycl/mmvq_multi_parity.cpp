@@ -43,29 +43,29 @@ namespace {
 
 struct Case {
     const char* name;
-    int type;          // stable GGML type id, from the list in native_mmvq.hpp
+    int type;  // stable GGML type id, from the list in native_mmvq.hpp
     int n_in;
     int n_out;
-    int block_elems;   // elements per weight block
+    int block_elems;  // elements per weight block
     int block_bytes;
-    int scale_at[2];   // byte offsets of the block's fp16 scales in native_mmvq.cu's block structs; -1 = none
+    int scale_at[2];  // byte offsets of the block's fp16 scales in native_mmvq.cu's block structs; -1 = none
 };
 
 // the types a head or a projection can have in this model
 const Case CASES[] = {
-    {"Q4_0", 2, 2048, 512, 32, 18, {0, -1}},          // Q40Block: half d
-    {"Q8_0", 8, 2048, 512, 32, 34, {0, -1}},          // Q80Block: half d
-    {"Q4_K", 12, 2048, 512, 256, 144, {0, 2}},        // Q4KBlock: half2 dm
-    {"Q5_K", 13, 2048, 512, 256, 176, {0, 2}},        // Q5KBlock: half2 dm
-    {"Q6_K", 14, 2048, 512, 256, 210, {208, -1}},     // Q6KBlock: half d after ql, qh, scales
-    {"IQ4_XS", 23, 4096, 512, 256, 136, {0, -1}},     // IQ4XSBlock: half d; n_in 4096, see THE NEGATIVE CONTROL
+    {"Q4_0", 2, 2048, 512, 32, 18, {0, -1}},       // Q40Block: half d
+    {"Q8_0", 8, 2048, 512, 32, 34, {0, -1}},       // Q80Block: half d
+    {"Q4_K", 12, 2048, 512, 256, 144, {0, 2}},     // Q4KBlock: half2 dm
+    {"Q5_K", 13, 2048, 512, 256, 176, {0, 2}},     // Q5KBlock: half2 dm
+    {"Q6_K", 14, 2048, 512, 256, 210, {208, -1}},  // Q6KBlock: half d after ql, qh, scales
+    {"IQ4_XS", 23, 4096, 512, 256, 136, {0, -1}},  // IQ4XSBlock: half d; n_in 4096, see THE NEGATIVE CONTROL
     {"Q5_K wide", 13, 4096, 2048, 256, 176, {0, 2}},
 };
 
 // a normal fp16 in +-[2^-10, 2^-5): exponent field 5..9 (bias 15), any mantissa, either sign
 uint16_t sane_half(std::mt19937& rng) {
     const uint32_t r = rng();
-    return (uint16_t) (((r >> 31) << 15) | ((5u + (r >> 10) % 5u) << 10) | (r & 0x3ffu));
+    return (uint16_t)(((r >> 31) << 15) | ((5u + (r >> 10) % 5u) << 10) | (r & 0x3ffu));
 }
 
 // T = 4 is the last width where the two layouts coincide, T = 5 the first where they differ
@@ -74,51 +74,54 @@ constexpr int COINCIDE_MAX_T = 4;
 
 // Returns the number of outputs that differ bit for bit; counts the non-finite outputs and the differences on
 // outputs that are finite in both paths.
-long long compare(const Case &c, int T, sycl::queue *s, long long &nonfinite,
-                  long long &diff_finite, bool &ran) try {
-    sycl::queue &q_ct1 = *s;
+long long compare(const Case& c, int T, sycl::queue* s, long long& nonfinite, long long& diff_finite, bool& ran) try {
+    sycl::queue& q_ct1 = *s;
     ran = false;
     if (!strata::kernels::native_mmvq_supported(c.type)) return -1;
 
     const std::size_t wbytes = strata::kernels::native_mmvq_weight_bytes(c.type, c.n_in, c.n_out);
-    const std::size_t qcol = strata::kernels::native_q8_1_bytes(c.n_in, 1);   // Q8_1 bytes of ONE column
+    const std::size_t qcol = strata::kernels::native_q8_1_bytes(c.n_in, 1);  // Q8_1 bytes of ONE column
     const std::size_t qall = strata::kernels::native_q8_1_bytes(c.n_in, T);
-    if (qall != qcol * (std::size_t) T) {
-        std::printf("%-12s T=%d: the Q8_1 bytes of T columns (%zu) are not T times those of one (%zu): the test "
-                    "assumes contiguous columns and they are not\n", c.name, T, qall, qcol);
+    if (qall != qcol * (std::size_t)T) {
+        std::printf(
+            "%-12s T=%d: the Q8_1 bytes of T columns (%zu) are not T times those of one (%zu): the test "
+            "assumes contiguous columns and they are not\n",
+            c.name, T, qall, qcol);
         return -1;
     }
 
-    std::mt19937 rng(1234u + (unsigned) c.type * 97u + (unsigned) T);
+    std::mt19937 rng(1234u + (unsigned)c.type * 97u + (unsigned)T);
     std::vector<uint8_t> w(wbytes);
-    for (auto& b : w) b = (uint8_t) (rng() & 0xff);
-    const std::size_t n_blocks = (std::size_t) c.n_out * (std::size_t) (c.n_in / c.block_elems);
-    if (n_blocks * (std::size_t) c.block_bytes != wbytes) {
-        std::printf("%-12s T=%d: %zu blocks of %d bytes are not the %zu weight bytes native_mmvq expects\n", c.name,
-                    T, n_blocks, c.block_bytes, wbytes);
+    for (auto& b : w)
+        b = (uint8_t)(rng() & 0xff);
+    const std::size_t n_blocks = (std::size_t)c.n_out * (std::size_t)(c.n_in / c.block_elems);
+    if (n_blocks * (std::size_t)c.block_bytes != wbytes) {
+        std::printf("%-12s T=%d: %zu blocks of %d bytes are not the %zu weight bytes native_mmvq expects\n", c.name, T,
+                    n_blocks, c.block_bytes, wbytes);
         return -1;
     }
     for (std::size_t k = 0; k < n_blocks; ++k)
         for (int at : c.scale_at)
             if (at >= 0) {
                 const uint16_t h = sane_half(rng);
-                std::memcpy(&w[k * (std::size_t) c.block_bytes + (std::size_t) at], &h, 2);
+                std::memcpy(&w[k * (std::size_t)c.block_bytes + (std::size_t)at], &h, 2);
             }
-    std::vector<float> x((std::size_t) T * c.n_in);
+    std::vector<float> x((std::size_t)T * c.n_in);
     std::normal_distribution<float> nd(0.f, 1.f);
-    for (auto& v : x) v = nd(rng);
+    for (auto& v : x)
+        v = nd(rng);
 
     void* dw = nullptr;
     void* xq = nullptr;
     float* dx = nullptr;
     float* dmulti = nullptr;
     float* dsingle = nullptr;
-    const std::size_t ybytes = (std::size_t) T * c.n_out * 4;
-    dw = (void *)sycl::malloc_device(wbytes, q_ct1);
-    xq = (void *)sycl::malloc_device(qall, q_ct1);
-    dx = (float *)sycl::malloc_device(x.size() * 4, q_ct1);
-    dmulti = (float *)sycl::malloc_device(ybytes, q_ct1);
-    dsingle = (float *)sycl::malloc_device(ybytes, q_ct1);
+    const std::size_t ybytes = (std::size_t)T * c.n_out * 4;
+    dw = (void*)sycl::malloc_device(wbytes, q_ct1);
+    xq = (void*)sycl::malloc_device(qall, q_ct1);
+    dx = (float*)sycl::malloc_device(x.size() * 4, q_ct1);
+    dmulti = (float*)sycl::malloc_device(ybytes, q_ct1);
+    dsingle = (float*)sycl::malloc_device(ybytes, q_ct1);
     if (!dw || !xq || !dx || !dmulti || !dsingle) return -1;
     q_ct1.memcpy(dw, w.data(), wbytes).wait();
     q_ct1.memcpy(dx, x.data(), x.size() * 4).wait();
@@ -130,15 +133,15 @@ long long compare(const Case &c, int T, sycl::queue *s, long long &nonfinite,
     try {
         strata::kernels::native_mmvq(c.type, dw, xq, dmulti, c.n_in, c.n_out, T, s);
         for (int j = 0; j < T; ++j)
-            strata::kernels::native_mmvq(c.type, dw, (const uint8_t*) xq + (std::size_t) j * qcol,
-                                         dsingle + (std::size_t) j * c.n_out, c.n_in, c.n_out, 1, s);
+            strata::kernels::native_mmvq(c.type, dw, (const uint8_t*)xq + (std::size_t)j * qcol,
+                                         dsingle + (std::size_t)j * c.n_out, c.n_in, c.n_out, 1, s);
     } catch (const std::exception& e) {
         std::printf("%-12s T=%d: %s\n", c.name, T, e.what());
         return -1;
     }
     s->wait();
 
-    std::vector<uint32_t> a((std::size_t) T * c.n_out), b(a.size());
+    std::vector<uint32_t> a((std::size_t)T * c.n_out), b(a.size());
     q_ct1.memcpy(a.data(), dmulti, ybytes).wait();
     q_ct1.memcpy(b.data(), dsingle, ybytes).wait();
 
@@ -156,25 +159,25 @@ long long compare(const Case &c, int T, sycl::queue *s, long long &nonfinite,
             if (both_finite) ++diff_finite;
         }
     }
-    sycl::free(dw, q_ct1); sycl::free(xq, q_ct1);
-    sycl::free(dx, q_ct1); sycl::free(dmulti, q_ct1);
+    sycl::free(dw, q_ct1);
+    sycl::free(xq, q_ct1);
+    sycl::free(dx, q_ct1);
+    sycl::free(dmulti, q_ct1);
     sycl::free(dsingle, q_ct1);
     ran = true;
     return diff;
-}
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
+} catch (sycl::exception const& exc) {
+    std::cerr << exc.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
+    std::exit(1);
 }
 
 struct Totals {
-    long long checked = 0, diff = 0, diff_finite = 0, nonfinite = 0;   // all widths
-    long long diff_finite_wide = 0;                                     // T > COINCIDE_MAX_T only
-    int powerless_cases = 0;   // cases where the control found no difference at any T > COINCIDE_MAX_T
+    long long checked = 0, diff = 0, diff_finite = 0, nonfinite = 0;  // all widths
+    long long diff_finite_wide = 0;                                   // T > COINCIDE_MAX_T only
+    int powerless_cases = 0;  // cases where the control found no difference at any T > COINCIDE_MAX_T
 };
 
-int sweep(bool exact, sycl::queue *s, Totals &t) {
+int sweep(bool exact, sycl::queue* s, Totals& t) {
     strata::kernels::native_mmvq_set_multi_exact(exact);
     if (strata::kernels::native_mmvq_multi_exact() != exact) {
         std::printf("native_mmvq_multi_exact() does not reflect what was set\n");
@@ -189,17 +192,26 @@ int sweep(bool exact, sycl::queue *s, Totals &t) {
             long long nf = 0, dfin = 0;
             bool ran = false;
             const long long diff = compare(c, T, s, nf, dfin, ran);
-            if (!ran) { ++bad; continue; }
-            const long long n = (long long) T * c.n_out;
+            if (!ran) {
+                ++bad;
+                continue;
+            }
+            const long long n = (long long)T * c.n_out;
             t.checked += n;
             t.diff += diff;
             t.diff_finite += dfin;
             t.nonfinite += nf;
-            if (T > COINCIDE_MAX_T) { t.diff_finite_wide += dfin; case_wide += dfin; }
+            if (T > COINCIDE_MAX_T) {
+                t.diff_finite_wide += dfin;
+                case_wide += dfin;
+            }
             const char* verdict;
-            if (exact) verdict = diff == 0 ? "ok" : "FAIL";
-            else if (dfin > 0) verdict = "control sees it";
-            else verdict = T <= COINCIDE_MAX_T ? "layouts coincide here (NW = 4)" : "no power at this T";
+            if (exact)
+                verdict = diff == 0 ? "ok" : "FAIL";
+            else if (dfin > 0)
+                verdict = "control sees it";
+            else
+                verdict = T <= COINCIDE_MAX_T ? "layouts coincide here (NW = 4)" : "no power at this T";
             std::printf("%-12s %3d %10lld %10lld %14lld %10lld  %s\n", c.name, T, n, diff, dfin, nf, verdict);
             if (exact && diff != 0) ++bad;
         }
@@ -217,42 +229,46 @@ int main() try {
     Totals on, off;
     const int bad = sweep(true, s, on);
     const int bad_off = sweep(false, s, off);
-    strata::kernels::native_mmvq_set_multi_exact(true);   // back to the default
+    strata::kernels::native_mmvq_set_multi_exact(true);  // back to the default
 
-    std::printf("\nmulti_exact on:   %lld outputs compared, %lld differ bitwise, %lld non-finite\n",
-                on.checked, on.diff, on.nonfinite);
-    std::printf("multi_exact off:  %lld outputs compared, %lld differ bitwise (%lld on finite outputs, %lld at T > %d)\n",
-                off.checked, off.diff, off.diff_finite, off.diff_finite_wide, COINCIDE_MAX_T);
+    std::printf("\nmulti_exact on:   %lld outputs compared, %lld differ bitwise, %lld non-finite\n", on.checked,
+                on.diff, on.nonfinite);
+    std::printf(
+        "multi_exact off:  %lld outputs compared, %lld differ bitwise (%lld on finite outputs, %lld at T > %d)\n",
+        off.checked, off.diff, off.diff_finite, off.diff_finite_wide, COINCIDE_MAX_T);
 
     if (on.nonfinite != 0 || off.nonfinite != 0) {
-        std::printf("\nmmvq_multi_parity: FAILED. %lld non-finite outputs from finite scales and activations: the "
-                    "bit comparison is only meaningful on finite outputs.\n", on.nonfinite + off.nonfinite);
+        std::printf(
+            "\nmmvq_multi_parity: FAILED. %lld non-finite outputs from finite scales and activations: the "
+            "bit comparison is only meaningful on finite outputs.\n",
+            on.nonfinite + off.nonfinite);
         return 1;
     }
     if (bad != 0 || bad_off != 0) {
-        std::printf("\nmmvq_multi_parity: FAILED. %d case(s) with multi_exact on differ from single-column calls "
-                    "or did not run, %d case(s) did not run with it off. If they differ, the sentence in "
-                    "native_mmvq.hpp does not hold, and neither does the bit-exactness verify.hpp claims.\n",
-                    bad, bad_off);
+        std::printf(
+            "\nmmvq_multi_parity: FAILED. %d case(s) with multi_exact on differ from single-column calls "
+            "or did not run, %d case(s) did not run with it off. If they differ, the sentence in "
+            "native_mmvq.hpp does not hold, and neither does the bit-exactness verify.hpp claims.\n",
+            bad, bad_off);
         return 1;
     }
     // THE NEGATIVE CONTROL, asserted where it can see something: past T = 4 the generic layout is a different one,
     // so if it still finds no difference the comparison cannot tell the layouts apart and the pass proves nothing.
     if (off.powerless_cases != 0) {
-        std::printf("\nmmvq_multi_parity: FAILED (no power). In %d case(s) no output differs with multi_exact off at "
-                    "any T > %d, where the generic layout is not the exact one: for those cases this comparison "
-                    "cannot tell the two layouts apart, so their pass above proves nothing.\n", off.powerless_cases,
-                    COINCIDE_MAX_T);
+        std::printf(
+            "\nmmvq_multi_parity: FAILED (no power). In %d case(s) no output differs with multi_exact off at "
+            "any T > %d, where the generic layout is not the exact one: for those cases this comparison "
+            "cannot tell the two layouts apart, so their pass above proves nothing.\n",
+            off.powerless_cases, COINCIDE_MAX_T);
         return 1;
     }
-    std::printf("\nmmvq_multi_parity: ok. With multi_exact on every column is bitwise equal to a single-column "
-                "call; with it off the control finds differences at T > %d in every case, so the comparison has "
-                "power.\n",
-                COINCIDE_MAX_T);
+    std::printf(
+        "\nmmvq_multi_parity: ok. With multi_exact on every column is bitwise equal to a single-column "
+        "call; with it off the control finds differences at T > %d in every case, so the comparison has "
+        "power.\n",
+        COINCIDE_MAX_T);
     return 0;
-}
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
+} catch (sycl::exception const& exc) {
+    std::cerr << exc.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
+    std::exit(1);
 }

@@ -62,7 +62,6 @@ inline T permute_sub_group_by_xor(sycl::sub_group g, T x, unsigned int mask) {
     return sycl::permute_group_by_xor(g, x, mask);
 }
 
-
 constexpr int THREADS = 128;
 
 void fail(const char* what) {
@@ -70,13 +69,9 @@ void fail(const char* what) {
     std::exit(1);
 }
 
-void check_launch(const char* what) {
-    (void)what;
-}
+void check_launch(const char* what) { (void)what; }
 
-[[maybe_unused]] void check_sync(const char *what) {
-    (void)what;
-}
+[[maybe_unused]] void check_sync(const char* what) { (void)what; }
 
 /// Geometry validation.  A silently wrong `head_dim % 4` would corrupt the gather's uint2 copy and a silently
 /// wrong `n_head % n_head_kv` would produce a plausible attention with the wrong key, so both are refused.
@@ -87,23 +82,23 @@ void validate(const QsaShapes& s, const char* who) {
         std::exit(1);
     }
     if (s.n_head % s.n_head_kv != 0) {
-        std::fprintf(stderr, "qsa: %s: n_head %lld is not a multiple of n_head_kv %lld\n", who,
-                     (long long) s.n_head, (long long) s.n_head_kv);
+        std::fprintf(stderr, "qsa: %s: n_head %lld is not a multiple of n_head_kv %lld\n", who, (long long)s.n_head,
+                     (long long)s.n_head_kv);
         std::exit(1);
     }
     if (s.head_dim % 4 != 0) {
         std::fprintf(stderr, "qsa: %s: head_dim %lld must be a multiple of 4 (the gather copies uint2)\n", who,
-                     (long long) s.head_dim);
+                     (long long)s.head_dim);
         std::exit(1);
     }
     if (s.n_rot <= 0 || s.n_rot % 2 != 0 || s.n_rot > s.head_dim || s.n_rot > s.idx_dim) {
         std::fprintf(stderr, "qsa: %s: n_rot %lld must be even and <= head_dim %lld and idx_dim %lld\n", who,
-                     (long long) s.n_rot, (long long) s.head_dim, (long long) s.idx_dim);
+                     (long long)s.n_rot, (long long)s.head_dim, (long long)s.idx_dim);
         std::exit(1);
     }
     if (s.idx_n_head > 32) {
         std::fprintf(stderr, "qsa: %s: idx_n_head %lld > 32 (one warp per indexer head)\n", who,
-                     (long long) s.idx_n_head);
+                     (long long)s.idx_n_head);
         std::exit(1);
     }
 }
@@ -112,19 +107,17 @@ inline float h2f(uint16_t bits) { return f32_from_f16(bits); }
 
 // ================= 1. kv_append =================
 
-void kv_append_kernel(uint16_t* __restrict__ k_pool, uint16_t* __restrict__ v_pool,
-                                 const int32_t* __restrict__ table, const int32_t* __restrict__ step,
-                                 const float* __restrict__ kcur, const float* __restrict__ vcur, int kv_heads,
-                                 int head_dim, int page_size, KvHostPools host) {
-        auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+void kv_append_kernel(uint16_t* __restrict__ k_pool, uint16_t* __restrict__ v_pool, const int32_t* __restrict__ table,
+                      const int32_t* __restrict__ step, const float* __restrict__ kcur, const float* __restrict__ vcur,
+                      int kv_heads, int head_dim, int page_size, KvHostPools host) {
+    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
     const long long pos = (long long)*(step + kStepPos);
-    const int i = item_ct1.get_group(2) * item_ct1.get_local_range(2) +
-                  item_ct1.get_local_id(2);
+    const int i = item_ct1.get_group(2) * item_ct1.get_local_range(2) + item_ct1.get_local_id(2);
     if (i >= kv_heads * head_dim) return;
     const int h = i / head_dim, d = i - h * head_dim;
     // `[page][kv_head][page_size][head_dim]`: one head's consecutive cells are contiguous inside a page.
     // KV streaming: the host copy (identity layout) always, the VRAM page only if the block is resident.
-    const long long page = (long long) table[pos / page_size];
+    const long long page = (long long)table[pos / page_size];
     if (page >= 0) {
         const long long row = (page * kv_heads + h) * page_size + (pos % page_size);
         k_pool[row * head_dim + d] = f16_from_f32(kcur[i]);
@@ -147,27 +140,26 @@ void kv_append_kernel(uint16_t* __restrict__ k_pool, uint16_t* __restrict__ v_po
 /// `pos`, which forced `pos` to be a host scalar, which meant a captured graph would replay the first token's
 /// position forever.  Doing it here reads the position from `pos_dev` like every other kernel, so the grid and
 /// the arguments are the same for every token and the graph replays correctly.
-void indexer_key_append_kernel(const float* __restrict__ raw, const int32_t* __restrict__ pos_dev,
-                                          int pos_base, const float* __restrict__ w_k_norm, float eps,
-                                          float* __restrict__ tail, float* __restrict__ dead,
-                                          float* __restrict__ pooled, int32_t* __restrict__ block_pos,
-                                          int idx_dim, int r, int n_rot, const float* __restrict__ cos_tab,
-                                          const float* __restrict__ sin_tab, const int32_t* __restrict__ mtab,
-                                          uint8_t *local_mem) {
+void indexer_key_append_kernel(const float* __restrict__ raw, const int32_t* __restrict__ pos_dev, int pos_base,
+                               const float* __restrict__ w_k_norm, float eps, float* __restrict__ tail,
+                               float* __restrict__ dead, float* __restrict__ pooled, int32_t* __restrict__ block_pos,
+                               int idx_dim, int r, int n_rot, const float* __restrict__ cos_tab,
+                               const float* __restrict__ sin_tab, const int32_t* __restrict__ mtab,
+                               uint8_t* local_mem) {
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
-    auto s_mean = (double *)local_mem; // idx_dim doubles
+    auto s_mean = (double*)local_mem;  // idx_dim doubles
     const int d = item_ct1.get_local_id(2);
-        const int pos = (int)*pos_dev;
+    const int pos = (int)*pos_dev;
     const int slot = pos % r;
 
     // The RAW tail: a cell that COMPLETES a block is not stored, because the pool below consumes it directly.
     // That is what makes `idx_block - 1` rows enough.
-    if (slot < r - 1) tail[(size_t) slot * idx_dim + d] = raw[d];
+    if (slot < r - 1) tail[(size_t)slot * idx_dim + d] = raw[d];
 
     // The spare slot's key is `rms_norm(raw[0])`, which is CONSTANT for the sequence and is the only reason
     // cell 0's raw key has to be kept: the three-row tail no longer holds it after the first block.
     if (pos == 0) {
-        double p = (double) raw[d];
+        double p = (double)raw[d];
         double ss = 0.0;
         // Same order as the pooled path, so the two are comparable: sum of squares over the dims, sequential.
         // Every thread computes the same `ss` and uses only its own output element.
@@ -178,13 +170,13 @@ void indexer_key_append_kernel(const float* __restrict__ raw, const int32_t* __r
         // key comes out 0.4 f32 ulp away - close enough that only a BIT-EXACT assertion notices.  `__ddiv_rn`
         // and `__dsqrt_rn` pin the reciprocal square root for the same reason.
         for (int i = 0; i < idx_dim; ++i) {
-            const double v = (double) raw[i];
-            
+            const double v = (double)raw[i];
+
             ss = ss + v * v;
         }
-        
+
         const double inv = 1.0 / sycl::sqrt(ss / (double)idx_dim + (double)eps);
-        float y = (float) (p * inv * (double) w_k_norm[d]);
+        float y = (float)(p * inv * (double)w_k_norm[d]);
         // The spare rotates at position 0 - ALWAYS row 0 of the table, whatever `pos_base` is, as the native
         // indexer's spare does.  At angle 0 the sine is exactly 0 in every scaling (sin(0) * mscale), so the
         // pair rotation reduces to `v * cos_tab[pair]` with no partner element to read (and no barrier).
@@ -199,40 +191,41 @@ void indexer_key_append_kernel(const float* __restrict__ raw, const int32_t* __r
     }
 
     if (slot != r - 1) return;
-    
-    item_ct1.barrier(); // the tail rows this thread is about to read are
-                        // written above
+
+    item_ct1.barrier();  // the tail rows this thread is about to read are
+                         // written above
 
     // The mean of this block's r raw keys, in CELL order: the r-1 tail rows (slots 0..r-2) then the incoming
     // cell (slot r-1).  The sum of r f32 values is exact in double, so the mean's order cannot matter here -
     // but the order of the SUM OF SQUARES below can, and it is fixed to d ascending on both sides.
     double m = 0.0;
-    
+
     for (int j = 0; j < r - 1; ++j)
         m = m + (double)tail[(size_t)j * idx_dim + d];
-    
+
     m = m + (double)raw[d];
-    m = m / (double) r;
+    m = m / (double)r;
     s_mean[d] = m;
-    
+
     item_ct1.barrier();
 
     double ss = 0.0;
-    
-    for (int i = 0; i < idx_dim; ++i) ss = ss + s_mean[i] * s_mean[i];
-    
+
+    for (int i = 0; i < idx_dim; ++i)
+        ss = ss + s_mean[i] * s_mean[i];
+
     const double inv = 1.0 / sycl::sqrt(ss / (double)idx_dim + (double)eps);
 
     const int b = pos / r;
-    pooled[(size_t) b * idx_dim + d] = (float) (m * inv * (double) w_k_norm[d]);
+    pooled[(size_t)b * idx_dim + d] = (float)(m * inv * (double)w_k_norm[d]);
     // The spare slot MOVES to b+1 and is rewritten with the same constant value.
-    pooled[(size_t) (b + 1) * idx_dim + d] = dead[d];
+    pooled[(size_t)(b + 1) * idx_dim + d] = dead[d];
     // The rotation position for this row, kept because a capture reader and the debug dumps want it.  It is the
     // block's first cell's POSITION, `pos_base + b*r`, and NOT the cell index `b*r`.
-    if (d == 0) *block_pos = (int32_t) (pos_base + b * r);
-    
-    item_ct1.barrier(); // the row is complete only now; the rotation below
-                        // reads TWO elements of it
+    if (d == 0) *block_pos = (int32_t)(pos_base + b * r);
+
+    item_ct1.barrier();  // the row is complete only now; the rotation below
+                         // reads TWO elements of it
 
     // ---- the rotation of the row that just completed, IN PLACE.
     //
@@ -243,8 +236,8 @@ void indexer_key_append_kernel(const float* __restrict__ raw, const int32_t* __r
     // every shape and every magnitude), and it comes from `pos_base`, which is constant for a sequence.
     const int half = n_rot / 2;
     if (d < half) {
-        float* row = pooled + (size_t) b * idx_dim;
-        const size_t toff = (size_t) mrope_pos(mtab, pos_base + b * r, d) * half;
+        float* row = pooled + (size_t)b * idx_dim;
+        const size_t toff = (size_t)mrope_pos(mtab, pos_base + b * r, d) * half;
         // THE SAME `rope_neox_pair` THE STANDALONE ROPE KERNEL USES.  A second transcription of the pairing is
         // what this project keeps finding written down wrong.
         rope_neox_pair(row[d], row[half + d], cos_tab[toff + d], sin_tab[toff + d], row[d], row[half + d]);
@@ -255,14 +248,12 @@ void indexer_key_append_kernel(const float* __restrict__ raw, const int32_t* __r
 
 /// One warp per indexer head, one block per pooled row; thread 0 sums the relu'd dots IN HEAD ORDER and maps
 /// the row's score onto its cells.  The reference's Relu is PER HEAD, so the dots cannot be summed first.
-void qsa_index_kernel(const float* __restrict__ pooled,
-                                 const float* __restrict__ q_idx, const float* __restrict__ bias,
-                                 int idx_n_head, int idx_dim, long long r,
-                                 const int32_t* __restrict__ step, float* __restrict__ cell_scores,
-                                 double *s_dot) {
-        auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+void qsa_index_kernel(const float* __restrict__ pooled, const float* __restrict__ q_idx, const float* __restrict__ bias,
+                      int idx_n_head, int idx_dim, long long r, const int32_t* __restrict__ step,
+                      float* __restrict__ cell_scores, double* s_dot) {
+    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
     const long long n_bid = (long long)*(step + kStepNBid);
-        const long long n_kv = (long long)*(step + kStepNKv);
+    const long long n_kv = (long long)*(step + kStepNKv);
 
     const long long b = item_ct1.get_group(2);
     // A BLOCK PAST THE COMPLETED-BLOCK COUNT MUST DO NOTHING.  This is what lets the LAYER launch a CONSTANT
@@ -271,28 +262,25 @@ void qsa_index_kernel(const float* __restrict__ pooled,
     // Without this guard, a capacity-sized grid would score pooled rows that have not been written yet -
     // reading zeros and producing a plausible score for a block that does not exist.
     if (b > n_bid) return;
-    const int wid = item_ct1.get_local_id(2) >> 5,
-              lane = item_ct1.get_local_id(2) & 31;
-    if (wid == 0) s_dot[lane] = 0.0;     // thread 0 reads all idx_n_head entries; zero the unused ones
+    const int wid = item_ct1.get_local_id(2) >> 5, lane = item_ct1.get_local_id(2) & 31;
+    if (wid == 0) s_dot[lane] = 0.0;  // thread 0 reads all idx_n_head entries; zero the unused ones
     item_ct1.barrier(sycl::access::fence_space::local_space);
 
     double acc = 0.0;
     for (int d = lane; d < idx_dim; d += 32)
-        
-        acc = acc + (double)pooled[(size_t)b * idx_dim + d] *
-                        (double)q_idx[(size_t)wid * idx_dim + d];
-    
-    
-    for (int o = 16; o > 0; o >>= 1) acc =
-        acc + permute_sub_group_by_xor(
-                  sycl::ext::oneapi::this_work_item::get_sub_group(), acc, o);
+
+        acc = acc + (double)pooled[(size_t)b * idx_dim + d] * (double)q_idx[(size_t)wid * idx_dim + d];
+
+    for (int o = 16; o > 0; o >>= 1)
+        acc = acc + permute_sub_group_by_xor(sycl::ext::oneapi::this_work_item::get_sub_group(), acc, o);
     if (lane == 0) s_dot[wid] = acc;
     item_ct1.barrier(sycl::access::fence_space::local_space);
 
     if (item_ct1.get_local_id(2) != 0) return;
     double score = 0.0;
-    for (int h = 0; h < idx_n_head; ++h) score += (s_dot[h] > 0.0) ? s_dot[h] : 0.0;
-    if (bias != nullptr) score += (double) bias[b];
+    for (int h = 0; h < idx_n_head; ++h)
+        score += (s_dot[h] > 0.0) ? s_dot[h] : 0.0;
+    if (bias != nullptr) score += (double)bias[b];
     // cell_block: cells of block b for b < n_bid, and the WHOLE incomplete tail for b == n_bid
     long long lo = b * r, hi = lo + r;
     if (b == n_bid) hi = n_kv;
@@ -300,9 +288,10 @@ void qsa_index_kernel(const float* __restrict__ pooled,
     // llama-memory-hybrid-idx.cpp::set_input_qsa gives incomplete-tail cells
     // a finite +1e9 bias before top-k.  Read the current step on every replay:
     // the spare row becomes an ordinary block as soon as its fourth cell arrives.
-    float sc = (float) score;
+    float sc = (float)score;
     if (b == n_bid && n_kv % r != 0) sc += 1e9f;
-    for (long long j = lo; j < hi; ++j) cell_scores[j] = sc;
+    for (long long j = lo; j < hi; ++j)
+        cell_scores[j] = sc;
 }
 
 // ================= 4. topk_512 =================
@@ -321,17 +310,15 @@ inline uint32_t order_key(float s) {
 
 constexpr int TOPK_THREADS = 256;
 
-
-void topk_kernel(const float *__restrict__ scores,
-                 const int32_t *__restrict__ step, int *__restrict__ out_ids,
-                 int *s_a, int *s_b, long long &s_cgt) {
-        auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+void topk_kernel(const float* __restrict__ scores, const int32_t* __restrict__ step, int* __restrict__ out_ids,
+                 int* s_a, int* s_b, long long& s_cgt) {
+    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
     const long long n_kv = (long long)*(step + kStepNKv);
-        const long long width = (long long)*(step + kStepWidth);
+    const long long width = (long long)*(step + kStepWidth);
 
     const int t = item_ct1.get_local_id(2);
     const long long chunk = (n_kv + TOPK_THREADS - 1) / TOPK_THREADS;
-    const long long lo = (long long) t * chunk;
+    const long long lo = (long long)t * chunk;
     long long hi = lo + chunk;
     if (hi > n_kv) hi = n_kv;
 
@@ -341,21 +328,21 @@ void topk_kernel(const float *__restrict__ scores,
     for (int bit = 31; bit >= 0; --bit) {
         const uint32_t cand = v | (1u << bit);
         int c = 0;
-        for (long long j = lo; j < hi; ++j) if (order_key(scores[j]) >= cand) ++c;
+        for (long long j = lo; j < hi; ++j)
+            if (order_key(scores[j]) >= cand) ++c;
         s_a[t] = c;
-        
+
         item_ct1.barrier(sycl::access::fence_space::local_space);
         for (int s = TOPK_THREADS / 2; s > 0; s >>= 1) {
             if (t < s) s_a[t] += s_a[t + s];
-            
+
             item_ct1.barrier(sycl::access::fence_space::local_space);
         }
         const int tot = s_a[0];
-        
-        item_ct1.barrier(
-            sycl::access::fence_space::local_space); // before the next round
-                                                     // overwrites s_a
-        if (tot >= (int) width) v = cand;
+
+        item_ct1.barrier(sycl::access::fence_space::local_space);  // before the next round
+                                                                   // overwrites s_a
+        if (tot >= (int)width) v = cand;
     }
     const uint32_t thr = v;
 
@@ -365,8 +352,10 @@ void topk_kernel(const float *__restrict__ scores,
     int gt = 0, eq = 0;
     for (long long j = lo; j < hi; ++j) {
         const uint32_t k = order_key(scores[j]);
-        if (k > thr) ++gt;
-        else if (k == thr) ++eq;
+        if (k > thr)
+            ++gt;
+        else if (k == thr)
+            ++eq;
     }
     s_a[t] = gt;
     s_b[t] = eq;
@@ -375,12 +364,12 @@ void topk_kernel(const float *__restrict__ scores,
         long long ag = 0, ae = 0;
         for (int i = 0; i < TOPK_THREADS; ++i) {
             const int g = s_a[i], e = s_b[i];
-            s_a[i] = (int) ag;
-            s_b[i] = (int) ae;
+            s_a[i] = (int)ag;
+            s_b[i] = (int)ae;
             ag += g;
             ae += e;
         }
-        s_cgt = ag;    // how many are strictly above the threshold, i.e. where the equals start
+        s_cgt = ag;  // how many are strictly above the threshold, i.e. where the equals start
     }
     item_ct1.barrier(sycl::access::fence_space::local_space);
     // THE RANK VS THE COUNT.  `off_eq` is how many equal-to-threshold cells come BEFORE this chunk, and it is
@@ -398,8 +387,12 @@ void topk_kernel(const float *__restrict__ scores,
         long long e = off_eq;
         for (long long j = lo; j < hi; ++j) {
             const uint32_t k = order_key(scores[j]);
-            if (k > thr) ++sel;
-            else if (k == thr && e < eq_budget) { ++sel; ++e; }
+            if (k > thr)
+                ++sel;
+            else if (k == thr && e < eq_budget) {
+                ++sel;
+                ++e;
+            }
         }
     }
     s_a[t] = sel;
@@ -408,7 +401,7 @@ void topk_kernel(const float *__restrict__ scores,
         long long a = 0;
         for (int i = 0; i < TOPK_THREADS; ++i) {
             const int c = s_a[i];
-            s_a[i] = (int) a;
+            s_a[i] = (int)a;
             a += c;
         }
     }
@@ -419,68 +412,63 @@ void topk_kernel(const float *__restrict__ scores,
     long long e = off_eq;
     for (long long j = lo; j < hi; ++j) {
         const uint32_t k = order_key(scores[j]);
-        if (k > thr) out_ids[w++] = (int) j;
-        else if (k == thr && e < eq_budget) { ++e; out_ids[w++] = (int) j; }
+        if (k > thr)
+            out_ids[w++] = (int)j;
+        else if (k == thr && e < eq_budget) {
+            ++e;
+            out_ids[w++] = (int)j;
+        }
     }
 }
 
 // ================= 5. kv_gather =================
 
 void kv_gather_kernel(const uint16_t* __restrict__ k_pool, const uint16_t* __restrict__ v_pool,
-                                 const int32_t* __restrict__ table, const int32_t* __restrict__ ids,
-                                const int32_t* __restrict__ step, int kv_heads, int head_dim, int page_size,
-                                uint16_t* __restrict__ k_scratch, uint16_t* __restrict__ v_scratch) {
-        auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+                      const int32_t* __restrict__ table, const int32_t* __restrict__ ids,
+                      const int32_t* __restrict__ step, int kv_heads, int head_dim, int page_size,
+                      uint16_t* __restrict__ k_scratch, uint16_t* __restrict__ v_scratch) {
+    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
     const long long n_ids = (long long)*(step + kStepWidth);
-    const int per = head_dim / 4;                       // 4 halfs per uint2
+    const int per = head_dim / 4;  // 4 halfs per uint2
     const long long total = n_ids * kv_heads * per;
-    const long long i =
-        item_ct1.get_group(2) * (long long)item_ct1.get_local_range(2) +
-        item_ct1.get_local_id(2);
+    const long long i = item_ct1.get_group(2) * (long long)item_ct1.get_local_range(2) + item_ct1.get_local_id(2);
     if (i >= total) return;
-    const long long id = i / (kv_heads * (long long) per);
-    const int rem = (int) (i % (kv_heads * (long long) per));
+    const long long id = i / (kv_heads * (long long)per);
+    const int rem = (int)(i % (kv_heads * (long long)per));
     const int h = rem / per, q = rem - h * per;
     const int cell = ids[id];
-    const long long page = (long long) table[cell / page_size];
-    const long long src = ((page * kv_heads + h) * page_size + (cell % page_size)) * (long long) per + q;
-    const long long dst = (id * kv_heads + h) * (long long) per + q;
-    reinterpret_cast<sycl::uint2 *>(k_scratch)[dst] =
-        reinterpret_cast<const sycl::uint2 *>(k_pool)[src];
-    reinterpret_cast<sycl::uint2 *>(v_scratch)[dst] =
-        reinterpret_cast<const sycl::uint2 *>(v_pool)[src];
+    const long long page = (long long)table[cell / page_size];
+    const long long src = ((page * kv_heads + h) * page_size + (cell % page_size)) * (long long)per + q;
+    const long long dst = (id * kv_heads + h) * (long long)per + q;
+    reinterpret_cast<sycl::uint2*>(k_scratch)[dst] = reinterpret_cast<const sycl::uint2*>(k_pool)[src];
+    reinterpret_cast<sycl::uint2*>(v_scratch)[dst] = reinterpret_cast<const sycl::uint2*>(v_pool)[src];
 }
 
 // ================= 6. qsa_attend =================
 
 inline float warp_max(float v) {
-    
-    for (int o = 16; o > 0; o >>= 1) v = sycl::fmax(
-        v, permute_sub_group_by_xor(
-               sycl::ext::oneapi::this_work_item::get_sub_group(), v, o));
+    for (int o = 16; o > 0; o >>= 1)
+        v = sycl::fmax(v, permute_sub_group_by_xor(sycl::ext::oneapi::this_work_item::get_sub_group(), v, o));
     return v;
 }
 
 inline float warp_sum(float v) {
-    
-    for (int o = 16; o > 0; o >>= 1) v += permute_sub_group_by_xor(
-        sycl::ext::oneapi::this_work_item::get_sub_group(), v, o);
+    for (int o = 16; o > 0; o >>= 1)
+        v += permute_sub_group_by_xor(sycl::ext::oneapi::this_work_item::get_sub_group(), v, o);
     return v;
 }
 
 /// One block per query head.  `s` holds the scores, which are then overwritten with the softmax weights.
 
-void qsa_attend_kernel(const float *__restrict__ q,
-                       const uint16_t *__restrict__ k_scratch,
-                       const uint16_t *__restrict__ v_scratch,
-                       const int32_t *__restrict__ step, int n_head,
-                       int n_head_kv, int head_dim, float *__restrict__ attn,
-                       float *__restrict__ weights, uint8_t *local_mem) {
-        auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+void qsa_attend_kernel(const float* __restrict__ q, const uint16_t* __restrict__ k_scratch,
+                       const uint16_t* __restrict__ v_scratch, const int32_t* __restrict__ step, int n_head,
+                       int n_head_kv, int head_dim, float* __restrict__ attn, float* __restrict__ weights,
+                       uint8_t* local_mem) {
+    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
     const long long n_ids = (long long)*(step + kStepWidth);
-    auto s_w = (float *)local_mem; // CAPACITY floats (scores, then weights) +
-                                    // 32 for the reductions
-    float* red = s_w;                    // red[0..31] live past the scores/weights: see the launch
+    auto s_w = (float*)local_mem;  // CAPACITY floats (scores, then weights) +
+                                   // 32 for the reductions
+    float* red = s_w;              // red[0..31] live past the scores/weights: see the launch
     float* w = s_w + 32;
     const int h = item_ct1.get_group(2);
     const int d = item_ct1.get_local_id(2);
@@ -494,36 +482,36 @@ void qsa_attend_kernel(const float *__restrict__ q,
             attn[(size_t)h * head_dim + i] = 0.0f;
         return;
     }
-    const int kv = h / (n_head / n_head_kv);       // ops.cpp L8729: iv2 = iq2 / rv2, NOT h % n_head_kv
+    const int kv = h / (n_head / n_head_kv);  // ops.cpp L8729: iv2 = iq2 / rv2, NOT h % n_head_kv
     const float scale = 1.0f / sycl::sqrt((float)head_dim);
-    const int lane = d & 31, wid = d >> 5,
-              nwarp = (int)((item_ct1.get_local_range(2) + 31) >> 5);
+    const int lane = d & 31, wid = d >> 5, nwarp = (int)((item_ct1.get_local_range(2) + 31) >> 5);
 
     for (long long j = d; j < n_ids; j += item_ct1.get_local_range(2)) {
         const uint16_t* krow = k_scratch + (j * n_head_kv + kv) * head_dim;
         float acc = 0.0f;
-        for (int i = 0; i < head_dim; ++i) acc += h2f(krow[i]) * q[(size_t) h * head_dim + i];
+        for (int i = 0; i < head_dim; ++i)
+            acc += h2f(krow[i]) * q[(size_t)h * head_dim + i];
         w[j] = acc * scale;
     }
-    
+
     item_ct1.barrier();
 
-    float mx = -FLT_MAX;    // not -inf, whose double -> float conversion nvcc warns about
+    float mx = -FLT_MAX;  // not -inf, whose double -> float conversion nvcc warns about
     for (long long j = d; j < n_ids; j += item_ct1.get_local_range(2))
         mx = sycl::fmax(mx, w[j]);
     mx = warp_max(mx);
     if (lane == 0) red[wid] = mx;
-    
+
     item_ct1.barrier();
     if (wid == 0) {
         mx = (lane < nwarp) ? red[lane] : -FLT_MAX;
         mx = warp_max(mx);
         if (lane == 0) red[0] = mx;
     }
-    
+
     item_ct1.barrier();
     mx = red[0];
-    
+
     item_ct1.barrier();
 
     float sum = 0.0f;
@@ -534,23 +522,23 @@ void qsa_attend_kernel(const float *__restrict__ q,
     }
     sum = warp_sum(sum);
     if (lane == 0) red[wid] = sum;
-    
+
     item_ct1.barrier();
     if (wid == 0) {
         sum = (lane < nwarp) ? red[lane] : 0.0f;
         sum = warp_sum(sum);
         if (lane == 0) red[0] = 1.0f / sum;
     }
-    
+
     item_ct1.barrier();
     const float inv = red[0];
-    
+
     item_ct1.barrier();
 
     float acc = 0.0f;
     for (long long j = 0; j < n_ids; ++j)
         acc += (w[j] * inv) * h2f(v_scratch[(j * n_head_kv + kv) * head_dim + d]);
-    attn[(size_t) h * head_dim + d] = acc;
+    attn[(size_t)h * head_dim + d] = acc;
     if (weights != nullptr) {
         for (long long j = d; j < n_ids; j += item_ct1.get_local_range(2))
             weights[(size_t)h * n_ids + j] = w[j] * inv;
@@ -559,22 +547,18 @@ void qsa_attend_kernel(const float *__restrict__ q,
 
 // ================= 7. qsa_gate_apply =================
 
-void qsa_gate_apply_kernel(const float* __restrict__ attn, const float* __restrict__ q_full,
-                                      int n_head, int head_dim, uint16_t* __restrict__ out) {
+void qsa_gate_apply_kernel(const float* __restrict__ attn, const float* __restrict__ q_full, int n_head, int head_dim,
+                           uint16_t* __restrict__ out) {
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
-    const long long i =
-        item_ct1.get_group(2) * (long long)item_ct1.get_local_range(2) +
-        item_ct1.get_local_id(2);
-    if (i >= (long long) n_head * head_dim) return;
-    const int h = (int) (i / head_dim), d = (int) (i % head_dim);
-    const double g = (double) q_full[((size_t) h * 2 * head_dim) + head_dim + d];   // the SECOND half
+    const long long i = item_ct1.get_group(2) * (long long)item_ct1.get_local_range(2) + item_ct1.get_local_id(2);
+    if (i >= (long long)n_head * head_dim) return;
+    const int h = (int)(i / head_dim), d = (int)(i % head_dim);
+    const double g = (double)q_full[((size_t)h * 2 * head_dim) + head_dim + d];  // the SECOND half
     const double sig = 1.0 / (1.0 + sycl::exp(-g));
-    out[i] = f16_from_f32((float) ((double) attn[i] * sig));
+    out[i] = f16_from_f32((float)((double)attn[i] * sig));
 }
 
-inline unsigned grid_for(long long n, int threads) {
-    return (unsigned) ((n + threads - 1) / threads);
-}
+inline unsigned grid_for(long long n, int threads) { return (unsigned)((n + threads - 1) / threads); }
 
 }  // namespace
 
@@ -588,11 +572,11 @@ inline unsigned grid_for(long long n, int threads) {
 /// stream's kernels, which is what every direct-launch caller here uses.
 namespace {
 
-int32_t *step_scratch() {
+int32_t* step_scratch() {
     static int32_t* d_step = nullptr;
     if (d_step == nullptr) {
         static sycl::queue default_queue{sycl::property::queue::in_order()};
-        d_step = (int32_t *)sycl::malloc_device(qsa_step_bytes(), default_queue);
+        d_step = (int32_t*)sycl::malloc_device(qsa_step_bytes(), default_queue);
         if (d_step == nullptr) {
             std::fprintf(stderr, "qsa: step upload: cudaMalloc failed\n");
             std::exit(1);
@@ -601,7 +585,7 @@ int32_t *step_scratch() {
     return d_step;
 }
 
-void step_upload_raw(const int32_t *h_step) {
+void step_upload_raw(const int32_t* h_step) {
     int32_t* d = step_scratch();
     static sycl::queue default_queue{sycl::property::queue::in_order()};
     default_queue.memcpy(d, h_step, qsa_step_bytes()).wait();
@@ -615,8 +599,8 @@ const int32_t* step_upload(int64_t pos, int64_t n_kv_hint, const QsaShapes& s) {
     // A caller that also knows `n_kv` is CHECKED against it rather than believed: a disagreement is exactly the
     // inconsistency `qsa_step_fill` exists to make impossible, so it is worth an exit rather than a silent
     // preference for one of the two.
-    if (n_kv_hint >= 0 && n_kv_hint != (int64_t) h[kStepNKv]) {
-        std::fprintf(stderr, "qsa: step upload: n_kv %lld disagrees with pos+1 = %d\n", (long long) n_kv_hint,
+    if (n_kv_hint >= 0 && n_kv_hint != (int64_t)h[kStepNKv]) {
+        std::fprintf(stderr, "qsa: step upload: n_kv %lld disagrees with pos+1 = %d\n", (long long)n_kv_hint,
                      h[kStepNKv]);
         std::exit(1);
     }
@@ -629,9 +613,10 @@ const int32_t* step_upload(int64_t pos, int64_t n_kv_hint, const QsaShapes& s) {
 /// because a stale entry is a value the NEXT kernel might read.
 const int32_t* step_upload_width(int64_t width, const QsaShapes& s) {
     int32_t h[kStepCount];
-    for (int i = 0; i < kStepCount; ++i) h[i] = 0;
-    h[kStepWidth] = (int32_t) width;
-    (void) s;
+    for (int i = 0; i < kStepCount; ++i)
+        h[i] = 0;
+    h[kStepWidth] = (int32_t)width;
+    (void)s;
     step_upload_raw(h);
     return step_scratch();
 }
@@ -651,108 +636,89 @@ void kv_append_step(uint16_t* k_pool, uint16_t* v_pool, const int32_t* page_tabl
     static sycl::queue default_queue{sycl::property::queue::in_order()};
     sycl::queue* cs = stream ? static_cast<sycl::queue*>(stream) : &default_queue;
     const long long n = s.n_head_kv * s.head_dim;
-    cs->submit([&](sycl::handler &cgh) {
+    cs->submit([&](sycl::handler& cgh) {
         KvHostPools host_host_KvHostPools_ct9 = host ? *host : KvHostPools{};
 
-        cgh.parallel_for(
-            sycl::nd_range<3>(sycl::range<3>(1, 1, grid_for(n, THREADS)) *
-                                  sycl::range<3>(1, 1, THREADS),
-                              sycl::range<3>(1, 1, THREADS)),
-            [=](sycl::nd_item<3> /*item_ct1*/) {
-                kv_append_kernel(k_pool, v_pool, page_table, step, kcur, vcur,
-                                 (int)s.n_head_kv, (int)s.head_dim,
-                                 (int)s.page_size, host_host_KvHostPools_ct9);
-            });
+        cgh.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, grid_for(n, THREADS)) * sycl::range<3>(1, 1, THREADS),
+                                           sycl::range<3>(1, 1, THREADS)),
+                         [=](sycl::nd_item<3> /*item_ct1*/) {
+                             kv_append_kernel(k_pool, v_pool, page_table, step, kcur, vcur, (int)s.n_head_kv,
+                                              (int)s.head_dim, (int)s.page_size, host_host_KvHostPools_ct9);
+                         });
     });
     if (!stream) default_queue.wait();
     check_launch("kv_append");
 }
 
-void qsa_index_step(const float* pooled, const float* q_idx, const float* bias, const QsaShapes& s,
-                    const int32_t* step, int64_t max_blocks, float* cell_scores, void* stream) {
+void qsa_index_step(const float* pooled, const float* q_idx, const float* bias, const QsaShapes& s, const int32_t* step,
+                    int64_t max_blocks, float* cell_scores, void* stream) {
     validate(s, "qsa_index");
     if (step == nullptr) fail("qsa_index: step is null");
     if (max_blocks <= 0) fail("qsa_index: max_blocks must be positive");
-    const int threads = 32 * (int) s.idx_n_head;
+    const int threads = 32 * (int)s.idx_n_head;
     static sycl::queue default_queue{sycl::property::queue::in_order()};
     sycl::queue* cs = stream ? static_cast<sycl::queue*>(stream) : &default_queue;
-    cs->submit([&](sycl::handler &cgh) {
+    cs->submit([&](sycl::handler& cgh) {
         sycl::local_accessor<double, 1> s_dot_acc(sycl::range<1>(32), cgh);
 
-        cgh.parallel_for(
-            sycl::nd_range<3>(
-                sycl::range<3>(1, 1, (unsigned)max_blocks) *
-                    sycl::range<3>(1, 1, threads),
-                sycl::range<3>(1, 1, threads)),
-            [=](sycl::nd_item<3> /*item_ct1*/) [[sycl::reqd_sub_group_size(32)]] {
-                qsa_index_kernel(
-                    pooled, q_idx, bias, (int)s.idx_n_head,
-                    (int)s.idx_dim, s.idx_block, step, cell_scores,
-                    &s_dot_acc[0]);
-            });
+        cgh.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, (unsigned)max_blocks) * sycl::range<3>(1, 1, threads),
+                                           sycl::range<3>(1, 1, threads)),
+                         [=](sycl::nd_item<3> /*item_ct1*/) [[sycl::reqd_sub_group_size(32)]] {
+                             qsa_index_kernel(pooled, q_idx, bias, (int)s.idx_n_head, (int)s.idx_dim, s.idx_block, step,
+                                              cell_scores, &s_dot_acc[0]);
+                         });
     });
     if (!stream) default_queue.wait();
     check_launch("qsa_index");
 }
 
-void topk_512_step(const float* cell_scores, const QsaShapes& s, int64_t cap, const int32_t* step,
-                   int32_t* ids, void* stream) {
+void topk_512_step(const float* cell_scores, const QsaShapes& s, int64_t cap, const int32_t* step, int32_t* ids,
+                   void* stream) {
     validate(s, "topk_512");
     if (step == nullptr) fail("topk_512: step is null");
     const int64_t width_max = qsa_selection_width(kTopkMaxCells, s);
     if (cap < width_max) {
-        std::fprintf(stderr, "qsa: topk_512: cap %lld < the largest possible selection width %lld\n",
-                     (long long) cap, (long long) width_max);
+        std::fprintf(stderr, "qsa: topk_512: cap %lld < the largest possible selection width %lld\n", (long long)cap,
+                     (long long)width_max);
         std::exit(1);
     }
     static sycl::queue default_queue{sycl::property::queue::in_order()};
     sycl::queue* cs = stream ? static_cast<sycl::queue*>(stream) : &default_queue;
-    cs->submit([&](sycl::handler &cgh) {
+    cs->submit([&](sycl::handler& cgh) {
         sycl::local_accessor<int, 1> s_a_acc(sycl::range<1>(256), cgh);
         sycl::local_accessor<int, 1> s_b_acc(sycl::range<1>(256), cgh);
         sycl::local_accessor<long long, 0> s_cgt_acc(cgh);
 
-        cgh.parallel_for(
-            sycl::nd_range<3>(sycl::range<3>(1, 1, TOPK_THREADS),
-                              sycl::range<3>(1, 1, TOPK_THREADS)),
-            [=](sycl::nd_item<3> /*item_ct1*/) {
-                topk_kernel(
-                    cell_scores, step, ids,
-                    &s_a_acc[0],
-                    &s_b_acc[0],
-                    s_cgt_acc);
-            });
+        cgh.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, TOPK_THREADS), sycl::range<3>(1, 1, TOPK_THREADS)),
+                         [=](sycl::nd_item<3> /*item_ct1*/) {
+                             topk_kernel(cell_scores, step, ids, &s_a_acc[0], &s_b_acc[0], s_cgt_acc);
+                         });
     });
     if (!stream) default_queue.wait();
     check_launch("topk_512");
 }
 
-void kv_gather_step(const uint16_t* k_pool, const uint16_t* v_pool, const int32_t* page_table,
-                    const int32_t* ids, const int32_t* step, int64_t max_ids, const QsaShapes& s,
-                    uint16_t* k_scratch, uint16_t* v_scratch, void* stream) {
+void kv_gather_step(const uint16_t* k_pool, const uint16_t* v_pool, const int32_t* page_table, const int32_t* ids,
+                    const int32_t* step, int64_t max_ids, const QsaShapes& s, uint16_t* k_scratch, uint16_t* v_scratch,
+                    void* stream) {
     validate(s, "kv_gather");
     if (step == nullptr) fail("kv_gather: step is null");
     if (max_ids <= 0) return;
     static sycl::queue default_queue{sycl::property::queue::in_order()};
     sycl::queue* cs = stream ? static_cast<sycl::queue*>(stream) : &default_queue;
     const long long total = max_ids * s.n_head_kv * (s.head_dim / 4);
-    cs->parallel_for(
-        sycl::nd_range<3>(sycl::range<3>(1, 1, grid_for(total, 256)) *
-                              sycl::range<3>(1, 1, 256),
-                          sycl::range<3>(1, 1, 256)),
-        [=](sycl::nd_item<3> /*item_ct1*/) {
-            kv_gather_kernel(k_pool, v_pool, page_table, ids, step,
-                             (int)s.n_head_kv, (int)s.head_dim,
-                             (int)s.page_size, k_scratch, v_scratch);
-        });
+    cs->parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, grid_for(total, 256)) * sycl::range<3>(1, 1, 256),
+                                       sycl::range<3>(1, 1, 256)),
+                     [=](sycl::nd_item<3> /*item_ct1*/) {
+                         kv_gather_kernel(k_pool, v_pool, page_table, ids, step, (int)s.n_head_kv, (int)s.head_dim,
+                                          (int)s.page_size, k_scratch, v_scratch);
+                     });
     if (!stream) default_queue.wait();
     check_launch("kv_gather");
 }
 
-void qsa_attend_step(const float *q, const uint16_t *k_scratch,
-                     const uint16_t *v_scratch, const int32_t *step,
-                     int64_t max_ids, const QsaShapes &s, float *attn,
-                     float *weights, void *stream) {
+void qsa_attend_step(const float* q, const uint16_t* k_scratch, const uint16_t* v_scratch, const int32_t* step,
+                     int64_t max_ids, const QsaShapes& s, float* attn, float* weights, void* stream) {
     validate(s, "qsa_attend");
     if (step == nullptr) fail("qsa_attend: step is null");
     if (max_ids <= 0) fail("qsa_attend: max_ids must be positive");
@@ -763,25 +729,22 @@ void qsa_attend_step(const float *q, const uint16_t *k_scratch,
     if (smem > s_configured) {
         int max_shared = (int)cs->get_device().get_info<sycl::info::device::local_mem_size>();
         max_shared = strata::smem_optin_of(max_shared);
-        if ((int) smem > max_shared) {
+        if ((int)smem > max_shared) {
             std::fprintf(stderr, "qsa: qsa_attend: max_ids %lld needs %zu B of shared, over the %d B limit\n",
-                         (long long) max_ids, smem, max_shared);
+                         (long long)max_ids, smem, max_shared);
             std::exit(1);
         }
         s_configured = smem;
     }
-    cs->submit([&](sycl::handler &cgh) {
+    cs->submit([&](sycl::handler& cgh) {
         sycl::local_accessor<uint8_t, 1> local_acc(sycl::range<1>(smem), cgh);
 
         cgh.parallel_for(
-            sycl::nd_range<3>(sycl::range<3>(1, 1, (unsigned)s.n_head) *
-                                  sycl::range<3>(1, 1, (unsigned)s.head_dim),
+            sycl::nd_range<3>(sycl::range<3>(1, 1, (unsigned)s.n_head) * sycl::range<3>(1, 1, (unsigned)s.head_dim),
                               sycl::range<3>(1, 1, (unsigned)s.head_dim)),
             [=](sycl::nd_item<3> /*item_ct1*/) [[sycl::reqd_sub_group_size(32)]] {
-                qsa_attend_kernel(
-                    q, k_scratch, v_scratch, step, (int)s.n_head,
-                    (int)s.n_head_kv, (int)s.head_dim, attn, weights,
-                    &local_acc[0]);
+                qsa_attend_kernel(q, k_scratch, v_scratch, step, (int)s.n_head, (int)s.n_head_kv, (int)s.head_dim, attn,
+                                  weights, &local_acc[0]);
             });
     });
     if (!stream) default_queue.wait();
@@ -801,44 +764,42 @@ void qsa_step_fill(int32_t* host_step, int64_t pos, const QsaShapes& s) {
     // This is the form the LAYER will use: every value a QSA kernel needs derives from one position, so one
     // H2D per token updates all of them and no entry point takes a per-token scalar.
     const int64_t n_kv = pos + 1;
-    host_step[kStepPos] = (int32_t) pos;
-    host_step[kStepNKv] = (int32_t) n_kv;
-    host_step[kStepNBid] = (int32_t) (n_kv / s.idx_block);
-    host_step[kStepWidth] = (int32_t) qsa_selection_width(n_kv, s);
+    host_step[kStepPos] = (int32_t)pos;
+    host_step[kStepNKv] = (int32_t)n_kv;
+    host_step[kStepNBid] = (int32_t)(n_kv / s.idx_block);
+    host_step[kStepWidth] = (int32_t)qsa_selection_width(n_kv, s);
 }
 
-void kv_append(uint16_t* k_pool, uint16_t* v_pool, const int32_t* page_table, int64_t pos,
-               const float* kcur, const float* vcur, const QsaShapes& s, void* stream) {
-    if (pos < 0) { validate(s, "kv_append"); fail("kv_append: pos < 0"); }
+void kv_append(uint16_t* k_pool, uint16_t* v_pool, const int32_t* page_table, int64_t pos, const float* kcur,
+               const float* vcur, const QsaShapes& s, void* stream) {
+    if (pos < 0) {
+        validate(s, "kv_append");
+        fail("kv_append: pos < 0");
+    }
     kv_append_step(k_pool, v_pool, page_table, step_upload(pos, -1, s), kcur, vcur, s, stream);
 }
 
-void indexer_key_append(const float* raw, const int32_t* pos_dev, int32_t pos_base, const float* w_k_norm,
-                        float eps, const QsaIndexerBuffers& b, const QsaShapes& s, const float* cos_tab,
-                        const float* sin_tab, void* stream) {
+void indexer_key_append(const float* raw, const int32_t* pos_dev, int32_t pos_base, const float* w_k_norm, float eps,
+                        const QsaIndexerBuffers& b, const QsaShapes& s, const float* cos_tab, const float* sin_tab,
+                        void* stream) {
     validate(s, "indexer_key_append");
     if (pos_dev == nullptr) fail("indexer_key_append: pos_dev is null");
     if (b.tail == nullptr || b.dead == nullptr || b.pooled == nullptr || b.block_pos == nullptr)
         fail("indexer_key_append: the indexer buffers are not all set (tail/dead/pooled/block_pos)");
-    const int threads = (int) s.idx_dim;
+    const int threads = (int)s.idx_dim;
     const size_t smem = (size_t)s.idx_dim * sizeof(double);
     static sycl::queue default_queue{sycl::property::queue::in_order()};
     sycl::queue* cs = stream ? static_cast<sycl::queue*>(stream) : &default_queue;
-    cs->submit([&](sycl::handler &cgh) {
+    cs->submit([&](sycl::handler& cgh) {
         sycl::local_accessor<uint8_t, 1> local_acc(sycl::range<1>(smem), cgh);
         auto mrope_table_ct14 = mrope_table();
 
-        cgh.parallel_for(
-            sycl::nd_range<3>(sycl::range<3>(1, 1, threads),
-                              sycl::range<3>(1, 1, threads)),
-            [=](sycl::nd_item<3> /*item_ct1*/) {
-                indexer_key_append_kernel(
-                    raw, pos_dev, (int)pos_base, w_k_norm, eps, b.tail,
-                    b.dead, b.pooled, b.block_pos, (int)s.idx_dim,
-                    (int)s.idx_block, (int)s.n_rot, cos_tab, sin_tab,
-                    mrope_table_ct14,
-                    &local_acc[0]);
-            });
+        cgh.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, threads), sycl::range<3>(1, 1, threads)),
+                         [=](sycl::nd_item<3> /*item_ct1*/) {
+                             indexer_key_append_kernel(raw, pos_dev, (int)pos_base, w_k_norm, eps, b.tail, b.dead,
+                                                       b.pooled, b.block_pos, (int)s.idx_dim, (int)s.idx_block,
+                                                       (int)s.n_rot, cos_tab, sin_tab, mrope_table_ct14, &local_acc[0]);
+                         });
     });
     if (!stream) default_queue.wait();
     check_launch("indexer_key_append");
@@ -851,8 +812,8 @@ void qsa_index(const float* pooled, int64_t n_bid, const float* q_idx, const flo
     // `n_kv`, `n_bid` and `width` are DERIVED from one position, so this refuses a caller whose two arguments
     // disagree rather than launching a kernel that would score the wrong number of blocks.
     if ((n_kv / s.idx_block) != n_bid) {
-        std::fprintf(stderr, "qsa: qsa_index: n_bid %lld is not n_kv %lld / r %lld\n", (long long) n_bid,
-                     (long long) n_kv, (long long) s.idx_block);
+        std::fprintf(stderr, "qsa: qsa_index: n_bid %lld is not n_kv %lld / r %lld\n", (long long)n_bid,
+                     (long long)n_kv, (long long)s.idx_block);
         std::exit(1);
     }
     // THIS TOKEN'S counts as the CAPACITIES: correct for a direct launch, WRONG in a graph.  The layer passes a
@@ -860,13 +821,12 @@ void qsa_index(const float* pooled, int64_t n_bid, const float* q_idx, const flo
     qsa_index_step(pooled, q_idx, bias, s, step_upload(n_kv - 1, n_kv, s), n_bid + 1, cell_scores, stream);
 }
 
-void topk_512(const float* cell_scores, int64_t n_kv, const QsaShapes& s, int64_t cap, int32_t* ids,
-              void* stream) {
+void topk_512(const float* cell_scores, int64_t n_kv, const QsaShapes& s, int64_t cap, int32_t* ids, void* stream) {
     validate(s, "topk_512");
     if (n_kv <= 0) return;
     if (n_kv > kTopkMaxCells) {
         std::fprintf(stderr, "qsa: topk_512: n_kv %lld > kTopkMaxCells %lld (one block; phase 3 replaces this)\n",
-                     (long long) n_kv, (long long) kTopkMaxCells);
+                     (long long)n_kv, (long long)kTopkMaxCells);
         std::exit(1);
     }
     topk_512_step(cell_scores, s, cap, step_upload(n_kv - 1, n_kv, s), ids, stream);
@@ -876,19 +836,19 @@ void kv_gather(const uint16_t* k_pool, const uint16_t* v_pool, const int32_t* pa
                int64_t n_ids, const QsaShapes& s, uint16_t* k_scratch, uint16_t* v_scratch, void* stream) {
     validate(s, "kv_gather");
     if (n_ids <= 0) return;
-    kv_gather_step(k_pool, v_pool, page_table, ids, step_upload_width(n_ids, s), n_ids, s, k_scratch,
-                   v_scratch, stream);
+    kv_gather_step(k_pool, v_pool, page_table, ids, step_upload_width(n_ids, s), n_ids, s, k_scratch, v_scratch,
+                   stream);
 }
 
-void qsa_attend(const float* q, const uint16_t* k_scratch, const uint16_t* v_scratch, int64_t n_ids,
-                const QsaShapes& s, float* attn, float* weights, void* stream) {
+void qsa_attend(const float* q, const uint16_t* k_scratch, const uint16_t* v_scratch, int64_t n_ids, const QsaShapes& s,
+                float* attn, float* weights, void* stream) {
     validate(s, "qsa_attend");
     if (n_ids < 0) fail("qsa_attend: n_ids < 0");
     if (n_ids == 0) {
         // The empty selection goes through the kernel's own zero path; `max_ids` must still be positive, so the
         // wrapper gives it the geometry's capacity rather than 0.
-        qsa_attend_step(q, k_scratch, v_scratch, step_upload_width(0, s),
-                        qsa_selection_width(kTopkMaxCells, s), s, attn, weights, stream);
+        qsa_attend_step(q, k_scratch, v_scratch, step_upload_width(0, s), qsa_selection_width(kTopkMaxCells, s), s,
+                        attn, weights, stream);
         return;
     }
     qsa_attend_step(q, k_scratch, v_scratch, step_upload_width(n_ids, s), n_ids, s, attn, weights, stream);
@@ -896,17 +856,15 @@ void qsa_attend(const float* q, const uint16_t* k_scratch, const uint16_t* v_scr
 
 /// The same multiply as `qsa_gate_apply_kernel` WITHOUT the fp16 round - see the header for why the caller
 /// whose weight is a K-quant needs the f32 form.  Identical arithmetic up to the last step.
-void qsa_gate_apply_f32_kernel(const float* __restrict__ attn, const float* __restrict__ q_full,
-                                          int n_head, int head_dim, float* __restrict__ out) {
+void qsa_gate_apply_f32_kernel(const float* __restrict__ attn, const float* __restrict__ q_full, int n_head,
+                               int head_dim, float* __restrict__ out) {
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
-    const long long i =
-        item_ct1.get_group(2) * (long long)item_ct1.get_local_range(2) +
-        item_ct1.get_local_id(2);
-    if (i >= (long long) n_head * head_dim) return;
-    const int h = (int) (i / head_dim), d = (int) (i % head_dim);
-    const double g = (double) q_full[((size_t) h * 2 * head_dim) + head_dim + d];   // the SECOND half
+    const long long i = item_ct1.get_group(2) * (long long)item_ct1.get_local_range(2) + item_ct1.get_local_id(2);
+    if (i >= (long long)n_head * head_dim) return;
+    const int h = (int)(i / head_dim), d = (int)(i % head_dim);
+    const double g = (double)q_full[((size_t)h * 2 * head_dim) + head_dim + d];  // the SECOND half
     const double sig = 1.0 / (1.0 + sycl::exp(-g));
-    out[i] = (float) ((double) attn[i] * sig);
+    out[i] = (float)((double)attn[i] * sig);
 }
 
 void qsa_gate_apply_f32(const float* attn, const float* q_full, const QsaShapes& s, float* out, void* stream) {
@@ -914,14 +872,11 @@ void qsa_gate_apply_f32(const float* attn, const float* q_full, const QsaShapes&
     const long long n = s.n_head * s.head_dim;
     static sycl::queue default_queue{sycl::property::queue::in_order()};
     sycl::queue* cs = stream ? static_cast<sycl::queue*>(stream) : &default_queue;
-    cs->parallel_for(
-        sycl::nd_range<3>(sycl::range<3>(1, 1, grid_for(n, 256)) *
-                              sycl::range<3>(1, 1, 256),
-                          sycl::range<3>(1, 1, 256)),
-        [=](sycl::nd_item<3> /*item_ct1*/) {
-            qsa_gate_apply_f32_kernel(attn, q_full, (int)s.n_head,
-                                      (int)s.head_dim, out);
-        });
+    cs->parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, grid_for(n, 256)) * sycl::range<3>(1, 1, 256),
+                                       sycl::range<3>(1, 1, 256)),
+                     [=](sycl::nd_item<3> /*item_ct1*/) {
+                         qsa_gate_apply_f32_kernel(attn, q_full, (int)s.n_head, (int)s.head_dim, out);
+                     });
     if (!stream) default_queue.wait();
     check_launch("qsa_gate_apply_f32");
 }
@@ -931,14 +886,11 @@ void qsa_gate_apply(const float* attn, const float* q_full, const QsaShapes& s, 
     const long long n = s.n_head * s.head_dim;
     static sycl::queue default_queue{sycl::property::queue::in_order()};
     sycl::queue* cs = stream ? static_cast<sycl::queue*>(stream) : &default_queue;
-    cs->parallel_for(
-        sycl::nd_range<3>(sycl::range<3>(1, 1, grid_for(n, 256)) *
-                              sycl::range<3>(1, 1, 256),
-                          sycl::range<3>(1, 1, 256)),
-        [=](sycl::nd_item<3> /*item_ct1*/) {
-            qsa_gate_apply_kernel(attn, q_full, (int)s.n_head,
-                                  (int)s.head_dim, out);
-        });
+    cs->parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, grid_for(n, 256)) * sycl::range<3>(1, 1, 256),
+                                       sycl::range<3>(1, 1, 256)),
+                     [=](sycl::nd_item<3> /*item_ct1*/) {
+                         qsa_gate_apply_kernel(attn, q_full, (int)s.n_head, (int)s.head_dim, out);
+                     });
     if (!stream) default_queue.wait();
     check_launch("qsa_gate_apply");
 }
