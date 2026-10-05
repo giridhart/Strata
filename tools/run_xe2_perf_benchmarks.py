@@ -103,6 +103,31 @@ BENCHMARK_TARGETS = [
         "title": "MTP Speculative Verification Pipeline",
         "description": "Multi-token verification throughput and scaling across candidate batch sizes B=1..8",
     },
+    # Tier 3: Multi-Operation & Data Movement Pipelines
+    {
+        "name": "perf_residual_pipeline",
+        "tier": 3,
+        "title": "Hyper-Connection Residual Ping-Pong & Fusion",
+        "description": "gr_read -> GEMV -> gr_write: R roundtrips vs L3 residency and fused read/write transition",
+    },
+    {
+        "name": "perf_layer_pipeline",
+        "tier": 3,
+        "title": "Full Composite Layer Pipeline Simulation",
+        "description": "9-kernel complete block: intermediate activation handover, pipelined vs CapturedGraph replay",
+    },
+    {
+        "name": "perf_moe_doorbell_stream",
+        "tier": 3,
+        "title": "MoE Doorbell Handshake & Expert Streaming",
+        "description": "PCIe doorbell signaling roundtrip, 51.2 KB parts streaming, and shared expert overlap slack",
+    },
+    {
+        "name": "perf_paged_kv_traffic",
+        "tier": 3,
+        "title": "Paged KV Cache Traffic & Indirection Penalty",
+        "description": "Non-contiguous paged gather vs contiguous memory, page size sweep (16..128) and INT8 vs FP16",
+    },
 ]
 
 
@@ -275,6 +300,25 @@ def generate_markdown_report(
             tps_b8 = next((b.get("tokens_per_sec", 0) for b in benchmarks if "Verify_Step/8" in b.get("name", "")), 0)
             ratio = (tps_b8 / tps_b1) if tps_b1 > 0 else 0
             metric_str = f"Verify Scaling: **{tps_b1/1e3:.1f}k** (B=1) -> **{tps_b8/1e3:.1f}k tok/s** (B=8) (**{ratio:.1f}x**)"
+        elif tname == "perf_residual_pipeline":
+            unfused_t = next((b.get("real_time", 0) for b in benchmarks if "Residual_Unfused" in b.get("name", "")), 0)
+            fused_t = next((b.get("real_time", 0) for b in benchmarks if "Residual_Fused" in b.get("name", "")), 0)
+            ratio = (unfused_t / fused_t) if fused_t > 0 else 0
+            metric_str = f"Fused: **{fused_t/1e3:.1f} µs** vs Unfused: **{unfused_t/1e3:.1f} µs** (**{ratio:.2f}x faster**)"
+        elif tname == "perf_layer_pipeline":
+            pipe_t = next((b.get("real_time", 0) for b in benchmarks if "Composite_Layer_Pipelined" in b.get("name", "")), 0)
+            graph_t = next((b.get("real_time", 0) for b in benchmarks if "Composite_Layer_Graph" in b.get("name", "")), 0)
+            ratio = (pipe_t / graph_t) if graph_t > 0 else 0
+            metric_str = f"Graph: **{graph_t/1e3:.1f} µs** vs Pipelined: **{pipe_t/1e3:.1f} µs** (**{ratio:.1f}x speedup**)"
+        elif tname == "perf_moe_doorbell_stream":
+            db_lat = next((b.get("real_time", 0) for b in benchmarks if "Doorbell_Roundtrip" in b.get("name", "")), 0)
+            slack = next((b.get("Slack_us", 0) for b in benchmarks if "Overlap_Slack" in b.get("name", "")), 0)
+            metric_str = f"Doorbell Latency: **{db_lat/1e3:.1f} µs** | Overlap Slack: **{slack:.1f} µs**"
+        elif tname == "perf_paged_kv_traffic":
+            contig_bw = next((b.get("Bandwidth_GBps", 0) for b in benchmarks if "KV_Contiguous/4096" in b.get("name", "")), 0) / 1e9
+            paged_bw = next((b.get("Bandwidth_GBps", 0) for b in benchmarks if "KV_Paged/4096" in b.get("name", "")), 0) / 1e9
+            penalty = ((contig_bw - paged_bw) / contig_bw * 100.0) if contig_bw > 0 else 0
+            metric_str = f"Contiguous: **{contig_bw:.2f} GB/s** vs Paged: **{paged_bw:.2f} GB/s** (Penalty: **{penalty:.1f}%**)"
 
         md.append(f"| **{target['title']}** | {target['description']} | {metric_str} | ✅ PASS |\n")
 
@@ -357,7 +401,7 @@ def generate_markdown_report(
 def main():
     p = argparse.ArgumentParser(description="Intel Xe2 / Arc B580 Benchmark Runner & Reporter")
     p.add_argument("--build-dir", default="build_sycl", help="Path to build directory containing perf binaries")
-    p.add_argument("--suite", choices=["all", "tier1", "tier2"], default="all", help="Select benchmark tier")
+    p.add_argument("--suite", choices=["all", "tier1", "tier2", "tier3"], default="all", help="Select benchmark tier")
     p.add_argument("--quick", action="store_true", help="Run in fast smoke mode (min_time=0.05s)")
     p.add_argument("--repetitions", type=int, default=1, help="Number of benchmark repetitions per test")
     p.add_argument("--filter", default="", help="Regex filter to pass to Google Benchmark --benchmark_filter")
@@ -391,6 +435,8 @@ def main():
         if args.suite == "tier1" and t["tier"] != 1:
             continue
         if args.suite == "tier2" and t["tier"] != 2:
+            continue
+        if args.suite == "tier3" and t["tier"] != 3:
             continue
         targets_to_run.append(t)
 
