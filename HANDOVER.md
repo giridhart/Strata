@@ -127,6 +127,14 @@ make -C build_sycl -j$(nproc) check-sycl
 
 1. **Model Pack Execution**: Run complete inference on a downloaded or packed Qwen3.8-Flash-Next model (`--pack pack/full` or `--native-dense-gguf`).
 2. **Ahead-of-Time (AOT) BMG Binary Artifacts**: Compile target binary specifically with `-fsycl-targets=spir64_gen -Xs "-device bmg"` for deployment on desktop Arc B580 systems.
-3. **Multi-Queue Compute/Transfer Overlap**: Profile USM copy engines and secondary queue concurrency with Intel VTune (`vtune -collect gpu-hotspots`).
+3. **Implement Tier 2 Performance Benchmarks** (specified in [`docs/INTEL_B580_OPTIMIZATION_PLAN.md`](docs/INTEL_B580_OPTIMIZATION_PLAN.md)):
+   - **BM 6**: `perf_fused_gdn.cpp` - Fused GDN recurrence & SLM state retention vs unfused roundtrip.
+   - **BM 7**: `perf_pcie_overlap.cpp` - Dual-queue PCIe Block Copy Engine (BCE) vs XMX compute concurrency.
+   - **BM 8**: `perf_graph_replay.cpp` - SYCL Command Graph 48-layer replay latency vs direct dispatch.
+   - **BM 9**: `perf_kv_decode.cpp` - Quantized KV cache decode attention bandwidth (FP16/INT8/K8V4/Q4_0 up to 262K).
+   - **BM 10**: `perf_prefill_gemm.cpp` - Native SYCL tiled GEMM prompt prefill scaling ($M=128\dots8192$) on B580 XMX.
+   - **BM 11**: `perf_speculative_verify.cpp` - MTP multi-token speculative verification pipeline ($B=1\dots5$).
+   - **BM 12**: `tools/bench_xe2_e2e.py` - Automated end-to-end tokens/s and TTFT macro-benchmark across context lengths.
+
 
 
