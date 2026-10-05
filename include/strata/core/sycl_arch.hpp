@@ -19,4 +19,4 @@ inline T sub_group_reduce(const sycl::sub_group& sg, T val, BinaryOp op = Binary
     return sycl::reduce_over_group(sg, val, op);
 }
 
-} // namespace strata::sycl_arch
+}  // namespace strata::sycl_arch

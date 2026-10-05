@@ -1,5 +1,5 @@
-// src/prefill/ggml_cuda_host.cu - prompt-speed plan step 2b: the host-side symbols of llama.cpp's ggml-cuda that its MMQ
-// and quantize code reference, for the MMQ kernels compiled into strata_mmq without the rest of ggml-cuda.cu.
+// src/prefill/ggml_cuda_host.cu - prompt-speed plan step 2b: the host-side symbols of llama.cpp's ggml-cuda that its
+// MMQ and quantize code reference, for the MMQ kernels compiled into strata_mmq without the rest of ggml-cuda.cu.
 #include <sycl/sycl.hpp>
 #include "strata/core/emulate.hpp"
 #include "common.cuh"
@@ -12,21 +12,18 @@
 
 namespace {
 inline sycl::queue& get_mmq_queue() {
-    static sycl::queue q{sycl::default_selector_v,
-                         sycl::property_list{sycl::property::queue::in_order{},
-                                             sycl::property::queue::enable_profiling{}}};
+    static sycl::queue q{sycl::default_selector_v, sycl::property_list{sycl::property::queue::in_order{},
+                                                                       sycl::property::queue::enable_profiling{}}};
     return q;
 }
-} // namespace
+}  // namespace
 
-[[noreturn]] void ggml_cuda_error(const char * stmt, const char * func, const char * file, int line, const char * msg) {
+[[noreturn]] void ggml_cuda_error(const char* stmt, const char* func, const char* file, int line, const char* msg) {
     std::fprintf(stderr, "ggml-cuda (strata mmq): %s: %s\n  in %s at %s:%d\n", msg, stmt, func, file, line);
     std::abort();
 }
 
-int ggml_cuda_get_device() {
-    return 0;
-}
+int ggml_cuda_get_device() { return 0; }
 
 #if defined(GGML_USE_HIP)
 namespace {
@@ -67,17 +64,19 @@ int ggml_cuda_parse_amd_id(const char* device_name) {
 }  // namespace
 #endif
 
-const ggml_cuda_device_info & ggml_cuda_info() {
+const ggml_cuda_device_info& ggml_cuda_info() {
     static ggml_cuda_device_info info = [] {
         ggml_cuda_device_info in = {};
         std::vector<sycl::device> gpus;
         try {
             gpus = sycl::device::get_devices(sycl::info::device_type::gpu);
-        } catch (...) {}
+        } catch (...) {
+        }
         if (gpus.empty()) {
             try {
                 gpus.push_back(sycl::device(sycl::default_selector_v));
-            } catch (...) {}
+            } catch (...) {
+            }
         }
         int n = static_cast<int>(gpus.size());
         n = n > GGML_CUDA_MAX_DEVICES ? GGML_CUDA_MAX_DEVICES : n;
@@ -85,7 +84,7 @@ const ggml_cuda_device_info & ggml_cuda_info() {
         in.physical_device_count = n;
         for (int id = 0; id < n; ++id) {
             const auto& dev = gpus[id];
-            auto & d = in.devices[id];
+            auto& d = in.devices[id];
 #if defined(GGML_USE_HIP)
             std::string dname = dev.get_info<sycl::info::device::name>();
             d.cc = ggml_cuda_parse_amd_id(dname.c_str());
@@ -116,14 +115,22 @@ const ggml_cuda_device_info & ggml_cuda_info() {
 namespace {
 // Buffers are kept and reused: MMQ asks for the same few sizes every launch (its stream-k fixup tiles).
 struct CachingPool : ggml_cuda_pool {
-    struct Buf { void * p; size_t size; bool used; };
+    struct Buf {
+        void* p;
+        size_t size;
+        bool used;
+    };
     std::vector<Buf> bufs;
     std::mutex mu;
-    void * alloc(size_t size, size_t * actual_size) override {
+    void* alloc(size_t size, size_t* actual_size) override {
         std::lock_guard<std::mutex> lk(mu);
-        for (auto & b : bufs)
-            if (!b.used && b.size >= size) { b.used = true; *actual_size = b.size; return b.p; }
-        void * p = sycl::malloc_device(size, get_mmq_queue());
+        for (auto& b : bufs)
+            if (!b.used && b.size >= size) {
+                b.used = true;
+                *actual_size = b.size;
+                return b.p;
+            }
+        void* p = sycl::malloc_device(size, get_mmq_queue());
         if (!p) {
             ggml_cuda_error("malloc_device", "alloc", __FILE__, __LINE__, "out of memory");
         }
@@ -131,17 +138,21 @@ struct CachingPool : ggml_cuda_pool {
         *actual_size = size;
         return p;
     }
-    void free(void * ptr, size_t) override {
+    void free(void* ptr, size_t) override {
         std::lock_guard<std::mutex> lk(mu);
-        for (auto & b : bufs)
-            if (b.p == ptr) { b.used = false; return; }
+        for (auto& b : bufs)
+            if (b.p == ptr) {
+                b.used = false;
+                return;
+            }
     }
     ~CachingPool() override {
-        for (auto & b : bufs) {
+        for (auto& b : bufs) {
             if (b.p) {
                 try {
                     sycl::free(b.p, get_mmq_queue());
-                } catch (...) {}
+                } catch (...) {
+                }
             }
         }
     }

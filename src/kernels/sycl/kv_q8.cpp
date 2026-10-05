@@ -15,52 +15,48 @@ static sycl::queue default_queue;
 
 void validate(const QsaShapes& s, const char* what) {
     if (s.head_dim % KV_Q8_GROUP != 0 || s.n_head_kv <= 0 || s.page_size <= 0) {
-        std::fprintf(stderr, "kv_q8: %s: head_dim %lld must be a multiple of %d\n", what, (long long) s.head_dim,
+        std::fprintf(stderr, "kv_q8: %s: head_dim %lld must be a multiple of %d\n", what, (long long)s.head_dim,
                      KV_Q8_GROUP);
         std::exit(1);
     }
 }
 
 // One block = one 64-value group of one KV head of K (blockIdx.z = 0) or V (1); 64 threads, one value each.
-void kv_append_q8_kernel(int8_t* __restrict__ k_q, int8_t* __restrict__ v_q,
-                         uint16_t* __restrict__ k_scale, uint16_t* __restrict__ v_scale,
-                         const int32_t* __restrict__ table, const int32_t* __restrict__ step,
-                         const float* __restrict__ kcur, const float* __restrict__ vcur, int kv_heads,
-                         int head_dim, int page_size, KvHostPools host,
-                         float *warp_max, const sycl::nd_item<3>& item) {
+void kv_append_q8_kernel(int8_t* __restrict__ k_q, int8_t* __restrict__ v_q, uint16_t* __restrict__ k_scale,
+                         uint16_t* __restrict__ v_scale, const int32_t* __restrict__ table,
+                         const int32_t* __restrict__ step, const float* __restrict__ kcur,
+                         const float* __restrict__ vcur, int kv_heads, int head_dim, int page_size, KvHostPools host,
+                         float* warp_max, const sycl::nd_item<3>& item) {
     const long long pos = (long long)*(step + kStepPos);
-    const int h = item.get_group(2), g = item.get_group(1),
-              t = item.get_local_id(2);
+    const int h = item.get_group(2), g = item.get_group(1), t = item.get_local_id(2);
     const bool is_v = item.get_group(0) == 1;
     const int groups = head_dim / KV_Q8_GROUP;
     const float x = (is_v ? vcur : kcur)[h * head_dim + g * KV_Q8_GROUP + t];
     // max |x| over the 64 values: two warps, then combine through shared memory in a fixed order
     float a = sycl::fabs(x);
-    for (int o = 16; o > 0; o >>= 1) a = sycl::fmax(
-        a, sycl::permute_group_by_xor(
-               item.get_sub_group(), a, o));
+    for (int o = 16; o > 0; o >>= 1)
+        a = sycl::fmax(a, sycl::permute_group_by_xor(item.get_sub_group(), a, o));
 
     if ((t & 31) == 0) warp_max[t >> 5] = a;
     item.barrier(sycl::access::fence_space::local_space);
     const float amax = sycl::fmax(warp_max[0], warp_max[1]);
     const uint16_t sbits = f16_from_f32(amax / 127.0f);
-    const float sf = f32_from_f16(sbits);                          // quantize against the STORED scale
+    const float sf = f32_from_f16(sbits);  // quantize against the STORED scale
     int q = 0;
     if (sf > 0.0f) {
-        q = sycl::vec<float, 1>{(x / sf)}
-                .convert<int, sycl::rounding_mode::rte>()[0];
+        q = sycl::vec<float, 1>{(x / sf)}.convert<int, sycl::rounding_mode::rte>()[0];
         q = q < -127 ? -127 : (q > 127 ? 127 : q);
     }
     // KV streaming: the host copy (identity layout) always, the VRAM page only if the block is resident
-    const long long page = (long long) table[pos / page_size];
+    const long long page = (long long)table[pos / page_size];
     if (page >= 0) {
         const long long row = (page * kv_heads + h) * page_size + (pos % page_size);
-        (is_v ? v_q : k_q)[row * head_dim + g * KV_Q8_GROUP + t] = (int8_t) q;
+        (is_v ? v_q : k_q)[row * head_dim + g * KV_Q8_GROUP + t] = (int8_t)q;
         if (t == 0) (is_v ? v_scale : k_scale)[row * groups + g] = sbits;
     }
     if (host.k_q != nullptr) {
         const long long row = ((pos / page_size) * kv_heads + h) * page_size + (pos % page_size);
-        (is_v ? host.v_q : host.k_q)[row * head_dim + g * KV_Q8_GROUP + t] = (int8_t) q;
+        (is_v ? host.v_q : host.k_q)[row * head_dim + g * KV_Q8_GROUP + t] = (int8_t)q;
         if (t == 0) (is_v ? host.v_scale : host.k_scale)[row * groups + g] = sbits;
     }
 }
@@ -75,24 +71,20 @@ void kv_gather_q8_kernel(const int8_t* __restrict__ k_q, const int8_t* __restric
     const long long n_ids = (long long)*(step + kStepWidth);
     const int per = head_dim / 4;
     const long long total = n_ids * kv_heads * per;
-    const long long i =
-        (long long)item.get_group(0) * item.get_local_range(0) +
-        item.get_local_id(0);
+    const long long i = (long long)item.get_group(0) * item.get_local_range(0) + item.get_local_id(0);
     if (i >= total) return;
-    const long long id = i / (kv_heads * (long long) per);
-    const int rem = (int) (i % (kv_heads * (long long) per));
+    const long long id = i / (kv_heads * (long long)per);
+    const int rem = (int)(i % (kv_heads * (long long)per));
     const int h = rem / per, q4 = rem - h * per;
     const int cell = ids[id];
-    const long long page = (long long) table[cell / page_size];
+    const long long page = (long long)table[cell / page_size];
     const long long row = (page * kv_heads + h) * page_size + (cell % page_size);
     const int d = q4 * 4;
     const int groups = head_dim / KV_Q8_GROUP;
     const float ks = f32_from_f16(k_scale[row * groups + d / KV_Q8_GROUP]);
     const float vs = f32_from_f16(v_scale[row * groups + d / KV_Q8_GROUP]);
-    const sycl::char4 kc =
-        reinterpret_cast<const sycl::char4 *>(k_q + row * head_dim)[q4];
-    const sycl::char4 vc =
-        reinterpret_cast<const sycl::char4 *>(v_q + row * head_dim)[q4];
+    const sycl::char4 kc = reinterpret_cast<const sycl::char4*>(k_q + row * head_dim)[q4];
+    const sycl::char4 vc = reinterpret_cast<const sycl::char4*>(v_q + row * head_dim)[q4];
     sycl::ushort4 ko, vo;
     ko.x() = f16_from_f32((float)kc.x() * ks);
     ko.y() = f16_from_f32((float)kc.y() * ks);
@@ -102,9 +94,9 @@ void kv_gather_q8_kernel(const int8_t* __restrict__ k_q, const int8_t* __restric
     vo.y() = f16_from_f32((float)vc.y() * vs);
     vo.z() = f16_from_f32((float)vc.z() * vs);
     vo.w() = f16_from_f32((float)vc.w() * vs);
-    const long long dst = (id * kv_heads + h) * (long long) per + q4;
-    reinterpret_cast<sycl::ushort4 *>(k_scratch)[dst] = ko;
-    reinterpret_cast<sycl::ushort4 *>(v_scratch)[dst] = vo;
+    const long long dst = (id * kv_heads + h) * (long long)per + q4;
+    reinterpret_cast<sycl::ushort4*>(k_scratch)[dst] = ko;
+    reinterpret_cast<sycl::ushort4*>(v_scratch)[dst] = vo;
 }
 
 }  // namespace
@@ -115,21 +107,16 @@ void kv_append_q8_step(int8_t* k_q, int8_t* v_q, uint16_t* k_scale, uint16_t* v_
     validate(s, "kv_append_q8");
     const sycl::range<3> grid(2, (unsigned)(s.head_dim / KV_Q8_GROUP), (unsigned)s.n_head_kv);
     sycl::queue* q = stream ? static_cast<sycl::queue*>(stream) : &default_queue;
-    q->submit([&](sycl::handler &cgh) {
+    q->submit([&](sycl::handler& cgh) {
         sycl::local_accessor<float, 1> warp_max_acc(sycl::range<1>(2), cgh);
         KvHostPools host_pools = host ? *host : KvHostPools{};
 
-        cgh.parallel_for(
-            sycl::nd_range<3>(grid * sycl::range<3>(1, 1, KV_Q8_GROUP),
-                              sycl::range<3>(1, 1, KV_Q8_GROUP)),
-            [=](sycl::nd_item<3> item) [[sycl::reqd_sub_group_size(32)]] {
-                kv_append_q8_kernel(
-                    k_q, v_q, k_scale, v_scale, page_table, step, kcur, vcur,
-                    (int)s.n_head_kv, (int)s.head_dim, (int)s.page_size,
-                    host_pools,
-                    warp_max_acc.get_multi_ptr<sycl::access::decorated::no>().get(),
-                    item);
-            });
+        cgh.parallel_for(sycl::nd_range<3>(grid * sycl::range<3>(1, 1, KV_Q8_GROUP), sycl::range<3>(1, 1, KV_Q8_GROUP)),
+                         [=](sycl::nd_item<3> item) [[sycl::reqd_sub_group_size(32)]] {
+                             kv_append_q8_kernel(k_q, v_q, k_scale, v_scale, page_table, step, kcur, vcur,
+                                                 (int)s.n_head_kv, (int)s.head_dim, (int)s.page_size, host_pools,
+                                                 warp_max_acc.get_multi_ptr<sycl::access::decorated::no>().get(), item);
+                         });
     });
     if (!stream) default_queue.wait();
 }
@@ -140,17 +127,12 @@ void kv_gather_q8_step(const int8_t* k_q, const int8_t* v_q, const uint16_t* k_s
     validate(s, "kv_gather_q8");
     if (max_ids <= 0) return;
     const long long total = max_ids * s.n_head_kv * (s.head_dim / 4);
-    const unsigned blocks = (unsigned) ((total + 255) / 256);
+    const unsigned blocks = (unsigned)((total + 255) / 256);
     sycl::queue* q = stream ? static_cast<sycl::queue*>(stream) : &default_queue;
-    q->parallel_for(
-        sycl::nd_range<1>(sycl::range<1>(blocks * 256),
-                          sycl::range<1>(256)),
-        [=](sycl::nd_item<1> item) {
-            kv_gather_q8_kernel(
-                k_q, v_q, k_scale, v_scale, page_table, ids,
-                step, (int)s.n_head_kv, (int)s.head_dim,
-                (int)s.page_size, k_scratch, v_scratch, item);
-        });
+    q->parallel_for(sycl::nd_range<1>(sycl::range<1>(blocks * 256), sycl::range<1>(256)), [=](sycl::nd_item<1> item) {
+        kv_gather_q8_kernel(k_q, v_q, k_scale, v_scale, page_table, ids, step, (int)s.n_head_kv, (int)s.head_dim,
+                            (int)s.page_size, k_scratch, v_scratch, item);
+    });
     if (!stream) default_queue.wait();
 }
 

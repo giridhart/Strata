@@ -11,8 +11,8 @@
 namespace {
 
 void ref_step(std::vector<double>& state, const std::vector<float>& q, const std::vector<float>& k,
-              const std::vector<float>& v, const std::vector<float>& gate, const std::vector<float>& beta,
-              int S, int h_k, int h_v, std::vector<float>& o) {
+              const std::vector<float>& v, const std::vector<float>& gate, const std::vector<float>& beta, int S,
+              int h_k, int h_v, std::vector<float>& o) {
     auto at = [&](int i, int j, int h) -> double& { return state[(size_t)(i * S + j) * h_v + h]; };
     std::vector<float> oo((size_t)h_v * S, 0.0f);
     const double scale = 1.0 / std::sqrt((double)S);
@@ -22,23 +22,25 @@ void ref_step(std::vector<double>& state, const std::vector<float>& q, const std
         const double b = (double)beta[(size_t)h];
         for (int j = 0; j < S; ++j) {
             double sk = 0.0;
-            for (int i = 0; i < S; ++i) sk += at(i, j, h) * (double)k[(size_t)(src * S + i)];
+            for (int i = 0; i < S; ++i)
+                sk += at(i, j, h) * (double)k[(size_t)(src * S + i)];
             const double d = ((double)v[(size_t)(h * S + j)] - dec * sk) * b;
-            for (int i = 0; i < S; ++i) at(i, j, h) = dec * at(i, j, h) + (double)k[(size_t)(src * S + i)] * d;
+            for (int i = 0; i < S; ++i)
+                at(i, j, h) = dec * at(i, j, h) + (double)k[(size_t)(src * S + i)] * d;
             double dot = 0.0;
-            for (int i = 0; i < S; ++i) dot += at(i, j, h) * (double)q[(size_t)(src * S + i)];
+            for (int i = 0; i < S; ++i)
+                dot += at(i, j, h) * (double)q[(size_t)(src * S + i)];
             oo[(size_t)(h * S + j)] = (float)(dot * scale);
         }
     }
     o = oo;
 }
 
-} // namespace
+}  // namespace
 
 int main() {
     sycl::queue q{sycl::property::queue::in_order()};
-    printf("Running native_gdn SYCL test on device: %s\n",
-           q.get_device().get_info<sycl::info::device::name>().c_str());
+    printf("Running native_gdn SYCL test on device: %s\n", q.get_device().get_info<sycl::info::device::name>().c_str());
 
     constexpr int S = 128;
     struct Config {
@@ -46,10 +48,7 @@ int main() {
         const char* desc;
     };
     const Config configs[] = {
-        {1, 1, "h_k=1, h_v=1"},
-        {2, 4, "h_k=2, h_v=4"},
-        {16, 48, "Qwen Flash-Next (h_k=16, h_v=48)"}
-    };
+        {1, 1, "h_k=1, h_v=1"}, {2, 4, "h_k=2, h_v=4"}, {16, 48, "Qwen Flash-Next (h_k=16, h_v=48)"}};
 
     std::mt19937 rng(42);
     std::normal_distribution<float> gauss(0.0f, 1.0f);
@@ -66,18 +65,23 @@ int main() {
                 for (int h = 0; h < h_v; ++h) {
                     const float val = (float)(0.001 * (i + 2 * j + 3 * h) - 1.0);
                     st_ref[(size_t)(i * S + j) * h_v + h] = val;
-                    st_dev[(size_t)(i * h_v + h) * S + j] = val; // Strata layout: (i*h_v + h)*S + j
+                    st_dev[(size_t)(i * h_v + h) * S + j] = val;  // Strata layout: (i*h_v + h)*S + j
                 }
             }
         }
 
         std::vector<float> q_vec((size_t)h_k * S), k_vec((size_t)h_k * S), v_vec((size_t)h_v * S);
         std::vector<float> gate_vec((size_t)h_v), beta_vec((size_t)h_v);
-        for (auto& x : q_vec) x = gauss(rng) * 0.1f;
-        for (auto& x : k_vec) x = gauss(rng) * 0.1f;
-        for (auto& x : v_vec) x = gauss(rng);
-        for (auto& x : gate_vec) x = -(2.0f + 4.0f * (float)(rng() % 100) / 100.0f);
-        for (auto& x : beta_vec) x = (float)(rng() % 100) / 100.0f;
+        for (auto& x : q_vec)
+            x = gauss(rng) * 0.1f;
+        for (auto& x : k_vec)
+            x = gauss(rng) * 0.1f;
+        for (auto& x : v_vec)
+            x = gauss(rng);
+        for (auto& x : gate_vec)
+            x = -(2.0f + 4.0f * (float)(rng() % 100) / 100.0f);
+        for (auto& x : beta_vec)
+            x = (float)(rng() % 100) / 100.0f;
 
         std::vector<float> want_o;
         std::vector<double> st_ref_mod = st_ref;
@@ -137,8 +141,8 @@ int main() {
             }
         }
 
-        printf("  %s: out max_rel=%.3e (bad=%d), state max_rel=%.3e (bad=%d)\n",
-               cfg.desc, max_rel_o, bad_o, max_rel_st, bad_st);
+        printf("  %s: out max_rel=%.3e (bad=%d), state max_rel=%.3e (bad=%d)\n", cfg.desc, max_rel_o, bad_o, max_rel_st,
+               bad_st);
         total_bad += bad_o + bad_st;
 
         sycl::free(d_st, q);

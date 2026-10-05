@@ -48,81 +48,89 @@ float to_bf16(float f) {
 uint16_t bf16_bits(float f) {
     uint32_t i;
     std::memcpy(&i, &f, 4);
-    return (uint16_t) (i >> 16);
+    return (uint16_t)(i >> 16);
 }
 
 struct Opts {
-    bool per_stream_norm = true;   ///< false: one RMS over the whole stack (WRONG)
-    bool scale_inside_silu = true; ///< false: silu(proj)/hc instead of silu(proj/hc) (WRONG)
-    bool sigmoid_on_gate = true;   ///< false: silu on the gate and sigmoid on lo (WRONG)
-    bool mean_over_streams = true; ///< false: sum over streams instead of mean (WRONG)
-    bool round_activation = true;  ///< false: pinned CUDA single-token BF16 MMVF contract
+    bool per_stream_norm = true;    ///< false: one RMS over the whole stack (WRONG)
+    bool scale_inside_silu = true;  ///< false: silu(proj)/hc instead of silu(proj/hc) (WRONG)
+    bool sigmoid_on_gate = true;    ///< false: silu on the gate and sigmoid on lo (WRONG)
+    bool mean_over_streams = true;  ///< false: sum over streams instead of mean (WRONG)
+    bool round_activation = true;   ///< false: pinned CUDA single-token BF16 MMVF contract
 };
 
 /// `ref/gr.py::gr_read`, transcribed with switches for the rival readings.
-void reference(const std::vector<float>& R, const std::vector<float>& w_norm,
-               const std::vector<float>& w_down, const std::vector<float>& w_up,
-               const std::vector<float>& w_inject, float eps, long long n_embd, long long hc, long long hc_lr,
-               const Opts& o, std::vector<float>& mixed, std::vector<float>& inject) {
+void reference(const std::vector<float>& R, const std::vector<float>& w_norm, const std::vector<float>& w_down,
+               const std::vector<float>& w_up, const std::vector<float>& w_inject, float eps, long long n_embd,
+               long long hc, long long hc_lr, const Opts& o, std::vector<float>& mixed, std::vector<float>& inject) {
     const long long hc_dim = hc * n_embd;
-    std::vector<float> xn((size_t) hc_dim);
+    std::vector<float> xn((size_t)hc_dim);
     if (o.per_stream_norm) {
         for (long long c = 0; c < hc; ++c) {
             double ms = 0;
-            for (long long d = 0; d < n_embd; ++d) ms += (double) R[(size_t) (c * n_embd + d)] * R[(size_t) (c * n_embd + d)];
-            ms /= (double) n_embd;
-            const float rs = (float) (1.0 / std::sqrt(ms + (double) eps));
+            for (long long d = 0; d < n_embd; ++d)
+                ms += (double)R[(size_t)(c * n_embd + d)] * R[(size_t)(c * n_embd + d)];
+            ms /= (double)n_embd;
+            const float rs = (float)(1.0 / std::sqrt(ms + (double)eps));
             for (long long d = 0; d < n_embd; ++d) {
-                const size_t i = (size_t) (c * n_embd + d);
+                const size_t i = (size_t)(c * n_embd + d);
                 xn[i] = R[i] * rs * w_norm[i];
             }
         }
     } else {
         double ms = 0;
-        for (long long i = 0; i < hc_dim; ++i) ms += (double) R[(size_t) i] * R[(size_t) i];
-        ms /= (double) hc_dim;
-        const float rs = (float) (1.0 / std::sqrt(ms + (double) eps));
-        for (long long i = 0; i < hc_dim; ++i) xn[(size_t) i] = R[(size_t) i] * rs * w_norm[(size_t) i];
+        for (long long i = 0; i < hc_dim; ++i)
+            ms += (double)R[(size_t)i] * R[(size_t)i];
+        ms /= (double)hc_dim;
+        const float rs = (float)(1.0 / std::sqrt(ms + (double)eps));
+        for (long long i = 0; i < hc_dim; ++i)
+            xn[(size_t)i] = R[(size_t)i] * rs * w_norm[(size_t)i];
     }
 
-    std::vector<float> act((size_t) hc_dim);
-    for (long long i = 0; i < hc_dim; ++i) act[(size_t) i] = o.round_activation ? to_bf16(xn[(size_t) i]) : xn[(size_t) i];
+    std::vector<float> act((size_t)hc_dim);
+    for (long long i = 0; i < hc_dim; ++i)
+        act[(size_t)i] = o.round_activation ? to_bf16(xn[(size_t)i]) : xn[(size_t)i];
 
     // lo
-    std::vector<float> lo((size_t) hc_lr);
+    std::vector<float> lo((size_t)hc_lr);
     for (long long k = 0; k < hc_lr; ++k) {
         double a = 0;
-        for (long long i = 0; i < hc_dim; ++i) a += (double) act[(size_t) i] * (double) w_down[(size_t) (k * hc_dim + i)];
-        const float p = (float) a;
-        if (o.sigmoid_on_gate) lo[(size_t) k] = o.scale_inside_silu ? (p / (float) hc) / (1.0f + std::exp(-(p / (float) hc)))
-                                                                  : (p / (1.0f + std::exp(-p))) / (float) hc;
-        else                   lo[(size_t) k] = o.scale_inside_silu ? 1.0f / (1.0f + std::exp(-(p / (float) hc)))
-                                                                    : (1.0f / (1.0f + std::exp(-p))) / (float) hc;
+        for (long long i = 0; i < hc_dim; ++i)
+            a += (double)act[(size_t)i] * (double)w_down[(size_t)(k * hc_dim + i)];
+        const float p = (float)a;
+        if (o.sigmoid_on_gate)
+            lo[(size_t)k] = o.scale_inside_silu ? (p / (float)hc) / (1.0f + std::exp(-(p / (float)hc)))
+                                                : (p / (1.0f + std::exp(-p))) / (float)hc;
+        else
+            lo[(size_t)k] = o.scale_inside_silu ? 1.0f / (1.0f + std::exp(-(p / (float)hc)))
+                                                : (1.0f / (1.0f + std::exp(-p))) / (float)hc;
     }
-    std::vector<float> lq((size_t) hc_lr);
+    std::vector<float> lq((size_t)hc_lr);
     for (long long k = 0; k < hc_lr; ++k)
-        lq[(size_t) k] = o.round_activation ? to_bf16(lo[(size_t) k]) : lo[(size_t) k];
+        lq[(size_t)k] = o.round_activation ? to_bf16(lo[(size_t)k]) : lo[(size_t)k];
 
     // gate and the gated mean
-    mixed.assign((size_t) n_embd, 0.0f);
+    mixed.assign((size_t)n_embd, 0.0f);
     for (long long d = 0; d < n_embd; ++d) {
         float m = 0.0f;
         for (long long c = 0; c < hc; ++c) {
             const long long i = c * n_embd + d;
             double a = 0;
-            for (long long k = 0; k < hc_lr; ++k) a += (double) lq[(size_t) k] * (double) w_up[(size_t) (i * hc_lr + k)];
-            const float g = (float) a;
+            for (long long k = 0; k < hc_lr; ++k)
+                a += (double)lq[(size_t)k] * (double)w_up[(size_t)(i * hc_lr + k)];
+            const float g = (float)a;
             const float s = o.sigmoid_on_gate ? 1.0f / (1.0f + std::exp(-g)) : g / (1.0f + std::exp(-g));
-            m += xn[(size_t) i] * s;
+            m += xn[(size_t)i] * s;
         }
-        mixed[(size_t) d] = o.mean_over_streams ? m / (float) hc : m;
+        mixed[(size_t)d] = o.mean_over_streams ? m / (float)hc : m;
     }
 
-    inject.assign((size_t) hc, 0.0f);
+    inject.assign((size_t)hc, 0.0f);
     for (long long c = 0; c < hc; ++c) {
         double a = 0;
-        for (long long i = 0; i < hc_dim; ++i) a += (double) act[(size_t) i] * (double) w_inject[(size_t) (c * hc_dim + i)];
-        inject[(size_t) c] = (float) a;
+        for (long long i = 0; i < hc_dim; ++i)
+            a += (double)act[(size_t)i] * (double)w_inject[(size_t)(c * hc_dim + i)];
+        inject[(size_t)c] = (float)a;
     }
 }
 
@@ -130,10 +138,10 @@ void reference(const std::vector<float>& R, const std::vector<float>& w_norm,
 double rel_diff(const std::vector<float>& a, const std::vector<float>& b, double* mag_out = nullptr) {
     double d = 0, mag = 0;
     for (size_t i = 0; i < a.size(); ++i) {
-        d += std::fabs((double) a[i] - (double) b[i]);
-        mag += std::fabs((double) a[i]);
+        d += std::fabs((double)a[i] - (double)b[i]);
+        mag += std::fabs((double)a[i]);
     }
-    if (mag_out) *mag_out = mag / (double) (a.empty() ? 1 : a.size());
+    if (mag_out) *mag_out = mag / (double)(a.empty() ? 1 : a.size());
     return d / (mag > 1e-30 ? mag : 1e-30);
 }
 
@@ -148,9 +156,7 @@ double rel_terms(double want, double got, double term_a, double term_b) {
     return std::fabs(want - got) / (den > 1e-30 ? den : 1e-30);
 }
 
-const char* activation_mode_name(int mode) {
-    return mode == 2 ? "native pinned GR" : (mode == 1 ? "FP32" : "BF16");
-}
+const char* activation_mode_name(int mode) { return mode == 2 ? "native pinned GR" : (mode == 1 ? "FP32" : "BF16"); }
 void select_activation_mode(int mode) {
     strata::kernels::gr_set_native_mmvf(mode == 2);
     // In mode 2 the precision-only switch is deliberately false: native MMVF must imply FP32 by itself.
@@ -168,10 +174,10 @@ int scalar_activation_contract() {
 
     using namespace strata::kernels;
     const GrShapes sh{2, 1, 2};
-    float *d_R = sycl::malloc_device<float>(2, q);
-    float *d_norm = sycl::malloc_device<float>(2, q);
-    float *d_mixed = sycl::malloc_device<float>(2, q);
-    float *d_inject = sycl::malloc_device<float>(1, q);
+    float* d_R = sycl::malloc_device<float>(2, q);
+    float* d_norm = sycl::malloc_device<float>(2, q);
+    float* d_mixed = sycl::malloc_device<float>(2, q);
+    float* d_inject = sycl::malloc_device<float>(1, q);
     uint16_t* d_weights = sycl::malloc_device<uint16_t>(10, q);
     void* d_scratch = (void*)sycl::malloc_device(gr_workspace_bytes(sh), q);
 
@@ -179,9 +185,16 @@ int scalar_activation_contract() {
     gr_workspace_init(sh, d_scratch, ws);
     const float ones[] = {1.0f, 1.0f};
     const uint16_t weights[] = {
-        bf16_bits(0.5f), 0, 0, 0,             // down: lo[0]=silu(xn[0]/2), lo[1]=0
-        bf16_bits(1.5f), 0, bf16_bits(1.5f), 0, // both gate rows consume lo[0]
-        bf16_bits(2.0f), 0                     // injection: 2*xn[0]
+        bf16_bits(0.5f),
+        0,
+        0,
+        0,  // down: lo[0]=silu(xn[0]/2), lo[1]=0
+        bf16_bits(1.5f),
+        0,
+        bf16_bits(1.5f),
+        0,  // both gate rows consume lo[0]
+        bf16_bits(2.0f),
+        0  // injection: 2*xn[0]
     };
     q.memcpy(d_R, ones, sizeof(ones)).wait();
     q.memcpy(d_weights, weights, sizeof(weights)).wait();
@@ -193,14 +206,12 @@ int scalar_activation_contract() {
         float mixed_by_mode[3][2] = {}, inject_by_mode[3] = {};
         for (int mode = 0; mode < 3; ++mode) {
             select_activation_mode(mode);
-            gr_read(d_R, d_norm, d_weights, d_weights + 4, d_weights + 8, 0.0f,
-                    sh, ws, d_mixed, d_inject, &stream);
+            gr_read(d_R, d_norm, d_weights, d_weights + 4, d_weights + 8, 0.0f, sh, ws, d_mixed, d_inject, &stream);
             stream.wait();
             cudaGraph_t graph;
             cudaGraphExec_t executable;
             cudaStreamBeginCapture(&stream, cudaStreamCaptureModeThreadLocal);
-            gr_read(d_R, d_norm, d_weights, d_weights + 4, d_weights + 8, 0.0f,
-                    sh, ws, d_mixed, d_inject, &stream);
+            gr_read(d_R, d_norm, d_weights, d_weights + 4, d_weights + 8, 0.0f, sh, ws, d_mixed, d_inject, &stream);
             cudaStreamEndCapture(&stream, &graph);
             cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0);
             // Changing both host options after capture cannot change the graph's selected kernels.
@@ -213,8 +224,7 @@ int scalar_activation_contract() {
             // In CUDA, graph capture preserved the kernels selected at capture time (`mode`).
             // To faithfully emulate graph replay in SYCL:
             select_activation_mode(mode);
-            gr_read(d_R, d_norm, d_weights, d_weights + 4, d_weights + 8, 0.0f,
-                    sh, ws, d_mixed, d_inject, &stream);
+            gr_read(d_R, d_norm, d_weights, d_weights + 4, d_weights + 8, 0.0f, sh, ws, d_mixed, d_inject, &stream);
             stream.wait();
             q.memcpy(mixed_by_mode[mode], d_mixed, 2 * sizeof(float)).wait();
             q.memcpy(&inject_by_mode[mode], d_inject, sizeof(float)).wait();
@@ -230,11 +240,9 @@ int scalar_activation_contract() {
             // actual pinned CUDA graphs. The nonzero projection/injection here
             // has only one exactly representable product and remains exact.
             const bool ok = std::fabs(mixed_by_mode[mode][0] - expected_mixed) <= 2e-7f &&
-                            mixed_by_mode[mode][0] == mixed_by_mode[mode][1] &&
-                            inject_by_mode[mode] == expected_inject;
-            std::printf("  scalar gamma %.8f %s activation/capture %s (mixed %.9f, ref %.9f)\n",
-                        gamma, activation_mode_name(mode), ok ? "pass" : "FAIL",
-                        mixed_by_mode[mode][0], expected_mixed);
+                            mixed_by_mode[mode][0] == mixed_by_mode[mode][1] && inject_by_mode[mode] == expected_inject;
+            std::printf("  scalar gamma %.8f %s activation/capture %s (mixed %.9f, ref %.9f)\n", gamma,
+                        activation_mode_name(mode), ok ? "pass" : "FAIL", mixed_by_mode[mode][0], expected_mixed);
             if (!ok) ++bad;
             cudaGraphExecDestroy(executable);
             cudaGraphDestroy(graph);
@@ -242,13 +250,13 @@ int scalar_activation_contract() {
             const float sentinel = -73.25f;
             q.memcpy(d_inject, &sentinel, sizeof(float)).wait();
             select_activation_mode(mode);
-            gr_read(d_R, d_norm, d_weights, d_weights + 4, nullptr, 0.0f,
-                    sh, ws, d_mixed, d_inject, &stream);
+            gr_read(d_R, d_norm, d_weights, d_weights + 4, nullptr, 0.0f, sh, ws, d_mixed, d_inject, &stream);
             stream.wait();
             float final_mixed[2] = {}, untouched = 0.0f;
             q.memcpy(final_mixed, d_mixed, sizeof(final_mixed)).wait();
             q.memcpy(&untouched, d_inject, sizeof(float)).wait();
-            const bool final_ok = std::memcmp(final_mixed, mixed_by_mode[mode], sizeof(final_mixed)) == 0 && untouched == sentinel;
+            const bool final_ok =
+                std::memcmp(final_mixed, mixed_by_mode[mode], sizeof(final_mixed)) == 0 && untouched == sentinel;
             std::printf("  scalar final mixer %s %s\n", activation_mode_name(mode), final_ok ? "pass" : "FAIL");
             if (!final_ok) ++bad;
         }
@@ -263,14 +271,16 @@ int scalar_activation_contract() {
         }
     }
     select_activation_mode(0);
-    sycl::free(d_R, q); sycl::free(d_norm, q);
-    sycl::free(d_mixed, q); sycl::free(d_inject, q);
-    sycl::free(d_weights, q); sycl::free(d_scratch, q);
+    sycl::free(d_R, q);
+    sycl::free(d_norm, q);
+    sycl::free(d_mixed, q);
+    sycl::free(d_inject, q);
+    sycl::free(d_weights, q);
+    sycl::free(d_scratch, q);
     return bad;
 }
 
-int fused_multi_lds_parity(const float *d_norm, const uint16_t *d_down,
-                           const uint16_t *d_up, const uint16_t *d_inject,
+int fused_multi_lds_parity(const float* d_norm, const uint16_t* d_down, const uint16_t* d_up, const uint16_t* d_inject,
                            float eps) {
     auto gpus = sycl::device::get_devices(sycl::info::device_type::gpu);
     sycl::device dev = gpus.empty() ? sycl::device(sycl::default_selector_v) : gpus.front();
@@ -281,20 +291,23 @@ int fused_multi_lds_parity(const float *d_norm, const uint16_t *d_down,
     constexpr int N = 2560, HC = 4, LR = 320, D = N * HC, T = kFusedGrMaxT;
     std::mt19937 rng(0x6f8a);
     std::normal_distribution<float> normal(0.0f, 0.3f);
-    std::vector<float> r((size_t) T * D), bo((size_t) T * N), inj((size_t) T * HC);
-    for (auto& x : r) x = normal(rng);
-    for (auto& x : bo) x = normal(rng);
-    for (auto& x : inj) x = normal(rng);
+    std::vector<float> r((size_t)T * D), bo((size_t)T * N), inj((size_t)T * HC);
+    for (auto& x : r)
+        x = normal(rng);
+    for (auto& x : bo)
+        x = normal(rng);
+    for (auto& x : inj)
+        x = normal(rng);
 
-    float *d_r = sycl::malloc_device<float>(r.size(), q);
-    float *d_r_out = sycl::malloc_device<float>(r.size(), q);
-    float *d_bo = sycl::malloc_device<float>(bo.size(), q);
-    float *d_inj = sycl::malloc_device<float>(inj.size(), q);
-    float *d_lo = sycl::malloc_device<float>((size_t)T * LR, q);
-    float *d_rs = sycl::malloc_device<float>((size_t)T * HC, q);
-    float *d_inj_out = sycl::malloc_device<float>((size_t)T * HC, q);
-    float *d_mixed = sycl::malloc_device<float>((size_t)T * N, q);
-    float *d_xn = sycl::malloc_device<float>((size_t)T * D, q);
+    float* d_r = sycl::malloc_device<float>(r.size(), q);
+    float* d_r_out = sycl::malloc_device<float>(r.size(), q);
+    float* d_bo = sycl::malloc_device<float>(bo.size(), q);
+    float* d_inj = sycl::malloc_device<float>(inj.size(), q);
+    float* d_lo = sycl::malloc_device<float>((size_t)T * LR, q);
+    float* d_rs = sycl::malloc_device<float>((size_t)T * HC, q);
+    float* d_inj_out = sycl::malloc_device<float>((size_t)T * HC, q);
+    float* d_mixed = sycl::malloc_device<float>((size_t)T * N, q);
+    float* d_xn = sycl::malloc_device<float>((size_t)T * D, q);
 
     q.memcpy(d_r, r.data(), r.size() * sizeof(float)).wait();
     q.memcpy(d_bo, bo.data(), bo.size() * sizeof(float)).wait();
@@ -303,20 +316,20 @@ int fused_multi_lds_parity(const float *d_norm, const uint16_t *d_down,
     std::vector<FusedGrArgs> args(T);
     for (int t = 0; t < T; ++t) {
         auto& a = args[t];
-        a.R = d_r + (size_t) t * D;
-        a.R_out = d_r_out + (size_t) t * D;
+        a.R = d_r + (size_t)t * D;
+        a.R_out = d_r_out + (size_t)t * D;
         a.apply = true;
-        a.bo_prev = d_bo + (size_t) t * N;
-        a.inj_prev = d_inj + (size_t) t * HC;
+        a.bo_prev = d_bo + (size_t)t * N;
+        a.inj_prev = d_inj + (size_t)t * HC;
         a.w_norm = d_norm;
         a.w_down = d_down;
         a.w_up = d_up;
         a.w_inject = d_inject;
         a.eps = eps;
-        a.lo = d_lo + (size_t) t * LR;
-        a.rs = d_rs + (size_t) t * HC;
-        a.inject_out = d_inj_out + (size_t) t * HC;
-        a.mixed = d_mixed + (size_t) t * N;
+        a.lo = d_lo + (size_t)t * LR;
+        a.rs = d_rs + (size_t)t * HC;
+        a.inject_out = d_inj_out + (size_t)t * HC;
+        a.mixed = d_mixed + (size_t)t * N;
     }
 
     struct Snapshot {
@@ -324,11 +337,11 @@ int fused_multi_lds_parity(const float *d_norm, const uint16_t *d_down,
     };
     auto snapshot = [&]() {
         Snapshot s;
-        s.r_out.resize((size_t) T * D);
-        s.lo.resize((size_t) T * LR);
-        s.rs.resize((size_t) T * HC);
-        s.inject.resize((size_t) T * HC);
-        s.mixed.resize((size_t) T * N);
+        s.r_out.resize((size_t)T * D);
+        s.lo.resize((size_t)T * LR);
+        s.rs.resize((size_t)T * HC);
+        s.inject.resize((size_t)T * HC);
+        s.mixed.resize((size_t)T * N);
         q.memcpy(s.r_out.data(), d_r_out, s.r_out.size() * sizeof(float)).wait();
         q.memcpy(s.lo.data(), d_lo, s.lo.size() * sizeof(float)).wait();
         q.memcpy(s.rs.data(), d_rs, s.rs.size() * sizeof(float)).wait();
@@ -338,19 +351,23 @@ int fused_multi_lds_parity(const float *d_norm, const uint16_t *d_down,
     };
     // the split read (STRATA_GR_V3=1) sums in another order than the single-token kernel: equal within float
     // rounding, not to the bit, so it is compared with a relative tolerance; the default kernels bit for bit
-    static const bool v3 = [] { const char* v = std::getenv("STRATA_GR_V3"); return v != nullptr && std::atoi(v) != 0; }();
+    static const bool v3 = [] {
+        const char* v = std::getenv("STRATA_GR_V3");
+        return v != nullptr && std::atoi(v) != 0;
+    }();
     auto close = [](const std::vector<float>& x, const std::vector<float>& y) {
         double worst = 0.0, mag = 1e-30;
         for (size_t i = 0; i < x.size(); ++i) {
-            worst = std::max(worst, (double) std::fabs(x[i] - y[i]));
-            mag = std::max(mag, (double) std::fabs(y[i]));
+            worst = std::max(worst, (double)std::fabs(x[i] - y[i]));
+            mag = std::max(mag, (double)std::fabs(y[i]));
         }
         if (worst > 2e-6 * mag)
-            std::printf("    tolerance: worst %.3e of max |ref| %.3e (rel %.3e), n %zu\n", worst, mag, worst / mag, x.size());
+            std::printf("    tolerance: worst %.3e of max |ref| %.3e (rel %.3e), n %zu\n", worst, mag, worst / mag,
+                        x.size());
         return worst <= 2e-6 * mag;
     };
     auto same = [&](const Snapshot& a, const Snapshot& b) {
-        if (v3)   // `lo` is the default kernels' workspace between down and up; the split read keeps it in shared memory
+        if (v3)  // `lo` is the default kernels' workspace between down and up; the split read keeps it in shared memory
             return close(a.r_out, b.r_out) && close(a.rs, b.rs) && close(a.inject, b.inject) && close(a.mixed, b.mixed);
         return std::memcmp(a.r_out.data(), b.r_out.data(), a.r_out.size() * sizeof(float)) == 0 &&
                std::memcmp(a.lo.data(), b.lo.data(), a.lo.size() * sizeof(float)) == 0 &&
@@ -363,7 +380,8 @@ int fused_multi_lds_parity(const float *d_norm, const uint16_t *d_down,
     fused_gr_read_multi(args.data(), T, d_xn, &stream);
     stream.wait();
     const Snapshot multi = snapshot();
-    for (int t = 0; t < T; ++t) fused_gr_read(args[t], &stream);
+    for (int t = 0; t < T; ++t)
+        fused_gr_read(args[t], &stream);
     stream.wait();
     const Snapshot single = snapshot();
     int bad = 0;
@@ -387,9 +405,12 @@ int fused_multi_lds_parity(const float *d_norm, const uint16_t *d_down,
     }
 
     // Reuse the same captured pointers with new payloads; then independently run the single-token path again.
-    for (size_t i = 0; i < r.size(); ++i) r[i] = -0.7f * r[i] + 0.001f * (float) (i % 17);
-    for (size_t i = 0; i < bo.size(); ++i) bo[i] = -0.4f * bo[i] + 0.02f;
-    for (size_t i = 0; i < inj.size(); ++i) inj[i] += 0.3f;
+    for (size_t i = 0; i < r.size(); ++i)
+        r[i] = -0.7f * r[i] + 0.001f * (float)(i % 17);
+    for (size_t i = 0; i < bo.size(); ++i)
+        bo[i] = -0.4f * bo[i] + 0.02f;
+    for (size_t i = 0; i < inj.size(); ++i)
+        inj[i] += 0.3f;
 
     stream.memcpy(d_r, r.data(), r.size() * sizeof(float));
     stream.memcpy(d_bo, bo.data(), bo.size() * sizeof(float));
@@ -401,15 +422,15 @@ int fused_multi_lds_parity(const float *d_norm, const uint16_t *d_down,
         std::printf("  fused GR graph replay ignored changed inputs\n");
         ++bad;
     }
-    for (int t = 0; t < T; ++t) fused_gr_read(args[t], &stream);
+    for (int t = 0; t < T; ++t)
+        fused_gr_read(args[t], &stream);
     stream.wait();
     if (!same(replay, snapshot())) {
         std::printf("  fused GR changed graph replay differs from single-token calls\n");
         ++bad;
     }
 
-    std::printf("  fused GR multi max-T=8 LDS launch and changing graph replay %s\n",
-                bad == 0 ? "pass" : "FAIL");
+    std::printf("  fused GR multi max-T=8 LDS launch and changing graph replay %s\n", bad == 0 ? "pass" : "FAIL");
     cudaGraphExecDestroy(graph_exec);
     cudaGraphDestroy(graph);
     sycl::free(d_xn, q);
@@ -426,14 +447,18 @@ int fused_multi_lds_parity(const float *d_norm, const uint16_t *d_down,
 
 }  // namespace
 
-int main(int argc, char **argv) {
+int main(int argc, char** argv) {
     auto gpus = sycl::device::get_devices(sycl::info::device_type::gpu);
     sycl::device dev = gpus.empty() ? sycl::device(sycl::default_selector_v) : gpus.front();
     sycl::queue q(dev, sycl::property::queue::in_order{});
     bool selftest = false;
     for (int i = 1; i < argc; ++i) {
-        if (std::string(argv[i]) == "--selftest") selftest = true;
-        else { std::fprintf(stderr, "usage: gr_parity [--selftest]\n"); return 2; }
+        if (std::string(argv[i]) == "--selftest")
+            selftest = true;
+        else {
+            std::fprintf(stderr, "usage: gr_parity [--selftest]\n");
+            return 2;
+        }
     }
 
     const long long n_embd = 256, hc = 4, hc_lr = 32;
@@ -447,23 +472,27 @@ int main(int argc, char **argv) {
     // and the test would then be measuring the fixture.
     auto bf16_weight = [&](size_t n, float sigma) {
         std::vector<float> v(n);
-        for (auto& x : v) x = to_bf16(gauss(rng) * sigma);
+        for (auto& x : v)
+            x = to_bf16(gauss(rng) * sigma);
         return v;
     };
-    std::vector<float> R((size_t) hc_dim);
-    for (auto& x : R) x = gauss(rng);
+    std::vector<float> R((size_t)hc_dim);
+    for (auto& x : R)
+        x = gauss(rng);
     // STREAM SCALES 1, 4, 16, 64.  Without them trap 1 is only ~5% observable, because four streams of i.i.d.
     // normal noise have nearly the same RMS by accident - so a whole-stack RMS and a per-stream RMS agree to
     // within the noise, and the fixture would be asserting a distinction it cannot see.  Giving the streams
     // different magnitudes is what makes "per-stream" a claim with content.
     for (long long c = 0; c < hc; ++c)
-        for (long long d = 0; d < n_embd; ++d) R[(size_t) (c * n_embd + d)] *= std::pow(4.0f, (float) c);
+        for (long long d = 0; d < n_embd; ++d)
+            R[(size_t)(c * n_embd + d)] *= std::pow(4.0f, (float)c);
     // gamma stored as (1 + w), so values near 1 - a reader expecting a plain scale is the one this catches
-    std::vector<float> w_norm((size_t) hc_dim);
-    for (auto& x : w_norm) x = 1.0f + 0.1f * gauss(rng);
-    std::vector<float> w_down = bf16_weight((size_t) (hc_lr * hc_dim), 0.2f);
-    std::vector<float> w_up = bf16_weight((size_t) (hc_dim * hc_lr), 0.2f);
-    std::vector<float> w_inject = bf16_weight((size_t) (hc * hc_dim), 0.05f);
+    std::vector<float> w_norm((size_t)hc_dim);
+    for (auto& x : w_norm)
+        x = 1.0f + 0.1f * gauss(rng);
+    std::vector<float> w_down = bf16_weight((size_t)(hc_lr * hc_dim), 0.2f);
+    std::vector<float> w_up = bf16_weight((size_t)(hc_dim * hc_lr), 0.2f);
+    std::vector<float> w_inject = bf16_weight((size_t)(hc * hc_dim), 0.05f);
 
     // NO PERMUTATION: the kernel takes both matrices exactly as the manifest (and `ref/gr.py`) store them.
     // `w_down` is (hc_lr, hc_dim) row-major and `w_up` is (hc_dim, hc_lr) row-major, so the bit-copy below is
@@ -472,18 +501,21 @@ int main(int argc, char **argv) {
     // makes it unnecessary.  What replaces it is the general orientation trap further down: a weight array
     // read with the wrong index expression must still produce a visibly different answer.
     std::vector<uint16_t> q_down(w_down.size()), q_up(w_up.size()), q_inject(w_inject.size());
-    for (size_t i = 0; i < w_down.size(); ++i) q_down[i] = bf16_bits(w_down[i]);
-    for (size_t i = 0; i < w_up.size(); ++i) q_up[i] = bf16_bits(w_up[i]);
-    for (size_t i = 0; i < w_inject.size(); ++i) q_inject[i] = bf16_bits(w_inject[i]);
+    for (size_t i = 0; i < w_down.size(); ++i)
+        q_down[i] = bf16_bits(w_down[i]);
+    for (size_t i = 0; i < w_up.size(); ++i)
+        q_up[i] = bf16_bits(w_up[i]);
+    for (size_t i = 0; i < w_inject.size(); ++i)
+        q_inject[i] = bf16_bits(w_inject[i]);
 
     // ---- device side
-    float *d_R = sycl::malloc_device<float>(R.size(), q);
-    float *d_norm = sycl::malloc_device<float>(w_norm.size(), q);
-    uint16_t *d_down = sycl::malloc_device<uint16_t>(q_down.size(), q);
-    uint16_t *d_up = sycl::malloc_device<uint16_t>(q_up.size(), q);
-    uint16_t *d_inj = sycl::malloc_device<uint16_t>(q_inject.size(), q);
-    float *d_mixed = sycl::malloc_device<float>((size_t)n_embd, q);
-    float *d_inject = sycl::malloc_device<float>((size_t)hc, q);
+    float* d_R = sycl::malloc_device<float>(R.size(), q);
+    float* d_norm = sycl::malloc_device<float>(w_norm.size(), q);
+    uint16_t* d_down = sycl::malloc_device<uint16_t>(q_down.size(), q);
+    uint16_t* d_up = sycl::malloc_device<uint16_t>(q_up.size(), q);
+    uint16_t* d_inj = sycl::malloc_device<uint16_t>(q_inject.size(), q);
+    float* d_mixed = sycl::malloc_device<float>((size_t)n_embd, q);
+    float* d_inject = sycl::malloc_device<float>((size_t)hc, q);
     q.memcpy(d_R, R.data(), R.size() * sizeof(float)).wait();
     q.memcpy(d_norm, w_norm.data(), w_norm.size() * sizeof(float)).wait();
     q.memcpy(d_down, q_down.data(), q_down.size() * sizeof(uint16_t)).wait();
@@ -496,7 +528,7 @@ int main(int argc, char **argv) {
     strata::kernels::GrWorkspace ws;
     strata::kernels::gr_workspace_init(sh, d_ws_raw, ws);
     strata::kernels::gr_read(d_R, d_norm, d_down, d_up, d_inj, eps, sh, ws, d_mixed, d_inject, &q);
-    std::vector<float> got_mixed((size_t) n_embd), got_inject((size_t) hc);
+    std::vector<float> got_mixed((size_t)n_embd), got_inject((size_t)hc);
     q.memcpy(got_mixed.data(), d_mixed, got_mixed.size() * sizeof(float)).wait();
     q.memcpy(got_inject.data(), d_inject, got_inject.size() * sizeof(float)).wait();
 
@@ -507,7 +539,11 @@ int main(int argc, char **argv) {
     std::vector<float> want_mixed, want_inject;
     reference(R, w_norm, w_down, w_up, w_inject, eps, n_embd, hc, hc_lr, right, want_mixed, want_inject);
 
-    struct Trap { const char* name; Opts o; double floor; };
+    struct Trap {
+        const char* name;
+        Opts o;
+        double floor;
+    };
     const Trap traps[] = {
         {"per-stream RMSNorm vs whole-stack", {false, true, true, true, true}, 0.05},
         {"/hc inside the silu vs outside", {true, false, true, true, true}, 0.05},
@@ -520,8 +556,8 @@ int main(int argc, char **argv) {
         reference(R, w_norm, w_down, w_up, w_inject, eps, n_embd, hc, hc_lr, t.o, m, i);
         const double rel = rel_diff(want_mixed, m);
         const bool observable = rel > t.floor;
-        std::printf("  %-40s %-4s (%.4f%% apart, floor %.3f%%)\n", t.name, observable ? "yes" : "*** NO ***",
-                    rel * 100, t.floor * 100);
+        std::printf("  %-40s %-4s (%.4f%% apart, floor %.3f%%)\n", t.name, observable ? "yes" : "*** NO ***", rel * 100,
+                    t.floor * 100);
         if (!observable) {
             std::printf("      *** the fixture cannot see this trap, so passing proves nothing about it ***\n");
             ++bad;
@@ -547,9 +583,11 @@ int main(int argc, char **argv) {
         // Say WHICH elements and by how much: a whole-array L1 hides whether this is one stream wrong (an
         // indexing bug) or all of them slightly wrong (a precision bug), and those need different responses.
         std::printf("    want:");
-        for (long long c = 0; c < hc; ++c) std::printf(" %12.6f", (double) want_inject[(size_t) c]);
+        for (long long c = 0; c < hc; ++c)
+            std::printf(" %12.6f", (double)want_inject[(size_t)c]);
         std::printf("\n    got :");
-        for (long long c = 0; c < hc; ++c) std::printf(" %12.6f", (double) got_inject[(size_t) c]);
+        for (long long c = 0; c < hc; ++c)
+            std::printf(" %12.6f", (double)got_inject[(size_t)c]);
         std::printf("\n");
         ++bad;
     }
@@ -559,7 +597,7 @@ int main(int argc, char **argv) {
     {
         Opts fp32;
         fp32.round_activation = false;
-        std::vector<float> wm, wi, gm((size_t) n_embd), gi((size_t) hc);
+        std::vector<float> wm, wi, gm((size_t)n_embd), gi((size_t)hc);
         reference(R, w_norm, w_down, w_up, w_inject, eps, n_embd, hc, hc_lr, fp32, wm, wi);
         strata::kernels::gr_set_fp32_activations(true);
         strata::kernels::gr_read(d_R, d_norm, d_down, d_up, d_inj, eps, sh, ws, d_mixed, d_inject, &q);
@@ -568,8 +606,7 @@ int main(int argc, char **argv) {
         strata::kernels::gr_set_fp32_activations(false);
         const double rm = rel_diff(wm, gm), ri = rel_diff(wi, gi);
         const bool ok = rm <= 1e-4 && ri <= 1e-4;
-        std::printf("  FP32 activations vs reference: %s (mixed %.3e, inject %.3e)\n",
-                    ok ? "pass" : "FAIL", rm, ri);
+        std::printf("  FP32 activations vs reference: %s (mixed %.3e, inject %.3e)\n", ok ? "pass" : "FAIL", rm, ri);
         if (!ok) ++bad;
         strata::kernels::gr_read(d_R, d_norm, d_down, d_up, d_inj, eps, sh, ws, d_mixed, d_inject, &q);
         q.memcpy(gm.data(), d_mixed, gm.size() * sizeof(float)).wait();
@@ -585,28 +622,28 @@ int main(int argc, char **argv) {
     // inside the kernel are still a place to be wrong, and a wrong one gives right-shaped, wrong-valued
     // output.  Feed transposed copies through the same code path and require the answer to differ.
     {
-        uint16_t *d_down_bad = sycl::malloc_device<uint16_t>(q_down.size(), q);
-        uint16_t *d_up_bad = sycl::malloc_device<uint16_t>(q_up.size(), q);
+        uint16_t* d_down_bad = sycl::malloc_device<uint16_t>(q_down.size(), q);
+        uint16_t* d_up_bad = sycl::malloc_device<uint16_t>(q_up.size(), q);
         std::vector<uint16_t> tr_down(q_down.size()), tr_up(q_up.size());
         for (long long k = 0; k < hc_lr; ++k)
             for (long long i = 0; i < hc_dim; ++i)
-                tr_down[(size_t) (i * hc_lr + k)] = q_down[(size_t) (k * hc_dim + i)];
+                tr_down[(size_t)(i * hc_lr + k)] = q_down[(size_t)(k * hc_dim + i)];
         for (long long i = 0; i < hc_dim; ++i)
             for (long long k = 0; k < hc_lr; ++k)
-                tr_up[(size_t) (k * hc_dim + i)] = q_up[(size_t) (i * hc_lr + k)];
+                tr_up[(size_t)(k * hc_dim + i)] = q_up[(size_t)(i * hc_lr + k)];
         q.memcpy(d_down_bad, tr_down.data(), tr_down.size() * sizeof(uint16_t)).wait();
         q.memcpy(d_up_bad, tr_up.data(), tr_up.size() * sizeof(uint16_t)).wait();
-        std::vector<float> bad_mixed((size_t) n_embd);
+        std::vector<float> bad_mixed((size_t)n_embd);
         float* d_bad = sycl::malloc_device<float>(bad_mixed.size(), q);
-        strata::kernels::gr_read(d_R, d_norm, d_down_bad, d_up_bad, d_inj, eps, sh, ws, d_bad, d_inject,
-                                 &q);
+        strata::kernels::gr_read(d_R, d_norm, d_down_bad, d_up_bad, d_inj, eps, sh, ws, d_bad, d_inject, &q);
         q.memcpy(bad_mixed.data(), d_bad, bad_mixed.size() * sizeof(float)).wait();
         const double rel = rel_diff(want_mixed, bad_mixed);
         const bool visible = rel > 0.05;
-        std::printf("  %-40s %s (%.1f%% apart)\n", "weight orientation is observable",
-                    visible ? "yes" : "*** NO ***", rel * 100);
+        std::printf("  %-40s %s (%.1f%% apart)\n", "weight orientation is observable", visible ? "yes" : "*** NO ***",
+                    rel * 100);
         if (!visible) ++bad;
-        sycl::free(d_down_bad, q); sycl::free(d_up_bad, q);
+        sycl::free(d_down_bad, q);
+        sycl::free(d_up_bad, q);
         sycl::free(d_bad, q);
     }
 
@@ -621,32 +658,33 @@ int main(int argc, char **argv) {
     if (!untouched) ++bad;
 
     // ---- gr_write: the `2*sigmoid` centring, asserted as the PROPERTY the source comment claims
-    std::vector<float> block_out((size_t) n_embd);
-    for (auto& x : block_out) x = gauss(rng);
-    std::vector<float> zero_inj((size_t) hc, 0.0f);
-    float *d_Rw = sycl::malloc_device<float>(R.size(), q);
-    float *d_bo = sycl::malloc_device<float>(block_out.size(), q);
-    float *d_zi = sycl::malloc_device<float>(zero_inj.size(), q);
-    float *d_outw = sycl::malloc_device<float>(R.size(), q);
+    std::vector<float> block_out((size_t)n_embd);
+    for (auto& x : block_out)
+        x = gauss(rng);
+    std::vector<float> zero_inj((size_t)hc, 0.0f);
+    float* d_Rw = sycl::malloc_device<float>(R.size(), q);
+    float* d_bo = sycl::malloc_device<float>(block_out.size(), q);
+    float* d_zi = sycl::malloc_device<float>(zero_inj.size(), q);
+    float* d_outw = sycl::malloc_device<float>(R.size(), q);
     q.memcpy(d_Rw, R.data(), R.size() * sizeof(float)).wait();
     q.memcpy(d_bo, block_out.data(), block_out.size() * sizeof(float)).wait();
     q.memcpy(d_zi, zero_inj.data(), zero_inj.size() * sizeof(float)).wait();
 
     strata::kernels::gr_write(d_Rw, d_bo, d_zi, sh, d_outw, &q);
-    std::vector<float> got_write((size_t) hc_dim);
+    std::vector<float> got_write((size_t)hc_dim);
     q.memcpy(got_write.data(), d_outw, got_write.size() * sizeof(float)).wait();
 
     double worst_plain = 0;
     for (long long c = 0; c < hc; ++c)
         for (long long d = 0; d < n_embd; ++d) {
-            const size_t i = (size_t) (c * n_embd + d);
-            const double want = (double) R[i] + (double) block_out[(size_t) d];
-            worst_plain = std::fmax(worst_plain, rel_terms(want, (double) got_write[i], (double) R[i],
-                                                           (double) block_out[(size_t) d]));
+            const size_t i = (size_t)(c * n_embd + d);
+            const double want = (double)R[i] + (double)block_out[(size_t)d];
+            worst_plain = std::fmax(worst_plain,
+                                    rel_terms(want, (double)got_write[i], (double)R[i], (double)block_out[(size_t)d]));
         }
     const bool plain = worst_plain < 1e-6;
-    std::printf("  %-40s %s (worst rel %.3e)\n", "zero injection -> plain residual add",
-                plain ? "yes" : "*** NO ***", worst_plain);
+    std::printf("  %-40s %s (worst rel %.3e)\n", "zero injection -> plain residual add", plain ? "yes" : "*** NO ***",
+                worst_plain);
     if (!plain) ++bad;
 
     // the rival reading: sigmoid without the 2 halves the update, and must be visible.
@@ -656,36 +694,37 @@ int main(int argc, char **argv) {
     // 100% error in `w` down to 2.27% - which is how this check first passed as "not observable" while being
     // perfectly observable.  Measure the quantity the claim is about.
     {
-        std::vector<float> got_delta((size_t) hc_dim), want_delta((size_t) hc_dim), wrong_delta((size_t) hc_dim);
+        std::vector<float> got_delta((size_t)hc_dim), want_delta((size_t)hc_dim), wrong_delta((size_t)hc_dim);
         for (long long c = 0; c < hc; ++c)
             for (long long d = 0; d < n_embd; ++d) {
-                const size_t i = (size_t) (c * n_embd + d);
-                got_delta[i] = (float) ((double) got_write[i] - (double) R[i]);
-                want_delta[i] = block_out[(size_t) d];        // 2*sigmoid(0) = 1.0
-                wrong_delta[i] = block_out[(size_t) d] * 0.5f; // 1*sigmoid(0) = 0.5
+                const size_t i = (size_t)(c * n_embd + d);
+                got_delta[i] = (float)((double)got_write[i] - (double)R[i]);
+                want_delta[i] = block_out[(size_t)d];          // 2*sigmoid(0) = 1.0
+                wrong_delta[i] = block_out[(size_t)d] * 0.5f;  // 1*sigmoid(0) = 0.5
             }
         const double rel = rel_diff(want_delta, wrong_delta);
         const double rel_got = rel_diff(want_delta, got_delta);
         const bool visible = rel > 0.05 && rel_got < 0.05;
-        std::printf("  %-40s %s (readings %.0f%% apart, kernel within %.2e)\n",
-                    "1*sigmoid vs 2*sigmoid is observable", visible ? "yes" : "*** NO ***", rel * 100, rel_got);
+        std::printf("  %-40s %s (readings %.0f%% apart, kernel within %.2e)\n", "1*sigmoid vs 2*sigmoid is observable",
+                    visible ? "yes" : "*** NO ***", rel * 100, rel_got);
         if (!visible) ++bad;
     }
 
     // a non-zero injection: every stream receives the SAME block output, differing only by weight
-    std::vector<float> inj((size_t) hc);
-    for (auto& x : inj) x = gauss(rng) * 3.0f;
+    std::vector<float> inj((size_t)hc);
+    for (auto& x : inj)
+        x = gauss(rng) * 3.0f;
     q.memcpy(d_zi, inj.data(), inj.size() * sizeof(float)).wait();
     strata::kernels::gr_write(d_Rw, d_bo, d_zi, sh, d_outw, &q);
     q.memcpy(got_write.data(), d_outw, got_write.size() * sizeof(float)).wait();
     double worst_stream = 0;
     for (long long c = 0; c < hc; ++c) {
-        const double w = 2.0 / (1.0 + std::exp(-(double) inj[(size_t) c] / (double) hc));
+        const double w = 2.0 / (1.0 + std::exp(-(double)inj[(size_t)c] / (double)hc));
         for (long long d = 0; d < n_embd; ++d) {
-            const size_t i = (size_t) (c * n_embd + d);
-            const double want = (double) R[i] + (double) block_out[(size_t) d] * w;
-            worst_stream = std::fmax(worst_stream, rel_terms(want, (double) got_write[i], (double) R[i],
-                                                             (double) block_out[(size_t) d] * w));
+            const size_t i = (size_t)(c * n_embd + d);
+            const double want = (double)R[i] + (double)block_out[(size_t)d] * w;
+            worst_stream = std::fmax(
+                worst_stream, rel_terms(want, (double)got_write[i], (double)R[i], (double)block_out[(size_t)d] * w));
         }
     }
     const bool streams_ok = worst_stream < 1e-6;
@@ -701,31 +740,38 @@ int main(int argc, char **argv) {
         std::normal_distribution<float> rg(0.0f, 1.0f);
         auto rbf16 = [&](size_t n, float sigma) {
             std::vector<float> v(n);
-            for (auto& x : v) x = to_bf16(rg(rrng) * sigma);
+            for (auto& x : v)
+                x = to_bf16(rg(rrng) * sigma);
             return v;
         };
-        std::vector<float> rR((size_t) rdim);
-        for (auto& x : rR) x = rg(rrng);
+        std::vector<float> rR((size_t)rdim);
+        for (auto& x : rR)
+            x = rg(rrng);
         for (long long c = 0; c < rhc; ++c)
-            for (long long d = 0; d < rn; ++d) rR[(size_t) (c * rn + d)] *= std::pow(4.0f, (float) c);
-        std::vector<float> rnorm((size_t) rdim);
-        for (auto& x : rnorm) x = 1.0f + 0.1f * rg(rrng);
-        std::vector<float> rdown = rbf16((size_t) (rlr * rdim), 0.2f);
-        std::vector<float> rup = rbf16((size_t) (rdim * rlr), 0.2f);
-        std::vector<float> rinj = rbf16((size_t) (rhc * rdim), 0.05f);
+            for (long long d = 0; d < rn; ++d)
+                rR[(size_t)(c * rn + d)] *= std::pow(4.0f, (float)c);
+        std::vector<float> rnorm((size_t)rdim);
+        for (auto& x : rnorm)
+            x = 1.0f + 0.1f * rg(rrng);
+        std::vector<float> rdown = rbf16((size_t)(rlr * rdim), 0.2f);
+        std::vector<float> rup = rbf16((size_t)(rdim * rlr), 0.2f);
+        std::vector<float> rinj = rbf16((size_t)(rhc * rdim), 0.05f);
 
         std::vector<uint16_t> qd(rdown.size()), qu(rup.size()), qi(rinj.size());
-        for (size_t i = 0; i < rdown.size(); ++i) qd[i] = bf16_bits(rdown[i]);
-        for (size_t i = 0; i < rup.size(); ++i) qu[i] = bf16_bits(rup[i]);
-        for (size_t i = 0; i < rinj.size(); ++i) qi[i] = bf16_bits(rinj[i]);
+        for (size_t i = 0; i < rdown.size(); ++i)
+            qd[i] = bf16_bits(rdown[i]);
+        for (size_t i = 0; i < rup.size(); ++i)
+            qu[i] = bf16_bits(rup[i]);
+        for (size_t i = 0; i < rinj.size(); ++i)
+            qi[i] = bf16_bits(rinj[i]);
 
-        float *dR = sycl::malloc_device<float>(rR.size(), q);
-        float *dN = sycl::malloc_device<float>(rnorm.size(), q);
-        uint16_t *dD = sycl::malloc_device<uint16_t>(qd.size(), q);
-        uint16_t *dU = sycl::malloc_device<uint16_t>(qu.size(), q);
-        uint16_t *dJ = sycl::malloc_device<uint16_t>(qi.size(), q);
-        float *dM = sycl::malloc_device<float>((size_t)rn, q);
-        float *dI = sycl::malloc_device<float>((size_t)rhc, q);
+        float* dR = sycl::malloc_device<float>(rR.size(), q);
+        float* dN = sycl::malloc_device<float>(rnorm.size(), q);
+        uint16_t* dD = sycl::malloc_device<uint16_t>(qd.size(), q);
+        uint16_t* dU = sycl::malloc_device<uint16_t>(qu.size(), q);
+        uint16_t* dJ = sycl::malloc_device<uint16_t>(qi.size(), q);
+        float* dM = sycl::malloc_device<float>((size_t)rn, q);
+        float* dI = sycl::malloc_device<float>((size_t)rhc, q);
         q.memcpy(dR, rR.data(), rR.size() * sizeof(float)).wait();
         q.memcpy(dN, rnorm.data(), rnorm.size() * sizeof(float)).wait();
         q.memcpy(dD, qd.data(), qd.size() * sizeof(uint16_t)).wait();
@@ -739,7 +785,7 @@ int main(int argc, char **argv) {
         for (int mode = 0; mode < 3; ++mode) {
             select_activation_mode(mode);
             strata::kernels::gr_read(dR, dN, dD, dU, dJ, eps, rsh, rws, dM, dI, &q);
-            std::vector<float> gm((size_t) rn), gi((size_t) rhc);
+            std::vector<float> gm((size_t)rn), gi((size_t)rhc);
             q.memcpy(gm.data(), dM, gm.size() * sizeof(float)).wait();
             q.memcpy(gi.data(), dI, gi.size() * sizeof(float)).wait();
 
@@ -749,23 +795,31 @@ int main(int argc, char **argv) {
             reference(rR, rnorm, rdown, rup, rinj, eps, rn, rhc, rlr, precision, wm, wi);
             const double rm = rel_diff(wm, gm), ri = rel_diff(wi, gi);
             const bool ok = rm <= 1e-4 && ri <= 1e-4;
-            std::printf("\n  real dims 2560/4/320 %s %s (mixed %.3e, inject %.3e)\n",
-                        activation_mode_name(mode), ok ? "pass" : "*** FAIL ***", rm, ri);
+            std::printf("\n  real dims 2560/4/320 %s %s (mixed %.3e, inject %.3e)\n", activation_mode_name(mode),
+                        ok ? "pass" : "*** FAIL ***", rm, ri);
             if (!ok) ++bad;
         }
         bad += fused_multi_lds_parity(dN, dD, dU, dJ, eps);
         select_activation_mode(0);
         sycl::free(rws_raw, q);
-        sycl::free(dR, q); sycl::free(dN, q);
-        sycl::free(dD, q); sycl::free(dU, q);
-        sycl::free(dJ, q); sycl::free(dM, q);
+        sycl::free(dR, q);
+        sycl::free(dN, q);
+        sycl::free(dD, q);
+        sycl::free(dU, q);
+        sycl::free(dJ, q);
+        sycl::free(dM, q);
         sycl::free(dI, q);
-        sycl::free(d_Rw, q); sycl::free(d_bo, q);
-        sycl::free(d_zi, q); sycl::free(d_outw, q);
+        sycl::free(d_Rw, q);
+        sycl::free(d_bo, q);
+        sycl::free(d_zi, q);
+        sycl::free(d_outw, q);
         sycl::free(d_ws_raw, q);
-        sycl::free(d_R, q); sycl::free(d_norm, q);
-        sycl::free(d_down, q); sycl::free(d_up, q);
-        sycl::free(d_inj, q); sycl::free(d_mixed, q);
+        sycl::free(d_R, q);
+        sycl::free(d_norm, q);
+        sycl::free(d_down, q);
+        sycl::free(d_up, q);
+        sycl::free(d_inj, q);
+        sycl::free(d_mixed, q);
         sycl::free(d_inject, q);
     }
 

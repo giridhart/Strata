@@ -36,33 +36,31 @@ static sycl::queue& default_queue() {
 }
 
 void s2_gemv_quads_kernel(const uint16_t* __restrict__ x, const uint8_t* __restrict__ codes,
-                          const float* __restrict__ scales, float* __restrict__ y, long long n_in,
-                          long long n_out, int threads_per_row,
-                          sycl::nd_item<1> item_ct1,
-                          float *partial) {
+                          const float* __restrict__ scales, float* __restrict__ y, long long n_in, long long n_out,
+                          int threads_per_row, sycl::nd_item<1> item_ct1, float* partial) {
     const long long o = item_ct1.get_group(0);
     if (o >= n_out) return;
     const int tid = item_ct1.get_local_id(0);
 
     const long long n_quads = n_in / 4;
-    const uint8_t* c = codes + o * n_quads;             // exactly one code byte per quad
+    const uint8_t* c = codes + o * n_quads;  // exactly one code byte per quad
     const float* s = scales + o * (n_in / QK_S2);
 
     float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
     for (long long q = tid; q < n_quads; q += threads_per_row) {
-        const uint8_t byte = c[q];                      // ONE load for four codes
-        const float d = s[q >> 4];                      // (q*4) >> 6, the group index as a shift
+        const uint8_t byte = c[q];  // ONE load for four codes
+        const float d = s[q >> 4];  // (q*4) >> 6, the group index as a shift
         // ONE 64-bit load for four halves.  `x` is 256-byte aligned and four halves are eight bytes, so
         // this is an aligned uint2 - if it were not, the misaligned access would fault rather than be slow.
-        const sycl::uint2 xw = *reinterpret_cast<const sycl::uint2 *>(x + q * 4);
-        const sycl::half2 h01 = *reinterpret_cast<const sycl::half2 *>(&xw.x());
-        const sycl::half2 h23 = *reinterpret_cast<const sycl::half2 *>(&xw.y());
+        const sycl::uint2 xw = *reinterpret_cast<const sycl::uint2*>(x + q * 4);
+        const sycl::half2 h01 = *reinterpret_cast<const sycl::half2*>(&xw.x());
+        const sycl::half2 h23 = *reinterpret_cast<const sycl::half2*>(&xw.y());
         // the four codes, each carrying the -1 bias in the INTEGER domain; the scale is applied once per
         // element here rather than once per group, which is the same expression the generic kernel uses
-        const float w0 = (float) ((int) (byte & 3) - 1) * d;
-        const float w1 = (float) ((int) ((byte >> 2) & 3) - 1) * d;
-        const float w2 = (float) ((int) ((byte >> 4) & 3) - 1) * d;
-        const float w3 = (float) ((int) ((byte >> 6) & 3) - 1) * d;
+        const float w0 = (float)((int)(byte & 3) - 1) * d;
+        const float w1 = (float)((int)((byte >> 2) & 3) - 1) * d;
+        const float w2 = (float)((int)((byte >> 4) & 3) - 1) * d;
+        const float w3 = (float)((int)((byte >> 6) & 3) - 1) * d;
         a0 += w0 * h01[0];
         a1 += w1 * h01[1];
         a2 += w2 * h23[0];
@@ -90,24 +88,20 @@ void s2_gemv_quads_kernel(const uint16_t* __restrict__ x, const uint8_t* __restr
 
 }  // namespace
 
-void s2_gemv_quads(const uint16_t *x, const uint8_t *codes, const float *scales,
-                   float *y, int64_t n_in, int64_t n_out,
+void s2_gemv_quads(const uint16_t* x, const uint8_t* codes, const float* scales, float* y, int64_t n_in, int64_t n_out,
                    int threads_per_row) {
     if (n_in <= 0 || n_out <= 0) return;
     if (n_in % 4 != 0) {
-        std::fprintf(stderr, "s2_gemv_quads: n_in %lld is not a multiple of 4\n", (long long) n_in);
+        std::fprintf(stderr, "s2_gemv_quads: n_in %lld is not a multiple of 4\n", (long long)n_in);
         std::exit(1);
     }
     auto& q = default_queue();
-    const sycl::nd_range<1> range(sycl::range<1>((size_t)n_out * threads_per_row),
-                                  sycl::range<1>(threads_per_row));
-    q.submit([&](sycl::handler &cgh) {
+    const sycl::nd_range<1> range(sycl::range<1>((size_t)n_out * threads_per_row), sycl::range<1>(threads_per_row));
+    q.submit([&](sycl::handler& cgh) {
         sycl::local_accessor<float, 1> partial_acc(sycl::range<1>(threads_per_row), cgh);
         cgh.parallel_for(range, [=](sycl::nd_item<1> item_ct1) {
-            s2_gemv_quads_kernel(
-                x, codes, scales, y, n_in, n_out, threads_per_row,
-                item_ct1,
-                partial_acc.get_multi_ptr<sycl::access::decorated::no>().get());
+            s2_gemv_quads_kernel(x, codes, scales, y, n_in, n_out, threads_per_row, item_ct1,
+                                 partial_acc.get_multi_ptr<sycl::access::decorated::no>().get());
         });
     });
     q.wait();

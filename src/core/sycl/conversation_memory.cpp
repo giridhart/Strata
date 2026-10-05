@@ -25,12 +25,12 @@ std::optional<uint64_t> conversation_mem_available(std::istream& meminfo) {
         if (result || !(fields >> value >> unit) || unit != "kB" || (fields >> extra)) return {};
         uint64_t kb = 0;
         const auto parsed = std::from_chars(value.data(), value.data() + value.size(), kb);
-        if (parsed.ec != std::errc{} ||
-            parsed.ptr != value.data() + value.size() ||
+        if (parsed.ec != std::errc{} || parsed.ptr != value.data() + value.size() ||
             /*
             DPCT1007:90: Migration of std::numeric_limits::max is not supported.
             */
-            kb > std::numeric_limits<uint64_t>::max() / 1024) return {};
+            kb > std::numeric_limits<uint64_t>::max() / 1024)
+            return {};
         result = kb * 1024;
     }
     if (meminfo.bad() || (meminfo.fail() && !meminfo.eof())) return {};
@@ -52,4 +52,4 @@ std::optional<uint64_t> conversation_available_memory() {
 #endif
 }
 
-} // namespace strata::core
+}  // namespace strata::core

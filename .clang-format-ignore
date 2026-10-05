@@ -1,0 +1,8 @@
+# .clang-format-ignore
+# Ignore third-party and external dependencies
+third_party/**
+build*/**
+.venv/**
+src/sycl_out/**
+include/sycl_out/**
+tests/sycl_out/**

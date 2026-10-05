@@ -34,83 +34,101 @@ inline sycl::queue& get_test_queue() {
     return q;
 }
 
-inline void check(int e, const char *what) {
-    (void) e; (void) what;
+inline void check(int e, const char* what) {
+    (void)e;
+    (void)what;
 }
 
 // The host reference for the specified order: top_k -> top_p -> temperature -> argmax.
 // `temp_first` swaps the first and last stages, which is the intuitive-but-wrong order.
 int reference_pick(const std::vector<float>& l, const strata::kernels::SamplerParams& p, bool temp_first) {
-    const int nv = (int) l.size();
+    const int nv = (int)l.size();
     const float inv_t = p.temperature > 0.0f ? 1.0f / p.temperature : 0.0f;
-    auto val = [&](int v) { return temp_first ? l[(size_t) v] * inv_t : l[(size_t) v]; };
+    auto val = [&](int v) { return temp_first ? l[(size_t)v] * inv_t : l[(size_t)v]; };
 
     std::vector<int> ids;
     const int k = p.top_k > 0 ? p.top_k : nv;
-    std::vector<char> taken((size_t) nv, 0);
+    std::vector<char> taken((size_t)nv, 0);
     for (int i = 0; i < k; ++i) {
         int best = -1;
         float bv = 0;
         for (int v = 0; v < nv; ++v) {
-            if (taken[(size_t) v]) continue;
-            if (best < 0 || val(v) > bv) { best = v; bv = val(v); }
+            if (taken[(size_t)v]) continue;
+            if (best < 0 || val(v) > bv) {
+                best = v;
+                bv = val(v);
+            }
         }
-        taken[(size_t) best] = 1;
+        taken[(size_t)best] = 1;
         ids.push_back(best);
     }
     if (p.top_p < 1.0f) {
         float mx = val(ids[0]);
-        for (int v : ids) mx = std::fmax(mx, val(v));
+        for (int v : ids)
+            mx = std::fmax(mx, val(v));
         double sum = 0;
-        for (int v : ids) sum += std::exp((double) val(v) - (double) mx);
+        for (int v : ids)
+            sum += std::exp((double)val(v) - (double)mx);
         double cum = 0;
-        int cut = (int) ids.size();
+        int cut = (int)ids.size();
         for (size_t i = 0; i < ids.size(); ++i) {
-            cum += std::exp((double) val(ids[i]) - (double) mx) / sum;
-            if (cum >= (double) p.top_p) { cut = (int) i + 1; break; }
+            cum += std::exp((double)val(ids[i]) - (double)mx) / sum;
+            if (cum >= (double)p.top_p) {
+                cut = (int)i + 1;
+                break;
+            }
         }
-        if (cut < p.min_keep) cut = p.min_keep < (int) ids.size() ? p.min_keep : (int) ids.size();
-        ids.resize((size_t) cut);
+        if (cut < p.min_keep) cut = p.min_keep < (int)ids.size() ? p.min_keep : (int)ids.size();
+        ids.resize((size_t)cut);
     }
-    return ids[0];      // greedy: the largest SURVIVING logit, and `ids` is in descending order
+    return ids[0];  // greedy: the largest SURVIVING logit, and `ids` is in descending order
 }
 
 // The number of survivors AFTER top_p, in the given order - the quantity the order actually changes.
 int reference_cut(const std::vector<float>& l, const strata::kernels::SamplerParams& p, bool temp_first) {
-    const int nv = (int) l.size();
+    const int nv = (int)l.size();
     const float inv_t = p.temperature > 0.0f ? 1.0f / p.temperature : 0.0f;
-    auto val = [&](int v) { return temp_first ? l[(size_t) v] * inv_t : l[(size_t) v]; };
+    auto val = [&](int v) { return temp_first ? l[(size_t)v] * inv_t : l[(size_t)v]; };
     const int k = p.top_k > 0 ? p.top_k : nv;
     std::vector<int> ids;
-    std::vector<char> taken((size_t) nv, 0);
+    std::vector<char> taken((size_t)nv, 0);
     for (int i = 0; i < k; ++i) {
-        int best = -1; float bv = 0;
+        int best = -1;
+        float bv = 0;
         for (int v = 0; v < nv; ++v) {
-            if (taken[(size_t) v]) continue;
-            if (best < 0 || val(v) > bv) { best = v; bv = val(v); }
+            if (taken[(size_t)v]) continue;
+            if (best < 0 || val(v) > bv) {
+                best = v;
+                bv = val(v);
+            }
         }
-        taken[(size_t) best] = 1; ids.push_back(best);
+        taken[(size_t)best] = 1;
+        ids.push_back(best);
     }
     if (p.top_p < 1.0f) {
         float mx = val(ids[0]);
-        for (int v : ids) mx = std::fmax(mx, val(v));
+        for (int v : ids)
+            mx = std::fmax(mx, val(v));
         double sum = 0;
-        for (int v : ids) sum += std::exp((double) val(v) - (double) mx);
+        for (int v : ids)
+            sum += std::exp((double)val(v) - (double)mx);
         double cum = 0;
-        int cut = (int) ids.size();
+        int cut = (int)ids.size();
         for (size_t i = 0; i < ids.size(); ++i) {
-            cum += std::exp((double) val(ids[i]) - (double) mx) / sum;
-            if (cum >= (double) p.top_p) { cut = (int) i + 1; break; }
+            cum += std::exp((double)val(ids[i]) - (double)mx) / sum;
+            if (cum >= (double)p.top_p) {
+                cut = (int)i + 1;
+                break;
+            }
         }
-        if (cut < p.min_keep) cut = p.min_keep < (int) ids.size() ? p.min_keep : (int) ids.size();
+        if (cut < p.min_keep) cut = p.min_keep < (int)ids.size() ? p.min_keep : (int)ids.size();
         return cut;
     }
-    return (int) ids.size();
+    return (int)ids.size();
 }
 
-int run(const char *name, const std::vector<float> &logits, int n_tokens,
-        const strata::kernels::SamplerParams &p, const std::vector<int> &want,
-        const std::vector<int> &hist = {}, int hist_len = 0) {
+int run(const char* name, const std::vector<float>& logits, int n_tokens, const strata::kernels::SamplerParams& p,
+        const std::vector<int>& want, const std::vector<int>& hist = {}, int hist_len = 0) {
     auto& q = get_test_queue();
     float* d_l = sycl::malloc_device<float>(logits.size(), q);
     int* d_o = sycl::malloc_device<int>((size_t)n_tokens, q);
@@ -123,12 +141,12 @@ int run(const char *name, const std::vector<float> &logits, int n_tokens,
         d_h = sycl::malloc_device<int>(hist.size(), q);
         q.memcpy(d_h, hist.data(), hist.size() * sizeof(int)).wait();
     }
-    strata::kernels::sample_tokens(d_l, n_tokens, (int) (logits.size() / n_tokens), d_h, hist_len, p, d_o,
-                                   &q);
-    std::vector<int> got((size_t) n_tokens);
+    strata::kernels::sample_tokens(d_l, n_tokens, (int)(logits.size() / n_tokens), d_h, hist_len, p, d_o, &q);
+    std::vector<int> got((size_t)n_tokens);
     q.memcpy(got.data(), d_o, got.size() * sizeof(int)).wait();
     int bad = 0;
-    for (int t = 0; t < n_tokens; ++t) if (got[(size_t) t] != want[(size_t) t]) ++bad;
+    for (int t = 0; t < n_tokens; ++t)
+        if (got[(size_t)t] != want[(size_t)t]) ++bad;
     std::printf("  %-34s %s (%d of %d differ)", name, bad ? "*** WRONG ***" : "matches", bad, n_tokens);
     if (bad) std::printf("   first: want %d got %d", want[0], got[0]);
     std::printf("\n");
@@ -142,26 +160,33 @@ int run(const char *name, const std::vector<float> &logits, int n_tokens,
 // just the greedy argmax) can be pinned against a reference.  `__umulhi(a, b)` is the high half of a 32x32
 // multiply, spelled `(uint32_t)(((uint64_t) a * b) >> 32)` here.
 struct PhiloxRound {
-    uint32_t& c0; uint32_t& c1; uint32_t& c2; uint32_t& c3;
+    uint32_t& c0;
+    uint32_t& c1;
+    uint32_t& c2;
+    uint32_t& c3;
     void step(uint32_t k0, uint32_t k1) const {
-        const uint32_t hi0 = (uint32_t) (((uint64_t) 0x9E3779B9u * c0) >> 32);
-        const uint32_t hi1 = (uint32_t) (((uint64_t) 0xBB67AE85u * c2) >> 32);
+        const uint32_t hi0 = (uint32_t)(((uint64_t)0x9E3779B9u * c0) >> 32);
+        const uint32_t hi1 = (uint32_t)(((uint64_t)0xBB67AE85u * c2) >> 32);
         const uint32_t lo0 = 0x9E3779B9u * c0;
         const uint32_t lo1 = 0xBB67AE85u * c2;
         const uint32_t n0 = hi1 ^ c1 ^ k0;
         const uint32_t n1 = lo1;
         const uint32_t n2 = hi0 ^ c3 ^ k1;
         const uint32_t n3 = lo0;
-        c0 = n0; c1 = n1; c2 = n2; c3 = n3;
+        c0 = n0;
+        c1 = n1;
+        c2 = n2;
+        c3 = n3;
     }
 };
 
 float host_philox_uniform(uint64_t seed, uint64_t counter) {
-    uint32_t c0 = (uint32_t) counter, c1 = (uint32_t) (counter >> 32);
-    uint32_t c2 = (uint32_t) seed, c3 = (uint32_t) (seed >> 32);
+    uint32_t c0 = (uint32_t)counter, c1 = (uint32_t)(counter >> 32);
+    uint32_t c2 = (uint32_t)seed, c3 = (uint32_t)(seed >> 32);
     PhiloxRound r{c0, c1, c2, c3};
-    for (int i = 0; i < 10; ++i) r.step((uint32_t) i, 0u);
-    return (float) (c0 >> 8) * (1.0f / 16777216.0f);
+    for (int i = 0; i < 10; ++i)
+        r.step((uint32_t)i, 0u);
+    return (float)(c0 >> 8) * (1.0f / 16777216.0f);
 }
 
 // The full SAMPLED chain, host side - the kernel's `sampler_kernel` in serial form, in llama.cpp's order:
@@ -172,38 +197,55 @@ int sampled_reference(const std::vector<float>& l, const std::vector<int>& hist,
                       const strata::kernels::SamplerParams& p, int row) {
     auto penal = [&](float logit, int count) {
         if (count <= 0) return logit;
-        if (logit <= 0.0f) logit *= p.penalty_repeat; else logit /= p.penalty_repeat;
-        logit -= (float) count * p.penalty_freq + (count > 0 ? 1.0f : 0.0f) * p.penalty_present;
+        if (logit <= 0.0f)
+            logit *= p.penalty_repeat;
+        else
+            logit /= p.penalty_repeat;
+        logit -= (float)count * p.penalty_freq + (count > 0 ? 1.0f : 0.0f) * p.penalty_present;
         return logit;
     };
-    auto count = [&](int v) { int c = 0; for (int h : hist) if (h == v) ++c; return c; };
-    const int nv = (int) l.size();
-    const int KMAX = 64;                       // 1..64 as given; 0 (off) and wider keep the widest list, 64
+    auto count = [&](int v) {
+        int c = 0;
+        for (int h : hist)
+            if (h == v) ++c;
+        return c;
+    };
+    const int nv = (int)l.size();
+    const int KMAX = 64;  // 1..64 as given; 0 (off) and wider keep the widest list, 64
     const int k = std::min(nv, (p.top_k > 0 && p.top_k < KMAX) ? p.top_k : KMAX);
     std::vector<int> sel_ids;
     std::vector<float> sel_logit;
-    std::vector<char> taken((size_t) nv, 0);
+    std::vector<char> taken((size_t)nv, 0);
     for (int i = 0; i < k; ++i) {
-        int best = -1; float bv = 0;
+        int best = -1;
+        float bv = 0;
         for (int v = 0; v < nv; ++v) {
-            if (taken[(size_t) v]) continue;
-            const float s = penal(l[(size_t) v], count(v));
-            if (best < 0 || s > bv) { best = v; bv = s; }
+            if (taken[(size_t)v]) continue;
+            const float s = penal(l[(size_t)v], count(v));
+            if (best < 0 || s > bv) {
+                best = v;
+                bv = s;
+            }
         }
-        taken[(size_t) best] = 1;
-        sel_ids.push_back(best); sel_logit.push_back(bv);
+        taken[(size_t)best] = 1;
+        sel_ids.push_back(best);
+        sel_logit.push_back(bv);
     }
     // llama.cpp's order (issue #53): top_p over the whole top_k list, then min_p on its survivors
-    const int n_sel = (int) sel_ids.size();
+    const int n_sel = (int)sel_ids.size();
     int n_keep = n_sel;
     if (p.top_p < 1.0f) {
         double sum = 0.0;
-        for (int i = 0; i < n_sel; ++i) sum += std::exp((double) sel_logit[(size_t) i] - (double) sel_logit[0]);
+        for (int i = 0; i < n_sel; ++i)
+            sum += std::exp((double)sel_logit[(size_t)i] - (double)sel_logit[0]);
         double cum = 0.0;
         int cut = n_sel;
         for (int i = 0; i < n_sel; ++i) {
-            cum += std::exp((double) sel_logit[(size_t) i] - (double) sel_logit[0]) / sum;
-            if (cum >= (double) p.top_p) { cut = i + 1; break; }
+            cum += std::exp((double)sel_logit[(size_t)i] - (double)sel_logit[0]) / sum;
+            if (cum >= (double)p.top_p) {
+                cut = i + 1;
+                break;
+            }
         }
         if (cut < p.min_keep) cut = p.min_keep < n_sel ? p.min_keep : n_sel;
         n_keep = cut;
@@ -211,20 +253,28 @@ int sampled_reference(const std::vector<float>& l, const std::vector<int>& hist,
     if (p.min_p > 0.0f) {
         const float thresh = sel_logit[0] + std::log(p.min_p);
         for (int i = 0; i < n_keep; ++i)
-            if (sel_logit[(size_t) i] < thresh) { n_keep = i; break; }
+            if (sel_logit[(size_t)i] < thresh) {
+                n_keep = i;
+                break;
+            }
     }
     const float inv_t = p.temperature > 0.0f ? 1.0f / p.temperature : 0.0f;
-    auto scaled = [&](int i) { return sel_logit[(size_t) i] * inv_t; };   // one penalties stage, before (#53)
+    auto scaled = [&](int i) { return sel_logit[(size_t)i] * inv_t; };  // one penalties stage, before (#53)
     float smx = scaled(0);
-    for (int i = 1; i < n_keep; ++i) smx = std::fmax(smx, scaled(i));
+    for (int i = 1; i < n_keep; ++i)
+        smx = std::fmax(smx, scaled(i));
     double sum = 0.0;
-    for (int i = 0; i < n_keep; ++i) sum += std::exp((double) scaled(i) - (double) smx);
-    const float u = host_philox_uniform(p.seed, p.counter + (uint64_t) row);
+    for (int i = 0; i < n_keep; ++i)
+        sum += std::exp((double)scaled(i) - (double)smx);
+    const float u = host_philox_uniform(p.seed, p.counter + (uint64_t)row);
     double cum = 0.0;
-    int pick = sel_ids[(size_t) (n_keep - 1)];
+    int pick = sel_ids[(size_t)(n_keep - 1)];
     for (int i = 0; i < n_keep; ++i) {
-        cum += std::exp((double) scaled(i) - (double) smx) / sum;
-        if ((double) u < cum) { pick = sel_ids[(size_t) i]; break; }
+        cum += std::exp((double)scaled(i) - (double)smx) / sum;
+        if ((double)u < cum) {
+            pick = sel_ids[(size_t)i];
+            break;
+        }
     }
     return pick;
 }
@@ -234,39 +284,59 @@ int sampled_reference(const std::vector<float>& l, const std::vector<int>& hist,
 int sampled_cut(const std::vector<float>& l, const std::vector<int>& hist, const strata::kernels::SamplerParams& p) {
     auto penal = [&](float logit, int count) {
         if (count <= 0) return logit;
-        if (logit <= 0.0f) logit *= p.penalty_repeat; else logit /= p.penalty_repeat;
-        logit -= (float) count * p.penalty_freq + (count > 0 ? 1.0f : 0.0f) * p.penalty_present;
+        if (logit <= 0.0f)
+            logit *= p.penalty_repeat;
+        else
+            logit /= p.penalty_repeat;
+        logit -= (float)count * p.penalty_freq + (count > 0 ? 1.0f : 0.0f) * p.penalty_present;
         return logit;
     };
-    auto count = [&](int v) { int c = 0; for (int h : hist) if (h == v) ++c; return c; };
-    const int nv = (int) l.size();
+    auto count = [&](int v) {
+        int c = 0;
+        for (int h : hist)
+            if (h == v) ++c;
+        return c;
+    };
+    const int nv = (int)l.size();
     const int KMAX = 64;
     const int k = std::min(nv, (p.top_k > 0 && p.top_k < KMAX) ? p.top_k : KMAX);
     std::vector<float> sel;
-    std::vector<char> taken((size_t) nv, 0);
+    std::vector<char> taken((size_t)nv, 0);
     for (int i = 0; i < k; ++i) {
-        int best = -1; float bv = 0;
+        int best = -1;
+        float bv = 0;
         for (int v = 0; v < nv; ++v) {
-            if (taken[(size_t) v]) continue;
-            const float s = penal(l[(size_t) v], count(v));
-            if (best < 0 || s > bv) { best = v; bv = s; }
+            if (taken[(size_t)v]) continue;
+            const float s = penal(l[(size_t)v], count(v));
+            if (best < 0 || s > bv) {
+                best = v;
+                bv = s;
+            }
         }
-        taken[(size_t) best] = 1; sel.push_back(bv);
+        taken[(size_t)best] = 1;
+        sel.push_back(bv);
     }
-    int n_minp = (int) sel.size();
+    int n_minp = (int)sel.size();
     if (p.min_p > 0.0f) {
         const float thresh = sel[0] + std::log(p.min_p);
-        for (int i = 0; i < (int) sel.size(); ++i)
-            if (sel[(size_t) i] < thresh) { n_minp = i; break; }
+        for (int i = 0; i < (int)sel.size(); ++i)
+            if (sel[(size_t)i] < thresh) {
+                n_minp = i;
+                break;
+            }
     }
     if (p.top_p >= 1.0f) return n_minp;
     double sum = 0.0;
-    for (int i = 0; i < n_minp; ++i) sum += std::exp((double) sel[(size_t) i] - (double) sel[0]);
+    for (int i = 0; i < n_minp; ++i)
+        sum += std::exp((double)sel[(size_t)i] - (double)sel[0]);
     double cum = 0.0;
     int cut = n_minp;
     for (int i = 0; i < n_minp; ++i) {
-        cum += std::exp((double) sel[(size_t) i] - (double) sel[0]) / sum;
-        if (cum >= (double) p.top_p) { cut = i + 1; break; }
+        cum += std::exp((double)sel[(size_t)i] - (double)sel[0]) / sum;
+        if (cum >= (double)p.top_p) {
+            cut = i + 1;
+            break;
+        }
     }
     if (cut < p.min_keep) cut = p.min_keep < n_minp ? p.min_keep : n_minp;
     return cut;
@@ -286,26 +356,33 @@ struct SelList {
 // The top_k list of `sampler_kernel` for one row: `window` is the counted history (the row's last penalty_last_n).
 SelList mirror_select(const float* l, int nv, const std::vector<int>& window, const strata::kernels::SamplerParams& p,
                       int k) {
-    std::vector<float> s((size_t) nv);
+    std::vector<float> s((size_t)nv);
     for (int v = 0; v < nv; ++v) {
         int c = 0;
-        for (int h : window) c += h == v;
+        for (int h : window)
+            c += h == v;
         float x = l[v];
         if (c > 0) {
-            if (x <= 0.0f) x *= p.penalty_repeat; else x /= p.penalty_repeat;
-            x -= (float) c * p.penalty_freq + (c > 0 ? 1.0f : 0.0f) * p.penalty_present;
+            if (x <= 0.0f)
+                x *= p.penalty_repeat;
+            else
+                x /= p.penalty_repeat;
+            x -= (float)c * p.penalty_freq + (c > 0 ? 1.0f : 0.0f) * p.penalty_present;
         }
-        s[(size_t) v] = x;
+        s[(size_t)v] = x;
     }
     SelList out;
-    std::vector<char> taken((size_t) nv, 0);
+    std::vector<char> taken((size_t)nv, 0);
     for (int i = 0; i < k; ++i) {
         int best = nv;
         float bv = -std::numeric_limits<float>::infinity();
         for (int v = 0; v < nv; ++v)
-            if (!taken[(size_t) v] && s[(size_t) v] > bv) { bv = s[(size_t) v]; best = v; }
+            if (!taken[(size_t)v] && s[(size_t)v] > bv) {
+                bv = s[(size_t)v];
+                best = v;
+            }
         const int id = best < nv ? best : 0;
-        taken[(size_t) id] = 1;
+        taken[(size_t)id] = 1;
         out.ids.push_back(id);
         out.logit.push_back(bv);
     }
@@ -316,15 +393,20 @@ SelList mirror_select(const float* l, int nv, const std::vector<int>& window, co
 int mirror_pick(const SelList& sel, int k, const strata::kernels::SamplerParams& p, int row) {
     int n_keep = k;
     float mx = sel.logit[0];
-    for (int i = 1; i < k; ++i) mx = std::fmax(mx, sel.logit[(size_t) i]);
+    for (int i = 1; i < k; ++i)
+        mx = std::fmax(mx, sel.logit[(size_t)i]);
     if (p.top_p < 1.0f) {
         double sum = 0.0;
-        for (int i = 0; i < k; ++i) sum += std::exp((double) sel.logit[(size_t) i] - (double) mx);
+        for (int i = 0; i < k; ++i)
+            sum += std::exp((double)sel.logit[(size_t)i] - (double)mx);
         double cum = 0.0;
         int cut = k;
         for (int i = 0; i < k; ++i) {
-            cum += std::exp((double) sel.logit[(size_t) i] - (double) mx) / sum;
-            if (cum >= (double) p.top_p) { cut = i + 1; break; }
+            cum += std::exp((double)sel.logit[(size_t)i] - (double)mx) / sum;
+            if (cum >= (double)p.top_p) {
+                cut = i + 1;
+                break;
+            }
         }
         if (cut < p.min_keep) cut = p.min_keep < k ? p.min_keep : k;
         n_keep = cut;
@@ -332,20 +414,28 @@ int mirror_pick(const SelList& sel, int k, const strata::kernels::SamplerParams&
     if (p.min_p > 0.0f) {
         const float thresh = sel.logit[0] + std::log(p.min_p);
         for (int i = 0; i < n_keep; ++i)
-            if (sel.logit[(size_t) i] < thresh) { n_keep = i; break; }
+            if (sel.logit[(size_t)i] < thresh) {
+                n_keep = i;
+                break;
+            }
     }
     const float inv_t = p.temperature > 0.0f ? 1.0f / p.temperature : 0.0f;
-    auto scaled = [&](int i) { return sel.logit[(size_t) i] * inv_t; };
+    auto scaled = [&](int i) { return sel.logit[(size_t)i] * inv_t; };
     float smx = scaled(0);
-    for (int i = 1; i < n_keep; ++i) smx = std::fmax(smx, scaled(i));
+    for (int i = 1; i < n_keep; ++i)
+        smx = std::fmax(smx, scaled(i));
     double sum = 0.0;
-    for (int i = 0; i < n_keep; ++i) sum += std::exp((double) scaled(i) - (double) smx);
-    const float u = host_philox_uniform(p.seed, p.counter + (uint64_t) row);
+    for (int i = 0; i < n_keep; ++i)
+        sum += std::exp((double)scaled(i) - (double)smx);
+    const float u = host_philox_uniform(p.seed, p.counter + (uint64_t)row);
     double cum = 0.0;
-    int pick = sel.ids[(size_t) (n_keep > 0 ? n_keep - 1 : 0)];
+    int pick = sel.ids[(size_t)(n_keep > 0 ? n_keep - 1 : 0)];
     for (int i = 0; i < n_keep; ++i) {
-        cum += std::exp((double) scaled(i) - (double) smx) / sum;
-        if ((double) u < cum) { pick = sel.ids[(size_t) i]; break; }
+        cum += std::exp((double)scaled(i) - (double)smx) / sum;
+        if ((double)u < cum) {
+            pick = sel.ids[(size_t)i];
+            break;
+        }
     }
     return pick;
 }
@@ -359,10 +449,8 @@ struct DeviceRows {
     int* h = nullptr;
     int* o = nullptr;
     int n_tokens = 0, nv = 0, hist_len = 0;
-    DeviceRows(const std::vector<float> &logits, int n_tokens_,
-               const std::vector<int> &hist, int hist_len_)
-        : n_tokens(n_tokens_), nv((int)(logits.size() / (size_t)n_tokens_)),
-          hist_len(hist_len_) {
+    DeviceRows(const std::vector<float>& logits, int n_tokens_, const std::vector<int>& hist, int hist_len_)
+        : n_tokens(n_tokens_), nv((int)(logits.size() / (size_t)n_tokens_)), hist_len(hist_len_) {
         auto& q_ct1 = get_test_queue();
         l = sycl::malloc_device<float>(logits.size(), q_ct1);
         o = sycl::malloc_device<int>((size_t)n_tokens, q_ct1);
@@ -380,14 +468,12 @@ struct DeviceRows {
         sycl::free(o, q_ct1);
         if (h) sycl::free(h, q_ct1);
     }
-    std::vector<int> sample(const strata::kernels::SamplerParams &p,
-                            sycl::queue* stream) {
+    std::vector<int> sample(const strata::kernels::SamplerParams& p, sycl::queue* stream) {
         auto& q_ct1 = get_test_queue();
         q_ct1.memset(o, 0xFF, (size_t)n_tokens * sizeof(int)).wait();
         strata::kernels::sample_tokens(l, n_tokens, nv, h, hist_len, p, o, stream);
-        if (stream != &q_ct1 && stream != nullptr)
-            stream->wait();
-        std::vector<int> got((size_t) n_tokens);
+        if (stream != &q_ct1 && stream != nullptr) stream->wait();
+        std::vector<int> got((size_t)n_tokens);
         q_ct1.memcpy(got.data(), o, got.size() * sizeof(int)).wait();
         return got;
     }
@@ -397,7 +483,7 @@ struct DeviceRows {
 std::vector<int> window_of(const std::vector<int>& hist, int hist_len, int t, int last_n) {
     if (hist_len <= 0 || last_n <= 0) return {};
     const int h = std::min(last_n, hist_len);
-    const int* row = hist.data() + (size_t) t * hist_len;
+    const int* row = hist.data() + (size_t)t * hist_len;
     return std::vector<int>(row + (hist_len - h), row + hist_len);
 }
 
@@ -409,27 +495,32 @@ void bench_sampled() {
     std::mt19937 rng(20);
     std::normal_distribution<float> g(0.0f, 3.0f);
     for (int T : {1, 4, 8}) {
-        std::vector<float> l((size_t) NV * T);
-        for (auto& v : l) v = g(rng);
+        std::vector<float> l((size_t)NV * T);
+        for (auto& v : l)
+            v = g(rng);
         float* d_l = sycl::malloc_device<float>(l.size(), q_ct1);
         int* d_o = sycl::malloc_device<int>((size_t)T, q_ct1);
         q_ct1.memcpy(d_l, l.data(), l.size() * sizeof(float)).wait();
         for (int k : {20, 64}) {
             strata::kernels::SamplerParams p;
-            p.top_k = k; p.top_p = 0.95f; p.temperature = 0.7f; p.seed = 1;
-            for (int w = 0; w < 3; ++w) strata::kernels::sample_tokens(d_l, T, NV, nullptr, 0, p, d_o, &s);
+            p.top_k = k;
+            p.top_p = 0.95f;
+            p.temperature = 0.7f;
+            p.seed = 1;
+            for (int w = 0; w < 3; ++w)
+                strata::kernels::sample_tokens(d_l, T, NV, nullptr, 0, p, d_o, &s);
             s.wait();
             const int iters = 50;
             auto t0 = std::chrono::high_resolution_clock::now();
             for (int it = 0; it < iters; ++it) {
-                p.counter = (uint64_t) it;
+                p.counter = (uint64_t)it;
                 strata::kernels::sample_tokens(d_l, T, NV, nullptr, 0, p, d_o, &s);
             }
             s.wait();
             auto t1 = std::chrono::high_resolution_clock::now();
             float ms = std::chrono::duration<float, std::milli>(t1 - t0).count();
             std::printf("  bench: n_vocab %d, rows %d, top_k %2d, top_p 0.95: %8.1f us per call\n", NV, T, k,
-                        1000.0 * (double) ms / iters);
+                        1000.0 * (double)ms / iters);
         }
         sycl::free(d_l, q_ct1);
         sycl::free(d_o, q_ct1);
@@ -438,17 +529,25 @@ void bench_sampled() {
 
 }  // namespace
 
-int main(int argc, char **argv) {
+int main(int argc, char** argv) {
     auto& q_ct1 = get_test_queue();
     bool selftest = false, bench = false;
     for (int i = 1; i < argc; ++i) {
-        if (std::string(argv[i]) == "--selftest") selftest = true;
-        else if (std::string(argv[i]) == "--bench") bench = true;
-        else { std::fprintf(stderr, "usage: sampler_parity [--selftest] [--bench]\n"); return 2; }
+        if (std::string(argv[i]) == "--selftest")
+            selftest = true;
+        else if (std::string(argv[i]) == "--bench")
+            bench = true;
+        else {
+            std::fprintf(stderr, "usage: sampler_parity [--selftest] [--bench]\n");
+            return 2;
+        }
     }
     {
         // the sampled path under test; ctest runs this binary once per path
-        auto on = [](const char* n) { const char* e = std::getenv(n); return e && *e && std::strcmp(e, "0") != 0; };
+        auto on = [](const char* n) {
+            const char* e = std::getenv(n);
+            return e && *e && std::strcmp(e, "0") != 0;
+        };
         std::printf("  sampled path: %s\n", on("STRATA_OLD_SAMPLER")         ? "sampler_kernel (STRATA_OLD_SAMPLER)"
                                             : on("STRATA_SAMPLER_ONE_BLOCK") ? "one block (STRATA_SAMPLER_ONE_BLOCK)"
                                                                              : "split top_k (default)");
@@ -462,31 +561,43 @@ int main(int argc, char **argv) {
 
     // ---- fixture 1: plain greedy.  top_k = 0 (disabled), top_p = 1 (disabled), T = 1 -> argmax.
     {
-        strata::kernels::SamplerParams p; p.top_k = 0; p.top_p = 1.0f; p.temperature = 1.0f; p.greedy = true;
-        std::mt19937 rng(3); std::normal_distribution<float> g(0.0f, 1.0f);
-        std::vector<float> l((size_t) NV * NT);
-        for (auto& v : l) v = g(rng);
-        std::vector<int> want((size_t) NT);
-        for (int t = 0; t < NT; ++t) want[(size_t) t] = reference_pick({l.begin() + (size_t) t * NV, l.begin() + (size_t) (t + 1) * NV}, p, false);
+        strata::kernels::SamplerParams p;
+        p.top_k = 0;
+        p.top_p = 1.0f;
+        p.temperature = 1.0f;
+        p.greedy = true;
+        std::mt19937 rng(3);
+        std::normal_distribution<float> g(0.0f, 1.0f);
+        std::vector<float> l((size_t)NV * NT);
+        for (auto& v : l)
+            v = g(rng);
+        std::vector<int> want((size_t)NT);
+        for (int t = 0; t < NT; ++t)
+            want[(size_t)t] = reference_pick({l.begin() + (size_t)t * NV, l.begin() + (size_t)(t + 1) * NV}, p, false);
         bad += run("greedy argmax", l, NT, p, want);
     }
 
     // ---- fixture 2: THE ORDER FIXTURE.  T = 0.5 sharpens the distribution enough that top_p = 0.5 cuts
     // differently before and after the scaling, and the two orders then pick DIFFERENT tokens.
     {
-        strata::kernels::SamplerParams p; p.top_k = 0; p.top_p = 0.5f; p.temperature = 0.5f;
-        p.min_keep = 1; p.greedy = true;
-        std::vector<float> l((size_t) NV * NT, -1000.0f);
+        strata::kernels::SamplerParams p;
+        p.top_k = 0;
+        p.top_p = 0.5f;
+        p.temperature = 0.5f;
+        p.min_keep = 1;
+        p.greedy = true;
+        std::vector<float> l((size_t)NV * NT, -1000.0f);
         for (int t = 0; t < NT; ++t) {
             // a flat-ish head so the cumulative mass crosses 0.5 inside it, and one clear leader
-            l[(size_t) t * NV + 0] = 3.0f;
-            for (int v = 1; v < 8; ++v) l[(size_t) t * NV + v] = 2.6f - 0.05f * (float) v;
+            l[(size_t)t * NV + 0] = 3.0f;
+            for (int v = 1; v < 8; ++v)
+                l[(size_t)t * NV + v] = 2.6f - 0.05f * (float)v;
         }
-        std::vector<int> want((size_t) NT), other((size_t) NT);
+        std::vector<int> want((size_t)NT), other((size_t)NT);
         for (int t = 0; t < NT; ++t) {
-            const std::vector<float> row(l.begin() + (size_t) t * NV, l.begin() + (size_t) (t + 1) * NV);
-            want[(size_t) t] = reference_pick(row, p, false);      // the SPECIFIED order
-            other[(size_t) t] = reference_pick(row, p, true);      // temperature first
+            const std::vector<float> row(l.begin() + (size_t)t * NV, l.begin() + (size_t)(t + 1) * NV);
+            want[(size_t)t] = reference_pick(row, p, false);  // the SPECIFIED order
+            other[(size_t)t] = reference_pick(row, p, true);  // temperature first
         }
         // If the two orders agree on this fixture the test cannot see the order, and saying "the kernel
         // matches the spec" would be vacuous.
@@ -496,14 +607,13 @@ int main(int argc, char **argv) {
         // order-SENSITIVE at the cut, which is a property of the fixture rather than of the kernel.
         int cut_spec = 0, cut_alt = 0;
         for (int t = 0; t < NT; ++t) {
-            const std::vector<float> row(l.begin() + (size_t) t * NV, l.begin() + (size_t) (t + 1) * NV);
+            const std::vector<float> row(l.begin() + (size_t)t * NV, l.begin() + (size_t)(t + 1) * NV);
             cut_spec += reference_cut(row, p, false);
             cut_alt += reference_cut(row, p, true);
         }
         const bool distinguishable = (cut_spec != cut_alt);
         std::printf("  %-34s %s (survivors: spec %d, temp-first %d)\n", "order is observable on this fixture",
-                    distinguishable ? "yes" : "*** NO - THE FIXTURE CANNOT SEE THE ORDER ***", cut_spec,
-                    cut_alt);
+                    distinguishable ? "yes" : "*** NO - THE FIXTURE CANNOT SEE THE ORDER ***", cut_spec, cut_alt);
         if (!distinguishable) ++bad;
         // greedy is still checked here, but as an ARGMAX check, not an order check
         bad += run("greedy over this fixture", l, NT, p, want);
@@ -512,110 +622,139 @@ int main(int argc, char **argv) {
     // ---- fixture 3: greedy consumes NO random number.  Two runs with different seeds must agree, or the
     // seeded streams diverge between greedy and sampled runs - which docs/sampling.md §3 calls out.
     {
-        strata::kernels::SamplerParams a; a.top_k = 20; a.top_p = 0.95f; a.temperature = 1.0f; a.greedy = true; a.seed = 1;
-        strata::kernels::SamplerParams b = a; b.seed = 999999;
-        std::mt19937 rng(5); std::normal_distribution<float> g(0.0f, 1.0f);
-        std::vector<float> l((size_t) NV * NT);
-        for (auto& v : l) v = g(rng);
-        std::vector<int> wa((size_t) NT);
-        for (int t = 0; t < NT; ++t) wa[(size_t) t] = reference_pick({l.begin() + (size_t) t * NV, l.begin() + (size_t) (t + 1) * NV}, a, false);
+        strata::kernels::SamplerParams a;
+        a.top_k = 20;
+        a.top_p = 0.95f;
+        a.temperature = 1.0f;
+        a.greedy = true;
+        a.seed = 1;
+        strata::kernels::SamplerParams b = a;
+        b.seed = 999999;
+        std::mt19937 rng(5);
+        std::normal_distribution<float> g(0.0f, 1.0f);
+        std::vector<float> l((size_t)NV * NT);
+        for (auto& v : l)
+            v = g(rng);
+        std::vector<int> wa((size_t)NT);
+        for (int t = 0; t < NT; ++t)
+            wa[(size_t)t] = reference_pick({l.begin() + (size_t)t * NV, l.begin() + (size_t)(t + 1) * NV}, a, false);
         float* d_l = sycl::malloc_device<float>(l.size(), q_ct1);
-        int *d_a = sycl::malloc_device<int>((size_t)NT, q_ct1);
-        int *d_b = sycl::malloc_device<int>((size_t)NT, q_ct1);
+        int* d_a = sycl::malloc_device<int>((size_t)NT, q_ct1);
+        int* d_b = sycl::malloc_device<int>((size_t)NT, q_ct1);
         q_ct1.memcpy(d_l, l.data(), l.size() * sizeof(float)).wait();
         strata::kernels::sample_tokens(d_l, NT, NV, nullptr, 0, a, d_a, &q_ct1);
         strata::kernels::sample_tokens(d_l, NT, NV, nullptr, 0, b, d_b, &q_ct1);
-        std::vector<int> ga((size_t) NT), gb((size_t) NT);
+        std::vector<int> ga((size_t)NT), gb((size_t)NT);
         q_ct1.memcpy(ga.data(), d_a, ga.size() * sizeof(int)).wait();
         q_ct1.memcpy(gb.data(), d_b, gb.size() * sizeof(int)).wait();
         int mismatch = 0, wrong = 0;
         for (int t = 0; t < NT; ++t) {
-            if (ga[(size_t) t] != gb[(size_t) t]) ++mismatch;
-            if (ga[(size_t) t] != wa[(size_t) t]) ++wrong;
+            if (ga[(size_t)t] != gb[(size_t)t]) ++mismatch;
+            if (ga[(size_t)t] != wa[(size_t)t]) ++wrong;
         }
-        std::printf("  %-34s %s (seed-independent: %d differ; vs reference: %d wrong)\n",
-                    "greedy ignores the seed", (!mismatch && !wrong) ? "matches" : "*** WRONG ***", mismatch,
-                    wrong);
+        std::printf("  %-34s %s (seed-independent: %d differ; vs reference: %d wrong)\n", "greedy ignores the seed",
+                    (!mismatch && !wrong) ? "matches" : "*** WRONG ***", mismatch, wrong);
         bad += mismatch + wrong;
         sycl::free(d_l, q_ct1);
         sycl::free(d_a, q_ct1);
         sycl::free(d_b, q_ct1);
     }
 
-
     // ---- fixture 4: PENALTIES.  Two sub-cases, each built so the rule it tests decides the answer.
     {
         // host reference for the penalty stage, transcribed from llama_sampler_penalties_apply
         auto penal = [](float logit, int count, const strata::kernels::SamplerParams& p) {
             if (count <= 0) return logit;
-            if (logit <= 0.0f) logit *= p.penalty_repeat; else logit /= p.penalty_repeat;
-            logit -= (float) count * p.penalty_freq + (count > 0 ? 1.0f : 0.0f) * p.penalty_present;
+            if (logit <= 0.0f)
+                logit *= p.penalty_repeat;
+            else
+                logit /= p.penalty_repeat;
+            logit -= (float)count * p.penalty_freq + (count > 0 ? 1.0f : 0.0f) * p.penalty_present;
             return logit;
         };
         auto pick = [&](const std::vector<float>& l, const std::vector<int>& hist,
                         const strata::kernels::SamplerParams& p, bool divide_unconditionally) {
-            int best = 0; float bv = 0; bool first = true;
-            for (int v = 0; v < (int) l.size(); ++v) {
-                int c = 0; for (int h : hist) if (h == v) ++c;
+            int best = 0;
+            float bv = 0;
+            bool first = true;
+            for (int v = 0; v < (int)l.size(); ++v) {
+                int c = 0;
+                for (int h : hist)
+                    if (h == v) ++c;
                 float s;
                 if (divide_unconditionally && c > 0) {
-                    s = l[(size_t) v] / p.penalty_repeat
-                        - (float) c * p.penalty_freq - (c > 0 ? 1.0f : 0.0f) * p.penalty_present;
+                    s = l[(size_t)v] / p.penalty_repeat - (float)c * p.penalty_freq -
+                        (c > 0 ? 1.0f : 0.0f) * p.penalty_present;
                 } else {
-                    s = penal(l[(size_t) v], c, p);
+                    s = penal(l[(size_t)v], c, p);
                 }
-                if (first || s > bv) { bv = s; best = v; first = false; }
+                if (first || s > bv) {
+                    bv = s;
+                    best = v;
+                    first = false;
+                }
             }
             return best;
         };
 
         const int NV2 = 8, NT2 = 2;
-        strata::kernels::SamplerParams p; p.top_k = 0; p.top_p = 1.0f; p.temperature = 1.0f;
-        p.greedy = true; p.penalty_last_n = 4; p.penalty_repeat = 2.0f;
+        strata::kernels::SamplerParams p;
+        p.top_k = 0;
+        p.top_p = 1.0f;
+        p.temperature = 1.0f;
+        p.greedy = true;
+        p.penalty_last_n = 4;
+        p.penalty_repeat = 2.0f;
 
         // A: ALL logits negative, so the multiply-or-divide rule decides the argmax
-        std::vector<float> la((size_t) NV2 * NT2, -8.0f);
+        std::vector<float> la((size_t)NV2 * NT2, -8.0f);
         for (int t = 0; t < NT2; ++t) {
-            la[(size_t) t * NV2 + 0] = -1.0f;      // in the history -> penalised
-            la[(size_t) t * NV2 + 1] = -1.2f;      // not penalised -> should win
+            la[(size_t)t * NV2 + 0] = -1.0f;  // in the history -> penalised
+            la[(size_t)t * NV2 + 1] = -1.2f;  // not penalised -> should win
         }
-        std::vector<int> hist_a((size_t) NT2 * 4, -1);
-        for (int t = 0; t < NT2; ++t) hist_a[(size_t) t * 4 + 0] = 0;
-        std::vector<int> want_a((size_t) NT2), alt_a((size_t) NT2);
+        std::vector<int> hist_a((size_t)NT2 * 4, -1);
+        for (int t = 0; t < NT2; ++t)
+            hist_a[(size_t)t * 4 + 0] = 0;
+        std::vector<int> want_a((size_t)NT2), alt_a((size_t)NT2);
         for (int t = 0; t < NT2; ++t) {
-            const std::vector<float> row(la.begin() + (size_t) t * NV2, la.begin() + (size_t) (t + 1) * NV2);
-            const std::vector<int> h(hist_a.begin() + (size_t) t * 4, hist_a.begin() + (size_t) (t + 1) * 4);
-            want_a[(size_t) t] = pick(row, h, p, false);
-            alt_a[(size_t) t] = pick(row, h, p, true);      // divide unconditionally
+            const std::vector<float> row(la.begin() + (size_t)t * NV2, la.begin() + (size_t)(t + 1) * NV2);
+            const std::vector<int> h(hist_a.begin() + (size_t)t * 4, hist_a.begin() + (size_t)(t + 1) * 4);
+            want_a[(size_t)t] = pick(row, h, p, false);
+            alt_a[(size_t)t] = pick(row, h, p, true);  // divide unconditionally
         }
         const bool A_visible = want_a[0] != alt_a[0];
-        std::printf("  %-34s %s (multiply-rule %d, divide-always %d)\n",
-                    "multiply-or-divide is observable", A_visible ? "yes" : "*** NO ***", want_a[0],
-                    alt_a[0]);
-        if (!A_visible) ++bad;
-        else bad += run("penalties: repeat on negatives", la, NT2, p, want_a, hist_a, 4);
+        std::printf("  %-34s %s (multiply-rule %d, divide-always %d)\n", "multiply-or-divide is observable",
+                    A_visible ? "yes" : "*** NO ***", want_a[0], alt_a[0]);
+        if (!A_visible)
+            ++bad;
+        else
+            bad += run("penalties: repeat on negatives", la, NT2, p, want_a, hist_a, 4);
 
         // B: the PRESENCE penalty is a boolean, so two occurrences cost the same as one.  The runner's margin
         // is inside the difference between one and two applications.
-        std::vector<float> lb((size_t) NV2 * NT2, -8.0f);
+        std::vector<float> lb((size_t)NV2 * NT2, -8.0f);
         for (int t = 0; t < NT2; ++t) {
-            lb[(size_t) t * NV2 + 0] = 5.0f;       // seen twice -> penalised ONCE (presence) + freq*2
-            lb[(size_t) t * NV2 + 1] = 3.4f;       // unseen
+            lb[(size_t)t * NV2 + 0] = 5.0f;  // seen twice -> penalised ONCE (presence) + freq*2
+            lb[(size_t)t * NV2 + 1] = 3.4f;  // unseen
         }
-        std::vector<int> hist_b((size_t) NT2 * 4, -1);
+        std::vector<int> hist_b((size_t)NT2 * 4, -1);
         for (int t = 0; t < NT2; ++t) {
-            hist_b[(size_t) t * 4 + 0] = 0;
-            hist_b[(size_t) t * 4 + 1] = 0;        // twice
+            hist_b[(size_t)t * 4 + 0] = 0;
+            hist_b[(size_t)t * 4 + 1] = 0;  // twice
         }
-        strata::kernels::SamplerParams q = p; q.penalty_present = 1.5f; q.penalty_freq = 0.0f;
-        std::vector<int> want_b((size_t) NT2);
+        strata::kernels::SamplerParams q = p;
+        q.penalty_present = 1.5f;
+        q.penalty_freq = 0.0f;
+        std::vector<int> want_b((size_t)NT2);
         for (int t = 0; t < NT2; ++t) {
-            const std::vector<float> row(lb.begin() + (size_t) t * NV2, lb.begin() + (size_t) (t + 1) * NV2);
-            const std::vector<int> h(hist_b.begin() + (size_t) t * 4, hist_b.begin() + (size_t) (t + 1) * 4);
-            want_b[(size_t) t] = pick(row, h, q, false);
+            const std::vector<float> row(lb.begin() + (size_t)t * NV2, lb.begin() + (size_t)(t + 1) * NV2);
+            const std::vector<int> h(hist_b.begin() + (size_t)t * 4, hist_b.begin() + (size_t)(t + 1) * 4);
+            want_b[(size_t)t] = pick(row, h, q, false);
         }
-        std::printf("  %-34s want token %d (with present=1.5, token 0 goes 5.0/2 - 1.5 = 1.0 vs token 1 at "
-                    "3.4)\n", "presence penalty is a boolean", want_b[0]);
+        std::printf(
+            "  %-34s want token %d (with present=1.5, token 0 goes 5.0/2 - 1.5 = 1.0 vs token 1 at "
+            "3.4)\n",
+            "presence penalty is a boolean", want_b[0]);
         bad += run("penalties: presence is boolean", lb, NT2, q, want_b, hist_b, 4);
     }
 
@@ -631,22 +770,28 @@ int main(int argc, char **argv) {
     // The fixture below makes token 0 the WORST token in every row, so returning 0 is unambiguously wrong.
     {
         const int NV3 = 512, NT3 = 4;
-        std::vector<float> l((size_t) NV3 * NT3, -5.0f);
-        std::vector<int> want((size_t) NT3);
+        std::vector<float> l((size_t)NV3 * NT3, -5.0f);
+        std::vector<int> want((size_t)NT3);
         for (int t = 0; t < NT3; ++t) {
-            const int best = 100 + t;                    // the argmax is never token 0
-            l[(size_t) t * NV3 + best] = 3.0f;
-            l[(size_t) t * NV3 + 0] = -9.0f;             // token 0 is the worst in the row
-            want[(size_t) t] = best;
+            const int best = 100 + t;  // the argmax is never token 0
+            l[(size_t)t * NV3 + best] = 3.0f;
+            l[(size_t)t * NV3 + 0] = -9.0f;  // token 0 is the worst in the row
+            want[(size_t)t] = best;
         }
         strata::kernels::SamplerParams p0;
-        p0.top_k = 0; p0.top_p = 1.0f; p0.temperature = 0.0f; p0.greedy = false;
+        p0.top_k = 0;
+        p0.top_p = 1.0f;
+        p0.temperature = 0.0f;
+        p0.greedy = false;
         bad += run("T=0 greedy=false is the argmax", l, NT3, p0, want);
 
-        strata::kernels::SamplerParams p1 = p0; p1.greedy = true;
+        strata::kernels::SamplerParams p1 = p0;
+        p1.greedy = true;
         bad += run("T=0 greedy=true  is the argmax", l, NT3, p1, want);
 
-        strata::kernels::SamplerParams p2 = p0; p2.greedy = true; p2.temperature = 1.0f;
+        strata::kernels::SamplerParams p2 = p0;
+        p2.greedy = true;
+        p2.temperature = 1.0f;
         bad += run("T=1 greedy=true  is the argmax", l, NT3, p2, want);
     }
 
@@ -656,33 +801,46 @@ int main(int argc, char **argv) {
     {
         const int NV2 = 8, NT2 = 2;
         strata::kernels::SamplerParams p;
-        p.top_k = 5; p.top_p = 0.9f; p.temperature = 0.8f; p.seed = 9; p.counter = 0;
-        p.penalty_last_n = 4; p.penalty_repeat = 3.0f; p.penalty_freq = 0.2f; p.penalty_present = 0.6f;
+        p.top_k = 5;
+        p.top_p = 0.9f;
+        p.temperature = 0.8f;
+        p.seed = 9;
+        p.counter = 0;
+        p.penalty_last_n = 4;
+        p.penalty_repeat = 3.0f;
+        p.penalty_freq = 0.2f;
+        p.penalty_present = 0.6f;
 
-        std::vector<float> l((size_t) NV2 * NT2, -8.0f);
-        std::vector<int> hist((size_t) NT2 * 4, -1);
+        std::vector<float> l((size_t)NV2 * NT2, -8.0f);
+        std::vector<int> hist((size_t)NT2 * 4, -1);
         for (int t = 0; t < NT2; ++t) {
-            float* row = l.data() + (size_t) t * NV2;
-            row[0] = 9.0f; row[1] = 4.5f; row[2] = 4.4f; row[3] = 4.3f;   // token 0 leads clean (9 vs 4.5)
-            hist[(size_t) t * 4 + 0] = 0;                                  // and falls to 2.2/2.0 penalised
-            hist[(size_t) t * 4 + 1] = t == 1 ? 0 : -1;                    // (repeat 3, freq, presence)
+            float* row = l.data() + (size_t)t * NV2;
+            row[0] = 9.0f;
+            row[1] = 4.5f;
+            row[2] = 4.4f;
+            row[3] = 4.3f;                              // token 0 leads clean (9 vs 4.5)
+            hist[(size_t)t * 4 + 0] = 0;                // and falls to 2.2/2.0 penalised
+            hist[(size_t)t * 4 + 1] = t == 1 ? 0 : -1;  // (repeat 3, freq, presence)
         }
-        std::vector<int> want((size_t) NT2), clean((size_t) NT2);
+        std::vector<int> want((size_t)NT2), clean((size_t)NT2);
         strata::kernels::SamplerParams clean_p = p;
-        clean_p.penalty_last_n = 0; clean_p.penalty_repeat = 1.0f;
-        clean_p.penalty_freq = 0.0f; clean_p.penalty_present = 0.0f;
+        clean_p.penalty_last_n = 0;
+        clean_p.penalty_repeat = 1.0f;
+        clean_p.penalty_freq = 0.0f;
+        clean_p.penalty_present = 0.0f;
         for (int t = 0; t < NT2; ++t) {
-            const std::vector<float> row(l.begin() + (size_t) t * NV2, l.begin() + (size_t) (t + 1) * NV2);
-            const std::vector<int> h(hist.begin() + (size_t) t * 4, hist.begin() + (size_t) (t + 1) * 4);
-            want[(size_t) t] = sampled_reference(row, h, p, t);
-            clean[(size_t) t] = sampled_reference(row, h, clean_p, t);
+            const std::vector<float> row(l.begin() + (size_t)t * NV2, l.begin() + (size_t)(t + 1) * NV2);
+            const std::vector<int> h(hist.begin() + (size_t)t * 4, hist.begin() + (size_t)(t + 1) * 4);
+            want[(size_t)t] = sampled_reference(row, h, p, t);
+            clean[(size_t)t] = sampled_reference(row, h, clean_p, t);
         }
         const bool visible = want[0] != clean[0] || want[1] != clean[1];
-        std::printf("  %-34s %s (penalised picks %d/%d, clean %d/%d)\n",
-                    "sampled penalties are observable", visible ? "yes" : "*** NO ***", want[0], want[1],
-                    clean[0], clean[1]);
-        if (!visible) ++bad;
-        else bad += run("sampled chain: penalties + top_k/p", l, NT2, p, want, hist, 4);
+        std::printf("  %-34s %s (penalised picks %d/%d, clean %d/%d)\n", "sampled penalties are observable",
+                    visible ? "yes" : "*** NO ***", want[0], want[1], clean[0], clean[1]);
+        if (!visible)
+            ++bad;
+        else
+            bad += run("sampled chain: penalties + top_k/p", l, NT2, p, want, hist, 4);
     }
 
     // ---- fixture 7: MIN_P.  The cut is a PREFIX of the descending top_k list (logit >= max + log(min_p)),
@@ -690,37 +848,47 @@ int main(int argc, char **argv) {
     // the kernel's pick equals the reference's through the full sampled chain (the correctness half).
     {
         const int NV3 = 8, NT3 = 2;
-        std::vector<float> l((size_t) NV3 * NT3, -8.0f);
+        std::vector<float> l((size_t)NV3 * NT3, -8.0f);
         for (int t = 0; t < NT3; ++t) {
-            float* row = l.data() + (size_t) t * NV3;
-            row[0] = 4.0f; row[1] = 3.5f; row[2] = 3.2f; row[3] = 3.1f;   // gaps keep the cut off the
-            row[4] = 2.0f;                                                // logf/rounding knife edge
+            float* row = l.data() + (size_t)t * NV3;
+            row[0] = 4.0f;
+            row[1] = 3.5f;
+            row[2] = 3.2f;
+            row[3] = 3.1f;  // gaps keep the cut off the
+            row[4] = 2.0f;  // logf/rounding knife edge
         }
         strata::kernels::SamplerParams base;
-        base.top_k = 6; base.top_p = 1.0f; base.temperature = 0.9f; base.seed = 77;
+        base.top_k = 6;
+        base.top_p = 1.0f;
+        base.temperature = 0.9f;
+        base.seed = 77;
 
         int c0 = 0, c05 = 0, c09 = 0;
         for (int t = 0; t < NT3; ++t) {
-            const std::vector<float> row(l.begin() + (size_t) t * NV3, l.begin() + (size_t) (t + 1) * NV3);
-            strata::kernels::SamplerParams q = base; q.min_p = 0.0f;
+            const std::vector<float> row(l.begin() + (size_t)t * NV3, l.begin() + (size_t)(t + 1) * NV3);
+            strata::kernels::SamplerParams q = base;
+            q.min_p = 0.0f;
             c0 += sampled_cut(row, {}, q);
-            q.min_p = 0.5f; c05 += sampled_cut(row, {}, q);
-            q.min_p = 0.9f; c09 += sampled_cut(row, {}, q);
+            q.min_p = 0.5f;
+            c05 += sampled_cut(row, {}, q);
+            q.min_p = 0.9f;
+            c09 += sampled_cut(row, {}, q);
         }
         const bool visible = c0 > c05 && c05 > c09 && c09 >= NT3;
-        std::printf("  %-34s %s (survivors: min_p 0 -> %d, 0.5 -> %d, 0.9 -> %d)\n",
-                    "min_p cut is observable", visible ? "yes" : "*** NO ***", c0, c05, c09);
+        std::printf("  %-34s %s (survivors: min_p 0 -> %d, 0.5 -> %d, 0.9 -> %d)\n", "min_p cut is observable",
+                    visible ? "yes" : "*** NO ***", c0, c05, c09);
         if (!visible) ++bad;
 
         for (float mp : {0.0f, 0.5f, 0.9f}) {
-            strata::kernels::SamplerParams q = base; q.min_p = mp;
-            std::vector<int> want((size_t) NT3);
+            strata::kernels::SamplerParams q = base;
+            q.min_p = mp;
+            std::vector<int> want((size_t)NT3);
             for (int t = 0; t < NT3; ++t) {
-                const std::vector<float> row(l.begin() + (size_t) t * NV3, l.begin() + (size_t) (t + 1) * NV3);
-                want[(size_t) t] = sampled_reference(row, {}, q, t);
+                const std::vector<float> row(l.begin() + (size_t)t * NV3, l.begin() + (size_t)(t + 1) * NV3);
+                want[(size_t)t] = sampled_reference(row, {}, q, t);
             }
             char name[64];
-            std::snprintf(name, sizeof name, "sampled chain: min_p=%.1f", (double) mp);
+            std::snprintf(name, sizeof name, "sampled chain: min_p=%.1f", (double)mp);
             bad += run(name, l, NT3, q, want);
         }
     }
@@ -732,31 +900,49 @@ int main(int argc, char **argv) {
     {
         const int NV4 = 8;
         strata::kernels::SamplerParams p;
-        p.top_k = 0; p.top_p = 1.0f; p.temperature = 1.0f; p.greedy = true;
-        p.penalty_last_n = 4; p.penalty_repeat = 3.0f; p.penalty_freq = 0.3f; p.penalty_present = 0.5f;
+        p.top_k = 0;
+        p.top_p = 1.0f;
+        p.temperature = 1.0f;
+        p.greedy = true;
+        p.penalty_last_n = 4;
+        p.penalty_repeat = 3.0f;
+        p.penalty_freq = 0.3f;
+        p.penalty_present = 0.5f;
 
-        std::vector<float> l((size_t) NV4, -8.0f);
-        l[0] = 6.0f; l[3] = 6.5f;                       // token 0 leads clean; token 3 is the tail offender
-        std::vector<int> hist = {0, 0, 0, 0, 3, 3, 3, 3};   // token 0 old (out), token 3 in the tail
+        std::vector<float> l((size_t)NV4, -8.0f);
+        l[0] = 6.0f;
+        l[3] = 6.5f;                                       // token 0 leads clean; token 3 is the tail offender
+        std::vector<int> hist = {0, 0, 0, 0, 3, 3, 3, 3};  // token 0 old (out), token 3 in the tail
 
         auto pick_clamped = [&](bool clamp) {
-            int best = 0; float bv = 0; bool first = true;
+            int best = 0;
+            float bv = 0;
+            bool first = true;
             for (int v = 0; v < NV4; ++v) {
                 int c = 0;
-                for (int i = 0; i < (clamp ? 4 : 8); ++i) if (hist[(size_t) (8 - (clamp ? 4 : 8) + i)] == v) ++c;
-                float logit = l[(size_t) v];
-                if (c > 0) { logit = logit <= 0.0f ? logit * p.penalty_repeat : logit / p.penalty_repeat;
-                             logit -= (float) c * p.penalty_freq + p.penalty_present; }
-                if (first || logit > bv) { bv = logit; best = v; first = false; }
+                for (int i = 0; i < (clamp ? 4 : 8); ++i)
+                    if (hist[(size_t)(8 - (clamp ? 4 : 8) + i)] == v) ++c;
+                float logit = l[(size_t)v];
+                if (c > 0) {
+                    logit = logit <= 0.0f ? logit * p.penalty_repeat : logit / p.penalty_repeat;
+                    logit -= (float)c * p.penalty_freq + p.penalty_present;
+                }
+                if (first || logit > bv) {
+                    bv = logit;
+                    best = v;
+                    first = false;
+                }
             }
             return best;
         };
         const int want = pick_clamped(true), unclamped = pick_clamped(false);
         const bool visible = want != unclamped;
-        std::printf("  %-34s %s (clamped pick %d, full-history pick %d)\n",
-                    "penalty window clamp is observable", visible ? "yes" : "*** NO ***", want, unclamped);
-        if (!visible) ++bad;
-        else bad += run("penalty window: tail only", {l.begin(), l.end()}, 1, p, {want}, hist, 8);
+        std::printf("  %-34s %s (clamped pick %d, full-history pick %d)\n", "penalty window clamp is observable",
+                    visible ? "yes" : "*** NO ***", want, unclamped);
+        if (!visible)
+            ++bad;
+        else
+            bad += run("penalty window: tail only", {l.begin(), l.end()}, 1, p, {want}, hist, 8);
     }
 
     // ---- fixture 9: ONE PENALTIES STAGE (issue #53), against an independently computed distribution, not the
@@ -768,17 +954,25 @@ int main(int argc, char **argv) {
     {
         const int NT9 = 8000;
         strata::kernels::SamplerParams p;
-        p.top_k = 2; p.top_p = 1.0f; p.min_p = 0.0f; p.temperature = 0.7f; p.seed = 53; p.counter = 0;
-        p.penalty_last_n = 1; p.penalty_repeat = 1.0f; p.penalty_freq = 0.0f; p.penalty_present = 1.5f;
-        std::vector<float> l((size_t) 2 * NT9, 0.0f);
-        std::vector<int> hist((size_t) NT9, 0);
-        std::vector<int> want((size_t) NT9);
+        p.top_k = 2;
+        p.top_p = 1.0f;
+        p.min_p = 0.0f;
+        p.temperature = 0.7f;
+        p.seed = 53;
+        p.counter = 0;
+        p.penalty_last_n = 1;
+        p.penalty_repeat = 1.0f;
+        p.penalty_freq = 0.0f;
+        p.penalty_present = 1.5f;
+        std::vector<float> l((size_t)2 * NT9, 0.0f);
+        std::vector<int> hist((size_t)NT9, 0);
+        std::vector<int> want((size_t)NT9);
         int zeros = 0;
         for (int t = 0; t < NT9; ++t) {
-            want[(size_t) t] = sampled_reference({0.0f, 0.0f}, {0}, p, t);
-            zeros += want[(size_t) t] == 0;
+            want[(size_t)t] = sampled_reference({0.0f, 0.0f}, {0}, p, t);
+            zeros += want[(size_t)t] == 0;
         }
-        const double expect = 1.0 / (1.0 + std::exp(1.5 / 0.7)), share = (double) zeros / NT9;
+        const double expect = 1.0 / (1.0 + std::exp(1.5 / 0.7)), share = (double)zeros / NT9;
         const bool near = std::fabs(share - expect) < 0.014;
         std::printf("  %-34s %s (token 0 drawn %.4f of %d, expected %.4f; twice-penalised would be 0.0255)\n",
                     "one penalties stage (#53)", near ? "yes" : "*** NO ***", share, NT9, expect);
@@ -793,16 +987,22 @@ int main(int argc, char **argv) {
     {
         const int NT10 = 256;
         strata::kernels::SamplerParams p;
-        p.top_k = 4; p.top_p = 0.75f; p.min_p = 0.3f; p.temperature = 1.0f; p.seed = 10; p.counter = 0;
+        p.top_k = 4;
+        p.top_p = 0.75f;
+        p.min_p = 0.3f;
+        p.temperature = 1.0f;
+        p.seed = 10;
+        p.counter = 0;
         const float lp[4] = {std::log(0.4f), std::log(0.3f), std::log(0.2f), std::log(0.1f)};
         std::vector<float> row = {lp[0], lp[1], lp[2], lp[3], -30.0f, -30.0f, -30.0f, -30.0f};
         std::vector<float> l;
-        for (int t = 0; t < NT10; ++t) l.insert(l.end(), row.begin(), row.end());
-        std::vector<int> want((size_t) NT10);
+        for (int t = 0; t < NT10; ++t)
+            l.insert(l.end(), row.begin(), row.end());
+        std::vector<int> want((size_t)NT10);
         int twos = 0;
         for (int t = 0; t < NT10; ++t) {
-            want[(size_t) t] = sampled_reference(row, {}, p, t);
-            twos += want[(size_t) t] == 2;
+            want[(size_t)t] = sampled_reference(row, {}, p, t);
+            twos += want[(size_t)t] == 2;
         }
         std::printf("  %-34s %s (token 2 drawn %d of %d times)\n", "top_p before min_p is observable",
                     twos > 0 ? "yes" : "*** NO ***", twos, NT10);
@@ -814,25 +1014,34 @@ int main(int argc, char **argv) {
     // from a previous penalised request while this request disables the penalties - the run must equal the
     // no-history run in both kernels, and the bitmap the launch did not size must stay untouched.
     {
-        std::mt19937 rng(11); std::normal_distribution<float> g(0.0f, 1.0f);
-        std::vector<float> l((size_t) NV * NT);
-        for (auto& v : l) v = g(rng);
-        std::vector<int> hist((size_t) NT * 8, -1);
-        for (int t = 0; t < NT; ++t) hist[(size_t) t * 8] = 3;
+        std::mt19937 rng(11);
+        std::normal_distribution<float> g(0.0f, 1.0f);
+        std::vector<float> l((size_t)NV * NT);
+        for (auto& v : l)
+            v = g(rng);
+        std::vector<int> hist((size_t)NT * 8, -1);
+        for (int t = 0; t < NT; ++t)
+            hist[(size_t)t * 8] = 3;
 
         strata::kernels::SamplerParams p;
-        p.top_k = 20; p.top_p = 0.95f; p.temperature = 0.8f; p.seed = 5;
-        std::vector<int> want((size_t) NT);
+        p.top_k = 20;
+        p.top_p = 0.95f;
+        p.temperature = 0.8f;
+        p.seed = 5;
+        std::vector<int> want((size_t)NT);
         for (int t = 0; t < NT; ++t)
-            want[(size_t) t] = sampled_reference({l.begin() + (size_t) t * NV,
-                                                  l.begin() + (size_t) (t + 1) * NV}, {}, p, t);
+            want[(size_t)t] =
+                sampled_reference({l.begin() + (size_t)t * NV, l.begin() + (size_t)(t + 1) * NV}, {}, p, t);
         bad += run("stale history, last_n=0 (sampled)", l, NT, p, want, hist, 8);
 
-        strata::kernels::SamplerParams gp = p; gp.greedy = true; gp.top_k = 0; gp.top_p = 1.0f;
-        std::vector<int> gwant((size_t) NT);
+        strata::kernels::SamplerParams gp = p;
+        gp.greedy = true;
+        gp.top_k = 0;
+        gp.top_p = 1.0f;
+        std::vector<int> gwant((size_t)NT);
         for (int t = 0; t < NT; ++t)
-            gwant[(size_t) t] = reference_pick({l.begin() + (size_t) t * NV,
-                                                l.begin() + (size_t) (t + 1) * NV}, gp, false);
+            gwant[(size_t)t] =
+                reference_pick({l.begin() + (size_t)t * NV, l.begin() + (size_t)(t + 1) * NV}, gp, false);
         bad += run("stale history, last_n=0 (greedy)", l, NT, gp, gwant, hist, 8);
     }
 
@@ -845,46 +1054,72 @@ int main(int argc, char **argv) {
     {
         auto greedy_pen = [](const std::vector<float>& l, const std::vector<int>& hist,
                              const strata::kernels::SamplerParams& p) {
-            int best = 0; float bv = 0; bool first = true;
-            for (int v = 0; v < (int) l.size(); ++v) {
-                int c = 0; for (int h : hist) if (h == v) ++c;
-                float s = l[(size_t) v];
+            int best = 0;
+            float bv = 0;
+            bool first = true;
+            for (int v = 0; v < (int)l.size(); ++v) {
+                int c = 0;
+                for (int h : hist)
+                    if (h == v) ++c;
+                float s = l[(size_t)v];
                 if (c > 0) {
-                    if (s <= 0.0f) s *= p.penalty_repeat; else s /= p.penalty_repeat;
-                    s -= (float) c * p.penalty_freq + p.penalty_present;
+                    if (s <= 0.0f)
+                        s *= p.penalty_repeat;
+                    else
+                        s /= p.penalty_repeat;
+                    s -= (float)c * p.penalty_freq + p.penalty_present;
                 }
-                if (first || s > bv) { bv = s; best = v; first = false; }
+                if (first || s > bv) {
+                    bv = s;
+                    best = v;
+                    first = false;
+                }
             }
             return best;
         };
-        std::mt19937 rng(12); std::normal_distribution<float> g(0.0f, 1.0f);
-        const int TAIL = 5000;                           // longer than the widest window below
-        std::vector<int32_t> tail((size_t) TAIL);
-        for (auto& v : tail) v = (int32_t) (rng() % NV);
+        std::mt19937 rng(12);
+        std::normal_distribution<float> g(0.0f, 1.0f);
+        const int TAIL = 5000;  // longer than the widest window below
+        std::vector<int32_t> tail((size_t)TAIL);
+        for (auto& v : tail)
+            v = (int32_t)(rng() % NV);
         int observable = 0, rows_checked = 0;
         for (int T : {1, 2, 4, 8}) {
             for (int H : {1, 64, 1024, 4096}) {
-                std::vector<int32_t> window((size_t) T);
-                for (int t = 0; t < T; ++t) window[(size_t) t] = (int32_t) (100 + 37 * t);   // distinct, in range
-                std::vector<int32_t> rows((size_t) T * H);
+                std::vector<int32_t> window((size_t)T);
+                for (int t = 0; t < T; ++t)
+                    window[(size_t)t] = (int32_t)(100 + 37 * t);  // distinct, in range
+                std::vector<int32_t> rows((size_t)T * H);
                 strata::kernels::penalty_rows(tail.data(), TAIL, window.data(), T, H, rows.data());
-                std::vector<float> l((size_t) T * NV);
-                for (auto& v : l) v = g(rng);
-                for (int t = 0; t < T; ++t) l[(size_t) t * NV + window[(size_t) t]] = 5.0f;
+                std::vector<float> l((size_t)T * NV);
+                for (auto& v : l)
+                    v = g(rng);
+                for (int t = 0; t < T; ++t)
+                    l[(size_t)t * NV + window[(size_t)t]] = 5.0f;
                 strata::kernels::SamplerParams gp;
-                gp.greedy = true; gp.temperature = 0.0f; gp.top_k = 0; gp.top_p = 1.0f;
-                gp.penalty_last_n = H; gp.penalty_present = 4.0f;
+                gp.greedy = true;
+                gp.temperature = 0.0f;
+                gp.top_k = 0;
+                gp.top_p = 1.0f;
+                gp.penalty_last_n = H;
+                gp.penalty_present = 4.0f;
                 strata::kernels::SamplerParams sp2;
-                sp2.top_k = 20; sp2.top_p = 0.9f; sp2.temperature = 0.7f; sp2.seed = 1000 + (uint64_t) H;
-                sp2.counter = 77; sp2.penalty_last_n = H; sp2.penalty_present = 4.0f; sp2.penalty_repeat = 1.1f;
-                std::vector<int> gwant((size_t) T), swant((size_t) T), rows_int(rows.begin(), rows.end());
+                sp2.top_k = 20;
+                sp2.top_p = 0.9f;
+                sp2.temperature = 0.7f;
+                sp2.seed = 1000 + (uint64_t)H;
+                sp2.counter = 77;
+                sp2.penalty_last_n = H;
+                sp2.penalty_present = 4.0f;
+                sp2.penalty_repeat = 1.1f;
+                std::vector<int> gwant((size_t)T), swant((size_t)T), rows_int(rows.begin(), rows.end());
                 for (int t = 0; t < T; ++t) {
-                    const std::vector<float> lr(l.begin() + (size_t) t * NV, l.begin() + (size_t) (t + 1) * NV);
-                    const std::vector<int> own(rows.begin() + (size_t) t * H, rows.begin() + (size_t) (t + 1) * H);
+                    const std::vector<float> lr(l.begin() + (size_t)t * NV, l.begin() + (size_t)(t + 1) * NV);
+                    const std::vector<int> own(rows.begin() + (size_t)t * H, rows.begin() + (size_t)(t + 1) * H);
                     const std::vector<int> row0(rows.begin(), rows.begin() + H);
-                    gwant[(size_t) t] = greedy_pen(lr, own, gp);
-                    swant[(size_t) t] = sampled_reference(lr, own, sp2, t);
-                    if (t > 0 && greedy_pen(lr, row0, gp) != gwant[(size_t) t]) ++observable;
+                    gwant[(size_t)t] = greedy_pen(lr, own, gp);
+                    swant[(size_t)t] = sampled_reference(lr, own, sp2, t);
+                    if (t > 0 && greedy_pen(lr, row0, gp) != gwant[(size_t)t]) ++observable;
                     ++rows_checked;
                 }
                 char name[64];
@@ -904,41 +1139,65 @@ int main(int argc, char **argv) {
     // an id >= n_vocab used to set a bit past its end (a shared-memory write out of bounds - compute-sanitizer
     // memcheck reports it).  They can never be a candidate, so the result equals the reference without them.
     {
-        std::mt19937 rng(13); std::normal_distribution<float> g(0.0f, 1.0f);
+        std::mt19937 rng(13);
+        std::normal_distribution<float> g(0.0f, 1.0f);
         const int H = 16;
-        std::vector<float> l((size_t) NV * NT);
-        for (auto& v : l) v = g(rng);
-        std::vector<int> hist((size_t) NT * H, -1), valid_only((size_t) NT * H, -1);
+        std::vector<float> l((size_t)NV * NT);
+        for (auto& v : l)
+            v = g(rng);
+        std::vector<int> hist((size_t)NT * H, -1), valid_only((size_t)NT * H, -1);
         const int junk[] = {NV, NV + 1000, 0x7fffffff, -5, 1 << 20};
         for (int t = 0; t < NT; ++t) {
             for (int j = 0; j < H; ++j) {
                 const bool bogus = j % 3 == 0;
-                const int v = bogus ? junk[(size_t) (j / 3) % 5] : (int) (rng() % NV);
-                hist[(size_t) t * H + j] = v;
-                if (!bogus) valid_only[(size_t) t * H + j] = v;
+                const int v = bogus ? junk[(size_t)(j / 3) % 5] : (int)(rng() % NV);
+                hist[(size_t)t * H + j] = v;
+                if (!bogus) valid_only[(size_t)t * H + j] = v;
             }
-            l[(size_t) t * NV + hist[(size_t) t * H + 1]] = 4.0f;     // a penalised favourite, so penalties matter
+            l[(size_t)t * NV + hist[(size_t)t * H + 1]] = 4.0f;  // a penalised favourite, so penalties matter
         }
         strata::kernels::SamplerParams gp;
-        gp.greedy = true; gp.temperature = 0.0f; gp.top_k = 0; gp.top_p = 1.0f;
-        gp.penalty_last_n = H; gp.penalty_present = 3.0f;
+        gp.greedy = true;
+        gp.temperature = 0.0f;
+        gp.top_k = 0;
+        gp.top_p = 1.0f;
+        gp.penalty_last_n = H;
+        gp.penalty_present = 3.0f;
         strata::kernels::SamplerParams sp2 = gp;
-        sp2.greedy = false; sp2.temperature = 0.8f; sp2.top_k = 20; sp2.top_p = 0.95f; sp2.seed = 13;
-        std::vector<int> gwant((size_t) NT), swant((size_t) NT);
+        sp2.greedy = false;
+        sp2.temperature = 0.8f;
+        sp2.top_k = 20;
+        sp2.top_p = 0.95f;
+        sp2.seed = 13;
+        std::vector<int> gwant((size_t)NT), swant((size_t)NT);
         for (int t = 0; t < NT; ++t) {
-            const std::vector<float> lr(l.begin() + (size_t) t * NV, l.begin() + (size_t) (t + 1) * NV);
-            const std::vector<int> ok(valid_only.begin() + (size_t) t * H, valid_only.begin() + (size_t) (t + 1) * H);
-            {   // the greedy reference with the penalty (reference_pick has none)
-                int best = 0; float bv = 0; bool first = true;
+            const std::vector<float> lr(l.begin() + (size_t)t * NV, l.begin() + (size_t)(t + 1) * NV);
+            const std::vector<int> ok(valid_only.begin() + (size_t)t * H, valid_only.begin() + (size_t)(t + 1) * H);
+            {  // the greedy reference with the penalty (reference_pick has none)
+                int best = 0;
+                float bv = 0;
+                bool first = true;
                 for (int v = 0; v < NV; ++v) {
-                    int c = 0; for (int h : ok) if (h == v) ++c;
-                    float s = lr[(size_t) v];
-                    if (c > 0) { if (s <= 0.0f) s *= gp.penalty_repeat; else s /= gp.penalty_repeat; s -= gp.penalty_present; }
-                    if (first || s > bv) { bv = s; best = v; first = false; }
+                    int c = 0;
+                    for (int h : ok)
+                        if (h == v) ++c;
+                    float s = lr[(size_t)v];
+                    if (c > 0) {
+                        if (s <= 0.0f)
+                            s *= gp.penalty_repeat;
+                        else
+                            s /= gp.penalty_repeat;
+                        s -= gp.penalty_present;
+                    }
+                    if (first || s > bv) {
+                        bv = s;
+                        best = v;
+                        first = false;
+                    }
                 }
-                gwant[(size_t) t] = best;
+                gwant[(size_t)t] = best;
             }
-            swant[(size_t) t] = sampled_reference(lr, ok, sp2, t);
+            swant[(size_t)t] = sampled_reference(lr, ok, sp2, t);
         }
         bad += run("out-of-vocab history ids (greedy)", l, NT, gp, gwant, hist, H);
         bad += run("out-of-vocab history ids (sampled)", l, NT, sp2, swant, hist, H);
@@ -948,21 +1207,29 @@ int main(int argc, char **argv) {
     // kernel keeps, 64 - and every row is written (the sampled kernel used to print an error for 0 and leave the
     // row unwritten, which a verify window then read as a token; `run` pre-fills -1 so that fails here).
     {
-        std::mt19937 rng(14); std::normal_distribution<float> g(0.0f, 1.0f);
-        std::vector<float> l((size_t) NV * NT);
-        for (auto& v : l) v = g(rng) * 0.3f;             // flat: the 64-wide list matters to the draw
+        std::mt19937 rng(14);
+        std::normal_distribution<float> g(0.0f, 1.0f);
+        std::vector<float> l((size_t)NV * NT);
+        for (auto& v : l)
+            v = g(rng) * 0.3f;  // flat: the 64-wide list matters to the draw
         strata::kernels::SamplerParams p64;
-        p64.top_k = 64; p64.top_p = 1.0f; p64.temperature = 1.5f; p64.seed = 14;
-        std::vector<int> want((size_t) NT);
+        p64.top_k = 64;
+        p64.top_p = 1.0f;
+        p64.temperature = 1.5f;
+        p64.seed = 14;
+        std::vector<int> want((size_t)NT);
         for (int t = 0; t < NT; ++t)
-            want[(size_t) t] = sampled_reference({l.begin() + (size_t) t * NV, l.begin() + (size_t) (t + 1) * NV},
-                                                 {}, p64, t);
+            want[(size_t)t] =
+                sampled_reference({l.begin() + (size_t)t * NV, l.begin() + (size_t)(t + 1) * NV}, {}, p64, t);
         bad += run("sampled top_k=64", l, NT, p64, want);
-        strata::kernels::SamplerParams p0 = p64; p0.top_k = 0;
+        strata::kernels::SamplerParams p0 = p64;
+        p0.top_k = 0;
         bad += run("sampled top_k=0 means 64", l, NT, p0, want);
-        strata::kernels::SamplerParams p100 = p64; p100.top_k = 100;
+        strata::kernels::SamplerParams p100 = p64;
+        p100.top_k = 100;
         bad += run("sampled top_k=100 means 64", l, NT, p100, want);
-        strata::kernels::SamplerParams pneg = p64; pneg.top_k = -3;
+        strata::kernels::SamplerParams pneg = p64;
+        pneg.top_k = -3;
         bad += run("sampled top_k=-3 means 64", l, NT, pneg, want);
     }
 
@@ -974,25 +1241,29 @@ int main(int argc, char **argv) {
         for (int n_tail : {0, 1, 5, 63, 64, 65, 300}) {
             for (int T : {1, 3, 8}) {
                 for (int h : {1, 4, 64, 100}) {
-                    std::vector<int32_t> tail((size_t) n_tail), window((size_t) T);
-                    for (int i = 0; i < n_tail; ++i) tail[(size_t) i] = 1000 + i;
-                    for (int i = 0; i < T; ++i) window[(size_t) i] = 5000 + i;
-                    std::vector<int32_t> rows((size_t) T * h, 12345);
+                    std::vector<int32_t> tail((size_t)n_tail), window((size_t)T);
+                    for (int i = 0; i < n_tail; ++i)
+                        tail[(size_t)i] = 1000 + i;
+                    for (int i = 0; i < T; ++i)
+                        window[(size_t)i] = 5000 + i;
+                    std::vector<int32_t> rows((size_t)T * h, 12345);
                     strata::kernels::penalty_rows(tail.data(), n_tail, window.data(), T, h, rows.data());
                     for (int t = 0; t < T; ++t) {
                         std::vector<int32_t> seq(tail);
                         seq.insert(seq.end(), window.begin(), window.begin() + t + 1);
-                        std::vector<int32_t> expect((size_t) h, -1);
-                        const int take = (int) std::min<size_t>((size_t) h, seq.size());
-                        for (int j = 0; j < take; ++j) expect[(size_t) (h - take + j)] = seq[seq.size() - take + j];
-                        if (!std::equal(expect.begin(), expect.end(), rows.begin() + (size_t) t * h)) ++wrong;
+                        std::vector<int32_t> expect((size_t)h, -1);
+                        const int take = (int)std::min<size_t>((size_t)h, seq.size());
+                        for (int j = 0; j < take; ++j)
+                            expect[(size_t)(h - take + j)] = seq[seq.size() - take + j];
+                        if (!std::equal(expect.begin(), expect.end(), rows.begin() + (size_t)t * h)) ++wrong;
                         ++cases;
                     }
                     // row 0 = the old single-row staging: consumed tail, then the fed-back head last
-                    std::vector<int32_t> old((size_t) h, -1);
-                    const int take0 = (int) std::min<int64_t>(h, (int64_t) n_tail + 1);
-                    for (int j = 0; j < take0 - 1; ++j) old[(size_t) (h - take0 + j)] = tail[(size_t) (n_tail - (take0 - 1) + j)];
-                    old[(size_t) (h - 1)] = window[0];
+                    std::vector<int32_t> old((size_t)h, -1);
+                    const int take0 = (int)std::min<int64_t>(h, (int64_t)n_tail + 1);
+                    for (int j = 0; j < take0 - 1; ++j)
+                        old[(size_t)(h - take0 + j)] = tail[(size_t)(n_tail - (take0 - 1) + j)];
+                    old[(size_t)(h - 1)] = window[0];
                     if (!std::equal(old.begin(), old.end(), rows.begin())) ++wrong;
                     ++cases;
                 }
@@ -1011,23 +1282,29 @@ int main(int argc, char **argv) {
         int* output = sycl::malloc_device<int>(count, q_ct1);
         q_ct1.memcpy(input, uniform.data(), uniform.size() * sizeof(float)).wait();
         strata::kernels::SamplerParams p;
-        p.top_k = vocab; p.top_p = 1.0f; p.seed = 123; p.counter = (uint64_t(1) << 32) + 7;
+        p.top_k = vocab;
+        p.top_p = 1.0f;
+        p.seed = 123;
+        p.counter = (uint64_t(1) << 32) + 7;
         strata::kernels::sample_tokens(input, count, vocab, nullptr, 0, p, output, &q_ct1);
         std::vector<int> batch(count), singles(count), repeated(count);
         q_ct1.memcpy(batch.data(), output, count * sizeof(int)).wait();
         for (int i = 0; i < count; ++i) {
-            auto one = p; one.counter += i;
+            auto one = p;
+            one.counter += i;
             strata::kernels::sample_tokens(input, 1, vocab, nullptr, 0, one, output + i, &q_ct1);
         }
         q_ct1.memcpy(singles.data(), output, count * sizeof(int)).wait();
         strata::kernels::sample_tokens(input, count, vocab, nullptr, 0, p, output, &q_ct1);
         q_ct1.memcpy(repeated.data(), output, count * sizeof(int)).wait();
         bool varies = false;
-        for (int i = 1; i < count; ++i) varies |= batch[i] != batch[0];
+        for (int i = 1; i < count; ++i)
+            varies |= batch[i] != batch[0];
         const bool valid = batch == singles && batch == repeated && varies;
         std::printf("  sampler draw counter segmentation/repeat: %s\n", valid ? "PASS" : "FAIL");
         bad += !valid;
-        sycl::free(input, q_ct1); sycl::free(output, q_ct1);
+        sycl::free(input, q_ct1);
+        sycl::free(output, q_ct1);
     }
 
     // ---- fixture 16: THE WHOLE top_k LIST, POSITION BY POSITION, UNDER TIES.  A pick shows the list
@@ -1045,74 +1322,84 @@ int main(int argc, char **argv) {
         int wrong = 0, probes = 0, sentinels = 0;
         for (int nv : {248320, 100003, 262144, 262145, 1000}) {
             const int T = 4, H = 64;
-            std::mt19937 rng((unsigned) (1600 + nv));
+            std::mt19937 rng((unsigned)(1600 + nv));
             std::normal_distribution<float> g(0.0f, 1.0f);
-            std::vector<float> l((size_t) nv * T);
-            for (auto& v : l) v = std::floor(g(rng) * 4.0f) / 4.0f;          // quarter steps: ties everywhere
-            auto spread = [&](int j) { return (int) (((int64_t) j * 7919 + 13) % nv); };
+            std::vector<float> l((size_t)nv * T);
+            for (auto& v : l)
+                v = std::floor(g(rng) * 4.0f) / 4.0f;  // quarter steps: ties everywhere
+            auto spread = [&](int j) { return (int)(((int64_t)j * 7919 + 13) % nv); };
             // row 0: 20 logits at 6.25 and 300 at 6.0 over the whole row, two +inf
             float* r0 = l.data();
-            for (int j = 0; j < 320; ++j) r0[spread(j)] = j < 20 ? 6.25f : 6.0f;
+            for (int j = 0; j < 320; ++j)
+                r0[spread(j)] = j < 20 ? 6.25f : 6.0f;
             r0[nv / 2] = inf;
             r0[nv - 1] = inf;
             // row 1: nothing above 0, every zero signed by its id's parity (-0 at even ids), one +inf
-            float* r1 = l.data() + (size_t) nv;
+            float* r1 = l.data() + (size_t)nv;
             for (int v = 0; v < nv; ++v) {
                 r1[v] = -std::fabs(r1[v]);
                 if (r1[v] == 0.0f) r1[v] = (v & 1) ? 0.0f : -0.0f;
             }
             r1[3] = inf;
             // row 2: -inf everywhere but ten finite logits (two values), two NaN and a +inf: 11 candidates in all
-            float* r2 = l.data() + (size_t) 2 * nv;
-            for (int v = 0; v < nv; ++v) r2[v] = -inf;
-            for (int j = 0; j < 10; ++j) r2[spread(j + 400)] = j < 5 ? 1.0f : 0.5f;
+            float* r2 = l.data() + (size_t)2 * nv;
+            for (int v = 0; v < nv; ++v)
+                r2[v] = -inf;
+            for (int j = 0; j < 10; ++j)
+                r2[spread(j + 400)] = j < 5 ? 1.0f : 0.5f;
             r2[spread(500)] = qnan;
             r2[spread(501)] = qnan;
             r2[spread(502)] = inf;
             // row 3: penalties.  Window ids on block and warp edges, repeats, and ids outside the vocabulary; the
             // penalised tokens sit at 9.0, which repeat 2 / freq 0.25 / present 0.5 turns into 4.0 - 0.25 x count
             // (3.75, 3.5, ...), values the quarter-step logits share.
-            float* r3 = l.data() + (size_t) 3 * nv;
-            std::vector<int> hist((size_t) T * H, -1);
-            int* h3 = hist.data() + (size_t) 3 * H;
+            float* r3 = l.data() + (size_t)3 * nv;
+            std::vector<int> hist((size_t)T * H, -1);
+            int* h3 = hist.data() + (size_t)3 * H;
             const int edges[] = {0, 1023, 1024, 4095, 4096, 8191, 8192, 12345, nv / 2 + 1, nv - 2};
             int hn = 0;
             for (int e : edges)
                 if (e < nv && e != nv / 2) {
                     h3[hn++] = e;
-                    if (hn % 3 == 0) h3[hn++] = e;                              // counted twice
+                    if (hn % 3 == 0) h3[hn++] = e;  // counted twice
                     r3[e] = 9.0f;
                 }
-            h3[hn++] = nv;                                                      // ignored: outside
+            h3[hn++] = nv;  // ignored: outside
             h3[hn++] = nv + 77;
             h3[hn++] = -5;
-            for (int j = 0; j < 30; ++j) r3[spread(j + 600)] = j < 15 ? 3.75f : 3.5f;
-            r3[nv / 2] = inf;                                                   // not in the window
+            for (int j = 0; j < 30; ++j)
+                r3[spread(j + 600)] = j < 15 ? 3.75f : 3.5f;
+            r3[nv / 2] = inf;  // not in the window
 
             strata::kernels::SamplerParams base;
-            base.top_p = 1.0f; base.min_p = 0.0f; base.temperature = 0.8f; base.seed = 16;
-            base.penalty_last_n = H; base.penalty_repeat = 2.0f; base.penalty_freq = 0.25f;
+            base.top_p = 1.0f;
+            base.min_p = 0.0f;
+            base.temperature = 0.8f;
+            base.seed = 16;
+            base.penalty_last_n = H;
+            base.penalty_repeat = 2.0f;
+            base.penalty_freq = 0.25f;
             base.penalty_present = 0.5f;
             const int kmax = sampled_k(64, nv);
             std::vector<SelList> lists;
             for (int t = 0; t < T; ++t)
-                lists.push_back(mirror_select(l.data() + (size_t) t * nv, nv, window_of(hist, H, t, H), base, kmax));
+                lists.push_back(mirror_select(l.data() + (size_t)t * nv, nv, window_of(hist, H, t, H), base, kmax));
             DeviceRows rows(l, T, hist, H);
             for (int top_k = 0; top_k <= 66; ++top_k) {
                 strata::kernels::SamplerParams p = base;
-                p.top_k = top_k == 65 ? 100 : top_k == 66 ? -3 : top_k;       // 0, 100 and -3 mean 64
-                p.top_p = (top_k & 1) ? 0.5f : 1.0f;                            // both tail branches (NaN: no cut)
-                p.counter = (uint64_t) top_k;
+                p.top_k = top_k == 65 ? 100 : top_k == 66 ? -3 : top_k;  // 0, 100 and -3 mean 64
+                p.top_p = (top_k & 1) ? 0.5f : 1.0f;                     // both tail branches (NaN: no cut)
+                p.counter = (uint64_t)top_k;
                 const int k = sampled_k(p.top_k, nv);
                 const std::vector<int> got = rows.sample(p, &q_ct1);
                 for (int t = 0; t < T; ++t) {
-                    const int want = lists[(size_t) t].ids[(size_t) (k - 1)];
+                    const int want = lists[(size_t)t].ids[(size_t)(k - 1)];
                     sentinels += (t == 2 && k > 11);
                     ++probes;
-                    if (got[(size_t) t] != want) {
+                    if (got[(size_t)t] != want) {
                         if (wrong < 8)
                             std::printf("    n_vocab %d row %d top_k %d: position %d want id %d got %d\n", nv, t,
-                                        p.top_k, k - 1, want, got[(size_t) t]);
+                                        p.top_k, k - 1, want, got[(size_t)t]);
                         ++wrong;
                     }
                 }
@@ -1135,60 +1422,69 @@ int main(int argc, char **argv) {
         sycl::queue cs(q_ct1.get_device(), sycl::property::queue::in_order{});
         int wrong = 0, draws = 0, tied = 0;
         for (int nv : {248320, 512}) {
-            std::mt19937 rng((unsigned) (1700 + nv));
+            std::mt19937 rng((unsigned)(1700 + nv));
             std::normal_distribution<float> g(0.0f, 1.5f);
-            std::vector<float> l((size_t) nv * T);
-            for (auto& v : l) v = std::floor(g(rng) * 2.0f) / 2.0f;
+            std::vector<float> l((size_t)nv * T);
+            for (auto& v : l)
+                v = std::floor(g(rng) * 2.0f) / 2.0f;
             if (nv == 512)
-                for (auto& v : l) v = std::floor(v / 2.0f);                    // whole steps: a few big tie groups
-            std::vector<int> hist((size_t) T * H);
+                for (auto& v : l)
+                    v = std::floor(v / 2.0f);  // whole steps: a few big tie groups
+            std::vector<int> hist((size_t)T * H);
             for (int t = 0; t < T; ++t) {
-                const float* row = l.data() + (size_t) t * nv;
+                const float* row = l.data() + (size_t)t * nv;
                 const float mx = *std::max_element(row, row + nv);
                 std::vector<int> head;
                 for (int v = 0; v < nv; ++v)
                     if (row[v] >= mx - 1.0f) head.push_back(v);
                 for (int j = 0; j < H; ++j)
-                    hist[(size_t) t * H + j] = (j & 1) ? (int) (rng() % (unsigned) nv)
-                                                       : head[(size_t) (rng() % (unsigned) head.size())];
+                    hist[(size_t)t * H + j] =
+                        (j & 1) ? (int)(rng() % (unsigned)nv) : head[(size_t)(rng() % (unsigned)head.size())];
             }
             DeviceRows rows(l, T, hist, H);
             int config = 0;
             for (int pen = 0; pen < 2; ++pen) {
                 strata::kernels::SamplerParams base;
-                base.temperature = 2.5f; base.seed = 17;
+                base.temperature = 2.5f;
+                base.seed = 17;
                 base.penalty_last_n = pen ? H : 0;
-                base.penalty_repeat = 1.25f; base.penalty_freq = 0.25f; base.penalty_present = 0.5f;
+                base.penalty_repeat = 1.25f;
+                base.penalty_freq = 0.25f;
+                base.penalty_present = 0.5f;
                 const int kmax = sampled_k(64, nv);
                 std::vector<SelList> lists;
                 for (int t = 0; t < T; ++t)
-                    lists.push_back(mirror_select(l.data() + (size_t) t * nv, nv, window_of(hist, H, t, base.penalty_last_n),
-                                                  base, kmax));
+                    lists.push_back(mirror_select(l.data() + (size_t)t * nv, nv,
+                                                  window_of(hist, H, t, base.penalty_last_n), base, kmax));
                 for (int top_k : {1, 20, 64})
                     for (float top_p : {0.9f, 1.0f})
                         for (float min_p : {0.0f, 0.05f})
                             for (sycl::queue* st : {&q_ct1, &cs}) {
                                 strata::kernels::SamplerParams p = base;
-                                p.top_k = top_k; p.top_p = top_p; p.min_p = min_p;
-                                p.counter = (uint64_t) (1000 * ++config);
+                                p.top_k = top_k;
+                                p.top_p = top_p;
+                                p.min_p = min_p;
+                                p.counter = (uint64_t)(1000 * ++config);
                                 const int k = sampled_k(top_k, nv);
                                 const std::vector<int> got = rows.sample(p, st);
                                 for (int t = 0; t < T; ++t) {
-                                    const SelList& sl = lists[(size_t) t];
+                                    const SelList& sl = lists[(size_t)t];
                                     const int want = mirror_pick(sl, k, p, t);
                                     ++draws;
                                     int same = 0;
                                     for (int i = 0; i < k; ++i) {
-                                        if (sl.ids[(size_t) i] != want) continue;
-                                        for (int j = 0; j < k; ++j) same += sl.logit[(size_t) j] == sl.logit[(size_t) i];
+                                        if (sl.ids[(size_t)i] != want) continue;
+                                        for (int j = 0; j < k; ++j)
+                                            same += sl.logit[(size_t)j] == sl.logit[(size_t)i];
                                         break;
                                     }
                                     tied += same > 1;
-                                    if (got[(size_t) t] != want) {
+                                    if (got[(size_t)t] != want) {
                                         if (wrong < 8)
-                                             std::printf("    n_vocab %d row %d top_k %d top_p %.2f min_p %.2f pen %d: "
-                                                         "want %d got %d\n", nv, t, top_k, (double) top_p,
-                                                         (double) min_p, pen, want, got[(size_t) t]);
+                                            std::printf(
+                                                "    n_vocab %d row %d top_k %d top_p %.2f min_p %.2f pen %d: "
+                                                "want %d got %d\n",
+                                                nv, t, top_k, (double)top_p, (double)min_p, pen, want, got[(size_t)t]);
                                         ++wrong;
                                     }
                                 }
@@ -1211,7 +1507,7 @@ int main(int argc, char **argv) {
         auto compare = [&](const char* what, const std::vector<int>& got, const std::vector<SelList>& lists, int k,
                            const strata::kernels::SamplerParams& p) {
             for (size_t t = 0; t < got.size(); ++t) {
-                const int want = mirror_pick(lists[t], k, p, (int) t);
+                const int want = mirror_pick(lists[t], k, p, (int)t);
                 ++draws;
                 if (got[t] != want) {
                     if (wrong < 8) std::printf("    %s row %zu: want %d got %d\n", what, t, want, got[t]);
@@ -1222,10 +1518,12 @@ int main(int argc, char **argv) {
         auto make = [&](int nv, int T, unsigned seed, std::vector<float>& l, std::vector<int>& hist) {
             std::mt19937 rng(seed);
             std::normal_distribution<float> g(0.0f, 1.5f);
-            l.assign((size_t) nv * T, 0.0f);
-            for (auto& v : l) v = std::floor(g(rng) * 2.0f) / 2.0f;
-            hist.assign((size_t) T * H, 0);
-            for (auto& h : hist) h = (int) (rng() % (unsigned) nv);
+            l.assign((size_t)nv * T, 0.0f);
+            for (auto& v : l)
+                v = std::floor(g(rng) * 2.0f) / 2.0f;
+            hist.assign((size_t)T * H, 0);
+            for (auto& h : hist)
+                h = (int)(rng() % (unsigned)nv);
         };
         {
             const int nv = 248320, T = 3;
@@ -1233,12 +1531,19 @@ int main(int argc, char **argv) {
             std::vector<int> hist;
             make(nv, T, 1800u, l, hist);
             strata::kernels::SamplerParams p;
-            p.top_k = 20; p.top_p = 0.9f; p.temperature = 2.5f; p.seed = 18; p.counter = 77;
-            p.penalty_last_n = H; p.penalty_repeat = 1.25f; p.penalty_freq = 0.25f; p.penalty_present = 0.5f;
+            p.top_k = 20;
+            p.top_p = 0.9f;
+            p.temperature = 2.5f;
+            p.seed = 18;
+            p.counter = 77;
+            p.penalty_last_n = H;
+            p.penalty_repeat = 1.25f;
+            p.penalty_freq = 0.25f;
+            p.penalty_present = 0.5f;
             const int k = sampled_k(p.top_k, nv);
             std::vector<SelList> lists;
             for (int t = 0; t < T; ++t)
-                lists.push_back(mirror_select(l.data() + (size_t) t * nv, nv, window_of(hist, H, t, H), p, k));
+                lists.push_back(mirror_select(l.data() + (size_t)t * nv, nv, window_of(hist, H, t, H), p, k));
             DeviceRows rows(l, T, hist, H);
             sycl::queue cs(q_ct1.get_device(), sycl::property::queue::in_order{});
             q_ct1.memset(rows.o, 0xFF, (size_t)T * sizeof(int)).wait();
@@ -1252,7 +1557,7 @@ int main(int argc, char **argv) {
                 q_ct1.memset(rows.o, 0xFF, (size_t)T * sizeof(int)).wait();
                 check(cudaGraphLaunch(exec, &cs), "graph launch");
                 cs.wait();
-                std::vector<int> got((size_t) T);
+                std::vector<int> got((size_t)T);
                 q_ct1.memcpy(got.data(), rows.o, got.size() * sizeof(int)).wait();
                 compare("captured graph", got, lists, k, p);
             }
@@ -1264,15 +1569,19 @@ int main(int argc, char **argv) {
             const int nv = 512;
             std::vector<float> l;
             std::vector<int> hist;
-            make(nv, T, 1810u + (unsigned) T, l, hist);
+            make(nv, T, 1810u + (unsigned)T, l, hist);
             strata::kernels::SamplerParams p;
-            p.top_k = 64; p.top_p = 1.0f; p.temperature = 2.5f; p.seed = 18; p.counter = (uint64_t) T;
+            p.top_k = 64;
+            p.top_p = 1.0f;
+            p.temperature = 2.5f;
+            p.seed = 18;
+            p.counter = (uint64_t)T;
             const int k = sampled_k(p.top_k, nv);
             std::vector<SelList> lists;
-            for (int t = 0; t < T; ++t) lists.push_back(mirror_select(l.data() + (size_t) t * nv, nv, {}, p, k));
+            for (int t = 0; t < T; ++t)
+                lists.push_back(mirror_select(l.data() + (size_t)t * nv, nv, {}, p, k));
             DeviceRows rows(l, T, hist, 0);
-            compare(T > 64 ? "70 rows (one block)" : "64 rows (split)",
-                    rows.sample(p, &q_ct1), lists, k, p);
+            compare(T > 64 ? "70 rows (one block)" : "64 rows (split)", rows.sample(p, &q_ct1), lists, k, p);
         }
         std::printf("  %-34s %s (%d of %d draws differ)\n", "fallbacks: graph capture, row cap",
                     wrong ? "*** WRONG ***" : "matches", wrong, draws);

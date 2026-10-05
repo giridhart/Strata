@@ -5,12 +5,11 @@
 
 namespace {
 inline sycl::queue& get_default_queue() {
-    static sycl::queue q{sycl::default_selector_v,
-                         sycl::property_list{sycl::property::queue::in_order{},
-                                            sycl::property::queue::enable_profiling{}}};
+    static sycl::queue q{sycl::default_selector_v, sycl::property_list{sycl::property::queue::in_order{},
+                                                                       sycl::property::queue::enable_profiling{}}};
     return q;
 }
-} // namespace
+}  // namespace
 #if defined(_WIN32)
 #include <intrin.h>
 #endif
@@ -67,19 +66,26 @@ constexpr float EPS = 1e-6f;
 using Clock = std::chrono::steady_clock;
 double ms_since(Clock::time_point t) { return std::chrono::duration<double, std::milli>(Clock::now() - t).count(); }
 const bool g_dbg = std::getenv("STRATA_VERIFY_DEBUG") != nullptr;
-#define VDBG(...) do { if (g_dbg) { std::fprintf(stderr, "verify dbg: " __VA_ARGS__); std::fflush(stderr); } } while (0)
+#define VDBG(...)                                             \
+    do {                                                      \
+        if (g_dbg) {                                          \
+            std::fprintf(stderr, "verify dbg: " __VA_ARGS__); \
+            std::fflush(stderr);                              \
+        }                                                     \
+    } while (0)
 
 struct Bump {
     uint8_t* base = nullptr;
     uint64_t used = 0;
-    template <typename T> T* take(uint64_t n) {
-        T* p = base ? (T*) (base + used) : nullptr;
+    template <typename T>
+    T* take(uint64_t n) {
+        T* p = base ? (T*)(base + used) : nullptr;
         used += (n * sizeof(T) + 255) & ~255ull;
         return p;
     }
 };
 
-bool mapped(size_t bytes, void **h, void **d) {
+bool mapped(size_t bytes, void** h, void** d) {
     try {
         *h = sycl::malloc_host(bytes, get_default_queue());
         if (!*h) return false;
@@ -133,7 +139,7 @@ void release_live_verifiers(std::FILE* f) {
             const bool done = v->release_gpu_waits(5000);
             if (f != nullptr)
                 std::fprintf(f, "strata: released the verify window's GPU waits (#267): the GPU %s\n",
-                             done ? ("finished in " + std::to_string((long long) ms_since(t0)) + " ms").c_str()
+                             done ? ("finished in " + std::to_string((long long)ms_since(t0)) + " ms").c_str()
                                   : "did not finish within 5 s");
         }
     if (f != nullptr) std::fflush(f);
@@ -146,7 +152,7 @@ std::string released_note(bool drained) {
 // GPU spins on a flag nobody raises - the bounded window wait and the release are then what ends it.  Unset: never.
 const int64_t g_test_stall = [] {
     const char* e = std::getenv("STRATA_TEST_VERIFY_STALL");
-    return e != nullptr ? (int64_t) std::atoll(e) : (int64_t) 0;
+    return e != nullptr ? (int64_t)std::atoll(e) : (int64_t)0;
 }();
 }  // namespace
 
@@ -156,7 +162,7 @@ bool Verifier::release_gpu_waits(int timeout_ms) try {
     // reaches them with no API call; UINT32_MAX is past every ring.  (E-6's skip words are device memory, but
     // wait_flag_ge_or also returns on its flag.)  A host function raising flag B later only raises.
     for (uint32_t* p : {h_flag_, h_flagA_, h_flagB_})
-        if (p != nullptr) *(volatile uint32_t*) p = UINT32_MAX;
+        if (p != nullptr) *(volatile uint32_t*)p = UINT32_MAX;
     std::atomic_thread_fence(std::memory_order_seq_cst);
     _mm_sfence();
     const OnDevice on_device(device_);
@@ -167,28 +173,29 @@ bool Verifier::release_gpu_waits(int timeout_ms) try {
             bool empty = false;
             try {
                 empty = s->ext_oneapi_empty();
-            } catch (...) {}
+            } catch (...) {
+            }
             if (empty) break;
             if (ms_since(t0) > timeout_ms) return false;
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
     }
     return true;
-}
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
+} catch (sycl::exception const& exc) {
+    std::cerr << exc.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
+    std::exit(1);
 }
 
 void Verifier::diag(std::FILE* f) const {
-    auto rd = [](const uint32_t* p) { return p ? *(const volatile uint32_t*) p : 0u; };
+    auto rd = [](const uint32_t* p) { return p ? *(const volatile uint32_t*)p : 0u; };
     // #251: outside a verify stage these are the LAST window's numbers (it finished), not the stalled work's
     const char* where = progress().where.load();
     const bool current = where != nullptr && std::strncmp(where, "verify window", 13) == 0;
-    std::fprintf(f, "  verify window%s: %d tokens at position %lld, host at layer step %u; the GPU rang %u; flags: "
-                    "served %u, plan (A) %u, copies (B) %u\n", current ? "" : " (last window, not the current stage)",
-                 last_t_, (long long) last_pos0_, cur_layer_ + 1, rd(h_seq_), rd(h_flag_), rd(h_flagA_), rd(h_flagB_));
+    std::fprintf(f,
+                 "  verify window%s: %d tokens at position %lld, host at layer step %u; the GPU rang %u; flags: "
+                 "served %u, plan (A) %u, copies (B) %u\n",
+                 current ? "" : " (last window, not the current stage)", last_t_, (long long)last_pos0_, cur_layer_ + 1,
+                 rd(h_seq_), rd(h_flag_), rd(h_flagA_), rd(h_flagB_));
 }
 
 Verifier::~Verifier() {
@@ -219,15 +226,14 @@ Verifier::~Verifier() {
         sycl::free(arena_, get_default_queue());
         arena_ = nullptr;
     }
-    void* hosts[] = {h_tok_, h_step_, h_pos_, h_commit_, h_ple_, h_out_, h_x_, h_ids_, h_w_, h_seq_, h_flag_, h_ymiss_,
-                     h_flagA_, h_plan_, h_flagB_};
+    void* hosts[] = {h_tok_, h_step_, h_pos_,  h_commit_, h_ple_,   h_out_,  h_x_,    h_ids_,
+                     h_w_,   h_seq_,  h_flag_, h_ymiss_,  h_flagA_, h_plan_, h_flagB_};
     for (void* h : hosts)
         if (h) sycl::free(h, get_default_queue());
 }
 
-bool Verifier::init(const WeightTable &wt, const ModelGeometry &g,
-                    SessionState &ss, const VerifyHits &hits,
-                    const NativeHead *head, int max_t, std::string &err) try {
+bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState& ss, const VerifyHits& hits,
+                    const NativeHead* head, int max_t, std::string& err) try {
     g_diag_verifier.store(this);
     diag_verify_fn().store(&diag_active_verifier);
     for (auto& slot : g_live) {
@@ -235,25 +241,26 @@ bool Verifier::init(const WeightTable &wt, const ModelGeometry &g,
         if (slot.load() == this || slot.compare_exchange_strong(none, this)) break;
     }
     release_gpu_fn().store(&release_live_verifiers);
-    device_ = 0; // a layer split's stage on another GPU
-                                             // GPU: its streams, graphs and
-                                             // buffers live there
-    strata::kernels::fused_gr_check();   // once per card: which bitwise-equal hyper-connection read runs there
+    device_ = 0;                        // a layer split's stage on another GPU
+                                        // GPU: its streams, graphs and
+                                        // buffers live there
+    strata::kernels::fused_gr_check();  // once per card: which bitwise-equal hyper-connection read runs there
     wt_ = &wt;
     g_ = &g;
     ss_ = &ss;
     hits_ = hits;
     head_ = head;
     max_t_ = max_t;
-    sampling_.greedy = true;      // a fresh verifier samples greedily until set_sampling says otherwise
+    sampling_.greedy = true;  // a fresh verifier samples greedily until set_sampling says otherwise
     sampling_.temperature = 0.0f;
     if (max_t < 2 || max_t > strata::kernels::kVerifyMaxT || max_t > strata::kernels::cpu::MAXT) {
         err = "verify: the window must hold 2.." + std::to_string(strata::kernels::kVerifyMaxT) + " tokens";
         return false;
     }
     if (hits.d_res == nullptr || hits.cache_base == nullptr || hits.blob <= 0) {
-        err = "verify: needs the profile-filled VRAM expert tier (--expert-profile and --expert-cache); with "
-              "--expert-cache auto, no VRAM was left for it: lower --max-context, use --kv k8v4 or images on the CPU";
+        err =
+            "verify: needs the profile-filled VRAM expert tier (--expert-profile and --expert-cache); with "
+            "--expert-cache auto, no VRAM was left for it: lower --max-context, use --kv k8v4 or images on the CPU";
         return false;
     }
     std::string why;
@@ -273,46 +280,48 @@ bool Verifier::init(const WeightTable &wt, const ModelGeometry &g,
         return false;
     }
     const WeightRef* wo = wt.find("output.weight");
-    if (wo == nullptr) { err = "verify: output.weight is missing"; return false; }
+    if (wo == nullptr) {
+        err = "verify: output.weight is missing";
+        return false;
+    }
     n_vocab_ = wo->ne1;
 
     const strata::kernels::QsaShapes s = shapes_of(g);
     cap_ = strata::kernels::qsa_selection_width(strata::kernels::kTopkMaxCells, s);
     max_blocks_ = ss.qsa_states[ss.qsa_primary()].max_cells / s.idx_block + 2;
-    attn_scratch_floats_ = (int64_t) strata::kernels::qsa_decode_attn_scratch_floats(cap_, s);
+    attn_scratch_floats_ = (int64_t)strata::kernels::qsa_decode_attn_scratch_floats(cap_, s);
 
-    const uint64_t T = (uint64_t) max_t, N = (uint64_t) g.n_embd, HC = (uint64_t) g.hc, K = (uint64_t) ss.k;
-    const uint64_t C = (uint64_t) g.ssm_conv_channels, ZV = (uint64_t) g.ssm_value_dim, HV = (uint64_t) g.ssm_v_heads;
-    const uint64_t NH = (uint64_t) g.n_head, HD = (uint64_t) g.head_dim, NKV = (uint64_t) g.n_head_kv;
-    const uint64_t IQ = (uint64_t) g.idx_q_heads, ID = (uint64_t) g.idx_key_dim;
-    const uint64_t nG = (uint64_t) g.n_gdn_layers(), nQ = (uint64_t) g.n_qsa_layers();
-    const uint64_t HS = (uint64_t) strata::kernels::NG_HIST * strata::kernels::NG_HC_DIM;
-    const uint64_t TS = (uint64_t) (s.idx_block - 1) * ID;
-    const int max_in = (int) std::max<uint64_t>(std::max<uint64_t>(N, ZV), NH * HD);
+    const uint64_t T = (uint64_t)max_t, N = (uint64_t)g.n_embd, HC = (uint64_t)g.hc, K = (uint64_t)ss.k;
+    const uint64_t C = (uint64_t)g.ssm_conv_channels, ZV = (uint64_t)g.ssm_value_dim, HV = (uint64_t)g.ssm_v_heads;
+    const uint64_t NH = (uint64_t)g.n_head, HD = (uint64_t)g.head_dim, NKV = (uint64_t)g.n_head_kv;
+    const uint64_t IQ = (uint64_t)g.idx_q_heads, ID = (uint64_t)g.idx_key_dim;
+    const uint64_t nG = (uint64_t)g.n_gdn_layers(), nQ = (uint64_t)g.n_qsa_layers();
+    const uint64_t HS = (uint64_t)strata::kernels::NG_HIST * strata::kernels::NG_HC_DIM;
+    const uint64_t TS = (uint64_t)(s.idx_block - 1) * ID;
+    const int max_in = (int)std::max<uint64_t>(std::max<uint64_t>(N, ZV), NH * HD);
 
     // ---- mapped staging
-    bool ok = mapped(T * 4, (void**) &h_tok_, (void**) &m_tok_) &&
-              mapped(T * strata::kernels::kStepCount * 4, (void**) &h_step_, (void**) &m_step_) &&
-              mapped(T * (NH + NKV + IQ) * 4, (void**) &h_pos_, (void**) &m_pos_) &&
-              mapped((2 + T) * 4 + 16, (void**) &h_commit_, (void**) &m_commit_) &&
-              mapped(T * N * 4, (void**) &h_ple_, (void**) &m_ple_) &&
-              mapped(T * 4 + 16, (void**) &h_out_, (void**) &m_out_) &&
-              mapped(T * N * 4, (void**) &h_x_, (void**) &m_x_) &&
-              mapped(T * K * 4, (void**) &h_ids_, (void**) &m_ids_) &&
-              mapped(T * K * 4, (void**) &h_w_, (void**) &m_w_) &&
-              mapped(64, (void**) &h_seq_, (void**) &m_seq_) &&
-              mapped(64, (void**) &h_flag_, (void**) &m_flag_) &&
-              mapped(64, (void**) &h_flagA_, (void**) &m_flagA_) &&
-              mapped(64, (void**) &h_flagB_, (void**) &m_flagB_) &&
-              mapped(T * K * N * 4, (void**) &h_ymiss_, (void**) &m_ymiss_);
-    if (!ok) { err = "verify: mapped staging allocation failed"; return false; }
+    bool ok = mapped(T * 4, (void**)&h_tok_, (void**)&m_tok_) &&
+              mapped(T * strata::kernels::kStepCount * 4, (void**)&h_step_, (void**)&m_step_) &&
+              mapped(T * (NH + NKV + IQ) * 4, (void**)&h_pos_, (void**)&m_pos_) &&
+              mapped((2 + T) * 4 + 16, (void**)&h_commit_, (void**)&m_commit_) &&
+              mapped(T * N * 4, (void**)&h_ple_, (void**)&m_ple_) &&
+              mapped(T * 4 + 16, (void**)&h_out_, (void**)&m_out_) && mapped(T * N * 4, (void**)&h_x_, (void**)&m_x_) &&
+              mapped(T * K * 4, (void**)&h_ids_, (void**)&m_ids_) && mapped(T * K * 4, (void**)&h_w_, (void**)&m_w_) &&
+              mapped(64, (void**)&h_seq_, (void**)&m_seq_) && mapped(64, (void**)&h_flag_, (void**)&m_flag_) &&
+              mapped(64, (void**)&h_flagA_, (void**)&m_flagA_) && mapped(64, (void**)&h_flagB_, (void**)&m_flagB_) &&
+              mapped(T * K * N * 4, (void**)&h_ymiss_, (void**)&m_ymiss_);
+    if (!ok) {
+        err = "verify: mapped staging allocation failed";
+        return false;
+    }
     // the GPU plan: counts(4) | start(cap+1) | dst(cap) | tok(cap) | pad | ptr(cap u64) | ptr2(cap u64) | start2(cap+1)
     {
-        const int64_t cap = (int64_t) (T * K);
+        const int64_t cap = (int64_t)(T * K);
         const int64_t i32 = 4 + (cap + 1) + cap + cap;
         const int64_t ptr_off = (i32 + 1) & ~1ll;
         plan_i32_ = ptr_off + 4 * cap + (cap + 1) + 1;
-        if (!mapped((size_t) plan_i32_ * 4 * 2 + 64, (void**) &h_plan_, (void**) &m_plan_)) {
+        if (!mapped((size_t)plan_i32_ * 4 * 2 + 64, (void**)&h_plan_, (void**)&m_plan_)) {
             err = "verify: mapped plan allocation failed";
             return false;
         }
@@ -320,7 +329,7 @@ bool Verifier::init(const WeightTable &wt, const ModelGeometry &g,
         sink_.start = h_plan_ + 4;
         sink_.dst = sink_.start + cap + 1;
         sink_.tok = sink_.dst + cap;
-        sink_.ptr = (unsigned long long*) (h_plan_ + ptr_off);
+        sink_.ptr = (unsigned long long*)(h_plan_ + ptr_off);
         sink_.ptr2 = sink_.ptr + cap;
         sink_.start2 = h_plan_ + ptr_off + 4 * cap;
         sink_.cap = cap;
@@ -331,43 +340,70 @@ bool Verifier::init(const WeightTable &wt, const ModelGeometry &g,
 
     // ---- the device arena: the same sequence counted, then carved
     auto carve = [&](Bump& b) {
-        tok_ = b.take<int32_t>(T); step_ = b.take<int32_t>(T * strata::kernels::kStepCount);
-        pos_ = b.take<int32_t>(T * (NH + NKV + IQ)); commit_ = b.take<int32_t>(2 + T);
-        ple_ = b.take<float>(T * N); emb_ = b.take<float>(T * N); R_ = b.take<float>(T * HC * N);
-        mixed_ = b.take<float>(T * N); bo_ = b.take<float>(T * N);
-        inj_ = b.take<float>(T * HC); inj2_ = b.take<float>(T * HC);
-        lo_ = b.take<float>(T * (uint64_t) g.hc_lr); rs_ = b.take<float>(T * HC); xn_ = b.take<float>(T * HC * N);
-        xq_ = b.take<uint8_t>(strata::kernels::native_q8_1_bytes(max_in, (int) T));
-        qkv_L_ = b.take<float>(nG * T * C); h_L_ = b.take<float>(nG * T * C);
-        gate_L_ = b.take<float>(nG * T * HV); beta_L_ = b.take<float>(nG * T * HV);
-        z_ = b.take<float>(T * ZV); y_ = b.take<float>(T * ZV); y_dummy_ = b.take<float>(T * ZV);
-        qfull_ = b.take<float>(T * NH * 2 * HD); qcur_ = b.take<float>(T * NH * HD);
-        kcur_ = b.take<float>(T * NKV * HD); vcur_ = b.take<float>(T * NKV * HD);
-        idx_raw_L_ = b.take<float>(nQ * T * ID); qidx_ = b.take<float>(T * IQ * ID);
-        scores_ = b.take<float>(T * (uint64_t) max_blocks_); sel_ = b.take<int32_t>(T * (uint64_t) cap_);
-        attn_ = b.take<float>(T * NH * HD); attn32_ = b.take<float>(T * NH * HD);
-        attn_scratch_ = b.take<float>(T * (uint64_t) attn_scratch_floats_);
+        tok_ = b.take<int32_t>(T);
+        step_ = b.take<int32_t>(T * strata::kernels::kStepCount);
+        pos_ = b.take<int32_t>(T * (NH + NKV + IQ));
+        commit_ = b.take<int32_t>(2 + T);
+        ple_ = b.take<float>(T * N);
+        emb_ = b.take<float>(T * N);
+        R_ = b.take<float>(T * HC * N);
+        mixed_ = b.take<float>(T * N);
+        bo_ = b.take<float>(T * N);
+        inj_ = b.take<float>(T * HC);
+        inj2_ = b.take<float>(T * HC);
+        lo_ = b.take<float>(T * (uint64_t)g.hc_lr);
+        rs_ = b.take<float>(T * HC);
+        xn_ = b.take<float>(T * HC * N);
+        xq_ = b.take<uint8_t>(strata::kernels::native_q8_1_bytes(max_in, (int)T));
+        qkv_L_ = b.take<float>(nG * T * C);
+        h_L_ = b.take<float>(nG * T * C);
+        gate_L_ = b.take<float>(nG * T * HV);
+        beta_L_ = b.take<float>(nG * T * HV);
+        z_ = b.take<float>(T * ZV);
+        y_ = b.take<float>(T * ZV);
+        y_dummy_ = b.take<float>(T * ZV);
+        qfull_ = b.take<float>(T * NH * 2 * HD);
+        qcur_ = b.take<float>(T * NH * HD);
+        kcur_ = b.take<float>(T * NKV * HD);
+        vcur_ = b.take<float>(T * NKV * HD);
+        idx_raw_L_ = b.take<float>(nQ * T * ID);
+        qidx_ = b.take<float>(T * IQ * ID);
+        scores_ = b.take<float>(T * (uint64_t)max_blocks_);
+        sel_ = b.take<int32_t>(T * (uint64_t)cap_);
+        attn_ = b.take<float>(T * NH * HD);
+        attn32_ = b.take<float>(T * NH * HD);
+        attn_scratch_ = b.take<float>(T * (uint64_t)attn_scratch_floats_);
         tail_snap_ = b.take<float>(nQ * TS);
-        logits_ = b.take<float>(T * (uint64_t) g.n_expert); w_ = b.take<float>(T * K); ids_ = b.take<int32_t>(T * K);
-        shared_ = b.take<float>(T * N); parts_ = b.take<float>(T * K * N); hit_out_ = b.take<float>(T * K * N);
-        hit_slot_ = b.take<int32_t>(T * K); hit_dst_ = b.take<int32_t>(T * K); hit_count_ = b.take<int32_t>(4);
-        plan_ = b.take<int32_t>(2 * ((uint64_t) plan_i32_ + 16));
-        staging_ = b.take<uint8_t>((uint64_t) kStagingBlobs * strata::kernels::cpu::expert_layout().max_blob);
-        hit_xq_ = b.take<uint8_t>(T * (N / 32) * 34); hit_xs_ = b.take<float>(T * (N / 32));
+        logits_ = b.take<float>(T * (uint64_t)g.n_expert);
+        w_ = b.take<float>(T * K);
+        ids_ = b.take<int32_t>(T * K);
+        shared_ = b.take<float>(T * N);
+        parts_ = b.take<float>(T * K * N);
+        hit_out_ = b.take<float>(T * K * N);
+        hit_slot_ = b.take<int32_t>(T * K);
+        hit_dst_ = b.take<int32_t>(T * K);
+        hit_count_ = b.take<int32_t>(4);
+        plan_ = b.take<int32_t>(2 * ((uint64_t)plan_i32_ + 16));
+        staging_ = b.take<uint8_t>((uint64_t)kStagingBlobs * strata::kernels::cpu::expert_layout().max_blob);
+        hit_xq_ = b.take<uint8_t>(T * (N / 32) * 34);
+        hit_xs_ = b.take<float>(T * (N / 32));
         nat_xq_ = b.take<uint8_t>(T * (N / 32) * 36);
-        hit_scratch_ = b.take<uint8_t>(std::max<uint64_t>(
-            strata::kernels::moe_hit_grouped_scratch_bytes((int64_t) (T * K), g.n_embd, g.n_ff),
-            strata::kernels::native_expert_scratch_bytes((int64_t) (T * K), g.n_ff)));
-        head_mixed_ = b.take<float>(T * N); head_inj_ = b.take<float>(HC);
-        sh_bf16_ = b.take<uint16_t>(T * N); sh_gate_ = b.take<float>(T * (uint64_t) g.n_ff);
-        sh_up_ = b.take<float>(T * (uint64_t) g.n_ff); sh_g_ = b.take<float>(T + 4);
-        head_logits_ = b.take<float>(T * (uint64_t) n_vocab_);
+        hit_scratch_ = b.take<uint8_t>(
+            std::max<uint64_t>(strata::kernels::moe_hit_grouped_scratch_bytes((int64_t)(T * K), g.n_embd, g.n_ff),
+                               strata::kernels::native_expert_scratch_bytes((int64_t)(T * K), g.n_ff)));
+        head_mixed_ = b.take<float>(T * N);
+        head_inj_ = b.take<float>(HC);
+        sh_bf16_ = b.take<uint16_t>(T * N);
+        sh_gate_ = b.take<float>(T * (uint64_t)g.n_ff);
+        sh_up_ = b.take<float>(T * (uint64_t)g.n_ff);
+        sh_g_ = b.take<float>(T + 4);
+        head_logits_ = b.take<float>(T * (uint64_t)n_vocab_);
         hist_snap_ = b.take<float>(T * HS);
     };
     Bump count;
     carve(count);
     try {
-        arena_ = (void *)sycl::malloc_device(count.used, get_default_queue());
+        arena_ = (void*)sycl::malloc_device(count.used, get_default_queue());
         if (!arena_) {
             err = "verify: the device arena (" + std::to_string(count.used >> 20) + " MiB) does not fit";
             return false;
@@ -379,9 +415,9 @@ bool Verifier::init(const WeightTable &wt, const ModelGeometry &g,
     get_default_queue().memset(arena_, 0, count.used).wait();
     prof_on_ = std::getenv("STRATA_VERIFY_PROFILE") != nullptr;
     if (prof_on_) {
-        const size_t np = (size_t) g.n_layers * kProfPer + 4;
+        const size_t np = (size_t)g.n_layers * kProfPer + 4;
         try {
-            prof_ = (unsigned long long *)sycl::malloc_device(np * 8, get_default_queue());
+            prof_ = (unsigned long long*)sycl::malloc_device(np * 8, get_default_queue());
             if (prof_) {
                 get_default_queue().memset(prof_, 0, np * 8).wait();
                 prof_h_.assign(np, 0);
@@ -389,25 +425,24 @@ bool Verifier::init(const WeightTable &wt, const ModelGeometry &g,
                 prof_on_ = false;
             }
         } catch (...) {
-            prof_on_ = false; prof_ = nullptr;
+            prof_on_ = false;
+            prof_ = nullptr;
         }
     }
     Bump real;
-    real.base = (uint8_t*) arena_;
+    real.base = (uint8_t*)arena_;
     carve(real);
-    sink_.staging = (unsigned long long) staging_;
+    sink_.staging = (unsigned long long)staging_;
     sink_.staging_cap = kStagingBlobs;
-    (void) TS;
+    (void)TS;
     try {
-        copy_ = new sycl::queue(sycl::default_selector_v,
-                                sycl::property_list{sycl::property::queue::in_order{}});
+        copy_ = new sycl::queue(sycl::default_selector_v, sycl::property_list{sycl::property::queue::in_order{}});
     } catch (const sycl::exception& e) {
         err = std::string("verify: copy stream create failed: ") + e.what();
         return false;
     }
     try {
-        cs_ = new sycl::queue(sycl::default_selector_v,
-                              sycl::property_list{sycl::property::queue::in_order{}});
+        cs_ = new sycl::queue(sycl::default_selector_v, sycl::property_list{sycl::property::queue::in_order{}});
     } catch (const sycl::exception& e) {
         err = std::string("verify: stream create failed: ") + e.what();
         return false;
@@ -427,34 +462,40 @@ bool Verifier::init(const WeightTable &wt, const ModelGeometry &g,
     if (device_plan_) {
         bool ok2 = true;
         try {
-            skip_ = (uint32_t *)sycl::malloc_device(64, get_default_queue());
-            if (!skip_) ok2 = false;
-            else get_default_queue().memset(skip_, 0, 64).wait();
+            skip_ = (uint32_t*)sycl::malloc_device(64, get_default_queue());
+            if (!skip_)
+                ok2 = false;
+            else
+                get_default_queue().memset(skip_, 0, 64).wait();
         } catch (...) {
             ok2 = false;
         }
         if (ok2 && hits.slot_off != nullptr && hits.n_slots > 0) {
             try {
                 slot_off_d_ = sycl::malloc_device<unsigned long long>((size_t)hits.n_slots, get_default_queue());
-                if (!slot_off_d_) ok2 = false;
-                else get_default_queue().memcpy(slot_off_d_, hits.slot_off, (size_t)hits.n_slots * sizeof(unsigned long long)).wait();
+                if (!slot_off_d_)
+                    ok2 = false;
+                else
+                    get_default_queue()
+                        .memcpy(slot_off_d_, hits.slot_off, (size_t)hits.n_slots * sizeof(unsigned long long))
+                        .wait();
             } catch (...) {
                 ok2 = false;
             }
         }
-        if (!ok2) { device_plan_ = false; }
+        if (!ok2) {
+            device_plan_ = false;
+        }
     }
     std::fprintf(stderr, "strata verify: window up to %d tokens, %.1f MiB of device buffers\n", max_t,
-                 (double) count.used / 1048576.0);
+                 (double)count.used / 1048576.0);
     return true;
-}
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
+} catch (sycl::exception const& exc) {
+    std::cerr << exc.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
+    std::exit(1);
 }
 
-const float* Verifier::final_R(int t) const { return R_ + (size_t) t * (size_t) (g_->hc * g_->n_embd); }
+const float* Verifier::final_R(int t) const { return R_ + (size_t)t * (size_t)(g_->hc * g_->n_embd); }
 
 // ================================ THE WINDOW, AS CAPTURED ================================
 //
@@ -466,7 +507,7 @@ const float* Verifier::final_R(int t) const { return R_ + (size_t) t * (size_t) 
 // so the CPU computes A's experts of layer l while the GPU runs B's mixer and router of layer l, and B's experts
 // while the GPU combines A and runs A's layer l+1.  B's mixer only needs A's mixer of the same layer (K/V, GDN
 // state), never A's experts, so nothing waits that did not wait before.  Every token's arithmetic is unchanged.
-bool Verifier::record_window(int T, sycl::queue* cs, std::string &err) try {
+bool Verifier::record_window(int T, sycl::queue* cs, std::string& err) try {
     using namespace strata::kernels;
     const ModelGeometry& g = *g_;
     const WeightTable& wt = *wt_;
@@ -476,62 +517,69 @@ bool Verifier::record_window(int T, sycl::queue* cs, std::string &err) try {
     const int64_t IQ = g.idx_q_heads, ID = g.idx_key_dim, NE = g.n_expert, MT = max_t_;
     const QsaShapes s = shapes_of(g);
     const GrShapes gs{g.n_embd, g.hc, g.hc_lr};
-    const uint64_t gdn_floats = (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size +
-                                (uint64_t) g.ssm_conv_channels * (g.ssm_d_conv - 1);
-    const int64_t HS = (int64_t) NG_HIST * NG_HC_DIM;
+    const uint64_t gdn_floats = (uint64_t)g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size +
+                                (uint64_t)g.ssm_conv_channels * (g.ssm_d_conv - 1);
+    const int64_t HS = (int64_t)NG_HIST * NG_HC_DIM;
     const int64_t TS = (s.idx_block - 1) * ID;
     const bool ple_on = ss.ple.ready() && ple_stage();
-    auto Rt = [&](int t) { return R_ + (size_t) t * HC * N; };
+    auto Rt = [&](int t) { return R_ + (size_t)t * HC * N; };
     const int G = (split_ && T >= 2) ? 2 : 1;
-    static const bool dec_batch = [] { const char* v = std::getenv("STRATA_DEC_BATCH"); return v == nullptr || std::atoi(v) != 0; }();
-    auto stamp = [&](int64_t l, int i, int grp) { if (prof_on_ && grp == 0) gpu_stamp(prof_, (int) (l * kProfPer + i), cs); };
+    static const bool dec_batch = [] {
+        const char* v = std::getenv("STRATA_DEC_BATCH");
+        return v == nullptr || std::atoi(v) != 0;
+    }();
+    auto stamp = [&](int64_t l, int i, int grp) {
+        if (prof_on_ && grp == 0) gpu_stamp(prof_, (int)(l * kProfPer + i), cs);
+    };
     const int tb_[2] = {0, (T + 1) / 2}, te_[2] = {G == 2 ? (T + 1) / 2 : T, T};
     groups_[T] = G;
 
     // ---- the window's inputs, from mapped staging
     copy_i32_from_mapped(tok_, m_tok_, T, cs);
-    copy_i32_from_mapped(step_, m_step_, (int64_t) T * kStepCount, cs);
-    copy_i32_from_mapped(pos_, m_pos_, (int64_t) MT * (NH + NKV + IQ), cs);
+    copy_i32_from_mapped(step_, m_step_, (int64_t)T * kStepCount, cs);
+    copy_i32_from_mapped(pos_, m_pos_, (int64_t)MT * (NH + NKV + IQ), cs);
     // per-ROW positions of the K rows [t][NKV] and the indexer query rows [t][IQ] (for batched RoPE)
     const int32_t* pos_k = pos_ + MT * NH;
     const int32_t* pos_i = pos_ + MT * (NH + NKV);
-    if (ple_on) copy_from_mapped(ple_, m_ple_, (int64_t) T * N, cs);
+    if (ple_on) copy_from_mapped(ple_, m_ple_, (int64_t)T * N, cs);
 
     // ---- the embeddings, broadcast to the hc streams - or, in a later stage of a layer split, the previous stage's
     // residual, pending write and inject (see set_stage)
     const int64_t HB = Verifier::handoff_floats(g);
     if (lb_ > 0) {
         for (int t = 0; t < T; ++t) {
-            copy_from_mapped(Rt(t), hand_in_ + (size_t) t * HB, HC * N, cs);
-            copy_from_mapped(bo_ + (size_t) t * N, hand_in_ + (size_t) t * HB + HC * N, N, cs);
-            copy_from_mapped(inj2_ + (size_t) t * HC, hand_in_ + (size_t) t * HB + HC * N + N, HC, cs);
+            copy_from_mapped(Rt(t), hand_in_ + (size_t)t * HB, HC * N, cs);
+            copy_from_mapped(bo_ + (size_t)t * N, hand_in_ + (size_t)t * HB + HC * N, N, cs);
+            copy_from_mapped(inj2_ + (size_t)t * HC, hand_in_ + (size_t)t * HB + HC * N + N, HC, cs);
         }
-    } else if (const NativeEmbed* ne = native_embed()) {       // plan v0.3 P6: the GGUF-form table
+    } else if (const NativeEmbed* ne = native_embed()) {  // plan v0.3 P6: the GGUF-form table
         ne->gather_dev(tok_, T, emb_, cs);
-        broadcast_streams(emb_, R_, N, (int) HC, T, cs);
+        broadcast_streams(emb_, R_, N, (int)HC, T, cs);
     } else {
         const WeightRef* w = wt.find("token_embd.weight");
         if (w == nullptr || w->codebook_iq4nl || (w->code_bits != 2 && w->code_bits != 4 && w->code_bits != 8)) {
             err = "verify: token_embd.weight is missing or not an S2/S4/S8 tensor";
             return false;
         }
-        const auto* codes = (const uint8_t*) w->data;
-        const auto* scales = (const float*) (codes + w->codes_bytes);
-        const auto* offsets = w->has_offset ? (const float*) (codes + w->codes_bytes + w->scales_bytes) : nullptr;
-        const uint64_t row_codes = (uint64_t) (w->ne0 / (8 / w->code_bits));
-        const uint64_t row_groups = (uint64_t) (w->ne0 / w->group_elems);
+        const auto* codes = (const uint8_t*)w->data;
+        const auto* scales = (const float*)(codes + w->codes_bytes);
+        const auto* offsets = w->has_offset ? (const float*)(codes + w->codes_bytes + w->scales_bytes) : nullptr;
+        const uint64_t row_codes = (uint64_t)(w->ne0 / (8 / w->code_bits));
+        const uint64_t row_groups = (uint64_t)(w->ne0 / w->group_elems);
         embedding_gather_dev(codes, scales, offsets, tok_, T, w->ne0, w->code_bits, w->code_bias, w->group_elems,
                              row_codes, row_groups, emb_, cs);
-        broadcast_streams(emb_, R_, N, (int) HC, T, cs);
+        broadcast_streams(emb_, R_, N, (int)HC, T, cs);
     }
 
     // per-layer state indices (GDN and QSA layers are numbered separately)
-    std::vector<int64_t> gdn_idx((size_t) g.n_layers, -1), qsa_idx((size_t) g.n_layers, -1);
+    std::vector<int64_t> gdn_idx((size_t)g.n_layers, -1), qsa_idx((size_t)g.n_layers, -1);
     {
         int64_t qi = 0, gi = 0;
         for (int64_t l = 0; l < g.n_layers; ++l) {
-            if (is_qsa_layer(g, l)) qsa_idx[(size_t) l] = qi++;
-            else gdn_idx[(size_t) l] = gi++;
+            if (is_qsa_layer(g, l))
+                qsa_idx[(size_t)l] = qi++;
+            else
+                gdn_idx[(size_t)l] = gi++;
         }
     }
 
@@ -560,7 +608,7 @@ bool Verifier::record_window(int T, sycl::queue* cs, std::string &err) try {
         // already applied it)
         bool pending = l > 0 && !cvec().covers(l - 1);
         if (l == 1 && ple_on) {
-            float* normalized = (float*) ((uint8_t*) ss.ple.scratch + ple_block_scratch_bytes());
+            float* normalized = (float*)((uint8_t*)ss.ple.scratch + ple_block_scratch_bytes());
             for (int t = tb; t < te; ++t) {
                 gr_write(Rt(t), bo_ + t * N, inj2_ + t * HC, gs, Rt(t), cs);
                 PleOut po;
@@ -577,7 +625,7 @@ bool Verifier::record_window(int T, sycl::queue* cs, std::string &err) try {
                     err = std::string("verify PLE: ") + e.what();
                     return false;
                 }
-                copy_from_mapped(hist_snap_ + (size_t) t * HS, ss.ple.hist, HS, cs);
+                copy_from_mapped(hist_snap_ + (size_t)t * HS, ss.ple.hist, HS, cs);
             }
             pending = false;
         }
@@ -588,20 +636,27 @@ bool Verifier::record_window(int T, sycl::queue* cs, std::string &err) try {
         available and adjust the code, or use smaller sub-group size to avoid
         high register pressure.
         */
-        auto gr_read_group = [&](int half, bool apply, float *inj_prev,
-                                 float *inj_out) {
+        auto gr_read_group = [&](int half, bool apply, float* inj_prev, float* inj_out) {
             FusedGrArgs fa[kFusedGrMaxT];
             for (int t = tb; t < te; ++t) {
                 FusedGrArgs& a = fa[t - tb];
-                a.R = Rt(t); a.R_out = Rt(t); a.apply = apply;
-                a.bo_prev = bo_ + t * N; a.inj_prev = inj_prev + t * HC;
-                a.w_norm = (const float*) wn[half]->data; a.w_down = (const uint16_t*) wd[half]->data;
-                a.w_up = (const uint16_t*) wu[half]->data; a.w_inject = (const uint16_t*) wi[half]->data;
-                a.eps = EPS; a.lo = lo_ + t * g.hc_lr; a.rs = rs_ + t * HC;
-                a.inject_out = inj_out + t * HC; a.mixed = mixed_ + t * N;
+                a.R = Rt(t);
+                a.R_out = Rt(t);
+                a.apply = apply;
+                a.bo_prev = bo_ + t * N;
+                a.inj_prev = inj_prev + t * HC;
+                a.w_norm = (const float*)wn[half]->data;
+                a.w_down = (const uint16_t*)wd[half]->data;
+                a.w_up = (const uint16_t*)wu[half]->data;
+                a.w_inject = (const uint16_t*)wi[half]->data;
+                a.eps = EPS;
+                a.lo = lo_ + t * g.hc_lr;
+                a.rs = rs_ + t * HC;
+                a.inject_out = inj_out + t * HC;
+                a.mixed = mixed_ + t * N;
             }
-            fused_gr_read_multi(fa, n, xn_ + (size_t) tb * HC * N, cs, (prof_on_ && grp == 0) ? prof_ : nullptr,
-                                (int) (l * kProfPer + (half == 0 ? 27 : 30)));
+            fused_gr_read_multi(fa, n, xn_ + (size_t)tb * HC * N, cs, (prof_on_ && grp == 0) ? prof_ : nullptr,
+                                (int)(l * kProfPer + (half == 0 ? 27 : 30)));
         };
         gr_read_group(0, pending, inj2_, inj_);
         stamp(l, 1, grp);
@@ -615,76 +670,90 @@ bool Verifier::record_window(int T, sycl::queue* cs, std::string &err) try {
                                 *wnm = need(v, "ssm_norm.weight", err), *wdt = need(v, "ssm_dt.bias", err),
                                 *wsa = need(v, "ssm_a", err);
                 if (!wqkv || !wg || !wout || !wa || !wb || !wc || !wnm || !wdt || !wsa) return false;
-                if (!native_of(wqkv, v.name("attn_qkv.weight"), err) || !native_of(wg, v.name("attn_gate.weight"), err) ||
-                    !native_of(wout, v.name("ssm_out.weight"), err))
+                if (!native_of(wqkv, v.name("attn_qkv.weight"), err) ||
+                    !native_of(wg, v.name("attn_gate.weight"), err) || !native_of(wout, v.name("ssm_out.weight"), err))
                     return false;
-                const int64_t gi = gdn_idx[(size_t) l];
-                float* state = ss.gdn_state + (size_t) (gi - ss.gdn_ord0) * gdn_floats;
-                float* conv = state + (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size;
-                float* qkv = qkv_L_ + (size_t) gi * MT * C;
-                float* hb = h_L_ + (size_t) gi * MT * C;
-                float* gate = gate_L_ + (size_t) gi * MT * HV;
-                float* beta = beta_L_ + (size_t) gi * MT * HV;
-                native_quantize_q8_1(xm, xq_, (int) N, n, cs);
-                native_mmvq(wqkv->native_type, wqkv->native_data, xq_, qkv + (size_t) tb * C, (int) N, (int) C, n, cs);
+                const int64_t gi = gdn_idx[(size_t)l];
+                float* state = ss.gdn_state + (size_t)(gi - ss.gdn_ord0) * gdn_floats;
+                float* conv = state + (uint64_t)g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size;
+                float* qkv = qkv_L_ + (size_t)gi * MT * C;
+                float* hb = h_L_ + (size_t)gi * MT * C;
+                float* gate = gate_L_ + (size_t)gi * MT * HV;
+                float* beta = beta_L_ + (size_t)gi * MT * HV;
+                native_quantize_q8_1(xm, xq_, (int)N, n, cs);
+                native_mmvq(wqkv->native_type, wqkv->native_data, xq_, qkv + (size_t)tb * C, (int)N, (int)C, n, cs);
                 stamp(l, 2, grp);
-                gdn_conv_l2_multi(conv, qkv, (const float*) wc->data, hb, (int) C, (int) (2 * HK), EPS, n, cs, tb);
+                gdn_conv_l2_multi(conv, qkv, (const float*)wc->data, hb, (int)C, (int)(2 * HK), EPS, n, cs, tb);
                 stamp(l, 3, grp);
-                gdn_ab_multi(xm, (const uint16_t*) wa->data, (const uint16_t*) wb->data, (const float*) wdt->data,
-                             (const float*) wsa->data, gate + (size_t) tb * HV, beta + (size_t) tb * HV, (int) N, (int) HV,
+                gdn_ab_multi(xm, (const uint16_t*)wa->data, (const uint16_t*)wb->data, (const float*)wdt->data,
+                             (const float*)wsa->data, gate + (size_t)tb * HV, beta + (size_t)tb * HV, (int)N, (int)HV,
                              n, cs);
                 stamp(l, 4, grp);
-                native_mmvq(wg->native_type, wg->native_data, xq_, z_ + (size_t) tb * ZV, (int) N, (int) ZV, n, cs);
+                native_mmvq(wg->native_type, wg->native_data, xq_, z_ + (size_t)tb * ZV, (int)N, (int)ZV, n, cs);
                 stamp(l, 5, grp);
                 // the recurrence from the untouched state over tokens [0, te); outputs only for this group's
-                gdn_step_norm_multi(state, hb, (int) C, gate, beta, z_, (const float*) wnm->data, EPS, y_, (int) HK,
-                                    (int) HV, te, nullptr, cs, tb);
+                gdn_step_norm_multi(state, hb, (int)C, gate, beta, z_, (const float*)wnm->data, EPS, y_, (int)HK,
+                                    (int)HV, te, nullptr, cs, tb);
                 stamp(l, 6, grp);
-                native_quantize_q8_1(y_ + (size_t) tb * ZV, xq_, (int) ZV, n, cs);
-                native_mmvq(wout->native_type, wout->native_data, xq_, bo_ + tb * N, (int) ZV, (int) N, n, cs);
+                native_quantize_q8_1(y_ + (size_t)tb * ZV, xq_, (int)ZV, n, cs);
+                native_mmvq(wout->native_type, wout->native_data, xq_, bo_ + tb * N, (int)ZV, (int)N, n, cs);
             } else {
                 // ======================= QSA =======================
-                const int64_t qi = qsa_idx[(size_t) l];
+                const int64_t qi = qsa_idx[(size_t)l];
                 const QsaState& st = ss.qsa_states[qi];
                 const WeightRef *wik = need(v, "indexer.k_proj.weight", err), *wq = need(v, "attn_q.weight", err),
                                 *wk = need(v, "attn_k.weight", err), *wv = need(v, "attn_v.weight", err),
                                 *wo = need(v, "attn_output.weight", err), *wiq = need(v, "indexer.q_proj.weight", err),
                                 *wqn = need(v, "attn_q_norm.weight", err), *wkn = need(v, "attn_k_norm.weight", err),
-                                *wiqn = need(v, "indexer.q_norm.weight", err), *wikn = need(v, "indexer.k_norm.weight", err);
+                                *wiqn = need(v, "indexer.q_norm.weight", err),
+                                *wikn = need(v, "indexer.k_norm.weight", err);
                 if (!wik || !wq || !wk || !wv || !wo || !wiq || !wqn || !wkn || !wiqn || !wikn) return false;
                 if (!native_of(wq, v.name("attn_q.weight"), err) || !native_of(wk, v.name("attn_k.weight"), err) ||
                     !native_of(wv, v.name("attn_v.weight"), err) || !native_of(wo, v.name("attn_output.weight"), err))
                     return false;
                 auto norm_rope = [&](float* data, const WeightRef* norm, int rows, int cols, const int32_t* pos) {
-                    if (native_qsa_enabled()) native_qsa_rms_norm_weighted(data, (const float*) norm->data, data, cols, rows, EPS, cs);
-                    else rms_norm_weighted(data, (const float*) norm->data, rows, cols, EPS, cs);
-                    if (native_rope_enabled()) native_rope_apply(data, data, rows, cols, (int) s.n_rot, rope_scaling(), pos, cs);
-                    else rope_neox_apply(data, data, rows, cols, (int) s.n_rot, st.cos_tab, st.sin_tab, pos, cs);
+                    if (native_qsa_enabled())
+                        native_qsa_rms_norm_weighted(data, (const float*)norm->data, data, cols, rows, EPS, cs);
+                    else
+                        rms_norm_weighted(data, (const float*)norm->data, rows, cols, EPS, cs);
+                    if (native_rope_enabled())
+                        native_rope_apply(data, data, rows, cols, (int)s.n_rot, rope_scaling(), pos, cs);
+                    else
+                        rope_neox_apply(data, data, rows, cols, (int)s.n_rot, st.cos_tab, st.sin_tab, pos, cs);
                 };
-                float* idx_raw = idx_raw_L_ + (size_t) qi * MT * ID;
+                float* idx_raw = idx_raw_L_ + (size_t)qi * MT * ID;
                 // the per-token GEMVs / norms / RoPEs / copies of this layer as one launch over the
                 // window's rows each - row-wise identical arithmetic (STRATA_DEC_BATCH=0: token by token)
                 const bool qb = dec_batch && n > 1 && native_qsa_enabled() && native_rope_enabled() && !st.kv_q4;
-                native_quantize_q8_1(xm, xq_, (int) N, n, cs);
-                if (qb) bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*) wik->data, idx_raw + tb * ID, ID, N, ID, n, cs);
-                else for (int t = tb; t < te; ++t)
-                    bf16_gemv_fp32_mmvf(mixed_ + t * N, (const uint16_t*) wik->data, idx_raw + t * ID, (int) N, (int) ID, cs);
+                native_quantize_q8_1(xm, xq_, (int)N, n, cs);
+                if (qb)
+                    bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*)wik->data, idx_raw + tb * ID, ID, N,
+                                              ID, n, cs);
+                else
+                    for (int t = tb; t < te; ++t)
+                        bf16_gemv_fp32_mmvf(mixed_ + t * N, (const uint16_t*)wik->data, idx_raw + t * ID, (int)N,
+                                            (int)ID, cs);
                 stamp(l, 7, grp);
-                native_mmvq(wk->native_type, wk->native_data, xq_, kcur_ + tb * NKV * HD, (int) N, (int) (NKV * HD), n, cs);
-                native_mmvq(wv->native_type, wv->native_data, xq_, vcur_ + tb * NKV * HD, (int) N, (int) (NKV * HD), n, cs);
-                if (qb) norm_rope(kcur_ + tb * NKV * HD, wkn, (int) (n * NKV), (int) HD, pos_k + tb * NKV);
-                else for (int t = tb; t < te; ++t) norm_rope(kcur_ + t * NKV * HD, wkn, (int) NKV, (int) HD, pos_ + t * NH);
-                if (st.kv_rot) {   // K and V rotated before they are stored (kv_q4.hpp)
-                    fwht256_inplace_cuda(kcur_ + tb * NKV * HD, (int64_t) n * NKV, cs);
-                    fwht256_inplace_cuda(vcur_ + tb * NKV * HD, (int64_t) n * NKV, cs);
-                } else if (st.kv_hybrid) {   // K8V4: only V is rotated
-                    fwht256_inplace_cuda(vcur_ + tb * NKV * HD, (int64_t) n * NKV, cs);
+                native_mmvq(wk->native_type, wk->native_data, xq_, kcur_ + tb * NKV * HD, (int)N, (int)(NKV * HD), n,
+                            cs);
+                native_mmvq(wv->native_type, wv->native_data, xq_, vcur_ + tb * NKV * HD, (int)N, (int)(NKV * HD), n,
+                            cs);
+                if (qb)
+                    norm_rope(kcur_ + tb * NKV * HD, wkn, (int)(n * NKV), (int)HD, pos_k + tb * NKV);
+                else
+                    for (int t = tb; t < te; ++t)
+                        norm_rope(kcur_ + t * NKV * HD, wkn, (int)NKV, (int)HD, pos_ + t * NH);
+                if (st.kv_rot) {  // K and V rotated before they are stored (kv_q4.hpp)
+                    fwht256_inplace_cuda(kcur_ + tb * NKV * HD, (int64_t)n * NKV, cs);
+                    fwht256_inplace_cuda(vcur_ + tb * NKV * HD, (int64_t)n * NKV, cs);
+                } else if (st.kv_hybrid) {  // K8V4: only V is rotated
+                    fwht256_inplace_cuda(vcur_ + tb * NKV * HD, (int64_t)n * NKV, cs);
                 }
                 stamp(l, 8, grp);
-                if (grp == 0) copy_from_mapped(tail_snap_ + (size_t) qi * TS, st.idx_tail, TS, cs);
+                if (grp == 0) copy_from_mapped(tail_snap_ + (size_t)qi * TS, st.idx_tail, TS, cs);
                 for (int t = tb; t < te; ++t) {
                     const int32_t* step_t = step_ + t * kStepCount;
-                    if (st.kv_hybrid) {   // K8V4: the unused half's lanes folded onto the used pool (layer.cpp)
+                    if (st.kv_hybrid) {  // K8V4: the unused half's lanes folded onto the used pool (layer.cpp)
                         kv_append_q8_step(st.k_q, st.k_q, st.k_scale, st.k_scale, st.page_table, step_t,
                                           kcur_ + t * NKV * HD, kcur_ + t * NKV * HD, s, cs, nullptr);
                         kv_append_q4_step(st.v_q4, st.v_q4, st.page_table, step_t, vcur_ + t * NKV * HD,
@@ -702,11 +771,10 @@ bool Verifier::record_window(int T, sycl::queue* cs, std::string &err) try {
                 const QsaIndexerBuffers ib{st.idx_tail, st.idx_dead, st.idx_pooled, st.idx_block_pos};
                 for (int t = tb; t < te; ++t)
                     native_qsa_indexer_append(idx_raw + t * ID, step_ + t * kStepCount + kStepPos, 0,
-                                              (const float*) wikn->data, EPS, ib, s, st.max_cells,
-                                              rope_scaling(), cs);
+                                              (const float*)wikn->data, EPS, ib, s, st.max_cells, rope_scaling(), cs);
                 stamp(l, 9, grp);
-                native_mmvq(wq->native_type, wq->native_data, xq_, qfull_ + tb * NH * 2 * HD, (int) N, (int) (NH * 2 * HD),
-                            n, cs);
+                native_mmvq(wq->native_type, wq->native_data, xq_, qfull_ + tb * NH * 2 * HD, (int)N,
+                            (int)(NH * 2 * HD), n, cs);
                 if (qb) {
                     float* dst_p = qcur_ + tb * NH * HD;
                     const float* src_p = qfull_ + tb * NH * 2 * HD;
@@ -717,58 +785,63 @@ bool Verifier::record_window(int T, sycl::queue* cs, std::string &err) try {
                         size_t c = id[1];
                         dst_p[r * hd_elems + c] = src_p[r * (hd_elems * 2) + c];
                     });
-                    norm_rope(qcur_ + tb * NH * HD, wqn, (int) (n * NH), (int) HD, pos_ + tb * NH);
-                    if (st.kv_rot) fwht256_inplace_cuda(qcur_ + tb * NH * HD, (int64_t) n * NH, cs);   // <Hq, Hk> = <q, k>
-                    bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*) wiq->data, qidx_ + tb * IQ * ID, IQ * ID,
-                                              N, IQ * ID, n, cs);
-                    norm_rope(qidx_ + tb * IQ * ID, wiqn, (int) (n * IQ), (int) ID, pos_i + tb * IQ);
+                    norm_rope(qcur_ + tb * NH * HD, wqn, (int)(n * NH), (int)HD, pos_ + tb * NH);
+                    if (st.kv_rot)
+                        fwht256_inplace_cuda(qcur_ + tb * NH * HD, (int64_t)n * NH, cs);  // <Hq, Hk> = <q, k>
+                    bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*)wiq->data, qidx_ + tb * IQ * ID,
+                                              IQ * ID, N, IQ * ID, n, cs);
+                    norm_rope(qidx_ + tb * IQ * ID, wiqn, (int)(n * IQ), (int)ID, pos_i + tb * IQ);
                 } else {
-                for (int t = tb; t < te; ++t) {
-                    float* qc = qcur_ + t * NH * HD;
-                    const float* src_p = qfull_ + t * NH * 2 * HD;
-                    const size_t total_rows = (size_t)NH;
-                    const size_t hd_elems = (size_t)HD;
-                    cs->parallel_for(sycl::range<2>(total_rows, hd_elems), [=](sycl::id<2> id) {
-                        size_t r = id[0];
-                        size_t c = id[1];
-                        qc[r * hd_elems + c] = src_p[r * (hd_elems * 2) + c];
-                    });
-                    norm_rope(qc, wqn, (int) NH, (int) HD, pos_ + t * NH);
-                    if (st.kv_rot) fwht256_inplace_cuda(qc, NH, cs);   // <Hq, Hk> = <q, k>
-                }
-                for (int t = tb; t < te; ++t) {
-                    float* qx = qidx_ + t * IQ * ID;
-                    bf16_gemv_fp32_mmvf(mixed_ + t * N, (const uint16_t*) wiq->data, qx, (int) N, (int) (IQ * ID), cs);
-                    norm_rope(qx, wiqn, (int) IQ, (int) ID, pos_ + t * NH);
-                }
+                    for (int t = tb; t < te; ++t) {
+                        float* qc = qcur_ + t * NH * HD;
+                        const float* src_p = qfull_ + t * NH * 2 * HD;
+                        const size_t total_rows = (size_t)NH;
+                        const size_t hd_elems = (size_t)HD;
+                        cs->parallel_for(sycl::range<2>(total_rows, hd_elems), [=](sycl::id<2> id) {
+                            size_t r = id[0];
+                            size_t c = id[1];
+                            qc[r * hd_elems + c] = src_p[r * (hd_elems * 2) + c];
+                        });
+                        norm_rope(qc, wqn, (int)NH, (int)HD, pos_ + t * NH);
+                        if (st.kv_rot) fwht256_inplace_cuda(qc, NH, cs);  // <Hq, Hk> = <q, k>
+                    }
+                    for (int t = tb; t < te; ++t) {
+                        float* qx = qidx_ + t * IQ * ID;
+                        bf16_gemv_fp32_mmvf(mixed_ + t * N, (const uint16_t*)wiq->data, qx, (int)N, (int)(IQ * ID), cs);
+                        norm_rope(qx, wiqn, (int)IQ, (int)ID, pos_ + t * NH);
+                    }
                 }
                 stamp(l, 10, grp);
-                qsa_block_scores(st.idx_pooled, st.idx_dead, qidx_ + tb * IQ * ID, step_ + tb * kStepCount, n, max_blocks_,
-                                 s, scores_ + (size_t) tb * max_blocks_, cs);
-                qsa_block_topk(scores_ + (size_t) tb * max_blocks_, step_ + tb * kStepCount, n, max_blocks_, cap_, s,
-                               sel_ + (size_t) tb * cap_, cs);
+                qsa_block_scores(st.idx_pooled, st.idx_dead, qidx_ + tb * IQ * ID, step_ + tb * kStepCount, n,
+                                 max_blocks_, s, scores_ + (size_t)tb * max_blocks_, cs);
+                qsa_block_topk(scores_ + (size_t)tb * max_blocks_, step_ + tb * kStepCount, n, max_blocks_, cap_, s,
+                               sel_ + (size_t)tb * cap_, cs);
                 stamp(l, 11, grp);
                 // KV streaming: the n selections' blocks resident (device-side, inside the graph)
-                qsa_kv_resolve(st, *g_, sel_ + (size_t) tb * cap_, step_ + tb * kStepCount, n, cap_, cs);
+                qsa_kv_resolve(st, *g_, sel_ + (size_t)tb * cap_, step_ + tb * kStepCount, n, cap_, cs);
                 stamp(l, 12, grp);
                 const QsaAttnPools pools = qsa_attn_pools(st);
-                qsa_decode_attn_batch(qcur_ + tb * NH * HD, pools, sel_ + (size_t) tb * cap_, step_ + tb * kStepCount, cap_,
-                                      s, attn_scratch_ + (size_t) tb * attn_scratch_floats_, attn_ + tb * NH * HD, n, cs);
+                qsa_decode_attn_batch(qcur_ + tb * NH * HD, pools, sel_ + (size_t)tb * cap_, step_ + tb * kStepCount,
+                                      cap_, s, attn_scratch_ + (size_t)tb * attn_scratch_floats_, attn_ + tb * NH * HD,
+                                      n, cs);
                 stamp(l, 13, grp);
-                if (st.kv_rot || st.kv_hybrid) fwht256_inplace_cuda(attn_ + tb * NH * HD, (int64_t) n * NH, cs);   // back: H^-1 = H
-                if (qb) native_qsa_gate_apply(attn_ + tb * NH * HD, qfull_ + tb * NH * 2 * HD, attn32_ + tb * NH * HD,
-                                              (int) (n * NH), (int) HD, cs);
+                if (st.kv_rot || st.kv_hybrid)
+                    fwht256_inplace_cuda(attn_ + tb * NH * HD, (int64_t)n * NH, cs);  // back: H^-1 = H
+                if (qb)
+                    native_qsa_gate_apply(attn_ + tb * NH * HD, qfull_ + tb * NH * 2 * HD, attn32_ + tb * NH * HD,
+                                          (int)(n * NH), (int)HD, cs);
                 else
-                for (int t = tb; t < te; ++t) {
-                    if (native_qsa_enabled())
-                        native_qsa_gate_apply(attn_ + t * NH * HD, qfull_ + t * NH * 2 * HD, attn32_ + t * NH * HD,
-                                              (int) NH, (int) HD, cs);
-                    else
-                        qsa_gate_apply_f32(attn_ + t * NH * HD, qfull_ + t * NH * 2 * HD, s, attn32_ + t * NH * HD, cs);
-                }
+                    for (int t = tb; t < te; ++t) {
+                        if (native_qsa_enabled())
+                            native_qsa_gate_apply(attn_ + t * NH * HD, qfull_ + t * NH * 2 * HD, attn32_ + t * NH * HD,
+                                                  (int)NH, (int)HD, cs);
+                        else
+                            qsa_gate_apply_f32(attn_ + t * NH * HD, qfull_ + t * NH * 2 * HD, s, attn32_ + t * NH * HD,
+                                               cs);
+                    }
                 stamp(l, 14, grp);
-                native_quantize_q8_1(attn32_ + tb * NH * HD, xq_, (int) (NH * HD), n, cs);
-                native_mmvq(wo->native_type, wo->native_data, xq_, bo_ + tb * N, (int) (NH * HD), (int) N, n, cs);
+                native_quantize_q8_1(attn32_ + tb * NH * HD, xq_, (int)(NH * HD), n, cs);
+                native_mmvq(wo->native_type, wo->native_data, xq_, bo_ + tb * N, (int)(NH * HD), (int)N, n, cs);
             }
         } catch (const std::exception& e) {
             /*
@@ -785,47 +858,59 @@ bool Verifier::record_window(int T, sycl::queue* cs, std::string &err) try {
         const WeightRef* w_router = v.get("ffn_gate_inp.weight");
         if (dec_batch && n > 1 && w_router != nullptr && native_router_enabled() && NE == 512 && K == 10) {
             try {
-                bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*) w_router->data, logits_ + tb * NE, NE, N,
+                bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*)w_router->data, logits_ + tb * NE, NE, N,
                                           NE, n, cs);
                 native_router_top10_multi(logits_ + tb * NE, ids_ + tb * K, w_ + tb * K, n, cs);
-            /*
-            DPCT1109:33: Virtual functions cannot be called in SYCL device code.
-            You need to adjust the code.
-            */
-            } catch (const std::exception &e) {
-                err = "verify router: " + std::string(e.what()); return false;
+                /*
+                DPCT1109:33: Virtual functions cannot be called in SYCL device code.
+                You need to adjust the code.
+                */
+            } catch (const std::exception& e) {
+                err = "verify router: " + std::string(e.what());
+                return false;
             }
         } else
-        for (int t = tb; t < te; ++t) {
-            MoEBuffers mb = ss.moe;
-            mb.logits = logits_ + t * NE; mb.ids = ids_ + t * K; mb.weights = w_ + t * K;
-            if (!moe_route(wt, g, l, K, mb, mixed_ + t * N, cs, err, nullptr)) return false;
-        }
-        if (device_plan_)   // E-6: every routed expert resident: this group's plan without the host
-            resident_plan(ids_ + tb * K, n * (int) K, (int) K, hits_.d_res + l * g.n_expert, (int) g.n_expert,
-                          hits_.cache_base, slot_off_d_, (long long) hits_.blob,
-                          plan_ + (size_t) grp * (size_t) (plan_i32_ + 16), (long long) max_t_ * K, skip_ + grp,
-                          (uint32_t) ((l - lb_) * G + grp + 1), cs);
-        doorbell_publish(xm, ids_ + tb * K, w_ + tb * K, (int64_t) n * N, (int64_t) n * K, m_x_ + tb * N,
-                         m_ids_ + tb * K, m_w_ + tb * K, m_seq_, cs);
+            for (int t = tb; t < te; ++t) {
+                MoEBuffers mb = ss.moe;
+                mb.logits = logits_ + t * NE;
+                mb.ids = ids_ + t * K;
+                mb.weights = w_ + t * K;
+                if (!moe_route(wt, g, l, K, mb, mixed_ + t * N, cs, err, nullptr)) return false;
+            }
+        if (device_plan_)  // E-6: every routed expert resident: this group's plan without the host
+            resident_plan(ids_ + tb * K, n * (int)K, (int)K, hits_.d_res + l * g.n_expert, (int)g.n_expert,
+                          hits_.cache_base, slot_off_d_, (long long)hits_.blob,
+                          plan_ + (size_t)grp * (size_t)(plan_i32_ + 16), (long long)max_t_ * K, skip_ + grp,
+                          (uint32_t)((l - lb_) * G + grp + 1), cs);
+        doorbell_publish(xm, ids_ + tb * K, w_ + tb * K, (int64_t)n * N, (int64_t)n * K, m_x_ + tb * N, m_ids_ + tb * K,
+                         m_w_ + tb * K, m_seq_, cs);
         stamp(l, 17, grp);
         {
-            const WeightRef *wgi = need(v, "ffn_gate_inp_shexp.weight", err), *wsg = need(v, "ffn_gate_shexp.weight", err),
-                            *wsu = need(v, "ffn_up_shexp.weight", err), *wsd = need(v, "ffn_down_shexp.weight", err);
+            const WeightRef *wgi = need(v, "ffn_gate_inp_shexp.weight", err),
+                            *wsg = need(v, "ffn_gate_shexp.weight", err), *wsu = need(v, "ffn_up_shexp.weight", err),
+                            *wsd = need(v, "ffn_down_shexp.weight", err);
             if (!wgi || !wsg || !wsu || !wsd) return false;
-            if (!native_of(wsg, v.name("ffn_gate_shexp.weight"), err) || !native_of(wsu, v.name("ffn_up_shexp.weight"), err) ||
+            if (!native_of(wsg, v.name("ffn_gate_shexp.weight"), err) ||
+                !native_of(wsu, v.name("ffn_up_shexp.weight"), err) ||
                 !native_of(wsd, v.name("ffn_down_shexp.weight"), err))
                 return false;
             NativeSharedWeights nsw;
-            nsw.gate_type = wsg->native_type; nsw.gate_data = wsg->native_data;
-            nsw.up_type = wsu->native_type; nsw.up_data = wsu->native_data;
-            nsw.down_type = wsd->native_type; nsw.down_data = wsd->native_data;
+            nsw.gate_type = wsg->native_type;
+            nsw.gate_data = wsg->native_data;
+            nsw.up_type = wsu->native_type;
+            nsw.up_data = wsu->native_data;
+            nsw.down_type = wsd->native_type;
+            nsw.down_data = wsd->native_data;
             nsw.q8_1 = xq_;
-            if (dec_batch) f32_to_bf16_bulk(mixed_ + tb * N, sh_bf16_ + tb * N, (int64_t) n * N, cs);   // contiguous rows
-            else for (int t = tb; t < te; ++t) f32_to_bf16_bulk(mixed_ + t * N, sh_bf16_ + t * N, N, cs);
+            if (dec_batch)
+                f32_to_bf16_bulk(mixed_ + tb * N, sh_bf16_ + tb * N, (int64_t)n * N, cs);  // contiguous rows
+            else
+                for (int t = tb; t < te; ++t)
+                    f32_to_bf16_bulk(mixed_ + t * N, sh_bf16_ + t * N, N, cs);
             try {
-                shared_expert_multi(n, xm, sh_bf16_ + tb * N, nsw, (const uint16_t*) wgi->data, sh_gate_ + (size_t) tb * g.n_ff,
-                                    sh_up_ + (size_t) tb * g.n_ff, sh_g_ + tb, shared_ + tb * N, N, g.n_ff, cs);
+                shared_expert_multi(n, xm, sh_bf16_ + tb * N, nsw, (const uint16_t*)wgi->data,
+                                    sh_gate_ + (size_t)tb * g.n_ff, sh_up_ + (size_t)tb * g.n_ff, sh_g_ + tb,
+                                    shared_ + tb * N, N, g.n_ff, cs);
             } catch (const std::exception& e) {
                 /*
                 DPCT1109:34: Virtual functions cannot be called in SYCL device
@@ -836,9 +921,10 @@ bool Verifier::record_window(int T, sycl::queue* cs, std::string &err) try {
             }
         }
         if (strata::kernels::cpu::expert_layout().native)
-            quantize_q8_1_rows(xm, n, N, nat_xq_ + (size_t) tb * (N / 32) * 36, cs);
+            quantize_q8_1_rows(xm, n, N, nat_xq_ + (size_t)tb * (N / 32) * 36, cs);
         else
-            quantize_q8_0_scaled(xm, hit_xq_ + (size_t) tb * (N / 32) * 34, hit_xs_ + (size_t) tb * (N / 32), (int64_t) n * N, cs);
+            quantize_q8_0_scaled(xm, hit_xq_ + (size_t)tb * (N / 32) * 34, hit_xs_ + (size_t)tb * (N / 32),
+                                 (int64_t)n * N, cs);
         stamp(l, 18, grp);
         return true;
     };
@@ -853,15 +939,16 @@ bool Verifier::record_window(int T, sycl::queue* cs, std::string &err) try {
     */
     auto post = [&](int64_t l, int grp) -> bool {
         const int tb = tb_[grp], te = te_[grp], n = te - tb;
-        const uint32_t ring = (uint32_t) ((l - lb_) * G + grp + 1);
-        const int64_t cap = (int64_t) n * K, capx = (int64_t) max_t_ * K;
-        int32_t* pl = plan_ + (size_t) grp * (size_t) (plan_i32_ + 16);
-        if (device_plan_) {   // E-6: skipped when the device planned this group (all its experts resident)
+        const uint32_t ring = (uint32_t)((l - lb_) * G + grp + 1);
+        const int64_t cap = (int64_t)n * K, capx = (int64_t)max_t_ * K;
+        int32_t* pl = plan_ + (size_t)grp * (size_t)(plan_i32_ + 16);
+        if (device_plan_) {  // E-6: skipped when the device planned this group (all its experts resident)
             wait_flag_ge_or(m_flagA_, ring, skip_ + grp, cs);
-            copy_i32_from_mapped_unless(pl, m_plan_ + (size_t) grp * (size_t) plan_i32_, plan_i32_, skip_ + grp, ring, cs);
+            copy_i32_from_mapped_unless(pl, m_plan_ + (size_t)grp * (size_t)plan_i32_, plan_i32_, skip_ + grp, ring,
+                                        cs);
         } else {
-            wait_flag_ge(m_flagA_, ring, cs);                  // the pool published this group's GPU plan
-            copy_i32_from_mapped(pl, m_plan_ + (size_t) grp * (size_t) plan_i32_, plan_i32_, cs);
+            wait_flag_ge(m_flagA_, ring, cs);  // the pool published this group's GPU plan
+            copy_i32_from_mapped(pl, m_plan_ + (size_t)grp * (size_t)plan_i32_, plan_i32_, cs);
         }
         stamp(l, 19, grp);
         const int32_t* p_counts = pl;
@@ -869,70 +956,76 @@ bool Verifier::record_window(int T, sycl::queue* cs, std::string &err) try {
         const int32_t* p_dst = p_start + capx + 1;
         const int32_t* p_tok = p_dst + capx;
         const int64_t ptr_off = ((4 + (capx + 1) + 2 * capx) + 1) & ~1ll;
-        const unsigned long long* p_ptr = (const unsigned long long*) (pl + ptr_off);
+        const unsigned long long* p_ptr = (const unsigned long long*)(pl + ptr_off);
         const unsigned long long* p_ptr2 = p_ptr + capx;
         const int32_t* p_start2 = pl + ptr_off + 4 * capx;
-        float* hit_out = hit_out_ + (size_t) tb * K * N;
+        float* hit_out = hit_out_ + (size_t)tb * K * N;
         const auto& lay = strata::kernels::cpu::expert_layout();
         // plan v0.3 P6: the VRAM groups now; the PCIe groups once the copy engine has landed them in staging
         auto grouped = [&](const unsigned long long* gp, const int32_t* gs, const int32_t* gn) {
             if (lay.native) {
                 // the layer's GGUF formats (i-quant gate/up, Q2_0 / IQ4_NL down)
-                const auto& f = lay.fmt[(size_t) l];
+                const auto& f = lay.fmt[(size_t)l];
                 const NativeExpertLayout L = native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff);
-                native_expert_grouped(L, gp, gs, gn, p_dst, p_tok, cap, cap,
-                                      nat_xq_ + (size_t) tb * (N / 32) * 36, hit_scratch_, hit_out, cs);
+                native_expert_grouped(L, gp, gs, gn, p_dst, p_tok, cap, cap, nat_xq_ + (size_t)tb * (N / 32) * 36,
+                                      hit_scratch_, hit_out, cs);
             } else {
-                moe_grouped_s2(gp, gs, gn, p_dst, p_tok, cap, cap, hit_xq_ + (size_t) tb * (N / 32) * 34,
-                               hit_xs_ + (size_t) tb * (N / 32), hit_scratch_, hit_out, cs);
+                moe_grouped_s2(gp, gs, gn, p_dst, p_tok, cap, cap, hit_xq_ + (size_t)tb * (N / 32) * 34,
+                               hit_xs_ + (size_t)tb * (N / 32), hit_scratch_, hit_out, cs);
             }
         };
         grouped(p_ptr, p_start, p_counts);
         stamp(l, 20, grp);
-        if (device_plan_) wait_flag_ge_or(m_flagB_, ring, skip_ + grp, cs);
-        else wait_flag_ge(m_flagB_, ring, cs);                 // the PCIe share is in staging (DMA) or mapped
-        if (sink_.pcie_mode == 2) {                            // stage it with a copy kernel, then point at staging
+        if (device_plan_)
+            wait_flag_ge_or(m_flagB_, ring, skip_ + grp, cs);
+        else
+            wait_flag_ge(m_flagB_, ring, cs);  // the PCIe share is in staging (DMA) or mapped
+        if (sink_.pcie_mode == 2) {            // stage it with a copy kernel, then point at staging
             const int64_t per = G == 2 ? kStagingBlobs / 2 : kStagingBlobs;
-            uint8_t* stage = staging_ + (size_t) (grp * per) * lay.max_blob;
-            fetch_blobs(p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), (int) per, cs);
-            rebase_ptrs((unsigned long long*) p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), cs);
+            uint8_t* stage = staging_ + (size_t)(grp * per) * lay.max_blob;
+            fetch_blobs(p_ptr2, p_counts + 2, stage, (int64_t)lay.blob_bytes(l), (int)per, cs);
+            rebase_ptrs((unsigned long long*)p_ptr2, p_counts + 2, stage, (int64_t)lay.blob_bytes(l), cs);
         }
         stamp(l, 21, grp);
         grouped(p_ptr2, p_start2, p_counts + 2);
         stamp(l, 22, grp);
-        if (device_plan_) {   // no CPU share when the device planned the group: its rows are zeros
+        if (device_plan_) {  // no CPU share when the device planned the group: its rows are zeros
             wait_flag_ge_or(m_flag_, ring, skip_ + grp, cs);
-            copy_or_zero_from_mapped(parts_ + (size_t) tb * K * N, m_ymiss_ + (size_t) tb * K * N, (long long) n * K * N,
+            copy_or_zero_from_mapped(parts_ + (size_t)tb * K * N, m_ymiss_ + (size_t)tb * K * N, (long long)n * K * N,
                                      skip_ + grp, ring, cs);
         } else {
-            wait_flag_ge(m_flag_, ring, cs);               // the CPU's share is in the mapped rows
+            wait_flag_ge(m_flag_, ring, cs);  // the CPU's share is in the mapped rows
             stamp(l, 23, grp);
-            if (dec_batch)   // only the CPU rows cross PCIe (p_dst[0, counts[1]) = the GPU's own rows)
-                copy_rows_from_mapped(parts_ + (size_t) tb * K * N, m_ymiss_ + (size_t) tb * K * N, (int64_t) n * K, N,
+            if (dec_batch)  // only the CPU rows cross PCIe (p_dst[0, counts[1]) = the GPU's own rows)
+                copy_rows_from_mapped(parts_ + (size_t)tb * K * N, m_ymiss_ + (size_t)tb * K * N, (int64_t)n * K, N,
                                       p_dst, p_counts + 1, cs);
             else
-                copy_from_mapped(parts_ + (size_t) tb * K * N, m_ymiss_ + (size_t) tb * K * N, (int64_t) n * K * N, cs);
+                copy_from_mapped(parts_ + (size_t)tb * K * N, m_ymiss_ + (size_t)tb * K * N, (int64_t)n * K * N, cs);
         }
-        moe_hit_add(parts_ + (size_t) tb * K * N, hit_out, p_dst, p_counts + 1, cap, N, cs);
-        if (dec_batch && n > 1 && native_moe_combine_enabled()) {   // one launch for the window's rows
+        moe_hit_add(parts_ + (size_t)tb * K * N, hit_out, p_dst, p_counts + 1, cap, N, cs);
+        if (dec_batch && n > 1 && native_moe_combine_enabled()) {  // one launch for the window's rows
             try {
-                native_moe_combine_multi(parts_ + (size_t) tb * K * N, w_ + tb * K, shared_ + tb * N, bo_ + tb * N, N, K, n, cs);
-            /*
-            DPCT1109:36: Virtual functions cannot be called in SYCL device code.
-            You need to adjust the code.
-            */
-            } catch (const std::exception &e) {
-                err = "verify combine: " + std::string(e.what()); return false;
+                native_moe_combine_multi(parts_ + (size_t)tb * K * N, w_ + tb * K, shared_ + tb * N, bo_ + tb * N, N, K,
+                                         n, cs);
+                /*
+                DPCT1109:36: Virtual functions cannot be called in SYCL device code.
+                You need to adjust the code.
+                */
+            } catch (const std::exception& e) {
+                err = "verify combine: " + std::string(e.what());
+                return false;
             }
         } else
-        for (int t = tb; t < te; ++t) {
-            MoEBuffers mb = ss.moe;
-            mb.weights = w_ + t * K; mb.shared = shared_ + t * N;
-            if (!moe_combine_parts(g, l, K, mb, parts_ + (size_t) t * K * N, bo_ + t * N, cs, err)) return false;
-        }
+            for (int t = tb; t < te; ++t) {
+                MoEBuffers mb = ss.moe;
+                mb.weights = w_ + t * K;
+                mb.shared = shared_ + t * N;
+                if (!moe_combine_parts(g, l, K, mb, parts_ + (size_t)t * K * N, bo_ + t * N, cs, err)) return false;
+            }
         stamp(l, 24, grp);
         if (l == g.n_layers - 1) {
-            for (int t = tb; t < te; ++t) gr_write(Rt(t), bo_ + t * N, inj2_ + t * HC, gs, Rt(t), cs);
+            for (int t = tb; t < te; ++t)
+                gr_write(Rt(t), bo_ + t * N, inj2_ + t * HC, gs, Rt(t), cs);
             if (cvec().covers(l)) cvec_apply(Rt(tb), l, n, HC * N, nullptr, 0, nullptr, 0, false, cs);
         } else if (cvec().covers(l)) {
             cvec_apply(Rt(tb), l, n, HC * N, bo_ + tb * N, N, inj2_ + tb * HC, HC, true, cs);
@@ -947,11 +1040,11 @@ bool Verifier::record_window(int T, sycl::queue* cs, std::string &err) try {
             if (!post(l, grp)) return false;
             if (l + 1 < le_ && !pre(l + 1, grp)) return false;
         }
-    if (le_ < g.n_layers) {   // a layer split's earlier stage: hand the residual on, no head
+    if (le_ < g.n_layers) {  // a layer split's earlier stage: hand the residual on, no head
         for (int t = 0; t < T; ++t) {
-            copy_from_mapped(hand_out_ + (size_t) t * HB, Rt(t), HC * N, cs);
-            copy_from_mapped(hand_out_ + (size_t) t * HB + HC * N, bo_ + (size_t) t * N, N, cs);
-            copy_from_mapped(hand_out_ + (size_t) t * HB + HC * N + N, inj2_ + (size_t) t * HC, HC, cs);
+            copy_from_mapped(hand_out_ + (size_t)t * HB, Rt(t), HC * N, cs);
+            copy_from_mapped(hand_out_ + (size_t)t * HB + HC * N, bo_ + (size_t)t * N, N, cs);
+            copy_from_mapped(hand_out_ + (size_t)t * HB + HC * N + N, inj2_ + (size_t)t * HC, HC, cs);
         }
         return true;
     }
@@ -961,21 +1054,24 @@ bool Verifier::record_window(int T, sycl::queue* cs, std::string &err) try {
     {
         const WeightRef *hn = wt.find("output_hc_norm.weight"), *hd = wt.find("output_hc_down.weight"),
                         *hu = wt.find("output_hc_up.weight");
-        if (!hn || !hd || !hu) { err = "verify: an output_hc_* weight is missing"; return false; }
+        if (!hn || !hd || !hu) {
+            err = "verify: an output_hc_* weight is missing";
+            return false;
+        }
         for (int t = 0; t < T; ++t) {
             BlockBuffers bb = ss.block;
             bb.R = Rt(t);
             bb.mixed = head_mixed_ + t * N;
             if (head_ != nullptr && head_->loaded()) {
                 if (!lm_head_mix(wt, g, bb, cs, err)) return false;
-            } else if (!lm_head(wt, g, bb, head_logits_ + (size_t) t * n_vocab_, cs, err)) {
+            } else if (!lm_head(wt, g, bb, head_logits_ + (size_t)t * n_vocab_, cs, err)) {
                 return false;
             }
         }
         if (head_ != nullptr && head_->loaded()) {
             try {
-                native_quantize_q8_1(head_mixed_, xq_, (int) N, T, cs);
-                native_mmvq(head_->type(), head_->weights(), xq_, head_logits_, (int) N, (int) n_vocab_, T, cs);
+                native_quantize_q8_1(head_mixed_, xq_, (int)N, T, cs);
+                native_mmvq(head_->type(), head_->weights(), xq_, head_logits_, (int)N, (int)n_vocab_, T, cs);
             } catch (const std::exception& e) {
                 err = std::string("verify head: ") + e.what();
                 return false;
@@ -987,24 +1083,50 @@ bool Verifier::record_window(int T, sycl::queue* cs, std::string &err) try {
         SamplerParams sp;
         sp.greedy = true;
         sp.temperature = 0.0f;
-        sample_tokens(head_logits_, T, (int) n_vocab_, nullptr, 0, sp, m_out_, cs);
+        sample_tokens(head_logits_, T, (int)n_vocab_, nullptr, 0, sp, m_out_, cs);
     }
     stamp(g.n_layers, 1, 0);
     return true;
-}
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
+} catch (sycl::exception const& exc) {
+    std::cerr << exc.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
+    std::exit(1);
 }
 
 std::string Verifier::profile_report() {
     if (!prof_on_ || prof_windows_ == 0) return std::string();
-    static const char* names[kProfPer] = {"-", "hc-read0", "q8+qkv/q-idx gemv", "conv", "ab", "z", "rec", "q8+kv-idx",
-                                          "k/v+norm-rope", "kv+idx append", "q+q-idx", "scores+topk", "kv-resolve",
-                                          "attention", "gate", "", "out-proj", "hc-read1+router", "shared+quant",
-                                          "waitA", "VRAM hits", "waitB", "PCIe grp", "waitCPU", "copy+combine",
-                                          "(gap)", "head", "  hc0 norm", "  hc0 down", "  hc0 up", "", "", ""};
+    static const char* names[kProfPer] = {"-",
+                                          "hc-read0",
+                                          "q8+qkv/q-idx gemv",
+                                          "conv",
+                                          "ab",
+                                          "z",
+                                          "rec",
+                                          "q8+kv-idx",
+                                          "k/v+norm-rope",
+                                          "kv+idx append",
+                                          "q+q-idx",
+                                          "scores+topk",
+                                          "kv-resolve",
+                                          "attention",
+                                          "gate",
+                                          "",
+                                          "out-proj",
+                                          "hc-read1+router",
+                                          "shared+quant",
+                                          "waitA",
+                                          "VRAM hits",
+                                          "waitB",
+                                          "PCIe grp",
+                                          "waitCPU",
+                                          "copy+combine",
+                                          "(gap)",
+                                          "head",
+                                          "  hc0 norm",
+                                          "  hc0 down",
+                                          "  hc0 up",
+                                          "",
+                                          "",
+                                          ""};
     std::string out;
     char b[80];
     double total = 0;
@@ -1013,18 +1135,21 @@ std::string Verifier::profile_report() {
         for (int i = 0; i < kProfPer; ++i) {
             if (prof_sum_[k][i] <= 0) continue;
             total += prof_sum_[k][i];
-            std::snprintf(b, sizeof b, " %s %.2f", names[i], prof_sum_[k][i] / 1e6 / (double) prof_windows_);
+            std::snprintf(b, sizeof b, " %s %.2f", names[i], prof_sum_[k][i] / 1e6 / (double)prof_windows_);
             out += b;
         }
     }
-    std::snprintf(b, sizeof b, " | total %.2f ms/window over %lld windows", total / 1e6 / (double) prof_windows_, (long long) prof_windows_);
+    std::snprintf(b, sizeof b, " | total %.2f ms/window over %lld windows", total / 1e6 / (double)prof_windows_,
+                  (long long)prof_windows_);
     out += b;
-    for (auto& r : prof_sum_) for (double& d : r) d = 0;
+    for (auto& r : prof_sum_)
+        for (double& d : r)
+            d = 0;
     prof_windows_ = 0;
     return out;
 }
 
-bool Verifier::capture(int T, std::string &err) try {
+bool Verifier::capture(int T, std::string& err) try {
     if (exec_[T] != nullptr) return true;
     /*
     DPCT1119:389: Migration of cudaStreamBeginCapture is not supported, please
@@ -1061,24 +1186,22 @@ bool Verifier::capture(int T, std::string &err) try {
     cs_->wait();
     std::fprintf(stderr, "strata verify: captured the %d-token window\n", T);
     return true;
-}
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
+} catch (sycl::exception const& exc) {
+    std::cerr << exc.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
+    std::exit(1);
 }
 
-bool Verifier::capture_commit(std::string &err) try {
+bool Verifier::capture_commit(std::string& err) try {
     if (commit_exec_ != nullptr) return true;
     using namespace strata::kernels;
     const ModelGeometry& g = *g_;
     SessionState& ss = *ss_;
     const QsaShapes s = shapes_of(g);
     const int64_t C = g.ssm_conv_channels, HV = g.ssm_v_heads, ID = g.idx_key_dim, MT = max_t_;
-    const uint64_t gdn_floats = (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size +
-                                (uint64_t) g.ssm_conv_channels * (g.ssm_d_conv - 1);
+    const uint64_t gdn_floats = (uint64_t)g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size +
+                                (uint64_t)g.ssm_conv_channels * (g.ssm_d_conv - 1);
     const int64_t TS = (s.idx_block - 1) * ID;
-    const int64_t HS = (int64_t) NG_HIST * NG_HC_DIM;
+    const int64_t HS = (int64_t)NG_HIST * NG_HC_DIM;
     /*
     DPCT1119:410: Migration of cudaStreamBeginCapture is not supported, please
     try to remigrate with option: --use-experimental-features=graph.
@@ -1091,30 +1214,37 @@ bool Verifier::capture_commit(std::string &err) try {
     try {
         copy_i32_from_mapped(commit_, m_commit_, 2 + MT, cs_);
         int64_t qsa_index = 0, gdn_index = 0;
-        for (int64_t l = 0; l < lb_; ++l) (is_qsa_layer(g, l) ? qsa_index : gdn_index) += 1;
+        for (int64_t l = 0; l < lb_; ++l)
+            (is_qsa_layer(g, l) ? qsa_index : gdn_index) += 1;
         for (int64_t l = lb_; l < le_ && ok; ++l) {
             const LayerView v(*wt_, l);
             if (!is_qsa_layer(g, l)) {
                 const WeightRef* wnm = need(v, "ssm_norm.weight", err);
-                if (!wnm) { ok = false; break; }
-                float* state = ss.gdn_state + (size_t) (gdn_index - ss.gdn_ord0) * gdn_floats;
-                float* conv = state + (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size;
-                const float* qkv = qkv_L_ + (size_t) gdn_index * MT * C;
-                gdn_conv_commit(conv, qkv, (int) C, commit_, cs_);
-                gdn_step_norm_multi(state, h_L_ + (size_t) gdn_index * MT * C, (int) C, gate_L_ + (size_t) gdn_index * MT * HV,
-                                    beta_L_ + (size_t) gdn_index * MT * HV, z_, (const float*) wnm->data, EPS, y_dummy_,
-                                    (int) g.ssm_k_heads, (int) HV, (int) MT, commit_, cs_);
+                if (!wnm) {
+                    ok = false;
+                    break;
+                }
+                float* state = ss.gdn_state + (size_t)(gdn_index - ss.gdn_ord0) * gdn_floats;
+                float* conv = state + (uint64_t)g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size;
+                const float* qkv = qkv_L_ + (size_t)gdn_index * MT * C;
+                gdn_conv_commit(conv, qkv, (int)C, commit_, cs_);
+                gdn_step_norm_multi(state, h_L_ + (size_t)gdn_index * MT * C, (int)C,
+                                    gate_L_ + (size_t)gdn_index * MT * HV, beta_L_ + (size_t)gdn_index * MT * HV, z_,
+                                    (const float*)wnm->data, EPS, y_dummy_, (int)g.ssm_k_heads, (int)HV, (int)MT,
+                                    commit_, cs_);
                 ++gdn_index;
             } else {
                 const QsaState& st = ss.qsa_states[qsa_index];
                 const WeightRef* wikn = need(v, "indexer.k_norm.weight", err);
-                if (!wikn) { ok = false; break; }
-                copy_from_mapped(st.idx_tail, tail_snap_ + (size_t) qsa_index * TS, TS, cs_);
+                if (!wikn) {
+                    ok = false;
+                    break;
+                }
+                copy_from_mapped(st.idx_tail, tail_snap_ + (size_t)qsa_index * TS, TS, cs_);
                 const QsaIndexerBuffers ib{st.idx_tail, st.idx_dead, st.idx_pooled, st.idx_block_pos};
                 for (int64_t t = 0; t < MT; ++t)
-                    native_qsa_indexer_append(idx_raw_L_ + (size_t) (qsa_index * MT + t) * ID, commit_ + 2 + t, 0,
-                                              (const float*) wikn->data, EPS, ib, s, st.max_cells,
-                                              rope_scaling(), cs_);
+                    native_qsa_indexer_append(idx_raw_L_ + (size_t)(qsa_index * MT + t) * ID, commit_ + 2 + t, 0,
+                                              (const float*)wikn->data, EPS, ib, s, st.max_cells, rope_scaling(), cs_);
                 ++qsa_index;
             }
         }
@@ -1136,22 +1266,29 @@ bool Verifier::capture_commit(std::string &err) try {
     }
     cudaGraphDestroy(graph);
     return true;
-}
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
+} catch (sycl::exception const& exc) {
+    std::cerr << exc.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
+    std::exit(1);
 }
 
-bool Verifier::run(int T, const int32_t *tokens, int64_t pos0, PoolMultiFn pool,
-                   void *user, int32_t *out, std::string &err) try {
+bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool, void* user, int32_t* out,
+                   std::string& err) try {
     using namespace strata::kernels;
     const OnDevice on_device(device_);
-    if (T < 1 || T > max_t_) { err = "verify: window size out of range"; return false; }
-    if (released_.load()) { err = "verify: an earlier window never finished on the GPU (#267); restart the engine"; return false; }
+    if (T < 1 || T > max_t_) {
+        err = "verify: window size out of range";
+        return false;
+    }
+    if (released_.load()) {
+        err = "verify: an earlier window never finished on the GPU (#267); restart the engine";
+        return false;
+    }
     const ModelGeometry& g = *g_;
     SessionState& ss = *ss_;
-    if (pos0 + T > ss.qsa_states[ss.qsa_primary()].max_cells) { err = "verify: the window runs past the context"; return false; }
+    if (pos0 + T > ss.qsa_states[ss.qsa_primary()].max_cells) {
+        err = "verify: the window runs past the context";
+        return false;
+    }
     if (!capture(T, err) || !capture_commit(err)) return false;
     VDBG("captured; staging\n");
     const Clock::time_point t0 = Clock::now();
@@ -1159,11 +1296,14 @@ bool Verifier::run(int T, const int32_t *tokens, int64_t pos0, PoolMultiFn pool,
     for (int t = 0; t < T; ++t) {
         h_tok_[t] = tokens[t];
         qsa_step_fill(h_step_ + t * kStepCount, pos0 + t, s);
-        for (int64_t h = 0; h < g.n_head; ++h) h_pos_[t * g.n_head + h] = (int32_t) (pos0 + t);
-        int32_t* pk = h_pos_ + (size_t) max_t_ * g.n_head;
-        int32_t* pi = pk + (size_t) max_t_ * g.n_head_kv;
-        for (int64_t h = 0; h < g.n_head_kv; ++h) pk[t * g.n_head_kv + h] = (int32_t) (pos0 + t);
-        for (int64_t h = 0; h < g.idx_q_heads; ++h) pi[t * g.idx_q_heads + h] = (int32_t) (pos0 + t);
+        for (int64_t h = 0; h < g.n_head; ++h)
+            h_pos_[t * g.n_head + h] = (int32_t)(pos0 + t);
+        int32_t* pk = h_pos_ + (size_t)max_t_ * g.n_head;
+        int32_t* pi = pk + (size_t)max_t_ * g.n_head_kv;
+        for (int64_t h = 0; h < g.n_head_kv; ++h)
+            pk[t * g.n_head_kv + h] = (int32_t)(pos0 + t);
+        for (int64_t h = 0; h < g.idx_q_heads; ++h)
+            pi[t * g.idx_q_heads + h] = (int32_t)(pos0 + t);
     }
     if (ss.ple.ready() && ple_stage()) {
         uint32_t rows[kVerifyMaxT * PLE_N_HEADS];
@@ -1173,16 +1313,17 @@ bool Verifier::run(int T, const int32_t *tokens, int64_t pos0, PoolMultiFn pool,
             prev[0] = prev[1];
             prev[1] = tokens[t];
         }
-        if (!ss.ple.table->gather_batch(rows, (size_t) T, h_ple_, err)) return false;
+        if (!ss.ple.table->gather_batch(rows, (size_t)T, h_ple_, err)) return false;
     }
-    *(volatile uint32_t*) h_seq_ = 0;
-    *(volatile uint32_t*) h_flag_ = 0;
-    *(volatile uint32_t*) h_flagA_ = 0;
-    *(volatile uint32_t*) h_flagB_ = 0;
+    *(volatile uint32_t*)h_seq_ = 0;
+    *(volatile uint32_t*)h_flag_ = 0;
+    *(volatile uint32_t*)h_flagA_ = 0;
+    *(volatile uint32_t*)h_flagB_ = 0;
     std::atomic_thread_fence(std::memory_order_seq_cst);
     last_t_ = T;
     last_pos0_ = pos0;
-    for (int t = 0; t < T; ++t) last_tokens_[t] = tokens[t];
+    for (int t = 0; t < T; ++t)
+        last_tokens_[t] = tokens[t];
     ms_host += ms_since(t0);
     VDBG("staged; launching\n");
     const int le = cudaGraphLaunch_mock(exec_[T], cs_);
@@ -1190,18 +1331,21 @@ bool Verifier::run(int T, const int32_t *tokens, int64_t pos0, PoolMultiFn pool,
         err = std::string("verify: launch: error ") + std::to_string(le);
         return false;
     }
-    try { (void)cs_->ext_oneapi_empty(); } catch (...) {}
+    try {
+        (void)cs_->ext_oneapi_empty();
+    } catch (...) {
+    }
     VDBG("launched\n");
     volatile uint32_t* const seq = h_seq_;
     volatile uint32_t* const flag = h_flag_;
     const int G = groups_[T] > 0 ? groups_[T] : 1;
     const int gtb[2] = {0, (T + 1) / 2}, gte[2] = {G == 2 ? (T + 1) / 2 : T, T};
     const int64_t steps = (le_ - lb_) * G;
-    const bool test_stall = g_test_stall > 0 && windows + 1 == g_test_stall;   // #267 test hook (off: false)
+    const bool test_stall = g_test_stall > 0 && windows + 1 == g_test_stall;  // #267 test hook (off: false)
     for (int64_t k = 0; k < steps; ++k) {
         const int64_t l = lb_ + k / G;
-        const int grp = (int) (k % G);
-        const uint32_t want = (uint32_t) (k + 1);
+        const int grp = (int)(k % G);
+        const uint32_t want = (uint32_t)(k + 1);
         const Clock::time_point a = Clock::now();
         auto last_flush = a;
         uint32_t spins = 0;
@@ -1215,7 +1359,8 @@ bool Verifier::run(int T, const int32_t *tokens, int64_t pos0, PoolMultiFn pool,
                 bool is_empty = false;
                 try {
                     is_empty = cs_->ext_oneapi_empty();
-                } catch (...) {}
+                } catch (...) {
+                }
                 if (!is_empty && *seq < want) {
                     err = "verify: layer " + std::to_string(l) + " never rang";
                     return false;
@@ -1228,48 +1373,46 @@ bool Verifier::run(int T, const int32_t *tokens, int64_t pos0, PoolMultiFn pool,
             }
         }
         const Clock::time_point b = Clock::now();
-        VDBG("layer %lld rang\n", (long long) l);
+        VDBG("layer %lld rang\n", (long long)l);
         cur_layer_ = want - 1;
         set_plan_slot(grp);
         const int tb = gtb[grp], n = gte[grp] - gtb[grp];
         progress_at("verify window: the CPU experts of layer", l);
         if (pool != nullptr)
-            pool(user, h_x_ + (size_t) tb * g.n_embd, h_ids_ + (size_t) tb * ss.k, n, ss.k,
-                 h_ymiss_ + (size_t) tb * ss.k * g.n_embd, l);
-        VDBG("layer %lld served\n", (long long) l);
+            pool(user, h_x_ + (size_t)tb * g.n_embd, h_ids_ + (size_t)tb * ss.k, n, ss.k,
+                 h_ymiss_ + (size_t)tb * ss.k * g.n_embd, l);
+        VDBG("layer %lld served\n", (long long)l);
         progress_tick();
         std::atomic_thread_fence(std::memory_order_seq_cst);
         _mm_sfence();
-        if (*(volatile uint32_t*) h_flagA_ != want) {        // the pool did not publish a plan: an empty one
+        if (*(volatile uint32_t*)h_flagA_ != want) {  // the pool did not publish a plan: an empty one
             sink_.counts[0] = 0;
             sink_.counts[1] = 0;
             sink_.counts[2] = 0;
             sink_.start[0] = 0;
             sink_.start2[0] = 0;
             std::atomic_thread_fence(std::memory_order_seq_cst);
-            *(volatile uint32_t*) h_flagA_ = want;
+            *(volatile uint32_t*)h_flagA_ = want;
             raise_flag(h_flagB_, want);
         }
         if (!(test_stall && k + 1 == steps)) *flag = want;
         ms_wait += std::chrono::duration<double, std::milli>(b - a).count();
         ms_pool += ms_since(b);
     }
-    progress_at("verify window: waiting for the GPU to finish the window (flags A/B/M raised)", (int64_t) T);
+    progress_at("verify window: waiting for the GPU to finish the window (flags A/B/M raised)", (int64_t)T);
     cs_->wait();
-    progress_at("verify window: waiting for the expert copies", (int64_t) T);
-    copy_->wait(); // no host function of this window may raise flag B in the next one
-    if (prof_on_ && G == 1) {       // the window's GPU stage stamps
-        get_default_queue()
-            .memcpy(prof_h_.data(), prof_, prof_h_.size() * 8)
-            .wait();
+    progress_at("verify window: waiting for the expert copies", (int64_t)T);
+    copy_->wait();             // no host function of this window may raise flag B in the next one
+    if (prof_on_ && G == 1) {  // the window's GPU stage stamps
+        get_default_queue().memcpy(prof_h_.data(), prof_, prof_h_.size() * 8).wait();
         const int64_t L = g.n_layers;
-        auto at = [&](int64_t l, int i) { return prof_h_[(size_t) (l * kProfPer + i)]; };
+        auto at = [&](int64_t l, int i) { return prof_h_[(size_t)(l * kProfPer + i)]; };
         // D8: the derived columns below read stamps the hc-read kernels write themselves or the next
         // layer's first.  A slot no kernel stamped is 0 and its unsigned difference wrapped to ~1e19 ns -
         // which is why (gap)/head/hc0 printed ~1e14 ms per window.  A missing or out-of-order stamp now
         // contributes nothing.
         const auto gap = [](unsigned long long to, unsigned long long from) {
-            return (from != 0 && to != 0 && to >= from) ? (double) (to - from) : 0.0;
+            return (from != 0 && to != 0 && to >= from) ? (double)(to - from) : 0.0;
         };
         for (int64_t l = 0; l < L; ++l) {
             const int kind = is_qsa_layer(g, l) ? 1 : 0;
@@ -1277,16 +1420,16 @@ bool Verifier::run(int T, const int32_t *tokens, int64_t pos0, PoolMultiFn pool,
             for (int i = 1; i <= 24; ++i) {
                 const unsigned long long x = at(l, i);
                 if (x == 0 || x < prev) continue;
-                prof_sum_[kind][i] += (double) (x - prev);
+                prof_sum_[kind][i] += (double)(x - prev);
                 prev = x;
             }
             if (l + 1 < L) prof_sum_[kind][25] += gap(at(l + 1, 0), at(l, 24));
             const double dn = gap(at(l, 27), at(l, 0)), dd = gap(at(l, 28), at(l, 27)), du = gap(at(l, 1), at(l, 28));
-            if (dn > 0 && dd > 0 && du > 0) {   // the split exists: show it split, not twice
-                prof_sum_[kind][27] += dn;      // hc-read0: norm
-                prof_sum_[kind][28] += dd;      //           down
-                prof_sum_[kind][29] += du;      //           up (through both halves, as before)
-                prof_sum_[kind][1] -= gap(at(l, 1), at(l, 0));   // (hc-read0 shown split)
+            if (dn > 0 && dd > 0 && du > 0) {                   // the split exists: show it split, not twice
+                prof_sum_[kind][27] += dn;                      // hc-read0: norm
+                prof_sum_[kind][28] += dd;                      //           down
+                prof_sum_[kind][29] += du;                      //           up (through both halves, as before)
+                prof_sum_[kind][1] -= gap(at(l, 1), at(l, 0));  // (hc-read0 shown split)
             }
         }
         prof_sum_[0][26] += gap(at(L, 1), at(L, 0));
@@ -1296,32 +1439,34 @@ bool Verifier::run(int T, const int32_t *tokens, int64_t pos0, PoolMultiFn pool,
     // own (a captured kernel would replay the same draws forever).  Row t's draw is Philox(seed, pos0 + t): tied to
     // the POSITION it samples, not to how the text was cut into windows, so a seed replays the same text whatever
     // the drafts were. Exact: a rejected row's draw is discarded, and no kept decision depends on a reused draw.
-    if (le_ < g.n_layers) {   // a layer split's earlier stage: the hand-off is written (synced above)
+    if (le_ < g.n_layers) {  // a layer split's earlier stage: the hand-off is written (synced above)
         ++windows;
         return next_ == nullptr || next_->run(T, tokens, pos0, pool, next_user_, out, err);
     }
     const bool sampled = !sampling_.greedy && sampling_.temperature > 0.0f;
     if (head_sampling_ && (sampled || hist_d_ != nullptr)) {
         SamplerParams sp = sampling_;
-        sp.counter = (uint64_t) pos0;
-        sample_tokens(head_logits_, T, (int) n_vocab_, hist_d_, hist_len_, sp, m_out_, cs_);
-        cs_->wait(); // m_out_ is the mapped h_out_: synced, it is readable
+        sp.counter = (uint64_t)pos0;
+        sample_tokens(head_logits_, T, (int)n_vocab_, hist_d_, hist_len_, sp, m_out_, cs_);
+        cs_->wait();  // m_out_ is the mapped h_out_: synced, it is readable
     }
-    for (int t = 0; t < T; ++t) out[t] = ((volatile int32_t*) h_out_)[t];
-    if (static const bool dbg = std::getenv("STRATA_DBG_NAN") != nullptr; dbg) {   // debug: the first non-finite head
+    for (int t = 0; t < T; ++t)
+        out[t] = ((volatile int32_t*)h_out_)[t];
+    if (static const bool dbg = std::getenv("STRATA_DBG_NAN") != nullptr; dbg) {  // debug: the first non-finite head
         static bool reported = false;
         if (!reported) {
-            std::vector<float> h((size_t) T * (size_t) n_vocab_);
-            get_default_queue()
-                .memcpy(h.data(), head_logits_, h.size() * 4)
-                .wait();
+            std::vector<float> h((size_t)T * (size_t)n_vocab_);
+            get_default_queue().memcpy(h.data(), head_logits_, h.size() * 4).wait();
             for (int t = 0; t < T && !reported; ++t) {
                 int64_t bad = 0;
-                for (int64_t v = 0; v < n_vocab_; ++v) bad += !std::isfinite(h[(size_t) t * n_vocab_ + v]);
+                for (int64_t v = 0; v < n_vocab_; ++v)
+                    bad += !std::isfinite(h[(size_t)t * n_vocab_ + v]);
                 if (bad) {
                     reported = true;
-                    std::fprintf(stderr, "strata dbg: verify window at position %lld, row %d: %lld of %lld logits non-finite "
-                                         "(token out %d)\n", (long long) pos0, t, (long long) bad, (long long) n_vocab_, out[t]);
+                    std::fprintf(stderr,
+                                 "strata dbg: verify window at position %lld, row %d: %lld of %lld logits non-finite "
+                                 "(token out %d)\n",
+                                 (long long)pos0, t, (long long)bad, (long long)n_vocab_, out[t]);
                 }
             }
         }
@@ -1331,44 +1476,45 @@ bool Verifier::run(int T, const int32_t *tokens, int64_t pos0, PoolMultiFn pool,
     progress_at("decode");
     progress_beat();
     return true;
-}
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
+} catch (sycl::exception const& exc) {
+    std::cerr << exc.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
+    std::exit(1);
 }
 
 void Verifier::set_plan_slot(int grp) {
     const int64_t cap = sink_.cap;
-    int32_t* base = h_plan_ + (size_t) grp * (size_t) plan_i32_;
+    int32_t* base = h_plan_ + (size_t)grp * (size_t)plan_i32_;
     const int64_t i32 = 4 + (cap + 1) + cap + cap;
     const int64_t ptr_off = (i32 + 1) & ~1ll;
     sink_.counts = base;
     sink_.start = base + 4;
     sink_.dst = sink_.start + cap + 1;
     sink_.tok = sink_.dst + cap;
-    sink_.ptr = (unsigned long long*) (base + ptr_off);
+    sink_.ptr = (unsigned long long*)(base + ptr_off);
     sink_.ptr2 = sink_.ptr + cap;
     sink_.start2 = base + ptr_off + 4 * cap;
     const int G = groups_[last_t_] > 0 ? groups_[last_t_] : 1;
     const int64_t per = G == 2 ? kStagingBlobs / 2 : kStagingBlobs;
-    sink_.staging = (unsigned long long) (staging_ + (size_t) (grp * per) * strata::kernels::cpu::expert_layout().max_blob);
+    sink_.staging =
+        (unsigned long long)(staging_ + (size_t)(grp * per) * strata::kernels::cpu::expert_layout().max_blob);
     sink_.staging_cap = per;
 }
 
 // Flag B only rises: a host function of an earlier layer may run after a later layer already raised it directly.
 void Verifier::raise_flag(uint32_t* flag, uint32_t value) {
 #if defined(_WIN32)
-    volatile long* f = (volatile long*) flag;
+    volatile long* f = (volatile long*)flag;
     long cur = *f;
-    while ((uint32_t) cur < value) {
-        const long prev = _InterlockedCompareExchange(f, (long) value, cur);
+    while ((uint32_t)cur < value) {
+        const long prev = _InterlockedCompareExchange(f, (long)value, cur);
         if (prev == cur) break;
         cur = prev;
     }
 #else
-    uint32_t cur = __atomic_load_n((uint32_t*) flag, __ATOMIC_SEQ_CST);
-    while (cur < value && !__atomic_compare_exchange_n((uint32_t*) flag, &cur, value, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {}
+    uint32_t cur = __atomic_load_n((uint32_t*)flag, __ATOMIC_SEQ_CST);
+    while (cur < value &&
+           !__atomic_compare_exchange_n((uint32_t*)flag, &cur, value, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {
+    }
 #endif
 }
 
@@ -1376,10 +1522,13 @@ void Verifier::raise_flag(uint32_t* flag, uint32_t value) {
 // GPU its VRAM experts; a host function raises flag B when they have landed (the graph waits for it before the PCIe
 // groups).  Staging is split between the two token groups of a split window.
 void Verifier::fetch_dma(void* ctx, const uint8_t* const* src, int n, size_t bytes) {
-    Verifier* v = (Verifier*) ctx;
+    Verifier* v = (Verifier*)ctx;
     const uint32_t want = v->cur_layer_ + 1;
-    if (n <= 0) { raise_flag(v->h_flagB_, want); return; }
-    uint8_t* stage = (uint8_t*) v->sink_.staging;                  // this group's half in a split window
+    if (n <= 0) {
+        raise_flag(v->h_flagB_, want);
+        return;
+    }
+    uint8_t* stage = (uint8_t*)v->sink_.staging;  // this group's half in a split window
     /*
     DPCT1124:425: cudaMemcpyAsync is migrated to asynchronous memcpy API. While
     the origin API might be synchronous, it depends on the type of operand
@@ -1391,19 +1540,17 @@ void Verifier::fetch_dma(void* ctx, const uint8_t* const* src, int n, size_t byt
     FlagSet& fs = v->flag_sets_[v->cur_layer_ % (sizeof v->flag_sets_ / sizeof v->flag_sets_[0])];
     fs.flag = v->h_flagB_;
     fs.value = want;
-    v->copy_->submit([&](sycl::handler &cgh) {
+    v->copy_->submit([&](sycl::handler& cgh) {
         cgh.host_task([=]() {
             raise_flag(fs.flag, fs.value);
-
-
         });
     });
 }
 
 void Verifier::publish_plan(void* ctx) {
-    Verifier* v = (Verifier*) ctx;
+    Verifier* v = (Verifier*)ctx;
     _mm_sfence();
-    *(volatile uint32_t*) v->h_flagA_ = v->cur_layer_ + 1;
+    *(volatile uint32_t*)v->h_flagA_ = v->cur_layer_ + 1;
 }
 
 bool Verifier::window_logprobs(const int32_t* targets, int T, int64_t pos0, int32_t extra_id, std::FILE* out,
@@ -1415,32 +1562,29 @@ bool Verifier::window_logprobs(const int32_t* targets, int T, int64_t pos0, int3
         return false;
     }
     // run() synchronized cs_ before returning, so the head of this window is complete
-    std::vector<float> h((size_t) T * (size_t) n_vocab_);
-    get_default_queue()
-        .memcpy(h.data(), head_logits_, h.size() * sizeof(float))
-        .wait();
+    std::vector<float> h((size_t)T * (size_t)n_vocab_);
+    get_default_queue().memcpy(h.data(), head_logits_, h.size() * sizeof(float)).wait();
     for (int t = 0; t < T; ++t) {
-        const float* row = h.data() + (size_t) t * (size_t) n_vocab_;
+        const float* row = h.data() + (size_t)t * (size_t)n_vocab_;
         const int32_t tgt = targets[t];
-        if (tgt < 0 || (int64_t) tgt >= n_vocab_) continue;
+        if (tgt < 0 || (int64_t)tgt >= n_vocab_) continue;
         int64_t top = 0;
         for (int64_t v = 1; v < n_vocab_; ++v)
             if (row[v] > row[top]) top = v;
         const double maxv = row[top];
-        const bool has_extra = extra_id >= 0 && (int64_t) extra_id < n_vocab_;
-        double sum = 0.0, sum_without = 0.0;   // the second skips extra_id: no cancellation when it holds ~all mass
+        const bool has_extra = extra_id >= 0 && (int64_t)extra_id < n_vocab_;
+        double sum = 0.0, sum_without = 0.0;  // the second skips extra_id: no cancellation when it holds ~all mass
         for (int64_t v = 0; v < n_vocab_; ++v) {
-            const double e = std::exp((double) row[v] - maxv);
+            const double e = std::exp((double)row[v] - maxv);
             sum += e;
-            if (v != (int64_t) extra_id) sum_without += e;
+            if (v != (int64_t)extra_id) sum_without += e;
         }
         const double lse = maxv + std::log(sum);
-        const double extra = has_extra ? (double) row[extra_id] - lse : NAN;
-        const double without = has_extra && tgt != extra_id && sum_without > 0.0
-                                   ? (double) row[tgt] - (maxv + std::log(sum_without)) : NAN;
-        std::fprintf(out, "%lld\t%d\t%.9f\t%lld\t%.9f\t%d\t%.9f\t%.9f", (long long) (pos0 + t), (int) tgt,
-                     (double) row[tgt] - lse, (long long) top, maxv - lse, (int) (top == (int64_t) tgt), extra,
-                     without);
+        const double extra = has_extra ? (double)row[extra_id] - lse : NAN;
+        const double without =
+            has_extra && tgt != extra_id && sum_without > 0.0 ? (double)row[tgt] - (maxv + std::log(sum_without)) : NAN;
+        std::fprintf(out, "%lld\t%d\t%.9f\t%lld\t%.9f\t%d\t%.9f\t%.9f", (long long)(pos0 + t), (int)tgt,
+                     (double)row[tgt] - lse, (long long)top, maxv - lse, (int)(top == (int64_t)tgt), extra, without);
         // STRATA_LOGPOS_TOPK=K: the K most likely tokens and their log-probabilities too (`id:logprob`), for a
         // top-k comparison with another engine on the same tokens (docs/UNSLOTH_Q4.md)
         static const int topk = [] {
@@ -1448,12 +1592,13 @@ bool Verifier::window_logprobs(const int32_t* targets, int T, int64_t pos0, int3
             return v != nullptr ? std::max(0, std::min(256, std::atoi(v))) : 0;
         }();
         if (topk > 0) {
-            std::vector<int32_t> order((size_t) n_vocab_);
-            for (int64_t v = 0; v < n_vocab_; ++v) order[(size_t) v] = (int32_t) v;
+            std::vector<int32_t> order((size_t)n_vocab_);
+            for (int64_t v = 0; v < n_vocab_; ++v)
+                order[(size_t)v] = (int32_t)v;
             std::partial_sort(order.begin(), order.begin() + topk, order.end(),
                               [&](int32_t a, int32_t b) { return row[a] > row[b]; });
             for (int j = 0; j < topk; ++j)
-                std::fprintf(out, "\t%d:%.6f", order[(size_t) j], (double) row[order[(size_t) j]] - lse);
+                std::fprintf(out, "\t%d:%.6f", order[(size_t)j], (double)row[order[(size_t)j]] - lse);
         }
         std::fprintf(out, "\n");
     }
@@ -1461,16 +1606,22 @@ bool Verifier::window_logprobs(const int32_t* targets, int T, int64_t pos0, int3
     return true;
 }
 
-namespace { bool g_commit_async = false; }
+namespace {
+bool g_commit_async = false;
+}
 void Verifier::set_commit_async(bool on) { g_commit_async = on && std::getenv("STRATA_COMMIT_SYNC") == nullptr; }
 
-bool Verifier::commit(int n_keep, std::string &err) try {
+bool Verifier::commit(int n_keep, std::string& err) try {
     const OnDevice on_device(device_);
-    if (n_keep < 1 || n_keep > last_t_) { err = "verify: commit count out of range"; return false; }
+    if (n_keep < 1 || n_keep > last_t_) {
+        err = "verify: commit count out of range";
+        return false;
+    }
     const Clock::time_point t0 = Clock::now();
     h_commit_[0] = n_keep;
     h_commit_[1] = n_keep - 1;
-    for (int t = 0; t < max_t_; ++t) h_commit_[2 + t] = t < n_keep ? (int32_t) (last_pos0_ + t) : -1;
+    for (int t = 0; t < max_t_; ++t)
+        h_commit_[2 + t] = t < n_keep ? (int32_t)(last_pos0_ + t) : -1;
     std::atomic_thread_fence(std::memory_order_seq_cst);
     const int le = cudaGraphLaunch_mock(commit_exec_, cs_);
     if (le != 0) {
@@ -1486,47 +1637,40 @@ bool Verifier::commit(int n_keep, std::string &err) try {
         *commit_done_ = cs_->ext_oneapi_submit_barrier();
         commit_pending_ = true;
     }
-    if (ple_stage())   // stages that share one session must advance it once
+    if (ple_stage())  // stages that share one session must advance it once
         for (int t = 0; t < n_keep; ++t) {
             ss_->ple_prev[0] = ss_->ple_prev[1];
             ss_->ple_prev[1] = last_tokens_[t];
         }
     ms_commit += ms_since(t0);
     return next_ == nullptr || next_->commit(n_keep, err);
-}
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
+} catch (sycl::exception const& exc) {
+    std::cerr << exc.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
+    std::exit(1);
 }
 
-bool Verifier::wait_commit(std::string &err) try {
+bool Verifier::wait_commit(std::string& err) try {
     if (commit_pending_) {
         const OnDevice on_device(device_);
         commit_pending_ = false;
         commit_done_->wait_and_throw();
     }
     return next_ == nullptr || next_->wait_commit(err);
-}
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
+} catch (sycl::exception const& exc) {
+    std::cerr << exc.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
+    std::exit(1);
 }
 
-bool Verifier::copy_logits(int t, float *host) const try {
-    if (next_ != nullptr) return next_->copy_logits(t, host);   // a layer split: the head is on the last stage
+bool Verifier::copy_logits(int t, float* host) const try {
+    if (next_ != nullptr) return next_->copy_logits(t, host);  // a layer split: the head is on the last stage
     if (head_logits_ == nullptr || host == nullptr || t < 0 || n_vocab_ <= 0) return false;
     get_default_queue()
-        .memcpy(host, head_logits_ + (size_t)t * (size_t)n_vocab_,
-                (size_t)n_vocab_ * sizeof(float))
+        .memcpy(host, head_logits_ + (size_t)t * (size_t)n_vocab_, (size_t)n_vocab_ * sizeof(float))
         .wait();
     return true;
-}
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
+} catch (sycl::exception const& exc) {
+    std::cerr << exc.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
+    std::exit(1);
 }
 
 }  // namespace strata::core

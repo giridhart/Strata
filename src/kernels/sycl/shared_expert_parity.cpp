@@ -51,8 +51,8 @@ using strata::kernels::f32_from_f16;
 double rel_l1(const std::vector<float>& a, const std::vector<float>& b) {
     double d = 0, m = 0;
     for (size_t i = 0; i < a.size(); ++i) {
-        d += std::fabs((double) a[i] - (double) b[i]);
-        m += std::fabs((double) a[i]);
+        d += std::fabs((double)a[i] - (double)b[i]);
+        m += std::fabs((double)a[i]);
     }
     return d / (m > 1e-30 ? m : 1e-30);
 }
@@ -60,49 +60,57 @@ double rel_l1(const std::vector<float>& a, const std::vector<float>& b) {
 /// `block_q8_0` on the host: 34 bytes per 32 elements, `fp16 d` then `int8 qs[32]`.  Written from the LAYOUT
 /// rather than from the kernel, so it can disagree with it.
 double q8_0_host(const std::vector<uint8_t>& x, long long i) {
-    const uint8_t* blk = x.data() + (size_t) (i / 32) * 34;
+    const uint8_t* blk = x.data() + (size_t)(i / 32) * 34;
     uint16_t db;
     std::memcpy(&db, blk, 2);
-    const int8_t q = ((const int8_t*) (blk + 2))[i % 32];
-    return (double) strata::kernels::f32_from_f16(db) * (double) q;
+    const int8_t q = ((const int8_t*)(blk + 2))[i % 32];
+    return (double)strata::kernels::f32_from_f16(db) * (double)q;
 }
 
-float s2_weight(const std::vector<uint8_t>& codes, const std::vector<float>& scales, long long row,                long long n_in, long long i) {
-    const uint8_t byte = codes[(size_t) (row * (n_in / 4) + i / 4)];
+float s2_weight(const std::vector<uint8_t>& codes, const std::vector<float>& scales, long long row, long long n_in,
+                long long i) {
+    const uint8_t byte = codes[(size_t)(row * (n_in / 4) + i / 4)];
     const int code = (byte >> ((i % 4) * 2)) & 3;
-    return (float) (code - 1) * scales[(size_t) (row * (n_in / 64) + i / 64)];
+    return (float)(code - 1) * scales[(size_t)(row * (n_in / 64) + i / 64)];
 }
 
 }  // namespace
 
-int main(int argc, char **argv) {
+int main(int argc, char** argv) {
     sycl::queue q_ct1{sycl::default_selector_v, sycl::property::queue::in_order()};
     bool selftest = false;
     for (int i = 1; i < argc; ++i) {
-        if (std::string(argv[i]) == "--selftest") selftest = true;
-        else { std::fprintf(stderr, "usage: shared_expert_parity [--selftest]\n"); return 2; }
+        if (std::string(argv[i]) == "--selftest")
+            selftest = true;
+        else {
+            std::fprintf(stderr, "usage: shared_expert_parity [--selftest]\n");
+            return 2;
+        }
     }
 
-    const long long n_embd = 256, n_ff = 64;      // small, so the host reference can be a plain loop
+    const long long n_embd = 256, n_ff = 64;  // small, so the host reference can be a plain loop
     const int tpr = 32;
     std::mt19937 rng(77);
     std::normal_distribution<float> gauss(0.0f, 1.0f);
 
     // POSITIVE activations, so the sign of each projection is set by the sign of its weights.
-    std::vector<float> fx((size_t) n_embd);
-    for (auto& v : fx) v = std::fabs(gauss(rng)) + 0.5f;
-    std::vector<uint16_t> hx((size_t) n_embd);
-    std::vector<uint8_t> hx0;   // filled below, once the Q8_0 image exists; the reference reads it
-    for (long long i = 0; i < n_embd; ++i) hx[(size_t) i] = f32_to_f16(fx[(size_t) i]);
+    std::vector<float> fx((size_t)n_embd);
+    for (auto& v : fx)
+        v = std::fabs(gauss(rng)) + 0.5f;
+    std::vector<uint16_t> hx((size_t)n_embd);
+    std::vector<uint8_t> hx0;  // filled below, once the Q8_0 image exists; the reference reads it
+    for (long long i = 0; i < n_embd; ++i)
+        hx[(size_t)i] = f32_to_f16(fx[(size_t)i]);
 
     // GATE CODES ALL 3 (+2d) AND UP CODES ALL 0 (-d): with positive scales and positive activations the gate
     // projection is strongly POSITIVE and the up projection strongly NEGATIVE, which is the configuration where
     // `silu(g)*u` and `silu(u)*g` differ by orders of magnitude rather than by percent.
-    std::vector<uint8_t> gc((size_t) n_ff * n_embd / 4, 0xFF), uc((size_t) n_ff * n_embd / 4, 0x00),
-        dc((size_t) n_embd * n_ff / 4);
-    for (auto& v : dc) v = (uint8_t) (rng() & 0xFF);
-    std::vector<float> gs((size_t) n_ff * (n_embd / 64)), us((size_t) n_ff * (n_embd / 64)),
-        ds((size_t) n_embd * (n_ff / 64));
+    std::vector<uint8_t> gc((size_t)n_ff * n_embd / 4, 0xFF), uc((size_t)n_ff * n_embd / 4, 0x00),
+        dc((size_t)n_embd * n_ff / 4);
+    for (auto& v : dc)
+        v = (uint8_t)(rng() & 0xFF);
+    std::vector<float> gs((size_t)n_ff * (n_embd / 64)), us((size_t)n_ff * (n_embd / 64)),
+        ds((size_t)n_embd * (n_ff / 64));
     // GATE/UP SCALES ARE 10x SMALLER THAN THE DOWN SCALES, and that asymmetry is load-bearing.
     //
     // The SwiGLU intermediate `h = silu(gate) * up` is converted to fp16 before the down projection, so the
@@ -114,83 +122,93 @@ int main(int argc, char **argv) {
     //
     // Keeping the DOWN scales large preserves the conditioning the raise was for; the gate/up pair only sets
     // the intermediate's magnitude, and `assert h stays in range` below now guards it.
-    auto fill_gu = [&](std::vector<float>& v) { for (auto& s : v) s = 0.02f + 0.001f * (float) (rng() % 50); };
-    auto fill_d = [&](std::vector<float>& v) { for (auto& s : v) s = 0.2f + 0.01f * (float) (rng() % 50); };
+    auto fill_gu = [&](std::vector<float>& v) {
+        for (auto& s : v)
+            s = 0.02f + 0.001f * (float)(rng() % 50);
+    };
+    auto fill_d = [&](std::vector<float>& v) {
+        for (auto& s : v)
+            s = 0.2f + 0.01f * (float)(rng() % 50);
+    };
     fill_gu(gs);
     fill_gu(us);
     fill_d(ds);
-    std::vector<float> ginp((size_t) n_embd);
-    for (auto& v : ginp) v = gauss(rng) * 0.05f;
+    std::vector<float> ginp((size_t)n_embd);
+    for (auto& v : ginp)
+        v = gauss(rng) * 0.05f;
 
     // THE SCALAR GATE'S TWO OPERANDS ARE BF16, because `ffn_gate_inp_shexp` is a BF16 weight and ggml converts
     // the activation to the weight's `vec_dot_type`.  The reference therefore dots the bf16 IMAGES of both, not
     // the originals - and the kernel is handed the same bf16 images.  Rounding both here rather than only on
     // the device is what keeps the comparison honest: rounding one side alone would show up as a fixed offset
     // in the gate and be blamed on the kernel.
-    std::vector<uint16_t> hx_bf16((size_t) n_embd), hginp_bf16((size_t) n_embd);
+    std::vector<uint16_t> hx_bf16((size_t)n_embd), hginp_bf16((size_t)n_embd);
     for (long long i = 0; i < n_embd; ++i) {
-        hx_bf16[(size_t) i] = strata::kernels::bf16_from_f32(fx[(size_t) i]);
-        hginp_bf16[(size_t) i] = strata::kernels::bf16_from_f32(ginp[(size_t) i]);
+        hx_bf16[(size_t)i] = strata::kernels::bf16_from_f32(fx[(size_t)i]);
+        hginp_bf16[(size_t)i] = strata::kernels::bf16_from_f32(ginp[(size_t)i]);
     }
 
     // ---- host reference, exactly as ref/moe.py writes it
     auto reference = [&](bool silu_on_up, bool elementwise_gate) {
-        std::vector<float> gp((size_t) n_ff, 0.0f), upp((size_t) n_ff, 0.0f);
+        std::vector<float> gp((size_t)n_ff, 0.0f), upp((size_t)n_ff, 0.0f);
         for (long long r = 0; r < n_ff; ++r) {
             double a = 0, b = 0;
             for (long long i = 0; i < n_embd; ++i) {
                 const double xv = q8_0_host(hx0, i);
-                a += xv * (double) s2_weight(gc, gs, r, n_embd, i);
-                b += xv * (double) s2_weight(uc, us, r, n_embd, i);
+                a += xv * (double)s2_weight(gc, gs, r, n_embd, i);
+                b += xv * (double)s2_weight(uc, us, r, n_embd, i);
             }
-            gp[(size_t) r] = (float) a;
-            upp[(size_t) r] = (float) b;
+            gp[(size_t)r] = (float)a;
+            upp[(size_t)r] = (float)b;
         }
-        std::vector<float> h((size_t) n_ff);
+        std::vector<float> h((size_t)n_ff);
         for (long long r = 0; r < n_ff; ++r) {
-            const double gv = silu_on_up ? upp[(size_t) r] : gp[(size_t) r];
-            const double other = silu_on_up ? gp[(size_t) r] : upp[(size_t) r];
-            h[(size_t) r] = (float) (gv / (1.0 + std::exp(-gv))) * (float) other;
+            const double gv = silu_on_up ? upp[(size_t)r] : gp[(size_t)r];
+            const double other = silu_on_up ? gp[(size_t)r] : upp[(size_t)r];
+            h[(size_t)r] = (float)(gv / (1.0 + std::exp(-gv))) * (float)other;
         }
         // THE INTERMEDIATE IS QUANTIZED TO Q8_0, which is what the DOWN weight's contract asks for and what the
         // kernel now does.  ggml's `quantize_row_q8_0`: `d = amax / 127`, `q = round(x / d)`, value `q * d`.
         // Written out here rather than reused, so that it CAN disagree with the kernel.
-        std::vector<float> h16((size_t) n_ff);
+        std::vector<float> h16((size_t)n_ff);
         for (long long b = 0; b < n_ff; b += 32) {
             const long long e = (b + 32 < n_ff) ? b + 32 : n_ff;
             double amax = 0;
-            for (long long r = b; r < e; ++r) amax = std::fmax(amax, std::fabs((double) h[(size_t) r]));
+            for (long long r = b; r < e; ++r)
+                amax = std::fmax(amax, std::fabs((double)h[(size_t)r]));
             const double dd = amax / 127.0;
             const double id = dd > 0 ? 1.0 / dd : 0.0;
             for (long long r = b; r < e; ++r) {
-                double q = std::round((double) h[(size_t) r] * id);
+                double q = std::round((double)h[(size_t)r] * id);
                 q = std::fmax(-127.0, std::fmin(127.0, q));
-                h16[(size_t) r] = (float) (q * dd);
+                h16[(size_t)r] = (float)(q * dd);
             }
         }
-        std::vector<float> out((size_t) n_embd, 0.0f);
+        std::vector<float> out((size_t)n_embd, 0.0f);
         for (long long o = 0; o < n_embd; ++o) {
             double a = 0;
-            for (long long r = 0; r < n_ff; ++r) a += (double) h16[(size_t) r] * (double) s2_weight(dc, ds, o, n_ff, r);
-            out[(size_t) o] = (float) a;
+            for (long long r = 0; r < n_ff; ++r)
+                a += (double)h16[(size_t)r] * (double)s2_weight(dc, ds, o, n_ff, r);
+            out[(size_t)o] = (float)a;
         }
         double dot = 0;
         for (long long i = 0; i < n_embd; ++i)
-            dot += (double) strata::kernels::f32_from_bf16(hx_bf16[(size_t) i]) * (double) strata::kernels::f32_from_bf16(hginp_bf16[(size_t) i]);
+            dot += (double)strata::kernels::f32_from_bf16(hx_bf16[(size_t)i]) *
+                   (double)strata::kernels::f32_from_bf16(hginp_bf16[(size_t)i]);
         const double sg = 1.0 / (1.0 + std::exp(-dot));
         for (long long o = 0; o < n_embd; ++o) {
-            out[(size_t) o] = elementwise_gate ? (float) ((double) out[(size_t) o] * sg)
-                                               : (float) ((double) out[(size_t) o] * sg);
+            out[(size_t)o] =
+                elementwise_gate ? (float)((double)out[(size_t)o] * sg) : (float)((double)out[(size_t)o] * sg);
         }
         return out;
     };
 
     // ---- device side
     uint16_t* d_x = sycl::malloc_device<uint16_t>(hx.size(), q_ct1);
-    uint8_t* d_x_used = nullptr;   // the Q8_0 image the kernel now takes
-    uint8_t* d_gc = (uint8_t *)sycl::malloc_device(gc.size(), q_ct1);
-    uint8_t* d_uc = (uint8_t *)sycl::malloc_device(uc.size(), q_ct1);
-    uint8_t* d_dc = (uint8_t *)sycl::malloc_device(dc.size(), q_ct1);
+    uint8_t* d_x_used = nullptr;  // the Q8_0 image the kernel now takes
+    uint8_t* d_gc = (uint8_t*)sycl::malloc_device(gc.size(), q_ct1);
+    uint8_t* d_uc = (uint8_t*)sycl::malloc_device(uc.size(), q_ct1);
+    uint8_t* d_dc = (uint8_t*)sycl::malloc_device(dc.size(), q_ct1);
     float* d_gs = sycl::malloc_device<float>(gs.size(), q_ct1);
     float* d_us = sycl::malloc_device<float>(us.size(), q_ct1);
     float* d_ds = sycl::malloc_device<float>(ds.size(), q_ct1);
@@ -214,10 +232,10 @@ int main(int argc, char **argv) {
     // an fp16 activation for all three projections, which was simply the wrong `vec_dot_type` - and the
     // reference here computed with the fp16 values, so the two agreed on a number the reference model would not
     // produce.  A fixture that agrees with the kernel about the wrong activation is not a check.
-    hx0.assign((size_t) (n_embd / 32) * 34, 0);
+    hx0.assign((size_t)(n_embd / 32) * 34, 0);
     {
-        float* d_xf = (float *)sycl::malloc_device((size_t)n_embd * 4, q_ct1);
-        uint8_t* d_x0 = (uint8_t *)sycl::malloc_device(hx0.size(), q_ct1);
+        float* d_xf = (float*)sycl::malloc_device((size_t)n_embd * 4, q_ct1);
+        uint8_t* d_x0 = (uint8_t*)sycl::malloc_device(hx0.size(), q_ct1);
         q_ct1.memcpy(d_xf, fx.data(), (size_t)n_embd * 4).wait();
         strata::kernels::quantize_q8_0(d_xf, d_x0, n_embd, nullptr);
         q_ct1.memcpy(hx0.data(), d_x0, hx0.size()).wait();
@@ -227,11 +245,10 @@ int main(int argc, char **argv) {
     // THE SCRATCH IS THE CALLER'S NOW.  It used to be four `cudaMalloc`s inside the kernel - illegal during
     // stream capture AND a token-path allocation that P2.T10 forbids.  The fixture owns it here, exactly as the
     // layer does, so the test exercises the real contract instead of a private one.
-    float* d_scratch = (float *)sycl::malloc_device(
-        strata::kernels::shared_expert_scratch_bytes(n_ff), q_ct1);
-    strata::kernels::shared_expert(d_x_used, nullptr, d_xb, f, d_gc, d_gs, nullptr, f, d_uc, d_us, nullptr, f,
-                                   d_dc, d_ds, nullptr, d_ginpb, d_scratch, d_out, n_embd, n_ff, tpr, nullptr);
-    std::vector<float> got((size_t) n_embd);
+    float* d_scratch = (float*)sycl::malloc_device(strata::kernels::shared_expert_scratch_bytes(n_ff), q_ct1);
+    strata::kernels::shared_expert(d_x_used, nullptr, d_xb, f, d_gc, d_gs, nullptr, f, d_uc, d_us, nullptr, f, d_dc,
+                                   d_ds, nullptr, d_ginpb, d_scratch, d_out, n_embd, n_ff, tpr, nullptr);
+    std::vector<float> got((size_t)n_embd);
     q_ct1.memcpy(got.data(), d_out, got.size() * sizeof(float)).wait();
 
     int bad = 0;
@@ -241,8 +258,8 @@ int main(int argc, char **argv) {
     // ---- the trap, asserted observable BEFORE the kernel is judged
     double d_wrong = 0, mag = 0;
     for (long long o = 0; o < n_embd; ++o) {
-        d_wrong += std::fabs((double) want[(size_t) o] - (double) wrong_silu[(size_t) o]);
-        mag += std::fabs((double) want[(size_t) o]);
+        d_wrong += std::fabs((double)want[(size_t)o] - (double)wrong_silu[(size_t)o]);
+        mag += std::fabs((double)want[(size_t)o]);
     }
     const double rel_wrong = d_wrong / (mag > 1e-30 ? mag : 1e-30);
     std::printf("  %-40s %s (%.2f%% apart)\n", "silu-on-gate vs silu-on-up is observable",
@@ -261,7 +278,7 @@ int main(int argc, char **argv) {
     double worst = 0, sum = 0;
     long long nonfinite = 0;
     for (long long o = 0; o < n_embd; ++o) {
-        const double a = want[(size_t) o], b = got[(size_t) o];
+        const double a = want[(size_t)o], b = got[(size_t)o];
         sum += std::fabs(a);
         if (!std::isfinite(a) || !std::isfinite(b)) ++nonfinite;
         const double rel = std::fabs(a - b) / (std::fabs(a) > 1e-30 ? std::fabs(a) : 1e-30);
@@ -271,8 +288,8 @@ int main(int argc, char **argv) {
         if (!(rel <= worst)) worst = rel;
     }
     if (nonfinite) {
-        std::printf("    *** %lld of %lld outputs are NOT FINITE - the fixture is out of range and every\n",
-                    nonfinite, n_embd);
+        std::printf("    *** %lld of %lld outputs are NOT FINITE - the fixture is out of range and every\n", nonfinite,
+                    n_embd);
         std::printf("        comparison below is meaningless ***\n");
         ++bad;
     }
@@ -284,8 +301,8 @@ int main(int argc, char **argv) {
     //
     // The tolerance is left loose ON PURPOSE: this test is for the STRUCTURE, and a tight bound here would be
     // asserting the summation order of a 64-term dot.  The number that matters is printed next to it.
-    std::printf("  %-40s worst rel %.3e over %lld outputs (mean |ref| %.4f)\n", "structure vs reference",
-                worst, n_embd, sum / (double) n_embd);
+    std::printf("  %-40s worst rel %.3e over %lld outputs (mean |ref| %.4f)\n", "structure vs reference", worst, n_embd,
+                sum / (double)n_embd);
     if (!(worst <= 1e-2)) {
         std::printf("    *** over 1e-2 - that is beyond the activation-format floor, so it is structural ***\n");
         ++bad;
@@ -305,8 +322,8 @@ int main(int argc, char **argv) {
             double a = 0, b = 0;
             for (long long i = 0; i < n_embd; ++i) {
                 const double xv = q8_0_host(hx0, i);
-                a += xv * (double) s2_weight(gc, gs, r, n_embd, i);
-                b += xv * (double) s2_weight(uc, us, r, n_embd, i);
+                a += xv * (double)s2_weight(gc, gs, r, n_embd, i);
+                b += xv * (double)s2_weight(uc, us, r, n_embd, i);
             }
             const double h = (a / (1.0 + std::exp(-a))) * b;
             hmax = std::fmax(hmax, std::fabs(h));
@@ -321,21 +338,22 @@ int main(int argc, char **argv) {
     // activation. A zero scalar weight first exposes half the ungated output without duplicating the GEMVs.
     {
         using namespace strata::kernels;
-        std::vector<uint16_t> zeros((size_t) n_embd, 0), basis(zeros);
+        std::vector<uint16_t> zeros((size_t)n_embd, 0), basis(zeros);
         basis[0] = bf16_from_f32(1.0f);
-        std::vector<float> witness((size_t) n_embd, 0.0f);
+        std::vector<float> witness((size_t)n_embd, 0.0f);
         witness[0] = 1.00390625f;
-        std::vector<uint16_t> witness_bf16((size_t) n_embd, 0);
+        std::vector<uint16_t> witness_bf16((size_t)n_embd, 0);
         witness_bf16[0] = bf16_from_f32(witness[0]);
         float* d_witness = sycl::malloc_device<float>(witness.size(), q_ct1);
         q_ct1.memcpy(d_witness, witness.data(), witness.size() * sizeof(float)).wait();
         auto run = [&](void* stream, const float* x_float = nullptr) {
-            shared_expert(d_x_used, nullptr, d_xb, f, d_gc, d_gs, nullptr, f, d_uc, d_us, nullptr, f,
-                          d_dc, d_ds, nullptr, d_ginpb, d_scratch, d_out, n_embd, n_ff, tpr, stream, x_float);
+            shared_expert(d_x_used, nullptr, d_xb, f, d_gc, d_gs, nullptr, f, d_uc, d_us, nullptr, f, d_dc, d_ds,
+                          nullptr, d_ginpb, d_scratch, d_out, n_embd, n_ff, tpr, stream, x_float);
         };
         q_ct1.memcpy(d_ginpb, zeros.data(), zeros.size() * sizeof(uint16_t)).wait();
         run(nullptr);
-        std::vector<float> half_output((size_t) n_embd), legacy((size_t) n_embd), native((size_t) n_embd), replay((size_t) n_embd);
+        std::vector<float> half_output((size_t)n_embd), legacy((size_t)n_embd), native((size_t)n_embd),
+            replay((size_t)n_embd);
         q_ct1.memcpy(half_output.data(), d_out, half_output.size() * sizeof(float)).wait();
         q_ct1.memcpy(d_ginpb, basis.data(), basis.size() * sizeof(uint16_t)).wait();
         q_ct1.memcpy(d_xb, witness_bf16.data(), witness_bf16.size() * sizeof(uint16_t)).wait();
@@ -343,7 +361,11 @@ int main(int argc, char **argv) {
         q_ct1.memcpy(legacy.data(), d_out, legacy.size() * sizeof(float)).wait();
         shared_expert_set_native_bf16(true);
         bool refused_missing = false;
-        try { run(nullptr); } catch (const std::invalid_argument&) { refused_missing = true; }
+        try {
+            run(nullptr);
+        } catch (const std::invalid_argument&) {
+            refused_missing = true;
+        }
         if (!refused_missing) ++bad;
         sycl::queue stream{q_ct1.get_context(), q_ct1.get_device(), sycl::property::queue::in_order()};
         run(&stream, d_witness);
@@ -353,8 +375,8 @@ int main(int argc, char **argv) {
         double error = 0.0, magnitude = 0.0;
         for (size_t i = 0; i < native.size(); ++i) {
             const float expected = (half_output[i] * 2.0f) * expected_gate;
-            error += std::fabs((double) native[i] - expected);
-            magnitude += std::fabs((double) expected);
+            error += std::fabs((double)native[i] - expected);
+            magnitude += std::fabs((double)expected);
         }
         const double rel = error / (magnitude > 1e-30 ? magnitude : 1e-30);
         const double visible = rel_l1(native, legacy);
@@ -401,44 +423,50 @@ int main(int argc, char **argv) {
         const long long n_embd2 = 256, k2 = 10;
         std::mt19937 rng2(31337);
         std::normal_distribution<float> g2(0.0f, 1.0f);
-        std::vector<float> parts((size_t) (k2 * n_embd2)), w((size_t) k2), shared((size_t) n_embd2);
-        for (auto& v : parts) v = g2(rng2);
+        std::vector<float> parts((size_t)(k2 * n_embd2)), w((size_t)k2), shared((size_t)n_embd2);
+        for (auto& v : parts)
+            v = g2(rng2);
         // Weights that genuinely VARY, and genuinely miss 1/k: with uniform weights the unweighted reading
         // would coincide with the weighted one and the fixture could not see reading A.
         double wsum = 0;
-        for (auto& v : w) { v = std::fabs(g2(rng2)) + 0.05f; wsum += v; }
-        for (auto& v : w) v = (float) (v / wsum);            // already renormalised, as router_top10 emits
-        for (auto& v : shared) v = g2(rng2) * 3.0f;
+        for (auto& v : w) {
+            v = std::fabs(g2(rng2)) + 0.05f;
+            wsum += v;
+        }
+        for (auto& v : w)
+            v = (float)(v / wsum);  // already renormalised, as router_top10 emits
+        for (auto& v : shared)
+            v = g2(rng2) * 3.0f;
 
         auto ref = [&](bool weight_routed, bool weight_shared) {
-            std::vector<float> y((size_t) n_embd2, 0.0f);
+            std::vector<float> y((size_t)n_embd2, 0.0f);
             for (long long j = 0; j < n_embd2; ++j) {
                 double a = 0;
                 for (long long e = 0; e < k2; ++e)
-                    a += (weight_routed ? (double) w[(size_t) e] : 1.0) * (double) parts[(size_t) (e * n_embd2 + j)];
-                a += weight_shared ? (double) w[0] * (double) shared[(size_t) j] : (double) shared[(size_t) j];
-                y[(size_t) j] = (float) a;
+                    a += (weight_routed ? (double)w[(size_t)e] : 1.0) * (double)parts[(size_t)(e * n_embd2 + j)];
+                a += weight_shared ? (double)w[0] * (double)shared[(size_t)j] : (double)shared[(size_t)j];
+                y[(size_t)j] = (float)a;
             }
             return y;
         };
         const std::vector<float> want = ref(true, false);
 
-        float* d_p = (float *)sycl::malloc_device(parts.size() * 4, q_ct1);
-        float* d_w = (float *)sycl::malloc_device(w.size() * 4, q_ct1);
-        float* d_s = (float *)sycl::malloc_device(shared.size() * 4, q_ct1);
-        float* d_y = (float *)sycl::malloc_device((size_t)n_embd2 * 4, q_ct1);
+        float* d_p = (float*)sycl::malloc_device(parts.size() * 4, q_ct1);
+        float* d_w = (float*)sycl::malloc_device(w.size() * 4, q_ct1);
+        float* d_s = (float*)sycl::malloc_device(shared.size() * 4, q_ct1);
+        float* d_y = (float*)sycl::malloc_device((size_t)n_embd2 * 4, q_ct1);
         q_ct1.memcpy(d_p, parts.data(), parts.size() * 4).wait();
         q_ct1.memcpy(d_w, w.data(), w.size() * 4).wait();
         q_ct1.memcpy(d_s, shared.data(), shared.size() * 4).wait();
         strata::kernels::moe_combine(d_p, d_w, d_s, d_y, n_embd2, k2, nullptr);
-        std::vector<float> got((size_t) n_embd2);
+        std::vector<float> got((size_t)n_embd2);
         q_ct1.memcpy(got.data(), d_y, got.size() * 4).wait();
 
         for (const auto& trap : {std::make_pair(false, false), std::make_pair(true, true)}) {
             const std::vector<float> wrong = ref(trap.first, trap.second);
             const double rel = rel_l1(want, wrong);
             const char* what = (!trap.first && !trap.second) ? "routed sum left UNWEIGHTED is observable"
-                              : "shared output router-WEIGHTED is observable";
+                                                             : "shared output router-WEIGHTED is observable";
             const bool visible = rel > 0.05;
             std::printf("  %-42s %-4s (%.2f%% apart)\n", what, visible ? "yes" : "*** NO ***", rel * 100);
             if (!visible) ++bad;
@@ -447,18 +475,23 @@ int main(int argc, char **argv) {
         const double rel_k = rel_l1(want, got);
         std::printf("  %-42s rel %.3e\n", "moe_combine vs reference", rel_k);
         // Both sides accumulate in double over the same k terms, so this is order-only.
-        if (!(rel_k <= 1e-6)) { std::printf("    *** over 1e-6 ***\n"); ++bad; }
+        if (!(rel_k <= 1e-6)) {
+            std::printf("    *** over 1e-6 ***\n");
+            ++bad;
+        }
 
         // a null `shared` must mean "no shared expert", not "add nothing but leave it undefined"
         strata::kernels::moe_combine(d_p, d_w, nullptr, d_y, n_embd2, k2, nullptr);
         q_ct1.memcpy(got.data(), d_y, got.size() * 4).wait();
         const double rel_no_shared = rel_l1(want, got);
         const bool differs = rel_no_shared > 0.05;
-        std::printf("  %-42s %s (%.2f%% apart - null shared really omits it)\n",
-                    "a null `shared` is observable", differs ? "yes" : "*** NO ***", rel_no_shared * 100);
+        std::printf("  %-42s %s (%.2f%% apart - null shared really omits it)\n", "a null `shared` is observable",
+                    differs ? "yes" : "*** NO ***", rel_no_shared * 100);
         if (!differs) ++bad;
-        sycl::free(d_p, q_ct1); sycl::free(d_w, q_ct1);
-        sycl::free(d_s, q_ct1); sycl::free(d_y, q_ct1);
+        sycl::free(d_p, q_ct1);
+        sycl::free(d_w, q_ct1);
+        sycl::free(d_s, q_ct1);
+        sycl::free(d_y, q_ct1);
     }
 
     sycl::free(d_x, q_ct1);

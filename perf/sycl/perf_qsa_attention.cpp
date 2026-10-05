@@ -28,16 +28,12 @@ namespace {
 
 /// QSA FlashAttention Subgroup Kernel for Xe2
 /// Each work-group computes one query head h in [0, 24).
-void qsa_flash_attn_kernel(sycl::nd_item<1> item,
-                           const float* __restrict__ q,
-                           const sycl::half* __restrict__ k,
-                           const sycl::half* __restrict__ v,
-                           float* __restrict__ out,
-                           int width, float scale,
+void qsa_flash_attn_kernel(sycl::nd_item<1> item, const float* __restrict__ q, const sycl::half* __restrict__ k,
+                           const sycl::half* __restrict__ v, float* __restrict__ out, int width, float scale,
                            sycl::local_accessor<float, 1> s_dots) {
-    const int h = item.get_group(0); // 0 .. 23
-    const int kv_head = h / 12;      // GQA: 2 KV heads for 24 query heads
-    const int lane = item.get_local_id(0); // 0 .. 255
+    const int h = item.get_group(0);        // 0 .. 23
+    const int kv_head = h / 12;             // GQA: 2 KV heads for 24 query heads
+    const int lane = item.get_local_id(0);  // 0 .. 255
     auto sg = item.get_sub_group();
 
     const float* q_h = q + h * 256;
@@ -86,14 +82,9 @@ void qsa_flash_attn_kernel(sycl::nd_item<1> item,
 
 /// Sparse Top-K Block Gather Kernel
 /// Gathers active KV blocks based on block index array.
-void qsa_topk_gather_kernel(sycl::nd_item<1> item,
-                            const sycl::half* __restrict__ kv_pool,
-                            const int32_t* __restrict__ active_bids,
-                            sycl::half* __restrict__ gathered_kv,
-                            int num_active_blocks,
-                            int block_size,
-                            int head_dim,
-                            int n_kv_heads) {
+void qsa_topk_gather_kernel(sycl::nd_item<1> item, const sycl::half* __restrict__ kv_pool,
+                            const int32_t* __restrict__ active_bids, sycl::half* __restrict__ gathered_kv,
+                            int num_active_blocks, int block_size, int head_dim, int n_kv_heads) {
     const int idx = item.get_global_id(0);
     const int total_elements = num_active_blocks * block_size * n_kv_heads * head_dim;
     if (idx >= total_elements) return;
@@ -106,7 +97,7 @@ void qsa_topk_gather_kernel(sycl::nd_item<1> item,
     gathered_kv[idx] = kv_pool[static_cast<size_t>(src_bid) * elements_per_block + offset_in_block];
 }
 
-} // namespace
+}  // namespace
 
 // ============================================================================
 // Benchmark: BM_Xe2_QSA_PromptAttention
@@ -117,20 +108,20 @@ static void BM_Xe2_QSA_PromptAttention(benchmark::State& state) {
     constexpr int n_head = 24;
     constexpr int n_head_kv = 2;
     constexpr int head_dim = 256;
-    constexpr float scale = 0.0625f; // 1.0 / sqrt(256)
+    constexpr float scale = 0.0625f;  // 1.0 / sqrt(256)
 
     sycl::queue q{sycl::default_selector_v, {sycl::property::queue::enable_profiling()}};
 
-    float* d_q      = sycl::malloc_device<float>(n_head * head_dim, q);
+    float* d_q = sycl::malloc_device<float>(n_head * head_dim, q);
     sycl::half* d_k = sycl::malloc_device<sycl::half>(static_cast<size_t>(width) * n_head_kv * head_dim, q);
     sycl::half* d_v = sycl::malloc_device<sycl::half>(static_cast<size_t>(width) * n_head_kv * head_dim, q);
-    float* d_out    = sycl::malloc_device<float>(n_head * head_dim, q);
+    float* d_out = sycl::malloc_device<float>(n_head * head_dim, q);
 
     if (!d_q || !d_k || !d_v || !d_out) {
         state.SkipWithError("Failed to allocate USM memory for QSA Attention benchmark");
-        if (d_q)   sycl::free(d_q, q);
-        if (d_k)   sycl::free(d_k, q);
-        if (d_v)   sycl::free(d_v, q);
+        if (d_q) sycl::free(d_q, q);
+        if (d_k) sycl::free(d_k, q);
+        if (d_v) sycl::free(d_v, q);
         if (d_out) sycl::free(d_out, q);
         return;
     }
@@ -143,11 +134,10 @@ static void BM_Xe2_QSA_PromptAttention(benchmark::State& state) {
 
     auto launch = [&](sycl::handler& cgh) {
         sycl::local_accessor<float, 1> s_dots(sycl::range<1>(16), cgh);
-        cgh.parallel_for(
-            sycl::nd_range<1>(n_head * 256, 256),
-            [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
-                qsa_flash_attn_kernel(item, d_q, d_k, d_v, d_out, width, scale, s_dots);
-            });
+        cgh.parallel_for(sycl::nd_range<1>(n_head * 256, 256),
+                         [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
+                             qsa_flash_attn_kernel(item, d_q, d_k, d_v, d_out, width, scale, s_dots);
+                         });
     };
 
     // Warmup
@@ -170,9 +160,12 @@ static void BM_Xe2_QSA_PromptAttention(benchmark::State& state) {
                          static_cast<double>(width * n_head_kv * head_dim * 2) * sizeof(sycl::half) +
                          static_cast<double>(n_head * head_dim) * sizeof(float);
 
-    state.counters["Bandwidth_GBps"] = benchmark::Counter(bytes, benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
-    state.counters["TFLOPS"]         = benchmark::Counter(flops, benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
-    state.counters["tokens_per_sec"] = benchmark::Counter(static_cast<double>(width), benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
+    state.counters["Bandwidth_GBps"] =
+        benchmark::Counter(bytes, benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
+    state.counters["TFLOPS"] =
+        benchmark::Counter(flops, benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
+    state.counters["tokens_per_sec"] = benchmark::Counter(
+        static_cast<double>(width), benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
 
     sycl::free(d_q, q);
     sycl::free(d_k, q);
@@ -189,7 +182,7 @@ static void BM_Xe2_QSA_TopK_Gather(benchmark::State& state) {
     constexpr int block_size = 4;
     constexpr int n_kv_heads = 2;
     constexpr int head_dim = 256;
-    constexpr int num_active_blocks = 256; // Top-256 blocks = 1024 cells
+    constexpr int num_active_blocks = 256;  // Top-256 blocks = 1024 cells
 
     const int total_blocks = total_cells / block_size;
     const size_t pool_size = static_cast<size_t>(total_blocks) * block_size * n_kv_heads * head_dim;
@@ -197,15 +190,15 @@ static void BM_Xe2_QSA_TopK_Gather(benchmark::State& state) {
 
     sycl::queue q{sycl::default_selector_v, {sycl::property::queue::enable_profiling()}};
 
-    sycl::half* d_pool      = sycl::malloc_device<sycl::half>(pool_size, q);
-    int32_t* d_active_bids  = sycl::malloc_device<int32_t>(num_active_blocks, q);
-    sycl::half* d_gathered  = sycl::malloc_device<sycl::half>(gather_size, q);
+    sycl::half* d_pool = sycl::malloc_device<sycl::half>(pool_size, q);
+    int32_t* d_active_bids = sycl::malloc_device<int32_t>(num_active_blocks, q);
+    sycl::half* d_gathered = sycl::malloc_device<sycl::half>(gather_size, q);
 
     if (!d_pool || !d_active_bids || !d_gathered) {
         state.SkipWithError("Failed to allocate USM memory for Top-K Gather benchmark");
-        if (d_pool)        sycl::free(d_pool, q);
+        if (d_pool) sycl::free(d_pool, q);
         if (d_active_bids) sycl::free(d_active_bids, q);
-        if (d_gathered)    sycl::free(d_gathered, q);
+        if (d_gathered) sycl::free(d_gathered, q);
         return;
     }
 
@@ -225,12 +218,11 @@ static void BM_Xe2_QSA_TopK_Gather(benchmark::State& state) {
     const size_t num_wgs = (gather_size + WG_SIZE - 1) / WG_SIZE;
 
     auto launch = [&](sycl::handler& cgh) {
-        cgh.parallel_for(
-            sycl::nd_range<1>(num_wgs * WG_SIZE, WG_SIZE),
-            [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
-                qsa_topk_gather_kernel(item, d_pool, d_active_bids, d_gathered,
-                                       num_active_blocks, block_size, head_dim, n_kv_heads);
-            });
+        cgh.parallel_for(sycl::nd_range<1>(num_wgs * WG_SIZE, WG_SIZE),
+                         [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
+                             qsa_topk_gather_kernel(item, d_pool, d_active_bids, d_gathered, num_active_blocks,
+                                                    block_size, head_dim, n_kv_heads);
+                         });
     };
 
     // Warmup
@@ -250,7 +242,8 @@ static void BM_Xe2_QSA_TopK_Gather(benchmark::State& state) {
     const double bytes = static_cast<double>(num_active_blocks * sizeof(int32_t)) +
                          static_cast<double>(gather_size * 2) * sizeof(sycl::half);
 
-    state.counters["Bandwidth_GBps"] = benchmark::Counter(bytes, benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
+    state.counters["Bandwidth_GBps"] =
+        benchmark::Counter(bytes, benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
 
     sycl::free(d_pool, q);
     sycl::free(d_active_bids, q);

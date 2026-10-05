@@ -47,8 +47,8 @@ inline float warp_sum(sycl::sub_group sg, float value) {
     return value;
 }
 
-inline float norm_sum(sycl::sub_group sg, sycl::group<1> grp, float value,
-                      sycl::local_accessor<float, 1> sums, int local_id) {
+inline float norm_sum(sycl::sub_group sg, sycl::group<1> grp, float value, sycl::local_accessor<float, 1> sums,
+                      int local_id) {
     const int lane = local_id % 32;
     value = warp_sum(sg, value);
     if (lane == 0) sums[local_id / 32] = value;
@@ -57,28 +57,26 @@ inline float norm_sum(sycl::sub_group sg, sycl::group<1> grp, float value,
     return warp_sum(sg, value);
 }
 
-inline float sigmoid(float value) {
-    return 1.0f / (1.0f + sycl::native::exp(-value));
-}
+inline float sigmoid(float value) { return 1.0f / (1.0f + sycl::native::exp(-value)); }
 
-void conv_silu(sycl::nd_item<1> item,
-               float* __restrict__ history, const float* __restrict__ input,
-               const float* __restrict__ weights, float* __restrict__ raw_output,
-               float* __restrict__ silu_output, int channels) {
+void conv_silu(sycl::nd_item<1> item, float* __restrict__ history, const float* __restrict__ input,
+               const float* __restrict__ weights, float* __restrict__ raw_output, float* __restrict__ silu_output,
+               int channels) {
     const int c = item.get_global_id(0);
     if (c >= channels) return;
     float values[4] = {history[c * 3], history[c * 3 + 1], history[c * 3 + 2], input[c]};
     float sum = 0.0f;
 #pragma unroll
-    for (int tap = 0; tap < 4; ++tap) sum += values[tap] * weights[c * 4 + tap];
+    for (int tap = 0; tap < 4; ++tap)
+        sum += values[tap] * weights[c * 4 + tap];
     raw_output[c] = sum;
     silu_output[c] = sum / (1.0f + sycl::native::exp(-sum));
 #pragma unroll
-    for (int tap = 0; tap < 3; ++tap) history[c * 3 + tap] = values[tap + 1];
+    for (int tap = 0; tap < 3; ++tap)
+        history[c * 3 + tap] = values[tap + 1];
 }
 
-void l2_norm(sycl::nd_item<1> item,
-             float* input, float epsilon, float scale_after,
+void l2_norm(sycl::nd_item<1> item, float* input, float epsilon, float scale_after,
              sycl::local_accessor<float, 1> sums) {
     const int col = item.get_local_id(0);
     input += (size_t)item.get_group(0) * S;
@@ -100,20 +98,16 @@ void beta_sigmoid(sycl::nd_item<1> item, float* beta, int count) {
     if (i < count) beta[i] = sigmoid(beta[i]);
 }
 
-void gate_softplus(sycl::nd_item<1> item,
-                   const float* __restrict__ alpha, const float* __restrict__ dt,
+void gate_softplus(sycl::nd_item<1> item, const float* __restrict__ alpha, const float* __restrict__ dt,
                    const float* __restrict__ ssm_a, float* __restrict__ gate, int count) {
     const int i = item.get_global_id(0);
     if (i >= count) return;
     const float value = alpha[i] + dt[i];
-    const float softplus = value > 20.0f
-                               ? value
-                               : sycl::log1p(sycl::native::exp(value));
+    const float softplus = value > 20.0f ? value : sycl::log1p(sycl::native::exp(value));
     gate[i] = softplus * ssm_a[i];
 }
 
-void out_norm(sycl::nd_item<1> item,
-              const float* __restrict__ input, const float* __restrict__ z,
+void out_norm(sycl::nd_item<1> item, const float* __restrict__ input, const float* __restrict__ z,
               const float* __restrict__ gamma, float* __restrict__ output, float epsilon,
               sycl::local_accessor<float, 1> sums) {
     const int col = item.get_local_id(0);
@@ -131,7 +125,10 @@ void out_norm(sycl::nd_item<1> item,
     }
 }
 
-struct Span { const void* pointer; size_t bytes; };
+struct Span {
+    const void* pointer;
+    size_t bytes;
+};
 void valid(Span span) {
     const auto address = reinterpret_cast<uintptr_t>(span.pointer);
     if (!span.pointer || address % sizeof(float) || span.bytes > UINTPTR_MAX - address)
@@ -151,29 +148,30 @@ void norm_geometry(int64_t rows, int64_t cols, float epsilon) {
     if (cols != S || !std::isfinite(epsilon) || epsilon < 0.0f)
         throw std::invalid_argument("native GDN norm requires width 128 and finite nonnegative epsilon");
 }
-} // namespace
+}  // namespace
 
-void native_gdn_conv_silu(float* history, const float* input, const float* weights,
-                          float* raw_output, float* silu_output, int64_t channels,
-                          int64_t d_conv, void* stream) {
+void native_gdn_conv_silu(float* history, const float* input, const float* weights, float* raw_output,
+                          float* silu_output, int64_t channels, int64_t d_conv, void* stream) {
     count_check(channels);
     if (d_conv != 4) throw std::invalid_argument("native GDN convolution requires four taps");
     const size_t bytes = size_t(channels) * sizeof(float);
     const Span writable[] = {{history, 3 * bytes}, {raw_output, bytes}, {silu_output, bytes}};
     const Span inputs[] = {{input, bytes}, {weights, 4 * bytes}};
-    for (auto span : writable) valid(span);
-    for (auto span : inputs) valid(span);
+    for (auto span : writable)
+        valid(span);
+    for (auto span : inputs)
+        valid(span);
     for (int i = 0; i < 3; ++i) {
-        for (int j = 0; j < i; ++j) disjoint(writable[i], writable[j]);
-        for (auto span : inputs) disjoint(writable[i], span);
+        for (int j = 0; j < i; ++j)
+            disjoint(writable[i], writable[j]);
+        for (auto span : inputs)
+            disjoint(writable[i], span);
     }
     sycl::queue* q_ptr = stream ? static_cast<sycl::queue*>(stream) : &default_queue();
-    q_ptr->parallel_for(
-        sycl::nd_range<1>(sycl::range<1>(((size_t)channels + 255) / 256 * 256),
-                          sycl::range<1>(256)),
-        [=](sycl::nd_item<1> item) {
-            conv_silu(item, history, input, weights, raw_output, silu_output, int(channels));
-        });
+    q_ptr->parallel_for(sycl::nd_range<1>(sycl::range<1>(((size_t)channels + 255) / 256 * 256), sycl::range<1>(256)),
+                        [=](sycl::nd_item<1> item) {
+                            conv_silu(item, history, input, weights, raw_output, silu_output, int(channels));
+                        });
 }
 
 void native_gdn_l2_norm(float* input, int64_t rows, int64_t cols, float epsilon, void* stream) {
@@ -184,12 +182,9 @@ void native_gdn_l2_norm(float* input, int64_t rows, int64_t cols, float epsilon,
         sycl::local_accessor<float, 1> sums(sycl::range<1>(32), cgh);
         const float eps_S = epsilon / S;
         const float scale_after = 1.0f / sqrtf(float(S));
-        cgh.parallel_for(
-            sycl::nd_range<1>(sycl::range<1>((size_t)rows * 256),
-                              sycl::range<1>(256)),
-            [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(32)]] {
-                l2_norm(item, input, eps_S, scale_after, sums);
-            });
+        cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t)rows * 256), sycl::range<1>(256)),
+                         [=](sycl::nd_item<1> item)
+                             [[sycl::reqd_sub_group_size(32)]] { l2_norm(item, input, eps_S, scale_after, sums); });
     });
 }
 
@@ -197,16 +192,12 @@ void native_gdn_beta_gate(float* beta, int64_t heads, void* stream) {
     count_check(heads);
     valid({beta, size_t(heads) * sizeof(float)});
     sycl::queue* q_ptr = stream ? static_cast<sycl::queue*>(stream) : &default_queue();
-    q_ptr->parallel_for(
-        sycl::nd_range<1>(sycl::range<1>(((size_t)heads + 255) / 256 * 256),
-                          sycl::range<1>(256)),
-        [=](sycl::nd_item<1> item) {
-            beta_sigmoid(item, beta, int(heads));
-        });
+    q_ptr->parallel_for(sycl::nd_range<1>(sycl::range<1>(((size_t)heads + 255) / 256 * 256), sycl::range<1>(256)),
+                        [=](sycl::nd_item<1> item) { beta_sigmoid(item, beta, int(heads)); });
 }
 
-void native_gdn_gate(const float* alpha, const float* dt, const float* ssm_a,
-                     float* gate, int64_t heads, void* stream) {
+void native_gdn_gate(const float* alpha, const float* dt, const float* ssm_a, float* gate, int64_t heads,
+                     void* stream) {
     count_check(heads);
     const size_t bytes = size_t(heads) * sizeof(float);
     const Span output{gate, bytes};
@@ -216,17 +207,12 @@ void native_gdn_gate(const float* alpha, const float* dt, const float* ssm_a,
         disjoint(output, input);
     }
     sycl::queue* q_ptr = stream ? static_cast<sycl::queue*>(stream) : &default_queue();
-    q_ptr->parallel_for(
-        sycl::nd_range<1>(sycl::range<1>(((size_t)heads + 255) / 256 * 256),
-                          sycl::range<1>(256)),
-        [=](sycl::nd_item<1> item) {
-            gate_softplus(item, alpha, dt, ssm_a, gate, int(heads));
-        });
+    q_ptr->parallel_for(sycl::nd_range<1>(sycl::range<1>(((size_t)heads + 255) / 256 * 256), sycl::range<1>(256)),
+                        [=](sycl::nd_item<1> item) { gate_softplus(item, alpha, dt, ssm_a, gate, int(heads)); });
 }
 
-void native_gdn_out_norm(const float* output, const float* z, const float* gamma,
-                         float* destination, int64_t heads, int64_t cols,
-                         float epsilon, void* stream) {
+void native_gdn_out_norm(const float* output, const float* z, const float* gamma, float* destination, int64_t heads,
+                         int64_t cols, float epsilon, void* stream) {
     norm_geometry(heads, cols, epsilon);
     const size_t bytes = size_t(heads) * S * sizeof(float);
     const Span writable{destination, bytes};
@@ -238,13 +224,11 @@ void native_gdn_out_norm(const float* output, const float* z, const float* gamma
     sycl::queue* q_ptr = stream ? static_cast<sycl::queue*>(stream) : &default_queue();
     q_ptr->submit([&](sycl::handler& cgh) {
         sycl::local_accessor<float, 1> sums(sycl::range<1>(32), cgh);
-        cgh.parallel_for(
-            sycl::nd_range<1>(sycl::range<1>((size_t)heads * 256),
-                              sycl::range<1>(256)),
-            [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(32)]] {
-                out_norm(item, output, z, gamma, destination, epsilon, sums);
-            });
+        cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t)heads * 256), sycl::range<1>(256)),
+                         [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(32)]] {
+                             out_norm(item, output, z, gamma, destination, epsilon, sums);
+                         });
     });
 }
 
-} // namespace strata::kernels
+}  // namespace strata::kernels

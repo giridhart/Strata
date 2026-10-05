@@ -17,47 +17,37 @@ constexpr int S = 128, HK = 16, HV = 48, C = 10240;
 
 inline float warp_sum(float v) {
 #pragma unroll
-    for (int o = 16; o > 0; o >>= 1) v += sycl::permute_group_by_xor(
-        sycl::ext::oneapi::this_work_item::get_sub_group(), v, o);
+    for (int o = 16; o > 0; o >>= 1)
+        v += sycl::permute_group_by_xor(sycl::ext::oneapi::this_work_item::get_sub_group(), v, o);
     return v;
 }
 inline float warp_max(float v) {
 #pragma unroll
-    for (int o = 16; o > 0; o >>= 1) v = sycl::fmax(
-        v, sycl::permute_group_by_xor(
-               sycl::ext::oneapi::this_work_item::get_sub_group(), v, o));
+    for (int o = 16; o > 0; o >>= 1)
+        v = sycl::fmax(v, sycl::permute_group_by_xor(sycl::ext::oneapi::this_work_item::get_sub_group(), v, o));
     return v;
 }
 inline uint16_t bf(float f) {
     uint32_t u = sycl::bit_cast<unsigned int>(f);
     u += 0x7fffu + ((u >> 16) & 1u);
-    return (uint16_t) (u >> 16);
+    return (uint16_t)(u >> 16);
 }
 // The BF16 GEMMs' second operand (STRATA_PREFILL_BF16X2): what the BF16 image `hi` left out of f, itself in BF16.
 // W.hi + W.lo carries ~16 mantissa bits of the activation - the decode path's FP32 x to within ~1e-5.
-inline uint16_t bf_lo(float f, uint16_t hi) {
-    return bf(f - sycl::bit_cast<float>((uint32_t)hi << 16));
-}
-inline float sigm(float x) {
-    return 1.0f / (1.0f + sycl::native::exp(-x));
-}
+inline uint16_t bf_lo(float f, uint16_t hi) { return bf(f - sycl::bit_cast<float>((uint32_t)hi << 16)); }
+inline float sigm(float x) { return 1.0f / (1.0f + sycl::native::exp(-x)); }
 inline uint16_t hf(float f) {
     return sycl::bit_cast<unsigned short, sycl::half>(
-               sycl::vec<float, 1>(f)
-                   .convert<sycl::half, sycl::rounding_mode::rte>()[0]);
+        sycl::vec<float, 1>(f).convert<sycl::half, sycl::rounding_mode::rte>()[0]);
 }
 // A SwiGLU product for an FP16 GEMM: saturated, so a token with a massive activation cannot turn into inf and then
 // NaN in the down projection (decode's q8_1 has room to ~8e6; FP16 ends at 65504).  A NaN stays NaN (fminf/fmaxf
 // would make it -65504 and hide where it came from); finite values below 65504 round exactly as before.
-inline uint16_t hf_sat(float f) {
-    return hf(sycl::isnan(f) ? f
-                             : sycl::fmin(sycl::fmax(f, -65504.0f), 65504.0f));
-}
+inline uint16_t hf_sat(float f) { return hf(sycl::isnan(f) ? f : sycl::fmin(sycl::fmax(f, -65504.0f), 65504.0f)); }
 // block-wide sum for blockDim.x <= 1024, result broadcast
 float block_sum(float v, float* sh) {
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
-    const int lane = item_ct1.get_local_id(2) & 31,
-              w = item_ct1.get_local_id(2) >> 5;
+    const int lane = item_ct1.get_local_id(2) & 31, w = item_ct1.get_local_id(2) >> 5;
     v = warp_sum(v);
     /*
     DPCT1065:495: Consider replacing sycl::nd_item::barrier() with
@@ -73,8 +63,7 @@ float block_sum(float v, float* sh) {
     */
     item_ct1.barrier();
     const size_t nw = (item_ct1.get_local_range(2) + 31) >> 5;
-    float t =
-        (item_ct1.get_local_id(2) < nw) ? sh[item_ct1.get_local_id(2)] : 0.0f;
+    float t = (item_ct1.get_local_id(2) < nw) ? sh[item_ct1.get_local_id(2)] : 0.0f;
     if (w == 0) t = warp_sum(t);
     if (item_ct1.get_local_id(2) == 0) sh[0] = t;
     /*
@@ -85,26 +74,22 @@ float block_sum(float v, float* sh) {
     item_ct1.barrier();
     return sh[0];
 }
-void check(const char* what) {
-    (void)what;
-}
-unsigned blocks_for(int64_t n, int t = 256) { return (unsigned) ((n + t - 1) / t); }
+void check(const char* what) { (void)what; }
+unsigned blocks_for(int64_t n, int t = 256) { return (unsigned)((n + t - 1) / t); }
 
 // ---------------------------------------------------------------- hyper-connection
-void gr_norm_kernel(const float* __restrict__ R, const float* __restrict__ w, float eps,
-                               float* __restrict__ xn, uint16_t* __restrict__ xn16, uint16_t* __restrict__ xn16_lo,
-                               float *sh) {
+void gr_norm_kernel(const float* __restrict__ R, const float* __restrict__ w, float eps, float* __restrict__ xn,
+                    uint16_t* __restrict__ xn16, uint16_t* __restrict__ xn16_lo, float* sh) {
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
 
-    const int64_t row = item_ct1.get_group(2); // t * 4 + c
-    const int c = (int) (row % HC);
+    const int64_t row = item_ct1.get_group(2);  // t * 4 + c
+    const int c = (int)(row % HC);
     const float* r = R + row * N;
     float ss = 0.0f;
-    for (int d = item_ct1.get_local_id(2); d < N;
-         d += item_ct1.get_local_range(2)) ss += r[d] * r[d];
+    for (int d = item_ct1.get_local_id(2); d < N; d += item_ct1.get_local_range(2))
+        ss += r[d] * r[d];
     const float rs = sycl::rsqrt(block_sum(ss, sh) / (float)N + eps);
-    for (int d = item_ct1.get_local_id(2); d < N;
-         d += item_ct1.get_local_range(2)) {
+    for (int d = item_ct1.get_local_id(2); d < N; d += item_ct1.get_local_range(2)) {
         const float v = r[d] * rs * w[c * N + d];
         xn[row * N + d] = v;
         const uint16_t h = bf(v);
@@ -114,21 +99,19 @@ void gr_norm_kernel(const float* __restrict__ R, const float* __restrict__ w, fl
 }
 // F-1: the row scale only (and the BF16 image); gr_mix_r_kernel recomputes r * rs * w itself, in the same order,
 // so the FP32 copy of the normalized rows (T x 10240 floats) is neither written nor read
-void gr_norm_rs_kernel(const float* __restrict__ R, const float* __restrict__ w, float eps,
-                                  float* __restrict__ rs_out, uint16_t* __restrict__ xn16,
-                                  uint16_t* __restrict__ xn16_lo, float *sh) {
+void gr_norm_rs_kernel(const float* __restrict__ R, const float* __restrict__ w, float eps, float* __restrict__ rs_out,
+                       uint16_t* __restrict__ xn16, uint16_t* __restrict__ xn16_lo, float* sh) {
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
 
-    const int64_t row = item_ct1.get_group(2); // t * 4 + c
-    const int c = (int) (row % HC);
+    const int64_t row = item_ct1.get_group(2);  // t * 4 + c
+    const int c = (int)(row % HC);
     const float* r = R + row * N;
     float ss = 0.0f;
-    for (int d = item_ct1.get_local_id(2); d < N;
-         d += item_ct1.get_local_range(2)) ss += r[d] * r[d];
+    for (int d = item_ct1.get_local_id(2); d < N; d += item_ct1.get_local_range(2))
+        ss += r[d] * r[d];
     const float rs = sycl::rsqrt(block_sum(ss, sh) / (float)N + eps);
     if (item_ct1.get_local_id(2) == 0) rs_out[row] = rs;
-    for (int d = item_ct1.get_local_id(2); d < N;
-         d += item_ct1.get_local_range(2)) {
+    for (int d = item_ct1.get_local_id(2); d < N; d += item_ct1.get_local_range(2)) {
         const float v = r[d] * rs * w[c * N + d];
         const uint16_t h = bf(v);
         xn16[row * N + d] = h;
@@ -136,22 +119,20 @@ void gr_norm_rs_kernel(const float* __restrict__ R, const float* __restrict__ w,
     }
 }
 void gr_mix_r_kernel(const float* __restrict__ R, const float* __restrict__ rs, const float* __restrict__ w,
-                                const float* __restrict__ g, float* __restrict__ mixed, uint16_t* __restrict__ mixed16,
-                                int64_t T, uint16_t* __restrict__ mixed_h, uint16_t* __restrict__ mixed16_lo) {
+                     const float* __restrict__ g, float* __restrict__ mixed, uint16_t* __restrict__ mixed16, int64_t T,
+                     uint16_t* __restrict__ mixed_h, uint16_t* __restrict__ mixed16_lo) {
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
-    const int64_t i =
-        (int64_t)item_ct1.get_group(2) * item_ct1.get_local_range(2) +
-        item_ct1.get_local_id(2);
+    const int64_t i = (int64_t)item_ct1.get_group(2) * item_ct1.get_local_range(2) + item_ct1.get_local_id(2);
     if (i >= T * N) return;
     const int64_t t = i / N, d = i % N;
     float s = 0.0f;
 #pragma unroll
     for (int c = 0; c < HC; ++c) {
         const int64_t j = t * D + c * N + d;
-        const float x = R[j] * rs[t * HC + c] * w[c * N + d];   // gr_norm_kernel's value, bit for bit
+        const float x = R[j] * rs[t * HC + c] * w[c * N + d];  // gr_norm_kernel's value, bit for bit
         s = sycl::fma((float)x, sigm(g[j]), s);
     }
-    s /= (float) HC;
+    s /= (float)HC;
     mixed[i] = s;
     if (mixed16) {
         const uint16_t h = bf(s);
@@ -164,19 +145,16 @@ void gr_mix_r_kernel(const float* __restrict__ R, const float* __restrict__ rs, 
 // weights - the same thread-to-element mapping (256 threads, stride 256) and block_sum, so rs and the BF16 image are
 // the same bits, and R is not read back
 constexpr int GRW_PER = (N + 255) / 256;
-void gr_write_norm_rs_kernel(float* __restrict__ R, const float* __restrict__ bo,
-                                                               const float* __restrict__ inj, int64_t inj_ld,
-                                                               const float* __restrict__ w, float eps,
-                                                               float* __restrict__ rs_out, uint16_t* __restrict__ xn16,
-                                                               uint16_t* __restrict__ xn16_lo,
-                                                               float *sh) {
+void gr_write_norm_rs_kernel(float* __restrict__ R, const float* __restrict__ bo, const float* __restrict__ inj,
+                             int64_t inj_ld, const float* __restrict__ w, float eps, float* __restrict__ rs_out,
+                             uint16_t* __restrict__ xn16, uint16_t* __restrict__ xn16_lo, float* sh) {
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
 
-    const int64_t row = item_ct1.get_group(2); // t * 4 + c
+    const int64_t row = item_ct1.get_group(2);  // t * 4 + c
     const int64_t t = row / HC;
-    const int c = (int) (row % HC);
+    const int c = (int)(row % HC);
     float* r = R + row * N;
-    const float sc = 2.0f * sigm(inj[t * inj_ld + c] / (float) HC);
+    const float sc = 2.0f * sigm(inj[t * inj_ld + c] / (float)HC);
     float v[GRW_PER];
     float ss = 0.0f;
     int k = 0;
@@ -199,25 +177,21 @@ void gr_write_norm_rs_kernel(float* __restrict__ R, const float* __restrict__ bo
     }
 }
 void gr_silu_kernel(const float* __restrict__ lo, uint16_t* __restrict__ lo16, uint16_t* __restrict__ lo16_lo,
-                               int64_t n) {
+                    int64_t n) {
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
-    const int64_t i =
-        (int64_t)item_ct1.get_group(2) * item_ct1.get_local_range(2) +
-        item_ct1.get_local_id(2);
+    const int64_t i = (int64_t)item_ct1.get_group(2) * item_ct1.get_local_range(2) + item_ct1.get_local_id(2);
     if (i >= n) return;
-    const float x = lo[i] / (float) HC;
+    const float x = lo[i] / (float)HC;
     const float v = x / (1.0f + sycl::native::exp(-x));
     const uint16_t h = bf(v);
     lo16[i] = h;
     if (lo16_lo) lo16_lo[i] = bf_lo(v, h);
 }
 void gr_mix_kernel(const float* __restrict__ xn, const float* __restrict__ g, float* __restrict__ mixed,
-                              uint16_t* __restrict__ mixed16, int64_t T, uint16_t* __restrict__ mixed_h,
-                              uint16_t* __restrict__ mixed16_lo) {
+                   uint16_t* __restrict__ mixed16, int64_t T, uint16_t* __restrict__ mixed_h,
+                   uint16_t* __restrict__ mixed16_lo) {
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
-    const int64_t i =
-        (int64_t)item_ct1.get_group(2) * item_ct1.get_local_range(2) +
-        item_ct1.get_local_id(2);
+    const int64_t i = (int64_t)item_ct1.get_group(2) * item_ct1.get_local_range(2) + item_ct1.get_local_id(2);
     if (i >= T * N) return;
     const int64_t t = i / N, d = i % N;
     float s = 0.0f;
@@ -226,7 +200,7 @@ void gr_mix_kernel(const float* __restrict__ xn, const float* __restrict__ g, fl
         const int64_t j = t * D + c * N + d;
         s = sycl::fma((float)(xn[j]), sigm(g[j]), s);
     }
-    s /= (float) HC;
+    s /= (float)HC;
     mixed[i] = s;
     if (mixed16) {
         const uint16_t h = bf(s);
@@ -235,35 +209,27 @@ void gr_mix_kernel(const float* __restrict__ xn, const float* __restrict__ g, fl
     }
     if (mixed_h) mixed_h[i] = hf(s);
 }
-void gr_write_kernel(float* __restrict__ R, const float* __restrict__ bo, const float* __restrict__ inj,
-                                int64_t inj_ld, int64_t T) {
+void gr_write_kernel(float* __restrict__ R, const float* __restrict__ bo, const float* __restrict__ inj, int64_t inj_ld,
+                     int64_t T) {
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
-    const int64_t i =
-        (int64_t)item_ct1.get_group(2) * item_ct1.get_local_range(2) +
-        item_ct1.get_local_id(2);
+    const int64_t i = (int64_t)item_ct1.get_group(2) * item_ct1.get_local_range(2) + item_ct1.get_local_id(2);
     if (i >= T * D) return;
     const int64_t t = i / D, c = (i % D) / N, d = i % N;
-    R[i] = sycl::fma((float)(bo[t * N + d]),
-                     2.0f * sigm(inj[t * inj_ld + c] / (float)HC), R[i]);
+    R[i] = sycl::fma((float)(bo[t * N + d]), 2.0f * sigm(inj[t * inj_ld + c] / (float)HC), R[i]);
 }
 void gr_broadcast_kernel(const float* __restrict__ e, float* __restrict__ R, int64_t T) {
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
-    const int64_t i =
-        (int64_t)item_ct1.get_group(2) * item_ct1.get_local_range(2) +
-        item_ct1.get_local_id(2);
+    const int64_t i = (int64_t)item_ct1.get_group(2) * item_ct1.get_local_range(2) + item_ct1.get_local_id(2);
     if (i >= T * D) return;
     const int64_t t = i / D, d = i % N;
     R[i] = e[t * N + d];
 }
 
 // ---------------------------------------------------------------- GDN
-void gdn_gates_kernel(const float* __restrict__ ab, const float* __restrict__ dt,
-                                 const float* __restrict__ ssm_a, float* __restrict__ gate, float* __restrict__ beta,
-                                 int64_t T) {
+void gdn_gates_kernel(const float* __restrict__ ab, const float* __restrict__ dt, const float* __restrict__ ssm_a,
+                      float* __restrict__ gate, float* __restrict__ beta, int64_t T) {
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
-    const int64_t i =
-        (int64_t)item_ct1.get_group(2) * item_ct1.get_local_range(2) +
-        item_ct1.get_local_id(2);
+    const int64_t i = (int64_t)item_ct1.get_group(2) * item_ct1.get_local_range(2) + item_ct1.get_local_id(2);
     if (i >= T * HV) return;
     const int64_t t = i / HV, h = i % HV;
     const float v = ab[t * 2 * HV + h] + dt[h];
@@ -272,10 +238,9 @@ void gdn_gates_kernel(const float* __restrict__ ab, const float* __restrict__ dt
 }
 // one thread per channel, walks the chunk; then a second kernel normalises
 void gdn_conv_kernel(float* __restrict__ hist, const float* __restrict__ qkv, const float* __restrict__ w,
-                                float* __restrict__ h, int64_t T) {
+                     float* __restrict__ h, int64_t T) {
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
-    const int c = item_ct1.get_group(2) * item_ct1.get_local_range(2) +
-                  item_ct1.get_local_id(2);
+    const int c = item_ct1.get_group(2) * item_ct1.get_local_range(2) + item_ct1.get_local_id(2);
     if (c >= C) return;
     float v0 = hist[c * 3], v1 = hist[c * 3 + 1], v2 = hist[c * 3 + 2];
     const float w0 = w[c * 4], w1 = w[c * 4 + 1], w2 = w[c * 4 + 2], w3 = w[c * 4 + 3];
@@ -283,47 +248,53 @@ void gdn_conv_kernel(float* __restrict__ hist, const float* __restrict__ qkv, co
         const float x = qkv[t * C + c];
         const float s = v0 * w0 + v1 * w1 + v2 * w2 + x * w3;
         h[t * C + c] = s / (1.0f + sycl::native::exp(-s));
-        v0 = v1; v1 = v2; v2 = x;
+        v0 = v1;
+        v1 = v2;
+        v2 = x;
     }
-    hist[c * 3] = v0; hist[c * 3 + 1] = v1; hist[c * 3 + 2] = v2;
+    hist[c * 3] = v0;
+    hist[c * 3 + 1] = v1;
+    hist[c * 3 + 2] = v2;
 }
 // C-3: the same 4-tap causal conv, tiled over tokens: thread (c, tile) reads its tile's 3 predecessors from the
 // chunk (or the history before it) instead of carrying them - the conv reads inputs, not its own outputs, so the
 // tiles are independent. The same expression per element (so the same bits); the history is written afterwards.
 constexpr int CONV_TILE = 64;
-void gdn_conv_tiled_kernel(const float* __restrict__ hist, const float* __restrict__ qkv,
-                                      const float* __restrict__ w, float* __restrict__ h, int64_t T) {
+void gdn_conv_tiled_kernel(const float* __restrict__ hist, const float* __restrict__ qkv, const float* __restrict__ w,
+                           float* __restrict__ h, int64_t T) {
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
-    const int c = item_ct1.get_group(2) * item_ct1.get_local_range(2) +
-                  item_ct1.get_local_id(2);
+    const int c = item_ct1.get_group(2) * item_ct1.get_local_range(2) + item_ct1.get_local_id(2);
     if (c >= C) return;
     const int64_t t0 = (int64_t)item_ct1.get_group(1) * CONV_TILE;
     if (t0 >= T) return;
     const int64_t t1 = t0 + CONV_TILE < T ? t0 + CONV_TILE : T;
-    auto input = [&](int64_t t) -> float { return t >= 0 ? qkv[t * C + c] : hist[c * 3 + (int) (t + 3)]; };
+    auto input = [&](int64_t t) -> float { return t >= 0 ? qkv[t * C + c] : hist[c * 3 + (int)(t + 3)]; };
     float v0 = input(t0 - 3), v1 = input(t0 - 2), v2 = input(t0 - 1);
     const float w0 = w[c * 4], w1 = w[c * 4 + 1], w2 = w[c * 4 + 2], w3 = w[c * 4 + 3];
     for (int64_t t = t0; t < t1; ++t) {
         const float x = qkv[t * C + c];
         const float s = v0 * w0 + v1 * w1 + v2 * w2 + x * w3;
         h[t * C + c] = s / (1.0f + sycl::native::exp(-s));
-        v0 = v1; v1 = v2; v2 = x;
+        v0 = v1;
+        v1 = v2;
+        v2 = x;
     }
 }
 // the history after the chunk: its last three inputs (the older history where the chunk is shorter than 3)
 void gdn_conv_hist_kernel(float* __restrict__ hist, const float* __restrict__ qkv, int64_t T) {
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
-    const int c = item_ct1.get_group(2) * item_ct1.get_local_range(2) +
-                  item_ct1.get_local_id(2);
+    const int c = item_ct1.get_group(2) * item_ct1.get_local_range(2) + item_ct1.get_local_id(2);
     if (c >= C) return;
     float v[3];
     for (int k = 0; k < 3; ++k) {
         const int64_t t = T - 3 + k;
-        v[k] = t >= 0 ? qkv[t * C + c] : hist[c * 3 + (int) (t + 3)];
+        v[k] = t >= 0 ? qkv[t * C + c] : hist[c * 3 + (int)(t + 3)];
     }
-    hist[c * 3] = v[0]; hist[c * 3 + 1] = v[1]; hist[c * 3 + 2] = v[2];
+    hist[c * 3] = v[0];
+    hist[c * 3 + 1] = v[1];
+    hist[c * 3 + 2] = v[2];
 }
-void gdn_l2_kernel(float* __restrict__ h, float eps, float *part) {
+void gdn_l2_kernel(float* __restrict__ h, float eps, float* part) {
     // block (t, head) over the 32 q/k heads, 128 threads
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
     const int64_t t = item_ct1.get_group(1);
@@ -332,8 +303,7 @@ void gdn_l2_kernel(float* __restrict__ h, float eps, float *part) {
     const float v = x[item_ct1.get_local_id(2)];
     float sq = warp_sum(v * v);
 
-    if ((item_ct1.get_local_id(2) & 31) == 0)
-        part[item_ct1.get_local_id(2) >> 5] = sq;
+    if ((item_ct1.get_local_id(2) & 31) == 0) part[item_ct1.get_local_id(2) >> 5] = sq;
     /*
     DPCT1065:500: Consider replacing sycl::nd_item::barrier() with
     sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
@@ -350,23 +320,21 @@ gdn_rec_kernel exceeds 128 bytes and may cause high register pressure. Consult
 with your hardware vendor to find the total register size available and adjust
 the code, or use smaller sub-group size to avoid high register pressure.
 */
-void gdn_rec_kernel(float *__restrict__ state, const float *__restrict__ h,
-                    const float *__restrict__ gate,
-                    const float *__restrict__ beta, const float *__restrict__ z,
-                    const float *__restrict__ gamma, float eps,
-                    float *__restrict__ y, uint16_t *__restrict__ y16,
-                    int64_t T, float *sk, float *sq,
-                    float red[4 /*RG*/][128 /*S*/], float *wsum) {
+void gdn_rec_kernel(float* __restrict__ state, const float* __restrict__ h, const float* __restrict__ gate,
+                    const float* __restrict__ beta, const float* __restrict__ z, const float* __restrict__ gamma,
+                    float eps, float* __restrict__ y, uint16_t* __restrict__ y16, int64_t T, float* sk, float* sq,
+                    float red[4 /*RG*/][128 /*S*/], float* wsum) {
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
 
-    const int head = item_ct1.get_group(2), col = item_ct1.get_local_id(2),
-              rg = item_ct1.get_local_id(1), tid = rg * S + col;
+    const int head = item_ct1.get_group(2), col = item_ct1.get_local_id(2), rg = item_ct1.get_local_id(1),
+              tid = rg * S + col;
     const int qh = head % HK;
     float s[RPG];
-    float* base = state + ((size_t) (rg * RPG) * HV + head) * S + col;
-    const size_t rs = (size_t) HV * S;
+    float* base = state + ((size_t)(rg * RPG) * HV + head) * S + col;
+    const size_t rs = (size_t)HV * S;
 #pragma unroll
-    for (int r = 0; r < RPG; ++r) s[r] = base[r * rs];
+    for (int r = 0; r < RPG; ++r)
+        s[r] = base[r * rs];
     const float g_col = gamma[col];
     for (int64_t t = 0; t < T; ++t) {
         const float* ht = h + t * C;
@@ -380,7 +348,10 @@ void gdn_rec_kernel(float *__restrict__ state, const float *__restrict__ h,
         better performance if there is no access to global memory.
         */
         item_ct1.barrier();
-        if (tid < S) { sq[tid] = ht[qh * S + tid]; sk[tid] = ht[HK * S + qh * S + tid]; }
+        if (tid < S) {
+            sq[tid] = ht[qh * S + tid];
+            sk[tid] = ht[HK * S + qh * S + tid];
+        }
         /*
         DPCT1118:42: SYCL group functions and algorithms must be encountered in
         converged control flow. You may need to adjust the code.
@@ -438,8 +409,7 @@ void gdn_rec_kernel(float *__restrict__ state, const float *__restrict__ h,
         item_ct1.barrier();
         float oc = 0.0f, sp = 0.0f;
         if (rg == 0) {
-            oc = (red[0][col] + red[1][col] + red[2][col] + red[3][col]) *
-                 sycl::rsqrt((float)S);
+            oc = (red[0][col] + red[1][col] + red[2][col] + red[3][col]) * sycl::rsqrt((float)S);
             sp = oc * oc;
         }
         sp = warp_sum(sp);
@@ -456,14 +426,14 @@ void gdn_rec_kernel(float *__restrict__ state, const float *__restrict__ h,
         item_ct1.barrier();
         if (rg == 0) {
             const float ss = wsum[0] + wsum[1] + wsum[2] + wsum[3];
-            const float v = oc * sycl::rsqrt(ss / (float)S + eps) * g_col *
-                            sigm(z[t * HV * S + head * S + col]);
+            const float v = oc * sycl::rsqrt(ss / (float)S + eps) * g_col * sigm(z[t * HV * S + head * S + col]);
             y[t * HV * S + head * S + col] = v;
             y16[t * HV * S + head * S + col] = hf(v);
         }
     }
 #pragma unroll
-    for (int r = 0; r < RPG; ++r) base[r * rs] = s[r];
+    for (int r = 0; r < RPG; ++r)
+        base[r * rs] = s[r];
 }
 
 // D-2: the recurrence with the value columns split over 4 blocks per head (4x the blocks of the kernel above, a
@@ -477,23 +447,20 @@ gdn_rec_cols_kernel exceeds 128 bytes and may cause high register pressure.
 Consult with your hardware vendor to find the total register size available and
 adjust the code, or use smaller sub-group size to avoid high register pressure.
 */
-void gdn_rec_cols_kernel(float *__restrict__ state, const float *__restrict__ h,
-                         const float *__restrict__ gate,
-                         const float *__restrict__ beta,
-                         float *__restrict__ oc_out, int64_t T, float *sk,
-                         float *sq, float red[4 /*RG*/][32 /*CB*/]) {
+void gdn_rec_cols_kernel(float* __restrict__ state, const float* __restrict__ h, const float* __restrict__ gate,
+                         const float* __restrict__ beta, float* __restrict__ oc_out, int64_t T, float* sk, float* sq,
+                         float red[4 /*RG*/][32 /*CB*/]) {
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
 
-    const int head = item_ct1.get_group(2) / NCB,
-              cb = item_ct1.get_group(2) % NCB;
-    const int c = item_ct1.get_local_id(2), rg = item_ct1.get_local_id(1),
-              tid = rg * CB + c, col = cb * CB + c;
+    const int head = item_ct1.get_group(2) / NCB, cb = item_ct1.get_group(2) % NCB;
+    const int c = item_ct1.get_local_id(2), rg = item_ct1.get_local_id(1), tid = rg * CB + c, col = cb * CB + c;
     const int qh = head % HK;
     float s[RPG];
-    float* base = state + ((size_t) (rg * RPG) * HV + head) * S + col;
-    const size_t rs = (size_t) HV * S;
+    float* base = state + ((size_t)(rg * RPG) * HV + head) * S + col;
+    const size_t rs = (size_t)HV * S;
 #pragma unroll
-    for (int r = 0; r < RPG; ++r) s[r] = base[r * rs];
+    for (int r = 0; r < RPG; ++r)
+        s[r] = base[r * rs];
     for (int64_t t = 0; t < T; ++t) {
         const float* ht = h + t * C;
         /*
@@ -506,7 +473,10 @@ void gdn_rec_cols_kernel(float *__restrict__ state, const float *__restrict__ h,
         better performance if there is no access to global memory.
         */
         item_ct1.barrier();
-        if (tid < S) { sq[tid] = ht[qh * S + tid]; sk[tid] = ht[HK * S + qh * S + tid]; }
+        if (tid < S) {
+            sq[tid] = ht[qh * S + tid];
+            sk[tid] = ht[HK * S + qh * S + tid];
+        }
         /*
         DPCT1118:49: SYCL group functions and algorithms must be encountered in
         converged control flow. You may need to adjust the code.
@@ -562,12 +532,13 @@ void gdn_rec_cols_kernel(float *__restrict__ state, const float *__restrict__ h,
         better performance if there is no access to global memory.
         */
         item_ct1.barrier();
-        if (rg == 0) oc_out[t * HV * S + head * S + col] =
-            (red[0][c] + red[1][c] + red[2][c] + red[3][c]) *
-            sycl::rsqrt((float)S);
+        if (rg == 0)
+            oc_out[t * HV * S + head * S + col] =
+                (red[0][c] + red[1][c] + red[2][c] + red[3][c]) * sycl::rsqrt((float)S);
     }
 #pragma unroll
-    for (int r = 0; r < RPG; ++r) base[r * rs] = s[r];
+    for (int r = 0; r < RPG; ++r)
+        base[r * rs] = s[r];
 }
 // gdn_rec_cols_kernel with the next token's inputs (q/k rows, v, gate, beta) loaded into registers while this token
 // computes (software pipelining).  The same arithmetic in the same order: the same bits, and the same CB-column split.
@@ -578,31 +549,30 @@ gdn_rec_cols_pipe_kernel exceeds 128 bytes and may cause high register pressure.
 Consult with your hardware vendor to find the total register size available and
 adjust the code, or use smaller sub-group size to avoid high register pressure.
 */
-void gdn_rec_cols_pipe_kernel(float *__restrict__ state,
-                              const float *__restrict__ h,
-                              const float *__restrict__ gate,
-                              const float *__restrict__ beta,
-                              float *__restrict__ oc_out, int64_t T, float *sk,
-                              float *sq, float red[4 /*RG*/][32 /*CB*/]) {
+void gdn_rec_cols_pipe_kernel(float* __restrict__ state, const float* __restrict__ h, const float* __restrict__ gate,
+                              const float* __restrict__ beta, float* __restrict__ oc_out, int64_t T, float* sk,
+                              float* sq, float red[4 /*RG*/][32 /*CB*/]) {
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
     constexpr int NT = CB * RG,
-                  LPT = S / NT; // threads, q/k rows loaded per thread
+                  LPT = S / NT;  // threads, q/k rows loaded per thread
 
-    const int head = item_ct1.get_group(2) / NCB,
-              cb = item_ct1.get_group(2) % NCB;
-    const int c = item_ct1.get_local_id(2), rg = item_ct1.get_local_id(1),
-              tid = rg * CB + c, col = cb * CB + c;
+    const int head = item_ct1.get_group(2) / NCB, cb = item_ct1.get_group(2) % NCB;
+    const int c = item_ct1.get_local_id(2), rg = item_ct1.get_local_id(1), tid = rg * CB + c, col = cb * CB + c;
     const int qh = head % HK;
     float s[RPG];
-    float* base = state + ((size_t) (rg * RPG) * HV + head) * S + col;
-    const size_t rs = (size_t) HV * S;
+    float* base = state + ((size_t)(rg * RPG) * HV + head) * S + col;
+    const size_t rs = (size_t)HV * S;
 #pragma unroll
-    for (int r = 0; r < RPG; ++r) s[r] = base[r * rs];
+    for (int r = 0; r < RPG; ++r)
+        s[r] = base[r * rs];
     float nq[LPT], nk[LPT], nv = 0.0f, ng = 0.0f, nb = 0.0f;
     auto fetch = [&](int64_t t) {
         const float* ht = h + t * C;
 #pragma unroll
-        for (int u = 0; u < LPT; ++u) { nq[u] = ht[qh * S + tid + u * NT]; nk[u] = ht[HK * S + qh * S + tid + u * NT]; }
+        for (int u = 0; u < LPT; ++u) {
+            nq[u] = ht[qh * S + tid + u * NT];
+            nk[u] = ht[HK * S + qh * S + tid + u * NT];
+        }
         nv = ht[2 * HK * S + head * S + col];
         ng = gate[t * HV + head];
         nb = beta[t * HV + head];
@@ -611,7 +581,10 @@ void gdn_rec_cols_pipe_kernel(float *__restrict__ state,
     for (int64_t t = 0; t < T; ++t) {
         float cq[LPT], ck[LPT];
 #pragma unroll
-        for (int u = 0; u < LPT; ++u) { cq[u] = nq[u]; ck[u] = nk[u]; }
+        for (int u = 0; u < LPT; ++u) {
+            cq[u] = nq[u];
+            ck[u] = nk[u];
+        }
         const float cv = nv, cg = ng, cbt = nb;
         /*
         DPCT1118:54: SYCL group functions and algorithms must be encountered in
@@ -624,7 +597,10 @@ void gdn_rec_cols_pipe_kernel(float *__restrict__ state,
         */
         item_ct1.barrier();
 #pragma unroll
-        for (int u = 0; u < LPT; ++u) { sq[tid + u * NT] = cq[u]; sk[tid + u * NT] = ck[u]; }
+        for (int u = 0; u < LPT; ++u) {
+            sq[tid + u * NT] = cq[u];
+            sk[tid + u * NT] = ck[u];
+        }
         /*
         DPCT1118:55: SYCL group functions and algorithms must be encountered in
         converged control flow. You may need to adjust the code.
@@ -681,21 +657,21 @@ void gdn_rec_cols_pipe_kernel(float *__restrict__ state,
         better performance if there is no access to global memory.
         */
         item_ct1.barrier();
-        if (rg == 0) oc_out[t * HV * S + head * S + col] =
-            (red[0][c] + red[1][c] + red[2][c] + red[3][c]) *
-            sycl::rsqrt((float)S);
+        if (rg == 0)
+            oc_out[t * HV * S + head * S + col] =
+                (red[0][c] + red[1][c] + red[2][c] + red[3][c]) * sycl::rsqrt((float)S);
     }
 #pragma unroll
-    for (int r = 0; r < RPG; ++r) base[r * rs] = s[r];
+    for (int r = 0; r < RPG; ++r)
+        base[r * rs] = s[r];
 }
-void gdn_out_norm_kernel(const float* __restrict__ z, const float* __restrict__ gamma,
-                                                         float eps, float* __restrict__ y, uint16_t* __restrict__ y16,
-                                                         float *wsum) {
+void gdn_out_norm_kernel(const float* __restrict__ z, const float* __restrict__ gamma, float eps, float* __restrict__ y,
+                         uint16_t* __restrict__ y16, float* wsum) {
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
 
     const int64_t t = item_ct1.get_group(2);
     const int head = item_ct1.get_group(1), col = item_ct1.get_local_id(2);
-    const size_t at = (size_t) t * HV * S + (size_t) head * S + col;
+    const size_t at = (size_t)t * HV * S + (size_t)head * S + col;
     const float oc = y[at];
     float sp = warp_sum(oc * oc);
     if ((col & 31) == 0) wsum[col >> 5] = sp;
@@ -706,8 +682,7 @@ void gdn_out_norm_kernel(const float* __restrict__ z, const float* __restrict__ 
     */
     item_ct1.barrier();
     const float ss = wsum[0] + wsum[1] + wsum[2] + wsum[3];
-    const float v = oc * sycl::rsqrt(ss / (float)S + eps) * gamma[col] *
-                    sigm(z[t * HV * S + head * S + col]);
+    const float v = oc * sycl::rsqrt(ss / (float)S + eps) * gamma[col] * sigm(z[t * HV * S + head * S + col]);
     y[at] = v;
     y16[at] = hf(v);
 }
@@ -720,54 +695,65 @@ route_kernel exceeds 128 bytes and may cause high register pressure. Consult
 with your hardware vendor to find the total register size available and adjust
 the code, or use smaller sub-group size to avoid high register pressure.
 */
-void route_kernel(const float *__restrict__ logits, int32_t *__restrict__ ids,
-                  float *__restrict__ wout, int64_t T) {
+void route_kernel(const float* __restrict__ logits, int32_t* __restrict__ ids, float* __restrict__ wout, int64_t T) {
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
     const int64_t t =
-        (int64_t)item_ct1.get_group(2) * (item_ct1.get_local_range(2) >> 5) +
-        (item_ct1.get_local_id(2) >> 5);
+        (int64_t)item_ct1.get_group(2) * (item_ct1.get_local_range(2) >> 5) + (item_ct1.get_local_id(2) >> 5);
     if (t >= T) return;
     const int lane = item_ct1.get_local_id(2) & 31;
     const float* lg = logits + t * (REG * 32);
     float v[REG];
 #pragma unroll
-    for (int i = 0; i < REG; ++i) v[i] = lg[lane + i * 32];
+    for (int i = 0; i < REG; ++i)
+        v[i] = lg[lane + i * 32];
     float mx = -INFINITY;
 #pragma unroll
-    for (int i = 0; i < REG; ++i) mx = sycl::fmax(mx, v[i]);
+    for (int i = 0; i < REG; ++i)
+        mx = sycl::fmax(mx, v[i]);
     mx = warp_max(mx);
     float sum = 0.0f;
 #pragma unroll
     for (int i = 0; i < REG; ++i) {
-        v[i] = sycl::native::exp(v[i] - mx); sum += v[i];
+        v[i] = sycl::native::exp(v[i] - mx);
+        sum += v[i];
     }
     const float rcp = 1.0f / warp_sum(sum);
 #pragma unroll
     for (int i = 0; i < REG; ++i) {
-        v[i] *= rcp; if (sycl::isnan(v[i])) v[i] = -FLT_MAX;
+        v[i] *= rcp;
+        if (sycl::isnan(v[i])) v[i] = -FLT_MAX;
     }
     float selected = 0.0f, selected_sum = 0.0f;
     for (int rank = 0; rank < 10; ++rank) {
         float best = v[0];
         int ex = lane;
 #pragma unroll
-        for (int i = 1; i < REG; ++i) if (v[i] > best) { best = v[i]; ex = lane + i * 32; }
+        for (int i = 1; i < REG; ++i)
+            if (v[i] > best) {
+                best = v[i];
+                ex = lane + i * 32;
+            }
 #pragma unroll
         for (int m = 16; m; m >>= 1) {
-            const float ob = sycl::permute_group_by_xor(
-                sycl::ext::oneapi::this_work_item::get_sub_group(), best, m);
-            const int oi = sycl::permute_group_by_xor(
-                sycl::ext::oneapi::this_work_item::get_sub_group(), ex, m);
-            if (ob > best || (ob == best && oi < ex)) { best = ob; ex = oi; }
+            const float ob = sycl::permute_group_by_xor(sycl::ext::oneapi::this_work_item::get_sub_group(), best, m);
+            const int oi = sycl::permute_group_by_xor(sycl::ext::oneapi::this_work_item::get_sub_group(), ex, m);
+            if (ob > best || (ob == best && oi < ex)) {
+                best = ob;
+                ex = oi;
+            }
         }
-        if ((ex & 31) == lane) { v[ex / 32] = -INFINITY; selected_sum += best; }
+        if ((ex & 31) == lane) {
+            v[ex / 32] = -INFINITY;
+            selected_sum += best;
+        }
         if (lane == 0) ids[t * 10 + rank] = ex;
         if (rank == lane) selected = best;
     }
     selected_sum = sycl::fmax(warp_sum(selected_sum), 6.103515625e-5f);
     if (lane < 10) wout[t * 10 + lane] = selected / selected_sum;
 }
-// Strata blob: gate/up codes [1280][640 B], down codes [2560][160 B], gate/up scales [1280][40] f16, down scales [2560][10] f16
+// Strata blob: gate/up codes [1280][640 B], down codes [2560][160 B], gate/up scales [1280][40] f16, down scales
+// [2560][10] f16
 template <bool HALF>
 /*
 DPCT1110:60: The total declared local variable size in device function
@@ -775,99 +761,91 @@ blob_dequant_kernel exceeds 128 bytes and may cause high register pressure.
 Consult with your hardware vendor to find the total register size available and
 adjust the code, or use smaller sub-group size to avoid high register pressure.
 */
-void blob_dequant_kernel(const uint8_t *__restrict__ blob,
-                         uint16_t *__restrict__ gu16,
-                         uint16_t *__restrict__ d16) {
+void blob_dequant_kernel(const uint8_t* __restrict__ blob, uint16_t* __restrict__ gu16, uint16_t* __restrict__ d16) {
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
-    constexpr size_t O_D_CODES = (size_t)1280 * 640,
-                     O_GU_SC = O_D_CODES + (size_t)2560 * 160,
+    constexpr size_t O_D_CODES = (size_t)1280 * 640, O_GU_SC = O_D_CODES + (size_t)2560 * 160,
                      O_D_SC = O_GU_SC + (size_t)1280 * 40 * 2;
-    const int64_t i =
-        (int64_t)item_ct1.get_group(2) * item_ct1.get_local_range(2) +
-        item_ct1.get_local_id(2); // one thread per 4 weights (one code byte)
+    const int64_t i = (int64_t)item_ct1.get_group(2) * item_ct1.get_local_range(2) +
+                      item_ct1.get_local_id(2);  // one thread per 4 weights (one code byte)
     const int64_t n_gu = 1280LL * 640, n_d = 2560LL * 160;
     if (i < n_gu) {
         const int64_t row = i / 640, byte = i % 640;
         const uint8_t c = blob[row * 640 + byte];
-        const uint8_t* sp = blob + O_GU_SC + (size_t) (row * 40 + (byte * 4) / 64) * 2;
+        const uint8_t* sp = blob + O_GU_SC + (size_t)(row * 40 + (byte * 4) / 64) * 2;
         const float d =
-            sycl::vec<sycl::half, 1>(sycl::bit_cast<sycl::half, unsigned short>(
-                                         (uint16_t)(sp[0] | (sp[1] << 8))))
+            sycl::vec<sycl::half, 1>(sycl::bit_cast<sycl::half, unsigned short>((uint16_t)(sp[0] | (sp[1] << 8))))
                 .convert<float, sycl::rounding_mode::automatic>()[0];
         uint16_t* o = gu16 + row * 2560 + byte * 4;
 #pragma unroll
-        for (int k = 0; k < 4; ++k) { const float v = (float) (((c >> (2 * k)) & 3) - 1) * d; o[k] = HALF ? hf(v) : bf(v); }
+        for (int k = 0; k < 4; ++k) {
+            const float v = (float)(((c >> (2 * k)) & 3) - 1) * d;
+            o[k] = HALF ? hf(v) : bf(v);
+        }
     } else if (i < n_gu + n_d) {
         const int64_t j = i - n_gu, row = j / 160, byte = j % 160;
         const uint8_t c = blob[O_D_CODES + row * 160 + byte];
-        const uint8_t* sp = blob + O_D_SC + (size_t) (row * 10 + (byte * 4) / 64) * 2;
+        const uint8_t* sp = blob + O_D_SC + (size_t)(row * 10 + (byte * 4) / 64) * 2;
         const float d =
-            sycl::vec<sycl::half, 1>(sycl::bit_cast<sycl::half, unsigned short>(
-                                         (uint16_t)(sp[0] | (sp[1] << 8))))
+            sycl::vec<sycl::half, 1>(sycl::bit_cast<sycl::half, unsigned short>((uint16_t)(sp[0] | (sp[1] << 8))))
                 .convert<float, sycl::rounding_mode::automatic>()[0];
         uint16_t* o = d16 + row * 640 + byte * 4;
 #pragma unroll
-        for (int k = 0; k < 4; ++k) { const float v = (float) (((c >> (2 * k)) & 3) - 1) * d; o[k] = HALF ? hf(v) : bf(v); }
+        for (int k = 0; k < 4; ++k) {
+            const float v = (float)(((c >> (2 * k)) & 3) - 1) * d;
+            o[k] = HALF ? hf(v) : bf(v);
+        }
     }
 }
 void swiglu_il_kernel(const float* __restrict__ gu, uint16_t* __restrict__ h16, int64_t n) {
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
-    const int64_t i =
-        (int64_t)item_ct1.get_group(2) * item_ct1.get_local_range(2) +
-        item_ct1.get_local_id(2);
+    const int64_t i = (int64_t)item_ct1.get_group(2) * item_ct1.get_local_range(2) + item_ct1.get_local_id(2);
     if (i >= n * 640) return;
     const int64_t r = i / 640, k = i % 640;
     const float g = gu[r * 1280 + 2 * k], u = gu[r * 1280 + 2 * k + 1];
     h16[i] = hf_sat(g / (1.0f + sycl::native::exp(-g)) * u);
 }
 void swiglu_pair_kernel(const float* __restrict__ g, const float* __restrict__ u, uint16_t* __restrict__ h16,
-                                   int64_t n) {
+                        int64_t n) {
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
-    const int64_t i =
-        (int64_t)item_ct1.get_group(2) * item_ct1.get_local_range(2) +
-        item_ct1.get_local_id(2);
+    const int64_t i = (int64_t)item_ct1.get_group(2) * item_ct1.get_local_range(2) + item_ct1.get_local_id(2);
     if (i >= n * 640) return;
     const float a = g[i];
     h16[i] = hf_sat(a / (1.0f + sycl::native::exp(-a)) * u[i]);
 }
-void gather_rows16_kernel(const uint16_t* __restrict__ x, const int32_t* __restrict__ src,
-                                     uint16_t* __restrict__ dst, int64_t n, int64_t width) {
+void gather_rows16_kernel(const uint16_t* __restrict__ x, const int32_t* __restrict__ src, uint16_t* __restrict__ dst,
+                          int64_t n, int64_t width) {
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
     const int64_t i =
-        (int64_t)item_ct1.get_group(2) * item_ct1.get_local_range(2) +
-        item_ct1.get_local_id(2); // one uint4 (8 bf16)
+        (int64_t)item_ct1.get_group(2) * item_ct1.get_local_range(2) + item_ct1.get_local_id(2);  // one uint4 (8 bf16)
     const int64_t per = width / 8;
     if (i >= n * per) return;
     const int64_t r = i / per, j = i % per;
-    reinterpret_cast<sycl::uint4 *>(dst)[r * per + j] =
-        reinterpret_cast<const sycl::uint4 *>(x)[(int64_t)src[r] * per + j];
+    reinterpret_cast<sycl::uint4*>(dst)[r * per + j] =
+        reinterpret_cast<const sycl::uint4*>(x)[(int64_t)src[r] * per + j];
 }
-void moe_combine_kernel(const float* __restrict__ Dm, const int32_t* __restrict__ slot,
-                                   const float* __restrict__ w, const float* __restrict__ shared,
-                                   const float* __restrict__ sg, float* __restrict__ bo, int64_t T) {
+void moe_combine_kernel(const float* __restrict__ Dm, const int32_t* __restrict__ slot, const float* __restrict__ w,
+                        const float* __restrict__ shared, const float* __restrict__ sg, float* __restrict__ bo,
+                        int64_t T) {
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
-    const int64_t i =
-        (int64_t)item_ct1.get_group(2) * item_ct1.get_local_range(2) +
-        item_ct1.get_local_id(2);
+    const int64_t i = (int64_t)item_ct1.get_group(2) * item_ct1.get_local_range(2) + item_ct1.get_local_id(2);
     if (i >= T * N) return;
     const int64_t t = i / N, d = i % N;
     float s = 0.0f;
 #pragma unroll
     for (int k = 0; k < 10; ++k)
-        s = sycl::fma((float)(w[t * 10 + k]),
-                      (float)(Dm[(int64_t)slot[t * 10 + k] * N + d]), s);
+        s = sycl::fma((float)(w[t * 10 + k]), (float)(Dm[(int64_t)slot[t * 10 + k] * N + d]), s);
     bo[i] = s + shared[i] * sigm(sg[t]);
 }
 
 // ---------------------------------------------------------------- QSA helpers
 void rms_rows_kernel(float* __restrict__ x, const float* __restrict__ w, int64_t cols, int64_t ld, float eps,
-                     float *sh) {
+                     float* sh) {
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
 
-    float *r = x + (int64_t)item_ct1.get_group(2) * ld;
+    float* r = x + (int64_t)item_ct1.get_group(2) * ld;
     float ss = 0.0f;
-    for (int64_t c = item_ct1.get_local_id(2); c < cols;
-         c += item_ct1.get_local_range(2)) ss += r[c] * r[c];
+    for (int64_t c = item_ct1.get_local_id(2); c < cols; c += item_ct1.get_local_range(2))
+        ss += r[c] * r[c];
     const float s = sycl::rsqrt(block_sum(ss, sh) / (float)cols + eps);
     /*
     DPCT1065:518: Consider replacing sycl::nd_item::barrier() with
@@ -875,30 +853,28 @@ void rms_rows_kernel(float* __restrict__ x, const float* __restrict__ w, int64_t
     performance if there is no access to global memory.
     */
     item_ct1.barrier();
-    for (int64_t c = item_ct1.get_local_id(2); c < cols;
-         c += item_ct1.get_local_range(2)) r[c] = s * r[c] * w[c];
+    for (int64_t c = item_ct1.get_local_id(2); c < cols; c += item_ct1.get_local_range(2))
+        r[c] = s * r[c] * w[c];
 }
 // TAB (#280, STRATA_ROPE_TABLE=1): the angles from the session's float64 table.  The host launches <false> whenever
 // no table applies - the default - so the default kernel is 0.1.31's code exactly (the table read is not in it;
 // with it merely skipped at run time, the compiled default path changed its results).
 template <bool TAB>
-void rope_kernel(float* __restrict__ x, int64_t heads, int64_t dim, int64_t ld, int64_t pos0,
-                            float theta_scale, float freq_scale, float corr_low, float corr_high,
-                            float ext_factor, float mscale, const int32_t* __restrict__ mtab,
-                            strata::kernels::RopeTab rt) {
+void rope_kernel(float* __restrict__ x, int64_t heads, int64_t dim, int64_t ld, int64_t pos0, float theta_scale,
+                 float freq_scale, float corr_low, float corr_high, float ext_factor, float mscale,
+                 const int32_t* __restrict__ mtab, strata::kernels::RopeTab rt) {
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
-    const int64_t row = item_ct1.get_group(2); // t * heads + h
-    const int pair = item_ct1.get_local_id(2); // 0..31
+    const int64_t row = item_ct1.get_group(2);  // t * heads + h
+    const int pair = item_ct1.get_local_id(2);  // 0..31
     const int64_t t = row / heads, h = row % heads;
     float* p = x + t * ld + h * dim;
     float c, s;
-    if (!(TAB && strata::kernels::rope_tab_cs(rt, strata::kernels::mrope_pos(mtab, (int) (pos0 + t), pair), pair, c,
-                                              s))) {
+    if (!(TAB &&
+          strata::kernels::rope_tab_cs(rt, strata::kernels::mrope_pos(mtab, (int)(pos0 + t), pair), pair, c, s))) {
         const float theta_extrap =
-            (float)strata::kernels::mrope_pos(mtab, (int)(pos0 + t), pair) *
-            sycl::pow(theta_scale, (float)pair);
-        strata::kernels::rope_scaled_angle(theta_extrap, freq_scale, corr_low, corr_high, ext_factor, mscale,
-                                           pair, c, s);
+            (float)strata::kernels::mrope_pos(mtab, (int)(pos0 + t), pair) * sycl::pow(theta_scale, (float)pair);
+        strata::kernels::rope_scaled_angle(theta_extrap, freq_scale, corr_low, corr_high, ext_factor, mscale, pair, c,
+                                           s);
     }
     const float a = p[pair], b = p[pair + 32];
     p[pair] = a * c - b * s;
@@ -906,33 +882,26 @@ void rope_kernel(float* __restrict__ x, int64_t heads, int64_t dim, int64_t ld, 
 }
 void split_q_kernel(const float* __restrict__ qf, float* __restrict__ q, int64_t T) {
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
-    const int64_t i =
-        (int64_t)item_ct1.get_group(2) * item_ct1.get_local_range(2) +
-        item_ct1.get_local_id(2);
+    const int64_t i = (int64_t)item_ct1.get_group(2) * item_ct1.get_local_range(2) + item_ct1.get_local_id(2);
     if (i >= T * 24 * 256) return;
     const int64_t t = i / (24 * 256), h = (i / 256) % 24, d = i % 256;
     q[i] = qf[t * 24 * 512 + h * 512 + d];
 }
 void gate_attn_kernel(const float* __restrict__ a, const float* __restrict__ qf, uint16_t* __restrict__ o16,
-                                 int64_t T) {
+                      int64_t T) {
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
-    const int64_t i =
-        (int64_t)item_ct1.get_group(2) * item_ct1.get_local_range(2) +
-        item_ct1.get_local_id(2);
+    const int64_t i = (int64_t)item_ct1.get_group(2) * item_ct1.get_local_range(2) + item_ct1.get_local_id(2);
     if (i >= T * 24 * 256) return;
     const int64_t t = i / (24 * 256), h = (i / 256) % 24, d = i % 256;
-    o16[i] =
-        hf(a[i] * (1.0f / (1.0f + sycl::native::exp(
-                                      -qf[t * 24 * 512 + h * 512 + 256 + d]))));
+    o16[i] = hf(a[i] * (1.0f / (1.0f + sycl::native::exp(-qf[t * 24 * 512 + h * 512 + 256 + d]))));
 }
 
 // one block per (token, kv head, 64-value group); 64 threads. KV streaming: the pool page only if the block is
 // resident (table >= 0), and the host copy and the prompt path's staging pool (both identity layout) when given.
 void kv_append_kernel(const float* __restrict__ K, const float* __restrict__ V, int64_t pos0,
-                                 const int32_t* __restrict__ table, int64_t page_size, uint16_t* k_pool,
-                                 uint16_t* v_pool, int8_t* k_q, int8_t* v_q, uint16_t* k_scale, uint16_t* v_scale,
-                                 strata::kernels::KvHostPools host, strata::kernels::KvHostPools stage,
-                                 float *wm) {
+                      const int32_t* __restrict__ table, int64_t page_size, uint16_t* k_pool, uint16_t* v_pool,
+                      int8_t* k_q, int8_t* v_q, uint16_t* k_scale, uint16_t* v_scale, strata::kernels::KvHostPools host,
+                      strata::kernels::KvHostPools stage, float* wm) {
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
     const int64_t t = item_ct1.get_group(2);
     const int kvh = item_ct1.get_group(1), g = item_ct1.get_group(0) >> 1;
@@ -951,12 +920,10 @@ void kv_append_kernel(const float* __restrict__ K, const float* __restrict__ V, 
         return;
     }
     float a = sycl::fabs(x);
-    for (int o = 16; o > 0; o >>= 1) a = sycl::fmax(
-        a, sycl::permute_group_by_xor(
-               sycl::ext::oneapi::this_work_item::get_sub_group(), a, o));
+    for (int o = 16; o > 0; o >>= 1)
+        a = sycl::fmax(a, sycl::permute_group_by_xor(sycl::ext::oneapi::this_work_item::get_sub_group(), a, o));
 
-    if ((item_ct1.get_local_id(2) & 31) == 0)
-        wm[item_ct1.get_local_id(2) >> 5] = a;
+    if ((item_ct1.get_local_id(2) & 31) == 0) wm[item_ct1.get_local_id(2) >> 5] = a;
     /*
     DPCT1065:519: Consider replacing sycl::nd_item::barrier() with
     sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
@@ -965,60 +932,43 @@ void kv_append_kernel(const float* __restrict__ K, const float* __restrict__ V, 
     item_ct1.barrier();
     const float amax = sycl::fmax(wm[0], wm[1]);
     const uint16_t sb = hf(amax / 127.0f);
-    const float sf =
-        sycl::vec<sycl::half, 1>(sycl::bit_cast<sycl::half, unsigned short>(sb))
-            .convert<float, sycl::rounding_mode::automatic>()[0];
+    const float sf = sycl::vec<sycl::half, 1>(sycl::bit_cast<sycl::half, unsigned short>(sb))
+                         .convert<float, sycl::rounding_mode::automatic>()[0];
     int q = 0;
     if (sf > 0.0f) {
-        q = sycl::vec<float, 1>{(x / sf)}
-                .convert<int, sycl::rounding_mode::rte>()[0];
+        q = sycl::vec<float, 1>{(x / sf)}.convert<int, sycl::rounding_mode::rte>()[0];
         q = q < -127 ? -127 : (q > 127 ? 127 : q);
     }
     if (page >= 0) {
-        (is_v ? v_q : k_q)[row * 256 + d] = (int8_t) q;
-        if (item_ct1.get_local_id(2) == 0)(is_v ? v_scale
-                                                : k_scale)[row * 4 + g] = sb;
+        (is_v ? v_q : k_q)[row * 256 + d] = (int8_t)q;
+        if (item_ct1.get_local_id(2) == 0) (is_v ? v_scale : k_scale)[row * 4 + g] = sb;
     }
     if (host.k_q != nullptr) {
-        (is_v ? host.v_q : host.k_q)[row_id * 256 + d] = (int8_t) q;
-        if (item_ct1.get_local_id(2) ==
-            0)(is_v ? host.v_scale : host.k_scale)[row_id * 4 + g] = sb;
+        (is_v ? host.v_q : host.k_q)[row_id * 256 + d] = (int8_t)q;
+        if (item_ct1.get_local_id(2) == 0) (is_v ? host.v_scale : host.k_scale)[row_id * 4 + g] = sb;
     }
     if (stage.k_q != nullptr) {
-        (is_v ? stage.v_q : stage.k_q)[row_id * 256 + d] = (int8_t) q;
-        if (item_ct1.get_local_id(2) ==
-            0)(is_v ? stage.v_scale : stage.k_scale)[row_id * 4 + g] = sb;
+        (is_v ? stage.v_q : stage.k_q)[row_id * 256 + d] = (int8_t)q;
+        if (item_ct1.get_local_id(2) == 0) (is_v ? stage.v_scale : stage.k_scale)[row_id * 4 + g] = sb;
     }
 }
 void to_f16_kernel(const float* __restrict__ x, uint16_t* __restrict__ y, int64_t n) {
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
-    for (int64_t i =
-             (int64_t)item_ct1.get_group(2) * item_ct1.get_local_range(2) +
-             item_ct1.get_local_id(2);
-         i < n; i += (int64_t)item_ct1.get_group_range(2) *
-                     item_ct1.get_local_range(2))
+    for (int64_t i = (int64_t)item_ct1.get_group(2) * item_ct1.get_local_range(2) + item_ct1.get_local_id(2); i < n;
+         i += (int64_t)item_ct1.get_group_range(2) * item_ct1.get_local_range(2))
         y[i] = hf(x[i]);
 }
 void round_f16_kernel(const float* __restrict__ x, float* __restrict__ y, int64_t n) {
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
-    for (int64_t i =
-             (int64_t)item_ct1.get_group(2) * item_ct1.get_local_range(2) +
-             item_ct1.get_local_id(2);
-         i < n; i += (int64_t)item_ct1.get_group_range(2) *
-                     item_ct1.get_local_range(2))
-        y[i] = sycl::vec<sycl::half, 1>(
-                   sycl::vec<float, 1>(x[i])
-                       .convert<sycl::half, sycl::rounding_mode::rte>()[0])
+    for (int64_t i = (int64_t)item_ct1.get_group(2) * item_ct1.get_local_range(2) + item_ct1.get_local_id(2); i < n;
+         i += (int64_t)item_ct1.get_group_range(2) * item_ct1.get_local_range(2))
+        y[i] = sycl::vec<sycl::half, 1>(sycl::vec<float, 1>(x[i]).convert<sycl::half, sycl::rounding_mode::rte>()[0])
                    .convert<float, sycl::rounding_mode::automatic>()[0];
 }
-void to_bf16_kernel(const float* __restrict__ x, uint16_t* __restrict__ y, uint16_t* __restrict__ ylo,
-                               int64_t n) {
+void to_bf16_kernel(const float* __restrict__ x, uint16_t* __restrict__ y, uint16_t* __restrict__ ylo, int64_t n) {
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
-    for (int64_t i =
-             (int64_t)item_ct1.get_group(2) * item_ct1.get_local_range(2) +
-             item_ct1.get_local_id(2);
-         i < n; i += (int64_t)item_ct1.get_group_range(2) *
-                     item_ct1.get_local_range(2)) {
+    for (int64_t i = (int64_t)item_ct1.get_group(2) * item_ct1.get_local_range(2) + item_ct1.get_local_id(2); i < n;
+         i += (int64_t)item_ct1.get_group_range(2) * item_ct1.get_local_range(2)) {
         const uint16_t h = bf(x[i]);
         y[i] = h;
         if (ylo) ylo[i] = bf_lo(x[i], h);
@@ -1031,563 +981,393 @@ void kv_append(const float* K, const float* V, int64_t T, int64_t pos0, const in
                uint16_t* k_pool, uint16_t* v_pool, int8_t* k_q, int8_t* v_q, uint16_t* k_scale, uint16_t* v_scale,
                void* stream, const strata::kernels::KvHostPools* host, const strata::kernels::KvHostPools* stage) {
     if (T <= 0) return;
-    static_cast<sycl::queue*>(stream)->submit([&](sycl::handler &cgh) {
+    static_cast<sycl::queue*>(stream)->submit([&](sycl::handler& cgh) {
         sycl::local_accessor<float, 1> wm_acc_ct1(sycl::range<1>(2), cgh);
 
         strata::kernels::KvHostPools host_host_strata_kernels_KvHostPools_ct11 =
             host ? *host : strata::kernels::KvHostPools{};
-        strata::kernels::KvHostPools
-            stage_stage_strata_kernels_KvHostPools_ct12 =
-                stage ? *stage : strata::kernels::KvHostPools{};
+        strata::kernels::KvHostPools stage_stage_strata_kernels_KvHostPools_ct12 =
+            stage ? *stage : strata::kernels::KvHostPools{};
 
         cgh.parallel_for(
-            sycl::nd_range<3>(sycl::range<3>(8, 2, (unsigned)T) *
-                                  sycl::range<3>(1, 1, 64),
-                              sycl::range<3>(1, 1, 64)),
+            sycl::nd_range<3>(sycl::range<3>(8, 2, (unsigned)T) * sycl::range<3>(1, 1, 64), sycl::range<3>(1, 1, 64)),
             [=](sycl::nd_item<3> /*item_ct1*/) [[sycl::reqd_sub_group_size(32)]] {
-                kv_append_kernel(
-                    K, V, pos0, page_table, page_size, k_pool, v_pool, k_q, v_q,
-                    k_scale, v_scale, host_host_strata_kernels_KvHostPools_ct11,
-                    stage_stage_strata_kernels_KvHostPools_ct12,
-                    wm_acc_ct1.get_multi_ptr<sycl::access::decorated::no>()
-                        .get());
+                kv_append_kernel(K, V, pos0, page_table, page_size, k_pool, v_pool, k_q, v_q, k_scale, v_scale,
+                                 host_host_strata_kernels_KvHostPools_ct11, stage_stage_strata_kernels_KvHostPools_ct12,
+                                 wm_acc_ct1.get_multi_ptr<sycl::access::decorated::no>().get());
             });
     });
     check("kv_append");
 }
 void to_f16(const float* x, uint16_t* y, int64_t n, void* stream) {
     if (n <= 0) return;
-    static_cast<sycl::queue*>(stream)
-        ->parallel_for(
-            sycl::nd_range<3>(sycl::range<3>(1, 1,
-                                             (unsigned)((n + 255) / 256 < 4096
-                                                            ? (n + 255) / 256
-                                                            : 4096)) *
-                                  sycl::range<3>(1, 1, 256),
-                              sycl::range<3>(1, 1, 256)),
-            [=](sycl::nd_item<3> /*item_ct1*/) {
-                to_f16_kernel(x, y, n);
-            });
+    static_cast<sycl::queue*>(stream)->parallel_for(
+        sycl::nd_range<3>(sycl::range<3>(1, 1, (unsigned)((n + 255) / 256 < 4096 ? (n + 255) / 256 : 4096)) *
+                              sycl::range<3>(1, 1, 256),
+                          sycl::range<3>(1, 1, 256)),
+        [=](sycl::nd_item<3> /*item_ct1*/) { to_f16_kernel(x, y, n); });
     check("to_f16");
 }
 void round_f16(const float* x, float* y, int64_t n, void* stream) {
     if (n <= 0) return;
-    static_cast<sycl::queue*>(stream)
-        ->parallel_for(
-            sycl::nd_range<3>(sycl::range<3>(1, 1,
-                                             (unsigned)((n + 255) / 256 < 4096
-                                                            ? (n + 255) / 256
-                                                            : 4096)) *
-                                  sycl::range<3>(1, 1, 256),
-                              sycl::range<3>(1, 1, 256)),
-            [=](sycl::nd_item<3> /*item_ct1*/) {
-                round_f16_kernel(x, y, n);
-            });
+    static_cast<sycl::queue*>(stream)->parallel_for(
+        sycl::nd_range<3>(sycl::range<3>(1, 1, (unsigned)((n + 255) / 256 < 4096 ? (n + 255) / 256 : 4096)) *
+                              sycl::range<3>(1, 1, 256),
+                          sycl::range<3>(1, 1, 256)),
+        [=](sycl::nd_item<3> /*item_ct1*/) { round_f16_kernel(x, y, n); });
     check("round_f16");
 }
 void to_bf16(const float* x, uint16_t* y, int64_t n, void* stream, uint16_t* ylo) {
     if (n <= 0) return;
-    static_cast<sycl::queue*>(stream)
-        ->parallel_for(
-            sycl::nd_range<3>(sycl::range<3>(1, 1,
-                                             (unsigned)((n + 255) / 256 < 4096
-                                                            ? (n + 255) / 256
-                                                            : 4096)) *
-                                  sycl::range<3>(1, 1, 256),
-                              sycl::range<3>(1, 1, 256)),
-            [=](sycl::nd_item<3> /*item_ct1*/) {
-                to_bf16_kernel(x, y, ylo, n);
-            });
+    static_cast<sycl::queue*>(stream)->parallel_for(
+        sycl::nd_range<3>(sycl::range<3>(1, 1, (unsigned)((n + 255) / 256 < 4096 ? (n + 255) / 256 : 4096)) *
+                              sycl::range<3>(1, 1, 256),
+                          sycl::range<3>(1, 1, 256)),
+        [=](sycl::nd_item<3> /*item_ct1*/) { to_bf16_kernel(x, y, ylo, n); });
     check("to_bf16");
 }
 
 void gr_norm(const float* R, const float* w_norm, float eps, float* xn, uint16_t* xn16, int64_t T, void* stream,
              uint16_t* xn16_lo) {
-    static_cast<sycl::queue*>(stream)->submit([&](sycl::handler &cgh) {
+    static_cast<sycl::queue*>(stream)->submit([&](sycl::handler& cgh) {
         sycl::local_accessor<float, 1> sh_acc_ct1(sycl::range<1>(32), cgh);
 
-        cgh.parallel_for(
-            sycl::nd_range<3>(sycl::range<3>(1, 1, (unsigned)(T * HC)) *
-                                  sycl::range<3>(1, 1, 256),
-                              sycl::range<3>(1, 1, 256)),
-            [=](sycl::nd_item<3> /*item_ct1*/) [[sycl::reqd_sub_group_size(32)]] {
-                gr_norm_kernel(
-                    R, w_norm, eps, xn, xn16, xn16_lo,
-                    sh_acc_ct1.get_multi_ptr<sycl::access::decorated::no>()
-                        .get());
-            });
+        cgh.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, (unsigned)(T * HC)) * sycl::range<3>(1, 1, 256),
+                                           sycl::range<3>(1, 1, 256)),
+                         [=](sycl::nd_item<3> /*item_ct1*/) [[sycl::reqd_sub_group_size(32)]] {
+                             gr_norm_kernel(R, w_norm, eps, xn, xn16, xn16_lo,
+                                            sh_acc_ct1.get_multi_ptr<sycl::access::decorated::no>().get());
+                         });
     });
     check("gr_norm");
 }
 void gr_norm_rs(const float* R, const float* w_norm, float eps, float* rs, uint16_t* xn16, int64_t T, void* stream,
                 uint16_t* xn16_lo) {
-    static_cast<sycl::queue*>(stream)->submit([&](sycl::handler &cgh) {
+    static_cast<sycl::queue*>(stream)->submit([&](sycl::handler& cgh) {
         sycl::local_accessor<float, 1> sh_acc_ct1(sycl::range<1>(32), cgh);
 
-        cgh.parallel_for(
-            sycl::nd_range<3>(sycl::range<3>(1, 1, (unsigned)(T * HC)) *
-                                  sycl::range<3>(1, 1, 256),
-                              sycl::range<3>(1, 1, 256)),
-            [=](sycl::nd_item<3> /*item_ct1*/) [[sycl::reqd_sub_group_size(32)]] {
-                gr_norm_rs_kernel(
-                    R, w_norm, eps, rs, xn16, xn16_lo,
-                    sh_acc_ct1.get_multi_ptr<sycl::access::decorated::no>()
-                        .get());
-            });
+        cgh.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, (unsigned)(T * HC)) * sycl::range<3>(1, 1, 256),
+                                           sycl::range<3>(1, 1, 256)),
+                         [=](sycl::nd_item<3> /*item_ct1*/) [[sycl::reqd_sub_group_size(32)]] {
+                             gr_norm_rs_kernel(R, w_norm, eps, rs, xn16, xn16_lo,
+                                               sh_acc_ct1.get_multi_ptr<sycl::access::decorated::no>().get());
+                         });
     });
     check("gr_norm_rs");
 }
 void gr_mix_r(const float* R, const float* rs, const float* w_norm, const float* gated, float* mixed, uint16_t* mixed16,
               int64_t T, void* stream, uint16_t* mixed_h, uint16_t* mixed16_lo) {
-    static_cast<sycl::queue*>(stream)
-        ->parallel_for(
-            sycl::nd_range<3>(sycl::range<3>(1, 1, blocks_for(T * N)) *
-                                  sycl::range<3>(1, 1, 256),
-                              sycl::range<3>(1, 1, 256)),
-            [=](sycl::nd_item<3> /*item_ct1*/) {
-                gr_mix_r_kernel(R, rs, w_norm, gated, mixed, mixed16, T,
-                                mixed_h, mixed16_lo);
-            });
+    static_cast<sycl::queue*>(stream)->parallel_for(
+        sycl::nd_range<3>(sycl::range<3>(1, 1, blocks_for(T * N)) * sycl::range<3>(1, 1, 256),
+                          sycl::range<3>(1, 1, 256)),
+        [=](sycl::nd_item<3> /*item_ct1*/) {
+            gr_mix_r_kernel(R, rs, w_norm, gated, mixed, mixed16, T, mixed_h, mixed16_lo);
+        });
     check("gr_mix_r");
 }
 void gr_write_norm_rs(float* R, const float* bo, const float* inj, int64_t inj_ld, const float* w_norm_next, float eps,
                       float* rs, uint16_t* xn16, int64_t T, void* stream, uint16_t* xn16_lo) {
-    static_cast<sycl::queue*>(stream)->submit([&](sycl::handler &cgh) {
+    static_cast<sycl::queue*>(stream)->submit([&](sycl::handler& cgh) {
         sycl::local_accessor<float, 1> sh_acc_ct1(sycl::range<1>(32), cgh);
 
-        cgh.parallel_for(
-            sycl::nd_range<3>(sycl::range<3>(1, 1, (unsigned)(T * HC)) *
-                                  sycl::range<3>(1, 1, 256),
-                              sycl::range<3>(1, 1, 256)),
-            [=](sycl::nd_item<3> /*item_ct1*/) [[sycl::reqd_sub_group_size(32)]] {
-                gr_write_norm_rs_kernel(
-                    R, bo, inj, inj_ld, w_norm_next, eps, rs, xn16, xn16_lo,
-                    sh_acc_ct1.get_multi_ptr<sycl::access::decorated::no>()
-                        .get());
-            });
+        cgh.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, (unsigned)(T * HC)) * sycl::range<3>(1, 1, 256),
+                                           sycl::range<3>(1, 1, 256)),
+                         [=](sycl::nd_item<3> /*item_ct1*/) [[sycl::reqd_sub_group_size(32)]] {
+                             gr_write_norm_rs_kernel(R, bo, inj, inj_ld, w_norm_next, eps, rs, xn16, xn16_lo,
+                                                     sh_acc_ct1.get_multi_ptr<sycl::access::decorated::no>().get());
+                         });
     });
     check("gr_write_norm_rs");
 }
 void gr_silu(const float* lo, uint16_t* lo16, int64_t T, void* stream, uint16_t* lo16_lo) {
-    static_cast<sycl::queue*>(stream)->submit([&](sycl::handler &cgh) {
+    static_cast<sycl::queue*>(stream)->submit([&](sycl::handler& cgh) {
         auto T_LR_ct3 = T * LR;
 
-        cgh.parallel_for(
-            sycl::nd_range<3>(sycl::range<3>(1, 1, blocks_for(T * LR)) *
-                                  sycl::range<3>(1, 1, 256),
-                              sycl::range<3>(1, 1, 256)),
-            [=](sycl::nd_item<3> /*item_ct1*/) {
-                gr_silu_kernel(lo, lo16, lo16_lo, T_LR_ct3);
-            });
+        cgh.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, blocks_for(T * LR)) * sycl::range<3>(1, 1, 256),
+                                           sycl::range<3>(1, 1, 256)),
+                         [=](sycl::nd_item<3> /*item_ct1*/) { gr_silu_kernel(lo, lo16, lo16_lo, T_LR_ct3); });
     });
     check("gr_silu");
 }
 void gr_mix(const float* xn, const float* gated, float* mixed, uint16_t* mixed16, int64_t T, void* stream,
             uint16_t* mixed_h, uint16_t* mixed16_lo) {
-    static_cast<sycl::queue*>(stream)
-        ->parallel_for(
-            sycl::nd_range<3>(sycl::range<3>(1, 1, blocks_for(T * N)) *
-                                  sycl::range<3>(1, 1, 256),
-                              sycl::range<3>(1, 1, 256)),
-            [=](sycl::nd_item<3> /*item_ct1*/) {
-                gr_mix_kernel(xn, gated, mixed, mixed16, T, mixed_h,
-                              mixed16_lo);
-            });
+    static_cast<sycl::queue*>(stream)->parallel_for(
+        sycl::nd_range<3>(sycl::range<3>(1, 1, blocks_for(T * N)) * sycl::range<3>(1, 1, 256),
+                          sycl::range<3>(1, 1, 256)),
+        [=](sycl::nd_item<3> /*item_ct1*/) { gr_mix_kernel(xn, gated, mixed, mixed16, T, mixed_h, mixed16_lo); });
     check("gr_mix");
 }
 void gr_write(float* R, const float* bo, const float* inj, int64_t inj_ld, int64_t T, void* stream) {
-    static_cast<sycl::queue*>(stream)
-        ->parallel_for(
-            sycl::nd_range<3>(sycl::range<3>(1, 1, blocks_for(T * D)) *
-                                  sycl::range<3>(1, 1, 256),
-                              sycl::range<3>(1, 1, 256)),
-            [=](sycl::nd_item<3> /*item_ct1*/) {
-                gr_write_kernel(R, bo, inj, inj_ld, T);
-            });
+    static_cast<sycl::queue*>(stream)->parallel_for(
+        sycl::nd_range<3>(sycl::range<3>(1, 1, blocks_for(T * D)) * sycl::range<3>(1, 1, 256),
+                          sycl::range<3>(1, 1, 256)),
+        [=](sycl::nd_item<3> /*item_ct1*/) { gr_write_kernel(R, bo, inj, inj_ld, T); });
     check("gr_write");
 }
 void gr_broadcast(const float* e, float* R, int64_t T, void* stream) {
-    static_cast<sycl::queue*>(stream)
-        ->parallel_for(
-            sycl::nd_range<3>(sycl::range<3>(1, 1, blocks_for(T * D)) *
-                                  sycl::range<3>(1, 1, 256),
-                              sycl::range<3>(1, 1, 256)),
-            [=](sycl::nd_item<3> /*item_ct1*/) {
-                gr_broadcast_kernel(e, R, T);
-            });
+    static_cast<sycl::queue*>(stream)->parallel_for(
+        sycl::nd_range<3>(sycl::range<3>(1, 1, blocks_for(T * D)) * sycl::range<3>(1, 1, 256),
+                          sycl::range<3>(1, 1, 256)),
+        [=](sycl::nd_item<3> /*item_ct1*/) { gr_broadcast_kernel(e, R, T); });
     check("gr_broadcast");
 }
-void gdn_gates(const float* ab, const float* dt, const float* ssm_a, float* gate, float* beta, int64_t T, void* stream) {
-    static_cast<sycl::queue*>(stream)
-        ->parallel_for(
-            sycl::nd_range<3>(sycl::range<3>(1, 1, blocks_for(T * HV)) *
-                                  sycl::range<3>(1, 1, 256),
-                              sycl::range<3>(1, 1, 256)),
-            [=](sycl::nd_item<3> /*item_ct1*/) {
-                gdn_gates_kernel(ab, dt, ssm_a, gate, beta, T);
-            });
+void gdn_gates(const float* ab, const float* dt, const float* ssm_a, float* gate, float* beta, int64_t T,
+               void* stream) {
+    static_cast<sycl::queue*>(stream)->parallel_for(
+        sycl::nd_range<3>(sycl::range<3>(1, 1, blocks_for(T * HV)) * sycl::range<3>(1, 1, 256),
+                          sycl::range<3>(1, 1, 256)),
+        [=](sycl::nd_item<3> /*item_ct1*/) { gdn_gates_kernel(ab, dt, ssm_a, gate, beta, T); });
     check("gdn_gates");
 }
 void gdn_conv(float* history, const float* qkv, const float* conv_w, float* h, int64_t T, float eps, void* stream) {
-    static const bool serial = std::getenv("STRATA_GDN_CONV_SERIAL") != nullptr;   // the old walk (A/B)
+    static const bool serial = std::getenv("STRATA_GDN_CONV_SERIAL") != nullptr;  // the old walk (A/B)
     if (serial || T <= CONV_TILE) {
-        static_cast<sycl::queue*>(stream)
-            ->parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, C / 128) *
-                                                 sycl::range<3>(1, 1, 128),
-                                             sycl::range<3>(1, 1, 128)),
-                           [=](sycl::nd_item<3> /*item_ct1*/) {
-                               gdn_conv_kernel(history, qkv, conv_w, h, T);
-                           });
+        static_cast<sycl::queue*>(stream)->parallel_for(
+            sycl::nd_range<3>(sycl::range<3>(1, 1, C / 128) * sycl::range<3>(1, 1, 128), sycl::range<3>(1, 1, 128)),
+            [=](sycl::nd_item<3> /*item_ct1*/) { gdn_conv_kernel(history, qkv, conv_w, h, T); });
     } else {
-        static_cast<sycl::queue*>(stream)
-            ->parallel_for(
-                sycl::nd_range<3>(
-                    sycl::range<3>(1,
-                                   (unsigned)((T + CONV_TILE - 1) / CONV_TILE),
-                                   C / 128) *
-                        sycl::range<3>(1, 1, 128),
-                    sycl::range<3>(1, 1, 128)),
-                [=](sycl::nd_item<3> /*item_ct1*/) {
-                    gdn_conv_tiled_kernel(history, qkv, conv_w, h, T);
-                });
-        static_cast<sycl::queue*>(stream)
-            ->parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, C / 128) *
-                                                 sycl::range<3>(1, 1, 128),
-                                             sycl::range<3>(1, 1, 128)),
-                           [=](sycl::nd_item<3> /*item_ct1*/) {
-                               gdn_conv_hist_kernel(history, qkv, T);
-                           });
+        static_cast<sycl::queue*>(stream)->parallel_for(
+            sycl::nd_range<3>(sycl::range<3>(1, (unsigned)((T + CONV_TILE - 1) / CONV_TILE), C / 128) *
+                                  sycl::range<3>(1, 1, 128),
+                              sycl::range<3>(1, 1, 128)),
+            [=](sycl::nd_item<3> /*item_ct1*/) { gdn_conv_tiled_kernel(history, qkv, conv_w, h, T); });
+        static_cast<sycl::queue*>(stream)->parallel_for(
+            sycl::nd_range<3>(sycl::range<3>(1, 1, C / 128) * sycl::range<3>(1, 1, 128), sycl::range<3>(1, 1, 128)),
+            [=](sycl::nd_item<3> /*item_ct1*/) { gdn_conv_hist_kernel(history, qkv, T); });
     }
-    static_cast<sycl::queue*>(stream)->submit([&](sycl::handler &cgh) {
+    static_cast<sycl::queue*>(stream)->submit([&](sycl::handler& cgh) {
         sycl::local_accessor<float, 1> part_acc_ct1(sycl::range<1>(4), cgh);
 
-        cgh.parallel_for(
-            sycl::nd_range<3>(sycl::range<3>(1, (unsigned)T, 2 * HK) *
-                                  sycl::range<3>(1, 1, S),
-                              sycl::range<3>(1, 1, S)),
-            [=](sycl::nd_item<3> /*item_ct1*/) [[sycl::reqd_sub_group_size(32)]] {
-                gdn_l2_kernel(
-                    h, eps,
-                    part_acc_ct1.get_multi_ptr<sycl::access::decorated::no>()
-                        .get());
-            });
+        cgh.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, (unsigned)T, 2 * HK) * sycl::range<3>(1, 1, S),
+                                           sycl::range<3>(1, 1, S)),
+                         [=](sycl::nd_item<3> /*item_ct1*/) [[sycl::reqd_sub_group_size(32)]] {
+                             gdn_l2_kernel(h, eps, part_acc_ct1.get_multi_ptr<sycl::access::decorated::no>().get());
+                         });
     });
     check("gdn_conv");
 }
 void gdn_recurrence(float* state, const float* h, const float* gate, const float* beta, const float* z,
                     const float* gamma, float eps, float* y, uint16_t* y16, int64_t T, void* stream) {
-    static const bool serial = std::getenv("STRATA_GDN_REC_HEADS") != nullptr;   // the one-block-per-head kernel (A/B)
+    static const bool serial = std::getenv("STRATA_GDN_REC_HEADS") != nullptr;  // the one-block-per-head kernel (A/B)
     if (serial || T <= 0) {
         /*
         DPCT1049:61: The work-group size passed to the SYCL kernel may exceed
         the limit. To get the device limit, query
         info::device::max_work_group_size. Adjust the work-group size if needed.
         */
-        static_cast<sycl::queue*>(stream)
-            ->submit([&](sycl::handler &cgh) {
-                /*
-                DPCT1101:554: 'S' expression was replaced with a value. Modify
-                the code to use the original expression, provided in comments,
-                if it is correct.
-                */
-                sycl::local_accessor<float, 1> sk_acc_ct1(
-                    sycl::range<1>(128 /*S*/), cgh);
-                /*
-                DPCT1101:555: 'S' expression was replaced with a value. Modify
-                the code to use the original expression, provided in comments,
-                if it is correct.
-                */
-                sycl::local_accessor<float, 1> sq_acc_ct1(
-                    sycl::range<1>(128 /*S*/), cgh);
-                /*
-                DPCT1101:556: 'RG' expression was replaced with a value. Modify
-                the code to use the original expression, provided in comments,
-                if it is correct.
-                */
-                /*
-                DPCT1101:557: 'S' expression was replaced with a value. Modify
-                the code to use the original expression, provided in comments,
-                if it is correct.
-                */
-                sycl::local_accessor<float[4 /*RG*/][128 /*S*/], 0> red_acc_ct1(
-                    cgh);
-                sycl::local_accessor<float, 1> wsum_acc_ct1(sycl::range<1>(16),
-                                                            cgh);
+        static_cast<sycl::queue*>(stream)->submit([&](sycl::handler& cgh) {
+            /*
+            DPCT1101:554: 'S' expression was replaced with a value. Modify
+            the code to use the original expression, provided in comments,
+            if it is correct.
+            */
+            sycl::local_accessor<float, 1> sk_acc_ct1(sycl::range<1>(128 /*S*/), cgh);
+            /*
+            DPCT1101:555: 'S' expression was replaced with a value. Modify
+            the code to use the original expression, provided in comments,
+            if it is correct.
+            */
+            sycl::local_accessor<float, 1> sq_acc_ct1(sycl::range<1>(128 /*S*/), cgh);
+            /*
+            DPCT1101:556: 'RG' expression was replaced with a value. Modify
+            the code to use the original expression, provided in comments,
+            if it is correct.
+            */
+            /*
+            DPCT1101:557: 'S' expression was replaced with a value. Modify
+            the code to use the original expression, provided in comments,
+            if it is correct.
+            */
+            sycl::local_accessor<float[4 /*RG*/][128 /*S*/], 0> red_acc_ct1(cgh);
+            sycl::local_accessor<float, 1> wsum_acc_ct1(sycl::range<1>(16), cgh);
 
-                cgh.parallel_for(
-                    sycl::nd_range<3>(sycl::range<3>(1, 1, HV) *
-                                          sycl::range<3>(1, RG, S),
-                                      sycl::range<3>(1, RG, S)),
-                    [=](sycl::nd_item<3> /*item_ct1*/) [[sycl::reqd_sub_group_size(
-                        32)]] {
-                        gdn_rec_kernel(
-                            state, h, gate, beta, z, gamma, eps, y, y16, T,
-                            sk_acc_ct1
-                                .get_multi_ptr<sycl::access::decorated::no>()
-                                .get(),
-                            sq_acc_ct1
-                                .get_multi_ptr<sycl::access::decorated::no>()
-                                .get(),
-                            red_acc_ct1,
-                            wsum_acc_ct1
-                                .get_multi_ptr<sycl::access::decorated::no>()
-                                .get());
-                    });
-            });
+            cgh.parallel_for(
+                sycl::nd_range<3>(sycl::range<3>(1, 1, HV) * sycl::range<3>(1, RG, S), sycl::range<3>(1, RG, S)),
+                [=](sycl::nd_item<3> /*item_ct1*/) [[sycl::reqd_sub_group_size(32)]] {
+                    gdn_rec_kernel(state, h, gate, beta, z, gamma, eps, y, y16, T,
+                                   sk_acc_ct1.get_multi_ptr<sycl::access::decorated::no>().get(),
+                                   sq_acc_ct1.get_multi_ptr<sycl::access::decorated::no>().get(), red_acc_ct1,
+                                   wsum_acc_ct1.get_multi_ptr<sycl::access::decorated::no>().get());
+                });
+        });
     } else {
-        static const bool pipe = [] { const char* v = std::getenv("STRATA_GDN_PIPELINE"); return v == nullptr || std::atoi(v) != 0; }();
-        if (pipe)   // the software-pipelined loads (same bits)
-            static_cast<sycl::queue*>(stream)
-                ->submit([&](sycl::handler &cgh) {
-                    /*
-                    DPCT1101:558: 'S' expression was replaced with a value.
-                    Modify the code to use the original expression, provided in
-                    comments, if it is correct.
-                    */
-                    sycl::local_accessor<float, 1> sk_acc_ct1(
-                        sycl::range<1>(128 /*S*/), cgh);
-                    /*
-                    DPCT1101:559: 'S' expression was replaced with a value.
-                    Modify the code to use the original expression, provided in
-                    comments, if it is correct.
-                    */
-                    sycl::local_accessor<float, 1> sq_acc_ct1(
-                        sycl::range<1>(128 /*S*/), cgh);
-                    /*
-                    DPCT1101:560: 'RG' expression was replaced with a value.
-                    Modify the code to use the original expression, provided in
-                    comments, if it is correct.
-                    */
-                    /*
-                    DPCT1101:561: 'CB' expression was replaced with a value.
-                    Modify the code to use the original expression, provided in
-                    comments, if it is correct.
-                    */
-                    sycl::local_accessor<float[4 /*RG*/][32 /*CB*/], 0>
-                        red_acc_ct1(cgh);
+        static const bool pipe = [] {
+            const char* v = std::getenv("STRATA_GDN_PIPELINE");
+            return v == nullptr || std::atoi(v) != 0;
+        }();
+        if (pipe)  // the software-pipelined loads (same bits)
+            static_cast<sycl::queue*>(stream)->submit([&](sycl::handler& cgh) {
+                /*
+                DPCT1101:558: 'S' expression was replaced with a value.
+                Modify the code to use the original expression, provided in
+                comments, if it is correct.
+                */
+                sycl::local_accessor<float, 1> sk_acc_ct1(sycl::range<1>(128 /*S*/), cgh);
+                /*
+                DPCT1101:559: 'S' expression was replaced with a value.
+                Modify the code to use the original expression, provided in
+                comments, if it is correct.
+                */
+                sycl::local_accessor<float, 1> sq_acc_ct1(sycl::range<1>(128 /*S*/), cgh);
+                /*
+                DPCT1101:560: 'RG' expression was replaced with a value.
+                Modify the code to use the original expression, provided in
+                comments, if it is correct.
+                */
+                /*
+                DPCT1101:561: 'CB' expression was replaced with a value.
+                Modify the code to use the original expression, provided in
+                comments, if it is correct.
+                */
+                sycl::local_accessor<float[4 /*RG*/][32 /*CB*/], 0> red_acc_ct1(cgh);
 
-                    cgh.parallel_for(
-                        sycl::nd_range<3>(sycl::range<3>(1, 1, HV * NCB) *
-                                              sycl::range<3>(1, RG, CB),
-                                          sycl::range<3>(1, RG, CB)),
-                        [=](sycl::nd_item<3> /*item_ct1*/) {
-                            gdn_rec_cols_pipe_kernel(
-                                state, h, gate, beta, y, T,
-                                sk_acc_ct1
-                                    .get_multi_ptr<
-                                        sycl::access::decorated::no>()
-                                    .get(),
-                                sq_acc_ct1
-                                    .get_multi_ptr<
-                                        sycl::access::decorated::no>()
-                                    .get(),
-                                red_acc_ct1);
-                        });
-                });
-        else
-            static_cast<sycl::queue*>(stream)
-                ->submit([&](sycl::handler &cgh) {
-                    /*
-                    DPCT1101:562: 'S' expression was replaced with a value.
-                    Modify the code to use the original expression, provided in
-                    comments, if it is correct.
-                    */
-                    sycl::local_accessor<float, 1> sk_acc_ct1(
-                        sycl::range<1>(128 /*S*/), cgh);
-                    /*
-                    DPCT1101:563: 'S' expression was replaced with a value.
-                    Modify the code to use the original expression, provided in
-                    comments, if it is correct.
-                    */
-                    sycl::local_accessor<float, 1> sq_acc_ct1(
-                        sycl::range<1>(128 /*S*/), cgh);
-                    /*
-                    DPCT1101:564: 'RG' expression was replaced with a value.
-                    Modify the code to use the original expression, provided in
-                    comments, if it is correct.
-                    */
-                    /*
-                    DPCT1101:565: 'CB' expression was replaced with a value.
-                    Modify the code to use the original expression, provided in
-                    comments, if it is correct.
-                    */
-                    sycl::local_accessor<float[4 /*RG*/][32 /*CB*/], 0>
-                        red_acc_ct1(cgh);
-
-                    cgh.parallel_for(
-                        sycl::nd_range<3>(sycl::range<3>(1, 1, HV * NCB) *
-                                              sycl::range<3>(1, RG, CB),
-                                          sycl::range<3>(1, RG, CB)),
-                        [=](sycl::nd_item<3> /*item_ct1*/) {
-                            gdn_rec_cols_kernel(
-                                state, h, gate, beta, y, T,
-                                sk_acc_ct1
-                                    .get_multi_ptr<
-                                        sycl::access::decorated::no>()
-                                    .get(),
-                                sq_acc_ct1
-                                    .get_multi_ptr<
-                                        sycl::access::decorated::no>()
-                                    .get(),
-                                red_acc_ct1);
-                        });
-                });
-        static_cast<sycl::queue*>(stream)
-            ->submit([&](sycl::handler &cgh) {
-                sycl::local_accessor<float, 1> wsum_acc_ct1(sycl::range<1>(4),
-                                                            cgh);
-
-                cgh.parallel_for(
-                    sycl::nd_range<3>(sycl::range<3>(1, HV, (unsigned)T) *
-                                          sycl::range<3>(1, 1, S),
-                                      sycl::range<3>(1, 1, S)),
-                    [=](sycl::nd_item<3> /*item_ct1*/) [[sycl::reqd_sub_group_size(
-                        32)]] {
-                        gdn_out_norm_kernel(
-                            z, gamma, eps, y, y16,
-                            wsum_acc_ct1
-                                .get_multi_ptr<sycl::access::decorated::no>()
-                                .get());
-                    });
+                cgh.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, HV * NCB) * sycl::range<3>(1, RG, CB),
+                                                   sycl::range<3>(1, RG, CB)),
+                                 [=](sycl::nd_item<3> /*item_ct1*/) {
+                                     gdn_rec_cols_pipe_kernel(
+                                         state, h, gate, beta, y, T,
+                                         sk_acc_ct1.get_multi_ptr<sycl::access::decorated::no>().get(),
+                                         sq_acc_ct1.get_multi_ptr<sycl::access::decorated::no>().get(), red_acc_ct1);
+                                 });
             });
+        else
+            static_cast<sycl::queue*>(stream)->submit([&](sycl::handler& cgh) {
+                /*
+                DPCT1101:562: 'S' expression was replaced with a value.
+                Modify the code to use the original expression, provided in
+                comments, if it is correct.
+                */
+                sycl::local_accessor<float, 1> sk_acc_ct1(sycl::range<1>(128 /*S*/), cgh);
+                /*
+                DPCT1101:563: 'S' expression was replaced with a value.
+                Modify the code to use the original expression, provided in
+                comments, if it is correct.
+                */
+                sycl::local_accessor<float, 1> sq_acc_ct1(sycl::range<1>(128 /*S*/), cgh);
+                /*
+                DPCT1101:564: 'RG' expression was replaced with a value.
+                Modify the code to use the original expression, provided in
+                comments, if it is correct.
+                */
+                /*
+                DPCT1101:565: 'CB' expression was replaced with a value.
+                Modify the code to use the original expression, provided in
+                comments, if it is correct.
+                */
+                sycl::local_accessor<float[4 /*RG*/][32 /*CB*/], 0> red_acc_ct1(cgh);
+
+                cgh.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, HV * NCB) * sycl::range<3>(1, RG, CB),
+                                                   sycl::range<3>(1, RG, CB)),
+                                 [=](sycl::nd_item<3> /*item_ct1*/) {
+                                     gdn_rec_cols_kernel(state, h, gate, beta, y, T,
+                                                         sk_acc_ct1.get_multi_ptr<sycl::access::decorated::no>().get(),
+                                                         sq_acc_ct1.get_multi_ptr<sycl::access::decorated::no>().get(),
+                                                         red_acc_ct1);
+                                 });
+            });
+        static_cast<sycl::queue*>(stream)->submit([&](sycl::handler& cgh) {
+            sycl::local_accessor<float, 1> wsum_acc_ct1(sycl::range<1>(4), cgh);
+
+            cgh.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, HV, (unsigned)T) * sycl::range<3>(1, 1, S),
+                                               sycl::range<3>(1, 1, S)),
+                             [=](sycl::nd_item<3> /*item_ct1*/) [[sycl::reqd_sub_group_size(32)]] {
+                                 gdn_out_norm_kernel(z, gamma, eps, y, y16,
+                                                     wsum_acc_ct1.get_multi_ptr<sycl::access::decorated::no>().get());
+                             });
+        });
     }
     check("gdn_recurrence");
 }
 void route(const float* logits, int32_t* ids, float* weights, int64_t T, int64_t n_expert, void* stream) {
     if (n_expert == 512)
-        static_cast<sycl::queue*>(stream)
-            ->parallel_for(sycl::nd_range<3>(
-                               sycl::range<3>(1, 1, (unsigned)((T + 7) / 8)) *
-                                   sycl::range<3>(1, 1, 256),
-                               sycl::range<3>(1, 1, 256)),
-                           [=](sycl::nd_item<3> /*item_ct1*/)
-                               [[sycl::reqd_sub_group_size(32)]] {
-                                   route_kernel<16>(logits, ids, weights, T);
-                               });
+        static_cast<sycl::queue*>(stream)->parallel_for(
+            sycl::nd_range<3>(sycl::range<3>(1, 1, (unsigned)((T + 7) / 8)) * sycl::range<3>(1, 1, 256),
+                              sycl::range<3>(1, 1, 256)),
+            [=](sycl::nd_item<3> /*item_ct1*/)
+                [[sycl::reqd_sub_group_size(32)]] { route_kernel<16>(logits, ids, weights, T); });
     else if (n_expert == 256)
-        static_cast<sycl::queue*>(stream)
-            ->parallel_for(sycl::nd_range<3>(
-                               sycl::range<3>(1, 1, (unsigned)((T + 7) / 8)) *
-                                   sycl::range<3>(1, 1, 256),
-                               sycl::range<3>(1, 1, 256)),
-                           [=](sycl::nd_item<3> /*item_ct1*/)
-                               [[sycl::reqd_sub_group_size(32)]] {
-                                   route_kernel<8>(logits, ids, weights, T);
-                               });
+        static_cast<sycl::queue*>(stream)->parallel_for(
+            sycl::nd_range<3>(sycl::range<3>(1, 1, (unsigned)((T + 7) / 8)) * sycl::range<3>(1, 1, 256),
+                              sycl::range<3>(1, 1, 256)),
+            [=](sycl::nd_item<3> /*item_ct1*/)
+                [[sycl::reqd_sub_group_size(32)]] { route_kernel<8>(logits, ids, weights, T); });
     else
-        strata::kernels::router_top10(logits, (int) T, (int) n_expert, 10, ids, weights, stream);
+        strata::kernels::router_top10(logits, (int)T, (int)n_expert, 10, ids, weights, stream);
     check("route");
 }
 void blob_dequant(const uint8_t* blob, uint16_t* gu16, uint16_t* down16, void* stream) {
-    static_cast<sycl::queue*>(stream)
-        ->parallel_for(
-            sycl::nd_range<3>(
-                sycl::range<3>(1, 1, blocks_for(1280LL * 640 + 2560LL * 160)) *
-                    sycl::range<3>(1, 1, 256),
-                sycl::range<3>(1, 1, 256)),
-            [=](sycl::nd_item<3> /*item_ct1*/) {
-                blob_dequant_kernel<false>(blob, gu16, down16);
-            });
+    static_cast<sycl::queue*>(stream)->parallel_for(
+        sycl::nd_range<3>(sycl::range<3>(1, 1, blocks_for(1280LL * 640 + 2560LL * 160)) * sycl::range<3>(1, 1, 256),
+                          sycl::range<3>(1, 1, 256)),
+        [=](sycl::nd_item<3> /*item_ct1*/) { blob_dequant_kernel<false>(blob, gu16, down16); });
     check("blob_dequant");
 }
 void blob_dequant_f16(const uint8_t* blob, uint16_t* gu16, uint16_t* down16, void* stream) {
-    static_cast<sycl::queue*>(stream)
-        ->parallel_for(
-            sycl::nd_range<3>(
-                sycl::range<3>(1, 1, blocks_for(1280LL * 640 + 2560LL * 160)) *
-                    sycl::range<3>(1, 1, 256),
-                sycl::range<3>(1, 1, 256)),
-            [=](sycl::nd_item<3> /*item_ct1*/) {
-                blob_dequant_kernel<true>(blob, gu16, down16);
-            });
+    static_cast<sycl::queue*>(stream)->parallel_for(
+        sycl::nd_range<3>(sycl::range<3>(1, 1, blocks_for(1280LL * 640 + 2560LL * 160)) * sycl::range<3>(1, 1, 256),
+                          sycl::range<3>(1, 1, 256)),
+        [=](sycl::nd_item<3> /*item_ct1*/) { blob_dequant_kernel<true>(blob, gu16, down16); });
     check("blob_dequant_f16");
 }
 void swiglu_interleaved(const float* gu, uint16_t* h16, int64_t n, void* stream) {
     if (n <= 0) return;
-    static_cast<sycl::queue*>(stream)
-        ->parallel_for(
-            sycl::nd_range<3>(sycl::range<3>(1, 1, blocks_for(n * 640)) *
-                                  sycl::range<3>(1, 1, 256),
-                              sycl::range<3>(1, 1, 256)),
-            [=](sycl::nd_item<3> /*item_ct1*/) {
-                swiglu_il_kernel(gu, h16, n);
-            });
+    static_cast<sycl::queue*>(stream)->parallel_for(
+        sycl::nd_range<3>(sycl::range<3>(1, 1, blocks_for(n * 640)) * sycl::range<3>(1, 1, 256),
+                          sycl::range<3>(1, 1, 256)),
+        [=](sycl::nd_item<3> /*item_ct1*/) { swiglu_il_kernel(gu, h16, n); });
     check("swiglu_interleaved");
 }
 void swiglu_pair(const float* g, const float* u, uint16_t* h16, int64_t n, void* stream) {
-    static_cast<sycl::queue*>(stream)
-        ->parallel_for(
-            sycl::nd_range<3>(sycl::range<3>(1, 1, blocks_for(n * 640)) *
-                                  sycl::range<3>(1, 1, 256),
-                              sycl::range<3>(1, 1, 256)),
-            [=](sycl::nd_item<3> /*item_ct1*/) {
-                swiglu_pair_kernel(g, u, h16, n);
-            });
+    static_cast<sycl::queue*>(stream)->parallel_for(
+        sycl::nd_range<3>(sycl::range<3>(1, 1, blocks_for(n * 640)) * sycl::range<3>(1, 1, 256),
+                          sycl::range<3>(1, 1, 256)),
+        [=](sycl::nd_item<3> /*item_ct1*/) { swiglu_pair_kernel(g, u, h16, n); });
     check("swiglu_pair");
 }
 namespace {
 void copy_i32_kernel(int32_t* __restrict__ dst, const int32_t* __restrict__ src, int64_t n) {
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
-    for (int64_t i =
-             (int64_t)item_ct1.get_group(2) * item_ct1.get_local_range(2) +
-             item_ct1.get_local_id(2);
-         i < n; i += (int64_t)item_ct1.get_group_range(2) *
-                     item_ct1.get_local_range(2))
+    for (int64_t i = (int64_t)item_ct1.get_group(2) * item_ct1.get_local_range(2) + item_ct1.get_local_id(2); i < n;
+         i += (int64_t)item_ct1.get_group_range(2) * item_ct1.get_local_range(2))
         dst[i] = src[i];
 }
 }  // namespace
 void copy_i32(int32_t* dst, const int32_t* src, int64_t n, void* stream) {
     if (n <= 0) return;
     const int64_t b = (n + 255) / 256;
-    static_cast<sycl::queue*>(stream)
-        ->parallel_for(sycl::nd_range<3>(
-                           sycl::range<3>(1, 1, (unsigned)(b < 256 ? b : 256)) *
-                               sycl::range<3>(1, 1, 256),
-                           sycl::range<3>(1, 1, 256)),
-                       [=](sycl::nd_item<3> /*item_ct1*/) {
-                           copy_i32_kernel(dst, src, n);
-                       });
+    static_cast<sycl::queue*>(stream)->parallel_for(
+        sycl::nd_range<3>(sycl::range<3>(1, 1, (unsigned)(b < 256 ? b : 256)) * sycl::range<3>(1, 1, 256),
+                          sycl::range<3>(1, 1, 256)),
+        [=](sycl::nd_item<3> /*item_ct1*/) { copy_i32_kernel(dst, src, n); });
     check("copy_i32");
 }
 void gather_rows16(const uint16_t* x16, const int32_t* src, uint16_t* dst16, int64_t n, int64_t width, void* stream) {
     if (n <= 0) return;
-    static_cast<sycl::queue*>(stream)
-        ->parallel_for(sycl::nd_range<3>(
-                           sycl::range<3>(1, 1, blocks_for(n * (width / 8))) *
-                               sycl::range<3>(1, 1, 256),
-                           sycl::range<3>(1, 1, 256)),
-                       [=](sycl::nd_item<3> /*item_ct1*/) {
-                           gather_rows16_kernel(x16, src, dst16, n, width);
-                       });
+    static_cast<sycl::queue*>(stream)->parallel_for(
+        sycl::nd_range<3>(sycl::range<3>(1, 1, blocks_for(n * (width / 8))) * sycl::range<3>(1, 1, 256),
+                          sycl::range<3>(1, 1, 256)),
+        [=](sycl::nd_item<3> /*item_ct1*/) { gather_rows16_kernel(x16, src, dst16, n, width); });
     check("gather_rows16");
 }
 void moe_combine(const float* Dm, const int32_t* slot, const float* w, const float* shared, const float* sg, float* bo,
                  int64_t T, void* stream) {
-    static_cast<sycl::queue*>(stream)
-        ->parallel_for(
-            sycl::nd_range<3>(sycl::range<3>(1, 1, blocks_for(T * N)) *
-                                  sycl::range<3>(1, 1, 256),
-                              sycl::range<3>(1, 1, 256)),
-            [=](sycl::nd_item<3> /*item_ct1*/) {
-                moe_combine_kernel(Dm, slot, w, shared, sg, bo, T);
-            });
+    static_cast<sycl::queue*>(stream)->parallel_for(
+        sycl::nd_range<3>(sycl::range<3>(1, 1, blocks_for(T * N)) * sycl::range<3>(1, 1, 256),
+                          sycl::range<3>(1, 1, 256)),
+        [=](sycl::nd_item<3> /*item_ct1*/) { moe_combine_kernel(Dm, slot, w, shared, sg, bo, T); });
     check("moe_combine");
 }
 void rms_rows(float* x, const float* w, int64_t rows, int64_t cols, int64_t ld, float eps, void* stream) {
     if (rows <= 0) return;
-    static_cast<sycl::queue*>(stream)->submit([&](sycl::handler &cgh) {
+    static_cast<sycl::queue*>(stream)->submit([&](sycl::handler& cgh) {
         sycl::local_accessor<float, 1> sh_acc_ct1(sycl::range<1>(32), cgh);
 
-        cgh.parallel_for(
-            sycl::nd_range<3>(sycl::range<3>(1, 1, (unsigned)rows) *
-                                  sycl::range<3>(1, 1, 256),
-                              sycl::range<3>(1, 1, 256)),
-            [=](sycl::nd_item<3> /*item_ct1*/) [[sycl::reqd_sub_group_size(32)]] {
-                rms_rows_kernel(
-                    x, w, cols, ld, eps,
-                    sh_acc_ct1.get_multi_ptr<sycl::access::decorated::no>()
-                        .get());
-            });
+        cgh.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, (unsigned)rows) * sycl::range<3>(1, 1, 256),
+                                           sycl::range<3>(1, 1, 256)),
+                         [=](sycl::nd_item<3> /*item_ct1*/) [[sycl::reqd_sub_group_size(32)]] {
+                             rms_rows_kernel(x, w, cols, ld, eps,
+                                             sh_acc_ct1.get_multi_ptr<sycl::access::decorated::no>().get());
+                         });
     });
     check("rms_rows");
 }
@@ -1599,67 +1379,47 @@ void rope(float* x, int64_t T, int64_t heads, int64_t dim, int64_t ld, int64_t p
         std::fprintf(stderr, "prefill rope: invalid rope scaling: %s\n", why);
         std::exit(1);
     }
-    const float theta_scale = powf((float) scaling.freq_base, -2.0f / 64.0f);
-    const strata::kernels::RopeKernelArgs k = scaling.kernel_args(64);   // none: the identity constants
+    const float theta_scale = powf((float)scaling.freq_base, -2.0f / 64.0f);
+    const strata::kernels::RopeKernelArgs k = scaling.kernel_args(64);  // none: the identity constants
     const strata::kernels::RopeTab rt = strata::kernels::rope_table_for(scaling);
     if (rt.cos != nullptr)
-        static_cast<sycl::queue*>(stream)
-            ->submit([&](sycl::handler &cgh) {
-                auto strata_kernels_mrope_table_ct11 =
-                    strata::kernels::mrope_table();
+        static_cast<sycl::queue*>(stream)->submit([&](sycl::handler& cgh) {
+            auto strata_kernels_mrope_table_ct11 = strata::kernels::mrope_table();
 
-                cgh.parallel_for(
-                    sycl::nd_range<3>(
-                        sycl::range<3>(1, 1, (unsigned)(T * heads)) *
-                            sycl::range<3>(1, 1, 32),
-                        sycl::range<3>(1, 1, 32)),
-                    [=](sycl::nd_item<3> /*item_ct1*/) {
-                        rope_kernel<true>(x, heads, dim, ld, pos0, theta_scale,
-                                          k.freq_scale, k.corr_low, k.corr_high,
-                                          k.ext_factor, k.attn_factor,
-                                          strata_kernels_mrope_table_ct11, rt);
-                    });
-            });
+            cgh.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, (unsigned)(T * heads)) * sycl::range<3>(1, 1, 32),
+                                               sycl::range<3>(1, 1, 32)),
+                             [=](sycl::nd_item<3> /*item_ct1*/) {
+                                 rope_kernel<true>(x, heads, dim, ld, pos0, theta_scale, k.freq_scale, k.corr_low,
+                                                   k.corr_high, k.ext_factor, k.attn_factor,
+                                                   strata_kernels_mrope_table_ct11, rt);
+                             });
+        });
     else
-        static_cast<sycl::queue*>(stream)
-            ->submit([&](sycl::handler &cgh) {
-                auto strata_kernels_mrope_table_ct11 =
-                    strata::kernels::mrope_table();
+        static_cast<sycl::queue*>(stream)->submit([&](sycl::handler& cgh) {
+            auto strata_kernels_mrope_table_ct11 = strata::kernels::mrope_table();
 
-                cgh.parallel_for(
-                    sycl::nd_range<3>(
-                        sycl::range<3>(1, 1, (unsigned)(T * heads)) *
-                            sycl::range<3>(1, 1, 32),
-                        sycl::range<3>(1, 1, 32)),
-                    [=](sycl::nd_item<3> /*item_ct1*/) {
-                        rope_kernel<false>(
-                            x, heads, dim, ld, pos0, theta_scale, k.freq_scale,
-                            k.corr_low, k.corr_high, k.ext_factor,
-                            k.attn_factor, strata_kernels_mrope_table_ct11, rt);
-                    });
-            });
+            cgh.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, (unsigned)(T * heads)) * sycl::range<3>(1, 1, 32),
+                                               sycl::range<3>(1, 1, 32)),
+                             [=](sycl::nd_item<3> /*item_ct1*/) {
+                                 rope_kernel<false>(x, heads, dim, ld, pos0, theta_scale, k.freq_scale, k.corr_low,
+                                                    k.corr_high, k.ext_factor, k.attn_factor,
+                                                    strata_kernels_mrope_table_ct11, rt);
+                             });
+        });
     check("rope");
 }
 void split_q(const float* q_full, float* q, int64_t T, void* stream) {
-    static_cast<sycl::queue*>(stream)
-        ->parallel_for(
-            sycl::nd_range<3>(sycl::range<3>(1, 1, blocks_for(T * 24 * 256)) *
-                                  sycl::range<3>(1, 1, 256),
-                              sycl::range<3>(1, 1, 256)),
-            [=](sycl::nd_item<3> /*item_ct1*/) {
-                split_q_kernel(q_full, q, T);
-            });
+    static_cast<sycl::queue*>(stream)->parallel_for(
+        sycl::nd_range<3>(sycl::range<3>(1, 1, blocks_for(T * 24 * 256)) * sycl::range<3>(1, 1, 256),
+                          sycl::range<3>(1, 1, 256)),
+        [=](sycl::nd_item<3> /*item_ct1*/) { split_q_kernel(q_full, q, T); });
     check("split_q");
 }
 void gate_attn(const float* attn, const float* q_full, uint16_t* out16, int64_t T, void* stream) {
-    static_cast<sycl::queue*>(stream)
-        ->parallel_for(
-            sycl::nd_range<3>(sycl::range<3>(1, 1, blocks_for(T * 24 * 256)) *
-                                  sycl::range<3>(1, 1, 256),
-                              sycl::range<3>(1, 1, 256)),
-            [=](sycl::nd_item<3> /*item_ct1*/) {
-                gate_attn_kernel(attn, q_full, out16, T);
-            });
+    static_cast<sycl::queue*>(stream)->parallel_for(
+        sycl::nd_range<3>(sycl::range<3>(1, 1, blocks_for(T * 24 * 256)) * sycl::range<3>(1, 1, 256),
+                          sycl::range<3>(1, 1, 256)),
+        [=](sycl::nd_item<3> /*item_ct1*/) { gate_attn_kernel(attn, q_full, out16, T); });
     check("gate_attn");
 }
 

@@ -56,9 +56,9 @@ const char* QKV = "blk.0.attn_qkv.weight";
 constexpr uint64_t NE0 = 256, NE1 = 4;
 
 std::vector<fixture::Kv> arch_keys() {
-    return {fixture::str("general.architecture", "qwen4exp"), fixture::u32("qwen4exp.block_count", 48),
-            fixture::u32("qwen4exp.embedding_length", 2560), fixture::u32("qwen4exp.expert_count", 512),
-            fixture::u32("qwen4exp.expert_used_count", 10), fixture::u32("qwen4exp.attention.head_count", 24),
+    return {fixture::str("general.architecture", "qwen4exp"),   fixture::u32("qwen4exp.block_count", 48),
+            fixture::u32("qwen4exp.embedding_length", 2560),    fixture::u32("qwen4exp.expert_count", 512),
+            fixture::u32("qwen4exp.expert_used_count", 10),     fixture::u32("qwen4exp.attention.head_count", 24),
             fixture::u32("qwen4exp.attention.head_count_kv", 2)};
 }
 
@@ -76,8 +76,9 @@ void write_pack(const fs::path& dir, bool bf16_key) {
         idx += std::string(KEY) + " 0 0 0 0 256 0 256 4 8 0 32 0 0 0 0 0 0 0\n";
     std::ofstream(dir / "index.txt", std::ios::binary) << idx;
     std::vector<char> bytes(bf16_key ? key_bytes : 16);
-    for (size_t i = 0; i < bytes.size(); ++i) bytes[i] = (char) fixture::pattern(9, i);
-    std::ofstream(dir / "dense.bin", std::ios::binary).write(bytes.data(), (std::streamsize) bytes.size());
+    for (size_t i = 0; i < bytes.size(); ++i)
+        bytes[i] = (char)fixture::pattern(9, i);
+    std::ofstream(dir / "dense.bin", std::ios::binary).write(bytes.data(), (std::streamsize)bytes.size());
 }
 
 struct Loaded {
@@ -87,11 +88,13 @@ struct Loaded {
     WeightTable wt;
     NativeDense dense;
     void* arena = nullptr;
-    ~Loaded() { if (arena) sycl::free(arena, get_test_queue()); }
+    ~Loaded() {
+        if (arena) sycl::free(arena, get_test_queue());
+    }
 };
 
 // generate.cpp's order: served_names, keep_unquantized_ple_key (native packs), pool_bytes, load, NativeDense::load.
-void load(const fs::path &pack, const std::string &shard, Loaded &l) try {
+void load(const fs::path& pack, const std::string& shard, Loaded& l) try {
     const std::vector<std::string> shards{shard};
     if (!NativeDense::served_names(shards, true, l.skip, l.err)) return;
     if (!NativeDense::keep_unquantized_ple_key(pack.string(), l.skip, l.err)) return;
@@ -99,15 +102,14 @@ void load(const fs::path &pack, const std::string &shard, Loaded &l) try {
     if (!WeightTable::pool_bytes(pack.string(), pool, l.err, &l.skip)) return;
     l.arena = sycl::malloc_device(pool ? pool : 256, get_test_queue());
     if (!l.arena) {
-        l.err = "sycl::malloc_device"; return;
+        l.err = "sycl::malloc_device";
+        return;
     }
     if (!l.wt.load(pack.string(), l.arena, pool ? pool : 256, l.err, &l.skip)) return;
     l.ok = l.dense.load(shards, l.wt, l.err, true);
-}
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
+} catch (sycl::exception const& exc) {
+    std::cerr << exc.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
+    std::exit(1);
 }
 }  // namespace
 
@@ -127,8 +129,10 @@ int main() try {
         fixture::write(shard, arch_keys(), {{QKV, {NE0, NE1}, 8, 1}, {KEY, {NE0, NE1}, 18, 2}});
         int bits = 99;
         std::string err;
-        check(WeightTable::index_code_bits(pack.string(), KEY, bits, err) && bits == 0, "index_code_bits: key row is 0");
-        check(WeightTable::index_code_bits(pack.string(), QKV, bits, err) && bits == 8, "index_code_bits: qkv row is 8");
+        check(WeightTable::index_code_bits(pack.string(), KEY, bits, err) && bits == 0,
+              "index_code_bits: key row is 0");
+        check(WeightTable::index_code_bits(pack.string(), QKV, bits, err) && bits == 8,
+              "index_code_bits: qkv row is 8");
         Loaded l;
         load(pack, shard, l);
         check(l.ok, "the pack loads (was: incompatible matrix) " + l.err);
@@ -138,11 +142,10 @@ int main() try {
         check(k && !k->native_data, "no native key attached");
         if (k && k->data) {
             std::vector<unsigned char> back(NE0 * NE1 * 2);
-            get_test_queue()
-                .memcpy(back.data(), k->data, back.size())
-                .wait();
+            get_test_queue().memcpy(back.data(), k->data, back.size()).wait();
             bool same = true;
-            for (size_t i = 0; i < back.size(); ++i) same = same && back[i] == fixture::pattern(9, i);
+            for (size_t i = 0; i < back.size(); ++i)
+                same = same && back[i] == fixture::pattern(9, i);
             check(same, "the arena holds the pack's BF16 bytes");
         }
         const auto* q = l.wt.find(QKV);
@@ -170,7 +173,8 @@ int main() try {
         int bits = 0;
         std::string err;
         check(WeightTable::index_code_bits((tmp.path / "orca").string(), "blk.9.nothing.weight", bits, err) &&
-                  bits == -1, "a missing row is -1");
+                  bits == -1,
+              "a missing row is -1");
         check(!WeightTable::index_code_bits((tmp.path / "none").string(), KEY, bits, err) && !err.empty(),
               "a missing index is an error");
         std::set<std::string> skip{QKV};
@@ -180,9 +184,7 @@ int main() try {
 
     std::printf(g_fail ? "native_dense_ple_key_test: %d FAILED\n" : "native_dense_ple_key_test: all passed\n", g_fail);
     return g_fail ? 1 : 0;
-}
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
+} catch (sycl::exception const& exc) {
+    std::cerr << exc.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
+    std::exit(1);
 }

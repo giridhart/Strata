@@ -34,9 +34,8 @@ std::atomic<bool> enabled{false};
 constexpr int D = 128, R = 4, ROT = 64, THREADS = 256;
 
 inline float f32_to_f16_to_f32(float v) {
-    return sycl::vec<sycl::half, 1>(
-               sycl::vec<float, 1>(v).convert<sycl::half, sycl::rounding_mode::rte>()[0])
-           .convert<float, sycl::rounding_mode::automatic>()[0];
+    return sycl::vec<sycl::half, 1>(sycl::vec<float, 1>(v).convert<sycl::half, sycl::rounding_mode::rte>()[0])
+        .convert<float, sycl::rounding_mode::automatic>()[0];
 }
 
 inline float warp_sum(float x, const sycl::sub_group& sg) {
@@ -50,14 +49,12 @@ inline float warp_sum(float x, const sycl::sub_group& sg) {
 // no table applies - the default - so the default kernel is 0.1.31's code exactly (the table read is not in it;
 // with it merely skipped at run time, the compiled default path changed its results).
 template <bool TAB>
-void append(const float* __restrict__ raw, const int32_t* __restrict__ pos_dev,
-            int pos_base, const float* __restrict__ gamma, float epsilon,
-            float* __restrict__ tail, float* __restrict__ dead,
-            float* __restrict__ pooled, int32_t* __restrict__ block_pos,
-            int max_cells, float theta_scale, float freq_scale, float corr_low,
-            float corr_high, float ext_factor, float mscale,
-            const int32_t* __restrict__ mtab, RopeTab rt,
-            float *values, float *partials, const sycl::nd_item<1>& item) {
+void append(const float* __restrict__ raw, const int32_t* __restrict__ pos_dev, int pos_base,
+            const float* __restrict__ gamma, float epsilon, float* __restrict__ tail, float* __restrict__ dead,
+            float* __restrict__ pooled, int32_t* __restrict__ block_pos, int max_cells, float theta_scale,
+            float freq_scale, float corr_low, float corr_high, float ext_factor, float mscale,
+            const int32_t* __restrict__ mtab, RopeTab rt, float* values, float* partials,
+            const sycl::nd_item<1>& item) {
     const int pos = *pos_dev, d = item.get_local_id(0);
     if (pos < 0 || pos >= max_cells) return;
     const int slot = pos % R;
@@ -77,7 +74,7 @@ void append(const float* __restrict__ raw, const int32_t* __restrict__ pos_dev,
 #pragma unroll
         for (int j = 1; j < R; ++j)
             sum = sum + (pos == 0 || j == R - 1 ? incoming : tail[j * D + d]);
-        mean = sycl::fma(0.25f, sum, 0.0f); // SCALE includes a zero bias.
+        mean = sycl::fma(0.25f, sum, 0.0f);  // SCALE includes a zero bias.
     }
     float square_sum = 0.0f;
     if (d < D) square_sum += mean * mean;
@@ -101,16 +98,17 @@ void append(const float* __restrict__ raw, const int32_t* __restrict__ pos_dev,
         float c, s;
         if (!(TAB && rope_tab_cs(rt, pos == 0 ? 0 : mrope_pos(mtab, rope_pos, pair), pair, c, s))) {
             const float theta_extrap =
-                (pos == 0 ? 0 : mrope_pos(mtab, rope_pos, pair)) *
-                sycl::pow(theta_scale, float(pair));
+                (pos == 0 ? 0 : mrope_pos(mtab, rope_pos, pair)) * sycl::pow(theta_scale, float(pair));
             rope_scaled_angle(theta_extrap, freq_scale, corr_low, corr_high, ext_factor, mscale, pair, c, s);
         }
         const float a = values[pair], z = values[pair + ROT / 2];
         y = d < ROT / 2 ? a * c - z * s : a * s + z * c;
     }
     pooled[std::size_t(b) * D + d] = y;
-    if (pos == 0) dead[d] = y;
-    else pooled[std::size_t(b + 1) * D + d] = dead[d];
+    if (pos == 0)
+        dead[d] = y;
+    else
+        pooled[std::size_t(b + 1) * D + d] = dead[d];
     if (d == 0 && pos != 0) *block_pos = rope_pos;
 }
 
@@ -120,11 +118,9 @@ void append(const float* __restrict__ raw, const int32_t* __restrict__ pos_dev,
 // (cell >= p0) or the tail the previous batch left (cell < p0).  Only the batch's last completed block writes the
 // spare after it (every earlier one's is overwritten by the next block in order).
 template <bool TAB>
-inline float
-pooled_value(const float *values, int d, int rope_pos, float theta_scale,
-             float freq_scale, float corr_low, float corr_high,
-             float ext_factor, float mscale, const int32_t *mtab, bool zero_pos,
-             const RopeTab &rt) {
+inline float pooled_value(const float* values, int d, int rope_pos, float theta_scale, float freq_scale, float corr_low,
+                          float corr_high, float ext_factor, float mscale, const int32_t* mtab, bool zero_pos,
+                          const RopeTab& rt) {
     float y = values[d];
     if (d < ROT) {
         const int pair = d % (ROT / 2);
@@ -134,8 +130,7 @@ pooled_value(const float *values, int d, int rope_pos, float theta_scale,
         float c, s;
         if (!(TAB && rope_tab_cs(rt, zero_pos ? 0 : mrope_pos(mtab, rope_pos, pair), pair, c, s))) {
             const float theta_extrap =
-                (zero_pos ? 0 : mrope_pos(mtab, rope_pos, pair)) *
-                sycl::pow(theta_scale, float(pair));
+                (zero_pos ? 0 : mrope_pos(mtab, rope_pos, pair)) * sycl::pow(theta_scale, float(pair));
             rope_scaled_angle(theta_extrap, freq_scale, corr_low, corr_high, ext_factor, mscale, pair, c, s);
         }
         const float a = values[pair], z = values[pair + ROT / 2];
@@ -144,7 +139,7 @@ pooled_value(const float *values, int d, int rope_pos, float theta_scale,
     return y;
 }
 
-inline float norm_scale(float mean, float *partials, int d, const sycl::nd_item<1>& item) {
+inline float norm_scale(float mean, float* partials, int d, const sycl::nd_item<1>& item) {
     float square_sum = d < D ? mean * mean : 0.0f;
     square_sum = warp_sum(square_sum, item.get_sub_group());
     const int lane = d % 32;
@@ -158,10 +153,9 @@ inline float norm_scale(float mean, float *partials, int d, const sycl::nd_item<
 // cell 0 of a sequence: the spare (every gather index names cell 0), written to pooled[0] and dead
 template <bool TAB>
 void append_first(const float* __restrict__ raw, const float* __restrict__ gamma, float epsilon,
-                  float* __restrict__ dead, float* __restrict__ pooled, float theta_scale,
-                  float freq_scale, float corr_low, float corr_high, float ext_factor, float mscale,
-                  const int32_t* __restrict__ mtab, RopeTab rt,
-                  float *values, float *partials, const sycl::nd_item<1>& item) {
+                  float* __restrict__ dead, float* __restrict__ pooled, float theta_scale, float freq_scale,
+                  float corr_low, float corr_high, float ext_factor, float mscale, const int32_t* __restrict__ mtab,
+                  RopeTab rt, float* values, float* partials, const sycl::nd_item<1>& item) {
     const int d = item.get_local_id(0);
 
     float mean = 0.0f;
@@ -169,7 +163,8 @@ void append_first(const float* __restrict__ raw, const float* __restrict__ gamma
         const float incoming = f32_to_f16_to_f32(raw[d]);
         float sum = incoming;
 #pragma unroll
-        for (int j = 1; j < R; ++j) sum = sum + incoming;
+        for (int j = 1; j < R; ++j)
+            sum = sum + incoming;
         mean = sycl::fma(0.25f, sum, 0.0f);
     }
     const float square_sum = norm_scale(mean, partials, d, item);
@@ -187,10 +182,9 @@ template <bool TAB>
 void append_blocks(const float* __restrict__ raw, [[maybe_unused]] int64_t n, int64_t p0, int pos_base,
                    const float* __restrict__ gamma, float epsilon, const float* __restrict__ tail,
                    const float* __restrict__ dead, float* __restrict__ pooled, int32_t* __restrict__ block_pos,
-                   int64_t first_block, int64_t last_block, float theta_scale, float freq_scale,
-                   float corr_low, float corr_high, float ext_factor, float mscale,
-                   const int32_t* __restrict__ mtab, RopeTab rt,
-                   float *values, float *partials, const sycl::nd_item<1>& item) {
+                   int64_t first_block, int64_t last_block, float theta_scale, float freq_scale, float corr_low,
+                   float corr_high, float ext_factor, float mscale, const int32_t* __restrict__ mtab, RopeTab rt,
+                   float* values, float* partials, const sycl::nd_item<1>& item) {
     const int64_t b = first_block + item.get_group(0);
     const int d = item.get_local_id(0);
 
@@ -198,13 +192,12 @@ void append_blocks(const float* __restrict__ raw, [[maybe_unused]] int64_t n, in
     if (d < D) {
         auto key = [&](int j) -> float {
             const int64_t cell = b * R + j;
-            return cell >= p0
-                       ? f32_to_f16_to_f32(raw[(cell - p0) * D + d])
-                       : tail[j * D + d];
+            return cell >= p0 ? f32_to_f16_to_f32(raw[(cell - p0) * D + d]) : tail[j * D + d];
         };
         float sum = key(0);
 #pragma unroll
-        for (int j = 1; j < R; ++j) sum = sum + key(j);
+        for (int j = 1; j < R; ++j)
+            sum = sum + key(j);
         mean = sycl::fma(0.25f, sum, 0.0f);
     }
     const float square_sum = norm_scale(mean, partials, d, item);
@@ -212,9 +205,9 @@ void append_blocks(const float* __restrict__ raw, [[maybe_unused]] int64_t n, in
     if (d < D) values[d] = scale * mean * gamma[d];
     item.barrier(sycl::access::fence_space::local_space);
     if (d >= D) return;
-    const int rope_pos = pos_base + R * (int) b;
-    pooled[std::size_t(b) * D + d] = pooled_value<TAB>(values, d, rope_pos, theta_scale, freq_scale, corr_low, corr_high,
-                                                       ext_factor, mscale, mtab, false, rt);
+    const int rope_pos = pos_base + R * (int)b;
+    pooled[std::size_t(b) * D + d] = pooled_value<TAB>(values, d, rope_pos, theta_scale, freq_scale, corr_low,
+                                                       corr_high, ext_factor, mscale, mtab, false, rt);
     if (b == last_block) {
         pooled[std::size_t(b + 1) * D + d] = dead[d];
         if (d == 0) *block_pos = rope_pos;
@@ -227,12 +220,15 @@ void append_tail(const float* __restrict__ raw, int64_t n, int64_t p0, float* __
     const int s = item.get_group(0), d = item.get_local_id(0);
     if (d >= D) return;
     const int64_t last = p0 + n - 1;
-    int64_t cell = last - ((last % R) - s + R) % R;       // the last cell <= last with cell % 4 == s
+    int64_t cell = last - ((last % R) - s + R) % R;  // the last cell <= last with cell % 4 == s
     if (cell < p0) return;
     tail[s * D + d] = f32_to_f16_to_f32(raw[(cell - p0) * D + d]);
 }
 
-struct Span { const void* p; std::size_t n; };
+struct Span {
+    const void* p;
+    std::size_t n;
+};
 void validate(Span s) {
     const auto p = reinterpret_cast<std::uintptr_t>(s.p);
     if (!p || p % 4 || s.n > UINTPTR_MAX - p)
@@ -243,26 +239,31 @@ bool overlaps(Span a, Span b) {
     const auto x = reinterpret_cast<std::uintptr_t>(a.p), y = reinterpret_cast<std::uintptr_t>(b.p);
     return x < y + b.n && y < x + a.n;
 }
-} // namespace
+}  // namespace
 
 void native_qsa_indexer_set_enabled(bool value) { enabled.store(value, std::memory_order_relaxed); }
 bool native_qsa_indexer_enabled() { return enabled.load(std::memory_order_relaxed); }
 
 void native_qsa_indexer_append(const float* raw, const int32_t* relative_pos_device, int32_t pos_base,
-                               const float* gamma, float epsilon, const QsaIndexerBuffers& b,
-                               const QsaShapes& s, int64_t max_cells, const RopeScaling& scaling, void* stream) {
-    if (!stream || s.idx_dim != D || s.idx_block != R || s.n_rot != ROT ||
-        max_cells < 1 || max_cells > INT32_MAX || pos_base < 0 || pos_base % R ||
-        int64_t(pos_base) + max_cells > INT32_MAX || !std::isfinite(epsilon) || epsilon <= 0.0f ||
-        rope_scaling_invalid(scaling) != nullptr)
-        throw std::invalid_argument("native QSA indexer requires fixed geometry, aligned position base, positive capacity/epsilon, valid frequency/scaling and explicit stream");
-    const Span spans[] = {{raw,D*4},{relative_pos_device,4},{gamma,D*4},{b.tail,(R-1)*D*4},
-        {b.dead,D*4},{b.pooled,std::size_t(max_cells/R+1)*D*4},{b.block_pos,4}};
-    for (const auto& span : spans) validate(span);
-    for (int i = 0; i < 7; ++i) for (int j = i + 1; j < 7; ++j)
-        if (overlaps(spans[i], spans[j])) throw std::invalid_argument("native QSA indexer buffers overlap");
-    const float theta_scale = powf((float) scaling.freq_base, -2.0f / ROT);
-    const RopeKernelArgs k = scaling.kernel_args(ROT);   // none: the identity constants
+                               const float* gamma, float epsilon, const QsaIndexerBuffers& b, const QsaShapes& s,
+                               int64_t max_cells, const RopeScaling& scaling, void* stream) {
+    if (!stream || s.idx_dim != D || s.idx_block != R || s.n_rot != ROT || max_cells < 1 || max_cells > INT32_MAX ||
+        pos_base < 0 || pos_base % R || int64_t(pos_base) + max_cells > INT32_MAX || !std::isfinite(epsilon) ||
+        epsilon <= 0.0f || rope_scaling_invalid(scaling) != nullptr)
+        throw std::invalid_argument(
+            "native QSA indexer requires fixed geometry, aligned position base, positive capacity/epsilon, valid "
+            "frequency/scaling and explicit stream");
+    const Span spans[] = {{raw, D * 4},    {relative_pos_device, 4},
+                          {gamma, D * 4},  {b.tail, (R - 1) * D * 4},
+                          {b.dead, D * 4}, {b.pooled, std::size_t(max_cells / R + 1) * D * 4},
+                          {b.block_pos, 4}};
+    for (const auto& span : spans)
+        validate(span);
+    for (int i = 0; i < 7; ++i)
+        for (int j = i + 1; j < 7; ++j)
+            if (overlaps(spans[i], spans[j])) throw std::invalid_argument("native QSA indexer buffers overlap");
+    const float theta_scale = powf((float)scaling.freq_base, -2.0f / ROT);
+    const RopeKernelArgs k = scaling.kernel_args(ROT);  // none: the identity constants
     const RopeTab rt = rope_table_for(scaling);
 
     static sycl::queue default_queue{sycl::property::queue::in_order()};
@@ -270,42 +271,32 @@ void native_qsa_indexer_append(const float* raw, const int32_t* relative_pos_dev
 
     const int32_t* mtab = mrope_table();
     if (rt.cos != nullptr) {
-        q->submit([&](sycl::handler &cgh) {
+        q->submit([&](sycl::handler& cgh) {
             sycl::local_accessor<float, 1> values_acc(sycl::range<1>(D), cgh);
             sycl::local_accessor<float, 1> partials_acc(sycl::range<1>(32), cgh);
 
-            cgh.parallel_for(
-                sycl::nd_range<1>(sycl::range<1>(THREADS), sycl::range<1>(THREADS)),
-                [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(32)]] {
-                    append<true>(
-                        raw, relative_pos_device, pos_base, gamma, epsilon,
-                        b.tail, b.dead, b.pooled, b.block_pos,
-                        int(max_cells), theta_scale, k.freq_scale,
-                        k.corr_low, k.corr_high, k.ext_factor,
-                        k.attn_factor, mtab, rt,
-                        values_acc.get_multi_ptr<sycl::access::decorated::no>().get(),
-                        partials_acc.get_multi_ptr<sycl::access::decorated::no>().get(),
-                        item);
-                });
+            cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(THREADS), sycl::range<1>(THREADS)),
+                             [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(32)]] {
+                                 append<true>(raw, relative_pos_device, pos_base, gamma, epsilon, b.tail, b.dead,
+                                              b.pooled, b.block_pos, int(max_cells), theta_scale, k.freq_scale,
+                                              k.corr_low, k.corr_high, k.ext_factor, k.attn_factor, mtab, rt,
+                                              values_acc.get_multi_ptr<sycl::access::decorated::no>().get(),
+                                              partials_acc.get_multi_ptr<sycl::access::decorated::no>().get(), item);
+                             });
         });
     } else {
-        q->submit([&](sycl::handler &cgh) {
+        q->submit([&](sycl::handler& cgh) {
             sycl::local_accessor<float, 1> values_acc(sycl::range<1>(D), cgh);
             sycl::local_accessor<float, 1> partials_acc(sycl::range<1>(32), cgh);
 
-            cgh.parallel_for(
-                sycl::nd_range<1>(sycl::range<1>(THREADS), sycl::range<1>(THREADS)),
-                [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(32)]] {
-                    append<false>(
-                        raw, relative_pos_device, pos_base, gamma, epsilon,
-                        b.tail, b.dead, b.pooled, b.block_pos,
-                        int(max_cells), theta_scale, k.freq_scale,
-                        k.corr_low, k.corr_high, k.ext_factor,
-                        k.attn_factor, mtab, rt,
-                        values_acc.get_multi_ptr<sycl::access::decorated::no>().get(),
-                        partials_acc.get_multi_ptr<sycl::access::decorated::no>().get(),
-                        item);
-                });
+            cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(THREADS), sycl::range<1>(THREADS)),
+                             [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(32)]] {
+                                 append<false>(raw, relative_pos_device, pos_base, gamma, epsilon, b.tail, b.dead,
+                                               b.pooled, b.block_pos, int(max_cells), theta_scale, k.freq_scale,
+                                               k.corr_low, k.corr_high, k.ext_factor, k.attn_factor, mtab, rt,
+                                               values_acc.get_multi_ptr<sycl::access::decorated::no>().get(),
+                                               partials_acc.get_multi_ptr<sycl::access::decorated::no>().get(), item);
+                             });
         });
     }
 }
@@ -318,8 +309,8 @@ void native_qsa_indexer_append_batch(const float* raw, int64_t n, int64_t p0, in
         max_cells > INT32_MAX || pos_base < 0 || pos_base % R || int64_t(pos_base) + max_cells > INT32_MAX ||
         !std::isfinite(epsilon) || epsilon <= 0.0f || rope_scaling_invalid(scaling) != nullptr)
         throw std::invalid_argument("native QSA indexer (batch): bad geometry, positions, parameters or scaling");
-    const float theta_scale = powf((float) scaling.freq_base, -2.0f / ROT);
-    const RopeKernelArgs k = scaling.kernel_args(ROT);   // none: the identity constants
+    const float theta_scale = powf((float)scaling.freq_base, -2.0f / ROT);
+    const RopeKernelArgs k = scaling.kernel_args(ROT);  // none: the identity constants
     const float fsf = k.freq_scale, cl = k.corr_low, ch = k.corr_high, ef = k.ext_factor, ms = k.attn_factor;
 
     static sycl::queue default_queue{sycl::property::queue::in_order()};
@@ -329,86 +320,68 @@ void native_qsa_indexer_append_batch(const float* raw, int64_t n, int64_t p0, in
     const RopeTab rt = rope_table_for(scaling);
     if (p0 == 0) {
         if (rt.cos != nullptr) {
-            q->submit([&](sycl::handler &cgh) {
+            q->submit([&](sycl::handler& cgh) {
                 sycl::local_accessor<float, 1> values_acc(sycl::range<1>(D), cgh);
                 sycl::local_accessor<float, 1> partials_acc(sycl::range<1>(32), cgh);
 
-                cgh.parallel_for(
-                    sycl::nd_range<1>(sycl::range<1>(THREADS), sycl::range<1>(THREADS)),
-                    [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(32)]] {
-                        append_first<true>(
-                            raw, gamma, epsilon, b.dead, b.pooled, theta_scale,
-                            fsf, cl, ch, ef, ms, mtab, rt,
-                            values_acc.get_multi_ptr<sycl::access::decorated::no>().get(),
-                            partials_acc.get_multi_ptr<sycl::access::decorated::no>().get(),
-                            item);
-                    });
+                cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(THREADS), sycl::range<1>(THREADS)),
+                                 [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(32)]] {
+                                     append_first<true>(
+                                         raw, gamma, epsilon, b.dead, b.pooled, theta_scale, fsf, cl, ch, ef, ms, mtab,
+                                         rt, values_acc.get_multi_ptr<sycl::access::decorated::no>().get(),
+                                         partials_acc.get_multi_ptr<sycl::access::decorated::no>().get(), item);
+                                 });
             });
         } else {
-            q->submit([&](sycl::handler &cgh) {
+            q->submit([&](sycl::handler& cgh) {
                 sycl::local_accessor<float, 1> values_acc(sycl::range<1>(D), cgh);
                 sycl::local_accessor<float, 1> partials_acc(sycl::range<1>(32), cgh);
 
-                cgh.parallel_for(
-                    sycl::nd_range<1>(sycl::range<1>(THREADS), sycl::range<1>(THREADS)),
-                    [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(32)]] {
-                        append_first<false>(
-                            raw, gamma, epsilon, b.dead, b.pooled, theta_scale,
-                            fsf, cl, ch, ef, ms, mtab, rt,
-                            values_acc.get_multi_ptr<sycl::access::decorated::no>().get(),
-                            partials_acc.get_multi_ptr<sycl::access::decorated::no>().get(),
-                            item);
-                    });
+                cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(THREADS), sycl::range<1>(THREADS)),
+                                 [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(32)]] {
+                                     append_first<false>(
+                                         raw, gamma, epsilon, b.dead, b.pooled, theta_scale, fsf, cl, ch, ef, ms, mtab,
+                                         rt, values_acc.get_multi_ptr<sycl::access::decorated::no>().get(),
+                                         partials_acc.get_multi_ptr<sycl::access::decorated::no>().get(), item);
+                                 });
             });
         }
     }
     // completed blocks: those whose last cell (4b+3) lies in [p0, p0 + n)
-    const int64_t first = p0 <= R - 1 ? 0 : (p0 - (R - 1) + R - 1) / R;       // the smallest b with 4b+3 >= p0
-    const int64_t hi = p0 + n - 1 >= R - 1 ? (p0 + n - 1 - (R - 1)) / R : -1;   // the largest b with 4b+3 <= p0+n-1
+    const int64_t first = p0 <= R - 1 ? 0 : (p0 - (R - 1) + R - 1) / R;        // the smallest b with 4b+3 >= p0
+    const int64_t hi = p0 + n - 1 >= R - 1 ? (p0 + n - 1 - (R - 1)) / R : -1;  // the largest b with 4b+3 <= p0+n-1
     if (hi >= first && rt.cos != nullptr) {
-        q->submit([&](sycl::handler &cgh) {
+        q->submit([&](sycl::handler& cgh) {
             sycl::local_accessor<float, 1> values_acc(sycl::range<1>(D), cgh);
             sycl::local_accessor<float, 1> partials_acc(sycl::range<1>(32), cgh);
 
             cgh.parallel_for(
-                sycl::nd_range<1>(sycl::range<1>((size_t)(hi - first + 1) * THREADS),
-                                  sycl::range<1>(THREADS)),
+                sycl::nd_range<1>(sycl::range<1>((size_t)(hi - first + 1) * THREADS), sycl::range<1>(THREADS)),
                 [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(32)]] {
-                    append_blocks<true>(
-                        raw, n, p0, pos_base, gamma, epsilon, b.tail,
-                        b.dead, b.pooled, b.block_pos, first, hi,
-                        theta_scale, fsf, cl, ch, ef, ms, mtab, rt,
-                        values_acc.get_multi_ptr<sycl::access::decorated::no>().get(),
-                        partials_acc.get_multi_ptr<sycl::access::decorated::no>().get(),
-                        item);
+                    append_blocks<true>(raw, n, p0, pos_base, gamma, epsilon, b.tail, b.dead, b.pooled, b.block_pos,
+                                        first, hi, theta_scale, fsf, cl, ch, ef, ms, mtab, rt,
+                                        values_acc.get_multi_ptr<sycl::access::decorated::no>().get(),
+                                        partials_acc.get_multi_ptr<sycl::access::decorated::no>().get(), item);
                 });
         });
     } else if (hi >= first) {
-        q->submit([&](sycl::handler &cgh) {
+        q->submit([&](sycl::handler& cgh) {
             sycl::local_accessor<float, 1> values_acc(sycl::range<1>(D), cgh);
             sycl::local_accessor<float, 1> partials_acc(sycl::range<1>(32), cgh);
 
             cgh.parallel_for(
-                sycl::nd_range<1>(sycl::range<1>((size_t)(hi - first + 1) * THREADS),
-                                  sycl::range<1>(THREADS)),
+                sycl::nd_range<1>(sycl::range<1>((size_t)(hi - first + 1) * THREADS), sycl::range<1>(THREADS)),
                 [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(32)]] {
-                    append_blocks<false>(
-                        raw, n, p0, pos_base, gamma, epsilon, b.tail,
-                        b.dead, b.pooled, b.block_pos, first, hi,
-                        theta_scale, fsf, cl, ch, ef, ms, mtab, rt,
-                        values_acc.get_multi_ptr<sycl::access::decorated::no>().get(),
-                        partials_acc.get_multi_ptr<sycl::access::decorated::no>().get(),
-                        item);
+                    append_blocks<false>(raw, n, p0, pos_base, gamma, epsilon, b.tail, b.dead, b.pooled, b.block_pos,
+                                         first, hi, theta_scale, fsf, cl, ch, ef, ms, mtab, rt,
+                                         values_acc.get_multi_ptr<sycl::access::decorated::no>().get(),
+                                         partials_acc.get_multi_ptr<sycl::access::decorated::no>().get(), item);
                 });
         });
     }
 
-    q->parallel_for(
-        sycl::nd_range<1>(sycl::range<1>((R - 1) * D),
-                          sycl::range<1>(D)),
-        [=](sycl::nd_item<1> item) {
-            append_tail(raw, n, p0, b.tail, item);
-        });
+    q->parallel_for(sycl::nd_range<1>(sycl::range<1>((R - 1) * D), sycl::range<1>(D)),
+                    [=](sycl::nd_item<1> item) { append_tail(raw, n, p0, b.tail, item); });
 }
 
-} // namespace strata::kernels
+}  // namespace strata::kernels

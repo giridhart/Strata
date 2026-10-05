@@ -30,16 +30,12 @@ namespace {
 std::atomic<bool> enabled{false};
 constexpr int D = 128, HEADS = 4, R = 4;
 
-void scalar_score_kernel(const float* __restrict__ pooled,
-                         const float* __restrict__ query,
-                         const float* __restrict__ bias,
-                         const int32_t* __restrict__ step,
-                         int max_cells,
-                         float* __restrict__ cells,
-                         const sycl::nd_item<1>& item) {
+void scalar_score_kernel(const float* __restrict__ pooled, const float* __restrict__ query,
+                         const float* __restrict__ bias, const int32_t* __restrict__ step, int max_cells,
+                         float* __restrict__ cells, const sycl::nd_item<1>& item) {
     const int n = step[kStepNKv], full = step[kStepNBid];
-    if (n < 1 || n > max_cells || step[kStepPos] != n - 1 || full != n / R ||
-        step[kStepWidth] != (n < 2051 ? n : 2051)) return;
+    if (n < 1 || n > max_cells || step[kStepPos] != n - 1 || full != n / R || step[kStepWidth] != (n < 2051 ? n : 2051))
+        return;
 
     const int row = item.get_group(0);
     if (row > full) return;
@@ -73,7 +69,10 @@ void scalar_score_kernel(const float* __restrict__ pooled,
     }
 }
 
-struct Span { const void* p; size_t n; };
+struct Span {
+    const void* p;
+    size_t n;
+};
 void validate(Span s) {
     const auto p = reinterpret_cast<uintptr_t>(s.p);
     if (!p || p % 4 || s.n > UINTPTR_MAX - p)
@@ -84,33 +83,36 @@ bool overlaps(Span a, Span b) {
     const auto x = reinterpret_cast<uintptr_t>(a.p), y = reinterpret_cast<uintptr_t>(b.p);
     return x < y + b.n && y < x + a.n;
 }
-} // namespace
+}  // namespace
 
 void native_qsa_score_set_enabled(bool value) { enabled.store(value, std::memory_order_relaxed); }
 bool native_qsa_score_enabled() { return enabled.load(std::memory_order_relaxed); }
 
-void native_qsa_score(const float* pooled, const float* query, const float* bias,
-                      const QsaShapes& s, const int32_t* step, int64_t max_blocks, int64_t max_cells,
-                      float* cells, void* stream) {
+void native_qsa_score(const float* pooled, const float* query, const float* bias, const QsaShapes& s,
+                      const int32_t* step, int64_t max_blocks, int64_t max_cells, float* cells, void* stream) {
     if (!stream || s.idx_dim != D || s.idx_n_head != HEADS || s.idx_block != R || s.idx_top_k != 2048 ||
         max_cells < 1 || max_cells > INT32_MAX - 3 || max_blocks != max_cells / R + 1)
-        throw std::invalid_argument("native QSA score requires 128dim/4heads/4cells/2048budget, exact capacities and explicit stream");
-    const Span spans[] = {{pooled, size_t(max_blocks) * D * 4}, {query, HEADS * D * 4},
-        {step, kStepCount * 4}, {cells, size_t(max_cells) * 4}, {bias, bias ? size_t(max_blocks) * 4 : 0}};
+        throw std::invalid_argument(
+            "native QSA score requires 128dim/4heads/4cells/2048budget, exact capacities and explicit stream");
+    const Span spans[] = {{pooled, size_t(max_blocks) * D * 4},
+                          {query, HEADS * D * 4},
+                          {step, kStepCount * 4},
+                          {cells, size_t(max_cells) * 4},
+                          {bias, bias ? size_t(max_blocks) * 4 : 0}};
     const int count = bias ? 5 : 4;
-    for (int i = 0; i < count; ++i) validate(spans[i]);
-    for (int i = 0; i < count; ++i) for (int j = i + 1; j < count; ++j)
-        if (overlaps(spans[i], spans[j])) throw std::invalid_argument("native QSA score spans overlap");
+    for (int i = 0; i < count; ++i)
+        validate(spans[i]);
+    for (int i = 0; i < count; ++i)
+        for (int j = i + 1; j < count; ++j)
+            if (overlaps(spans[i], spans[j])) throw std::invalid_argument("native QSA score spans overlap");
 
     static sycl::queue default_queue{sycl::property::queue::in_order()};
     sycl::queue* q = stream ? static_cast<sycl::queue*>(stream) : &default_queue;
 
-    q->parallel_for(
-        sycl::nd_range<1>(sycl::range<1>((size_t)max_blocks * 32),
-                          sycl::range<1>(32)),
-        [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(32)]] {
-            scalar_score_kernel(pooled, query, bias, step, int(max_cells), cells, item);
-        });
+    q->parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t)max_blocks * 32), sycl::range<1>(32)),
+                    [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(32)]] {
+                        scalar_score_kernel(pooled, query, bias, step, int(max_cells), cells, item);
+                    });
 }
 
-} // namespace strata::kernels
+}  // namespace strata::kernels

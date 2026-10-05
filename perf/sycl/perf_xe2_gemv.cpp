@@ -37,11 +37,9 @@ namespace {
 /// Optimized for native SIMD16 execution on Intel Xe2 Vector Engines (XVE).
 /// One subgroup computes one output token/channel (b, o).
 template <int SG_SIZE, int WG_SIZE>
-void xe2_subgroup_gemv_kernel(sycl::nd_item<1> item,
-                              const sycl::ext::oneapi::bfloat16* __restrict__ in,
+void xe2_subgroup_gemv_kernel(sycl::nd_item<1> item, const sycl::ext::oneapi::bfloat16* __restrict__ in,
                               const sycl::ext::oneapi::bfloat16* __restrict__ w,
-                              sycl::ext::oneapi::bfloat16* __restrict__ out,
-                              int K, int N, int total_tasks) {
+                              sycl::ext::oneapi::bfloat16* __restrict__ out, int K, int N, int total_tasks) {
     auto sg = item.get_sub_group();
     constexpr int sgs_per_wg = WG_SIZE / SG_SIZE;
     const int gid = item.get_group(0);
@@ -59,7 +57,7 @@ void xe2_subgroup_gemv_kernel(sycl::nd_item<1> item,
     const sycl::ext::oneapi::bfloat16* w_o = w + o * K;
 
     float acc = 0.0f;
-    #pragma unroll 4
+#pragma unroll 4
     for (int i = lane; i < K; i += SG_SIZE) {
         acc += static_cast<float>(x_b[i]) * static_cast<float>(w_o[i]);
     }
@@ -74,11 +72,9 @@ void xe2_subgroup_gemv_kernel(sycl::nd_item<1> item,
 /// Used for narrow output shapes (e.g. ssm_alpha [2560, 48], indexer.k_proj [2560, 128])
 /// where output width is too small to saturate all Xe-cores.
 template <int TPR>
-void xe2_split_gemv_kernel(sycl::nd_item<1> item,
-                           const sycl::ext::oneapi::bfloat16* __restrict__ in,
+void xe2_split_gemv_kernel(sycl::nd_item<1> item, const sycl::ext::oneapi::bfloat16* __restrict__ in,
                            const sycl::ext::oneapi::bfloat16* __restrict__ w,
-                           sycl::ext::oneapi::bfloat16* __restrict__ out,
-                           int K, int N, int total_tasks,
+                           sycl::ext::oneapi::bfloat16* __restrict__ out, int K, int N, int total_tasks,
                            sycl::local_accessor<float, 1> scratch) {
     const int task_id = item.get_group(0);
     if (task_id >= total_tasks) return;
@@ -91,7 +87,7 @@ void xe2_split_gemv_kernel(sycl::nd_item<1> item,
     const sycl::ext::oneapi::bfloat16* w_o = w + o * K;
 
     float acc = 0.0f;
-    #pragma unroll 4
+#pragma unroll 4
     for (int i = t; i < K; i += TPR) {
         acc += static_cast<float>(x_b[i]) * static_cast<float>(w_o[i]);
     }
@@ -111,7 +107,7 @@ void xe2_split_gemv_kernel(sycl::nd_item<1> item,
     }
 }
 
-} // namespace
+}  // namespace
 
 // ============================================================================
 // 1. Primary Benchmark: BM_Xe2_GEMV
@@ -126,14 +122,14 @@ static void BM_Xe2_GEMV(benchmark::State& state) {
     sycl::queue q{sycl::default_selector_v, {sycl::property::queue::enable_profiling()}};
 
     // Allocate USM device buffers
-    auto* in  = sycl::malloc_device<sycl::ext::oneapi::bfloat16>(B * K, q);
-    auto* w   = sycl::malloc_device<sycl::ext::oneapi::bfloat16>(K * N, q);
+    auto* in = sycl::malloc_device<sycl::ext::oneapi::bfloat16>(B * K, q);
+    auto* w = sycl::malloc_device<sycl::ext::oneapi::bfloat16>(K * N, q);
     auto* out = sycl::malloc_device<sycl::ext::oneapi::bfloat16>(B * N, q);
 
     if (!in || !w || !out) {
         state.SkipWithError("Failed to allocate SYCL device memory");
-        if (in)  sycl::free(in, q);
-        if (w)   sycl::free(w, q);
+        if (in) sycl::free(in, q);
+        if (w) sycl::free(w, q);
         if (out) sycl::free(out, q);
         return;
     }
@@ -144,8 +140,8 @@ static void BM_Xe2_GEMV(benchmark::State& state) {
     q.fill(out, sycl::ext::oneapi::bfloat16{0.0f}, B * N);
     q.wait_and_throw();
 
-    constexpr int SG_SIZE = 16;  // Native Xe2 SIMD16
-    constexpr int WG_SIZE = 256; // 16 subgroups per work-group
+    constexpr int SG_SIZE = 16;   // Native Xe2 SIMD16
+    constexpr int WG_SIZE = 256;  // 16 subgroups per work-group
     constexpr int sgs_per_wg = WG_SIZE / SG_SIZE;
     const int total_tasks = B * N;
     const int num_wgs = (total_tasks + sgs_per_wg - 1) / sgs_per_wg;
@@ -153,24 +149,20 @@ static void BM_Xe2_GEMV(benchmark::State& state) {
     // GPU Steady-State Warmup: ramp clocks from idle (800 MHz) to peak boost (2850 MHz)
     for (int warmup = 0; warmup < 10; ++warmup) {
         q.submit([&](sycl::handler& cgh) {
-            cgh.parallel_for(
-                sycl::nd_range<1>(num_wgs * WG_SIZE, WG_SIZE),
-                [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
-                    xe2_subgroup_gemv_kernel<SG_SIZE, WG_SIZE>(
-                        item, in, w, out, K, N, total_tasks);
-                });
-        }).wait();
+             cgh.parallel_for(sycl::nd_range<1>(num_wgs * WG_SIZE, WG_SIZE),
+                              [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
+                                  xe2_subgroup_gemv_kernel<SG_SIZE, WG_SIZE>(item, in, w, out, K, N, total_tasks);
+                              });
+         }).wait();
     }
 
     // Timed microbenchmark loop using hardware event profiling
     for (auto _ : state) {
         auto ev = q.submit([&](sycl::handler& cgh) {
-            cgh.parallel_for(
-                sycl::nd_range<1>(num_wgs * WG_SIZE, WG_SIZE),
-                [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
-                    xe2_subgroup_gemv_kernel<SG_SIZE, WG_SIZE>(
-                        item, in, w, out, K, N, total_tasks);
-                });
+            cgh.parallel_for(sycl::nd_range<1>(num_wgs * WG_SIZE, WG_SIZE),
+                             [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
+                                 xe2_subgroup_gemv_kernel<SG_SIZE, WG_SIZE>(item, in, w, out, K, N, total_tasks);
+                             });
         });
         ev.wait();
 
@@ -181,9 +173,12 @@ static void BM_Xe2_GEMV(benchmark::State& state) {
 
     // Hardware performance metrics & counters
     const double bytes = static_cast<double>(K * N + B * K + B * N) * sizeof(sycl::ext::oneapi::bfloat16);
-    state.counters["Bandwidth_GBps"] = benchmark::Counter(bytes, benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
-    state.counters["TFLOPS"]         = benchmark::Counter((2.0 * B * K * N), benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
-    state.counters["tokens_per_sec"] = benchmark::Counter(static_cast<double>(B), benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
+    state.counters["Bandwidth_GBps"] =
+        benchmark::Counter(bytes, benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
+    state.counters["TFLOPS"] = benchmark::Counter((2.0 * B * K * N), benchmark::Counter::kIsIterationInvariantRate,
+                                                  benchmark::Counter::kIs1000);
+    state.counters["tokens_per_sec"] = benchmark::Counter(
+        static_cast<double>(B), benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
 
     sycl::free(in, q);
     sycl::free(w, q);
@@ -197,22 +192,22 @@ static void BM_Xe2_GEMV(benchmark::State& state) {
 // to verify Xe2 SIMD16 architectural advantages and occupancy scaling.
 
 static void BM_Xe2_GEMV_TuneSubgroup(benchmark::State& state) {
-    const int K       = static_cast<int>(state.range(0));
-    const int N       = static_cast<int>(state.range(1));
-    const int B       = static_cast<int>(state.range(2));
+    const int K = static_cast<int>(state.range(0));
+    const int N = static_cast<int>(state.range(1));
+    const int B = static_cast<int>(state.range(2));
     const int SG_SIZE = static_cast<int>(state.range(3));
     const int WG_SIZE = static_cast<int>(state.range(4));
 
     sycl::queue q{sycl::default_selector_v, {sycl::property::queue::enable_profiling()}};
 
-    auto* in  = sycl::malloc_device<sycl::ext::oneapi::bfloat16>(B * K, q);
-    auto* w   = sycl::malloc_device<sycl::ext::oneapi::bfloat16>(K * N, q);
+    auto* in = sycl::malloc_device<sycl::ext::oneapi::bfloat16>(B * K, q);
+    auto* w = sycl::malloc_device<sycl::ext::oneapi::bfloat16>(K * N, q);
     auto* out = sycl::malloc_device<sycl::ext::oneapi::bfloat16>(B * N, q);
 
     if (!in || !w || !out) {
         state.SkipWithError("Failed to allocate SYCL device memory");
-        if (in)  sycl::free(in, q);
-        if (w)   sycl::free(w, q);
+        if (in) sycl::free(in, q);
+        if (w) sycl::free(w, q);
         if (out) sycl::free(out, q);
         return;
     }
@@ -229,43 +224,37 @@ static void BM_Xe2_GEMV_TuneSubgroup(benchmark::State& state) {
     auto launch_kernel = [&](sycl::handler& cgh) {
         if (SG_SIZE == 16) {
             if (WG_SIZE == 64) {
-                cgh.parallel_for(
-                    sycl::nd_range<1>(num_wgs * 64, 64),
-                    [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
-                        xe2_subgroup_gemv_kernel<16, 64>(item, in, w, out, K, N, total_tasks);
-                    });
+                cgh.parallel_for(sycl::nd_range<1>(num_wgs * 64, 64),
+                                 [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
+                                     xe2_subgroup_gemv_kernel<16, 64>(item, in, w, out, K, N, total_tasks);
+                                 });
             } else if (WG_SIZE == 128) {
-                cgh.parallel_for(
-                    sycl::nd_range<1>(num_wgs * 128, 128),
-                    [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
-                        xe2_subgroup_gemv_kernel<16, 128>(item, in, w, out, K, N, total_tasks);
-                    });
+                cgh.parallel_for(sycl::nd_range<1>(num_wgs * 128, 128),
+                                 [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
+                                     xe2_subgroup_gemv_kernel<16, 128>(item, in, w, out, K, N, total_tasks);
+                                 });
             } else {
-                cgh.parallel_for(
-                    sycl::nd_range<1>(num_wgs * 256, 256),
-                    [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
-                        xe2_subgroup_gemv_kernel<16, 256>(item, in, w, out, K, N, total_tasks);
-                    });
+                cgh.parallel_for(sycl::nd_range<1>(num_wgs * 256, 256),
+                                 [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
+                                     xe2_subgroup_gemv_kernel<16, 256>(item, in, w, out, K, N, total_tasks);
+                                 });
             }
         } else {
             if (WG_SIZE == 64) {
-                cgh.parallel_for(
-                    sycl::nd_range<1>(num_wgs * 64, 64),
-                    [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(32)]] {
-                        xe2_subgroup_gemv_kernel<32, 64>(item, in, w, out, K, N, total_tasks);
-                    });
+                cgh.parallel_for(sycl::nd_range<1>(num_wgs * 64, 64),
+                                 [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(32)]] {
+                                     xe2_subgroup_gemv_kernel<32, 64>(item, in, w, out, K, N, total_tasks);
+                                 });
             } else if (WG_SIZE == 128) {
-                cgh.parallel_for(
-                    sycl::nd_range<1>(num_wgs * 128, 128),
-                    [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(32)]] {
-                        xe2_subgroup_gemv_kernel<32, 128>(item, in, w, out, K, N, total_tasks);
-                    });
+                cgh.parallel_for(sycl::nd_range<1>(num_wgs * 128, 128),
+                                 [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(32)]] {
+                                     xe2_subgroup_gemv_kernel<32, 128>(item, in, w, out, K, N, total_tasks);
+                                 });
             } else {
-                cgh.parallel_for(
-                    sycl::nd_range<1>(num_wgs * 256, 256),
-                    [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(32)]] {
-                        xe2_subgroup_gemv_kernel<32, 256>(item, in, w, out, K, N, total_tasks);
-                    });
+                cgh.parallel_for(sycl::nd_range<1>(num_wgs * 256, 256),
+                                 [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(32)]] {
+                                     xe2_subgroup_gemv_kernel<32, 256>(item, in, w, out, K, N, total_tasks);
+                                 });
             }
         }
     };
@@ -285,8 +274,10 @@ static void BM_Xe2_GEMV_TuneSubgroup(benchmark::State& state) {
     }
 
     const double bytes = static_cast<double>(K * N + B * K + B * N) * sizeof(sycl::ext::oneapi::bfloat16);
-    state.counters["Bandwidth_GBps"] = benchmark::Counter(bytes, benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
-    state.counters["TFLOPS"]         = benchmark::Counter((2.0 * B * K * N), benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
+    state.counters["Bandwidth_GBps"] =
+        benchmark::Counter(bytes, benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
+    state.counters["TFLOPS"] = benchmark::Counter((2.0 * B * K * N), benchmark::Counter::kIsIterationInvariantRate,
+                                                  benchmark::Counter::kIs1000);
 
     sycl::free(in, q);
     sycl::free(w, q);
@@ -300,21 +291,21 @@ static void BM_Xe2_GEMV_TuneSubgroup(benchmark::State& state) {
 // multi-thread cooperative reductions saturate Xe-cores better on narrow shapes.
 
 static void BM_Xe2_GEMV_SplitReduction(benchmark::State& state) {
-    const int K   = static_cast<int>(state.range(0));
-    const int N   = static_cast<int>(state.range(1));
-    const int B   = static_cast<int>(state.range(2));
+    const int K = static_cast<int>(state.range(0));
+    const int N = static_cast<int>(state.range(1));
+    const int B = static_cast<int>(state.range(2));
     const int TPR = static_cast<int>(state.range(3));
 
     sycl::queue q{sycl::default_selector_v, {sycl::property::queue::enable_profiling()}};
 
-    auto* in  = sycl::malloc_device<sycl::ext::oneapi::bfloat16>(B * K, q);
-    auto* w   = sycl::malloc_device<sycl::ext::oneapi::bfloat16>(K * N, q);
+    auto* in = sycl::malloc_device<sycl::ext::oneapi::bfloat16>(B * K, q);
+    auto* w = sycl::malloc_device<sycl::ext::oneapi::bfloat16>(K * N, q);
     auto* out = sycl::malloc_device<sycl::ext::oneapi::bfloat16>(B * N, q);
 
     if (!in || !w || !out) {
         state.SkipWithError("Failed to allocate SYCL device memory");
-        if (in)  sycl::free(in, q);
-        if (w)   sycl::free(w, q);
+        if (in) sycl::free(in, q);
+        if (w) sycl::free(w, q);
         if (out) sycl::free(out, q);
         return;
     }
@@ -329,25 +320,22 @@ static void BM_Xe2_GEMV_SplitReduction(benchmark::State& state) {
     auto launch_split = [&](sycl::handler& cgh) {
         if (TPR == 64) {
             sycl::local_accessor<float, 1> scratch(sycl::range<1>(64), cgh);
-            cgh.parallel_for(
-                sycl::nd_range<1>(total_tasks * 64, 64),
-                [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
-                    xe2_split_gemv_kernel<64>(item, in, w, out, K, N, total_tasks, scratch);
-                });
+            cgh.parallel_for(sycl::nd_range<1>(total_tasks * 64, 64),
+                             [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
+                                 xe2_split_gemv_kernel<64>(item, in, w, out, K, N, total_tasks, scratch);
+                             });
         } else if (TPR == 128) {
             sycl::local_accessor<float, 1> scratch(sycl::range<1>(128), cgh);
-            cgh.parallel_for(
-                sycl::nd_range<1>(total_tasks * 128, 128),
-                [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
-                    xe2_split_gemv_kernel<128>(item, in, w, out, K, N, total_tasks, scratch);
-                });
+            cgh.parallel_for(sycl::nd_range<1>(total_tasks * 128, 128),
+                             [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
+                                 xe2_split_gemv_kernel<128>(item, in, w, out, K, N, total_tasks, scratch);
+                             });
         } else {
             sycl::local_accessor<float, 1> scratch(sycl::range<1>(256), cgh);
-            cgh.parallel_for(
-                sycl::nd_range<1>(total_tasks * 256, 256),
-                [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
-                    xe2_split_gemv_kernel<256>(item, in, w, out, K, N, total_tasks, scratch);
-                });
+            cgh.parallel_for(sycl::nd_range<1>(total_tasks * 256, 256),
+                             [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
+                                 xe2_split_gemv_kernel<256>(item, in, w, out, K, N, total_tasks, scratch);
+                             });
         }
     };
 
@@ -366,8 +354,10 @@ static void BM_Xe2_GEMV_SplitReduction(benchmark::State& state) {
     }
 
     const double bytes = static_cast<double>(K * N + B * K + B * N) * sizeof(sycl::ext::oneapi::bfloat16);
-    state.counters["Bandwidth_GBps"] = benchmark::Counter(bytes, benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
-    state.counters["TFLOPS"]         = benchmark::Counter((2.0 * B * K * N), benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
+    state.counters["Bandwidth_GBps"] =
+        benchmark::Counter(bytes, benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
+    state.counters["TFLOPS"] = benchmark::Counter((2.0 * B * K * N), benchmark::Counter::kIsIterationInvariantRate,
+                                                  benchmark::Counter::kIs1000);
 
     sycl::free(in, q);
     sycl::free(w, q);
@@ -389,12 +379,12 @@ BENCHMARK(BM_Xe2_GEMV)->UseManualTime()->Args({320, 10240, 1});  // hc_attn_up [
 BENCHMARK(BM_Xe2_GEMV)->UseManualTime()->Args({2560, 2560, 1});  // ple_value / q_proj / out_proj [2560, 2560]
 
 // Register expert projections
-BENCHMARK(BM_Xe2_GEMV)->UseManualTime()->Args({2560, 10240, 1}); // gate / up expert [2560, 10240]
-BENCHMARK(BM_Xe2_GEMV)->UseManualTime()->Args({10240, 2560, 1}); // down expert [10240, 2560]
+BENCHMARK(BM_Xe2_GEMV)->UseManualTime()->Args({2560, 10240, 1});  // gate / up expert [2560, 10240]
+BENCHMARK(BM_Xe2_GEMV)->UseManualTime()->Args({10240, 2560, 1});  // down expert [10240, 2560]
 
 // Register prefill context chunking (B=24, B=32)
-BENCHMARK(BM_Xe2_GEMV)->UseManualTime()->Args({10240, 320, 24}); // prefill hc_attn_down chunking
-BENCHMARK(BM_Xe2_GEMV)->UseManualTime()->Args({2560, 2560, 32}); // prefill attention/ffn chunking
+BENCHMARK(BM_Xe2_GEMV)->UseManualTime()->Args({10240, 320, 24});  // prefill hc_attn_down chunking
+BENCHMARK(BM_Xe2_GEMV)->UseManualTime()->Args({2560, 2560, 32});  // prefill attention/ffn chunking
 
 // ============================================================================
 // Registration: Microarchitectural Parameter Tuning Sweeps

@@ -119,7 +119,7 @@ bool CapturedGraph::wait_ms(int timeout_ms) const {
 }
 
 bool GraphRegistry::record(LayerType type, int n_tokens, const std::function<void()>& body, std::string& err) {
-    const Key k{(int) type, n_tokens};
+    const Key k{(int)type, n_tokens};
     if (graphs_.count(k)) return true;
 
     CapturedGraph g;
@@ -133,7 +133,7 @@ bool GraphRegistry::record(LayerType type, int n_tokens, const std::function<voi
 }
 
 const CapturedGraph* GraphRegistry::find(LayerType type, int n_tokens) const {
-    const auto it = graphs_.find(Key{(int) type, n_tokens});
+    const auto it = graphs_.find(Key{(int)type, n_tokens});
     return it == graphs_.end() ? nullptr : &it->second;
 }
 

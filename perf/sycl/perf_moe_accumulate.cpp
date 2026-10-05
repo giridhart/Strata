@@ -24,7 +24,7 @@
 namespace {
 
 constexpr int N_EXPERTS = 10;
-constexpr int N_EMBD    = 2560;
+constexpr int N_EMBD = 2560;
 
 // ============================================================================
 // MoE Reduction Kernels
@@ -32,11 +32,8 @@ constexpr int N_EMBD    = 2560;
 
 /// 1. Atomic Add Reduction
 /// Each work-item processes one expert for one column and atomically accumulates to output.
-void moe_atomic_kernel(sycl::nd_item<1> item,
-                       const float* __restrict__ parts,
-                       const float* __restrict__ weights,
-                       float* __restrict__ output,
-                       int B, int n_embd, int k) {
+void moe_atomic_kernel(sycl::nd_item<1> item, const float* __restrict__ parts, const float* __restrict__ weights,
+                       float* __restrict__ output, int B, int n_embd, int k) {
     const int idx = item.get_global_id(0);
     const int total_items = B * k * n_embd;
     if (idx >= total_items) return;
@@ -48,21 +45,16 @@ void moe_atomic_kernel(sycl::nd_item<1> item,
 
     const float val = parts[idx] * weights[b * k + expert];
 
-    auto out_ref = sycl::atomic_ref<float,
-                                    sycl::memory_order::relaxed,
-                                    sycl::memory_scope::device,
+    auto out_ref = sycl::atomic_ref<float, sycl::memory_order::relaxed, sycl::memory_scope::device,
                                     sycl::access::address_space::global_space>(output[b * n_embd + col]);
     out_ref.fetch_add(val);
 }
 
 /// 2. Direct Column-Strided Reduction (from native_moe.cpp)
 /// One thread per output column, iterating across all K experts sequentially.
-void moe_combine_kernel(sycl::nd_item<2> item,
-                        const float* __restrict__ parts,
-                        const float* __restrict__ weights,
-                        float* __restrict__ output,
-                        int n_embd, int k) {
-    const int64_t tk = item.get_group(0); // Token / Batch index
+void moe_combine_kernel(sycl::nd_item<2> item, const float* __restrict__ parts, const float* __restrict__ weights,
+                        float* __restrict__ output, int n_embd, int k) {
+    const int64_t tk = item.get_group(0);  // Token / Batch index
     parts += tk * k * n_embd;
     weights += tk * k;
     output += tk * n_embd;
@@ -71,7 +63,7 @@ void moe_combine_kernel(sycl::nd_item<2> item,
     if (col >= n_embd) return;
 
     float sum = parts[col] * weights[0];
-    #pragma unroll
+#pragma unroll
     for (int expert = 1; expert < k; ++expert) {
         sum += parts[int64_t(expert) * n_embd + col] * weights[expert];
     }
@@ -80,11 +72,8 @@ void moe_combine_kernel(sycl::nd_item<2> item,
 
 /// 3. SIMD16 Subgroup Cooperative Reduction
 /// Subgroups stride across columns with unrolled vectorized memory operations.
-void moe_subgroup_kernel(sycl::nd_item<1> item,
-                         const float* __restrict__ parts,
-                         const float* __restrict__ weights,
-                         float* __restrict__ output,
-                         int B, int n_embd, int k) {
+void moe_subgroup_kernel(sycl::nd_item<1> item, const float* __restrict__ parts, const float* __restrict__ weights,
+                         float* __restrict__ output, int B, int n_embd, int k) {
     const int total_cols = B * n_embd;
     const int col_idx = item.get_global_id(0);
     if (col_idx >= total_cols) return;
@@ -96,14 +85,14 @@ void moe_subgroup_kernel(sycl::nd_item<1> item,
     const float* w_tok = weights + b * k;
 
     float sum = 0.0f;
-    #pragma unroll 10
+#pragma unroll 10
     for (int e = 0; e < k; ++e) {
         sum += p_tok[static_cast<size_t>(e) * n_embd] * w_tok[e];
     }
     output[col_idx] = sum;
 }
 
-} // namespace
+}  // namespace
 
 // ============================================================================
 // Benchmarks
@@ -117,15 +106,15 @@ static void BM_Xe2_MoE_Atomic(benchmark::State& state) {
     const size_t weights_size = static_cast<size_t>(B) * N_EXPERTS;
     const size_t out_size = static_cast<size_t>(B) * N_EMBD;
 
-    float* d_parts   = sycl::malloc_device<float>(parts_size, q);
+    float* d_parts = sycl::malloc_device<float>(parts_size, q);
     float* d_weights = sycl::malloc_device<float>(weights_size, q);
-    float* d_out     = sycl::malloc_device<float>(out_size, q);
+    float* d_out = sycl::malloc_device<float>(out_size, q);
 
     if (!d_parts || !d_weights || !d_out) {
         state.SkipWithError("Failed to allocate USM memory for MoE benchmark");
-        if (d_parts)   sycl::free(d_parts, q);
+        if (d_parts) sycl::free(d_parts, q);
         if (d_weights) sycl::free(d_weights, q);
-        if (d_out)     sycl::free(d_out, q);
+        if (d_out) sycl::free(d_out, q);
         return;
     }
 
@@ -139,11 +128,10 @@ static void BM_Xe2_MoE_Atomic(benchmark::State& state) {
     const size_t n_wgs = (total_items + WG - 1) / WG;
 
     auto launch = [&](sycl::handler& cgh) {
-        cgh.parallel_for(
-            sycl::nd_range<1>(n_wgs * WG, WG),
-            [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
-                moe_atomic_kernel(item, d_parts, d_weights, d_out, B, N_EMBD, N_EXPERTS);
-            });
+        cgh.parallel_for(sycl::nd_range<1>(n_wgs * WG, WG),
+                         [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
+                             moe_atomic_kernel(item, d_parts, d_weights, d_out, B, N_EMBD, N_EXPERTS);
+                         });
     };
 
     // Warmup
@@ -162,9 +150,13 @@ static void BM_Xe2_MoE_Atomic(benchmark::State& state) {
     }
 
     const double bytes = static_cast<double>(parts_size + weights_size + out_size) * sizeof(float);
-    state.counters["Bandwidth_GBps"] = benchmark::Counter(bytes, benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
-    state.counters["TFLOPS"]         = benchmark::Counter(2.0 * static_cast<double>(parts_size), benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
-    state.counters["tokens_per_sec"] = benchmark::Counter(static_cast<double>(B), benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
+    state.counters["Bandwidth_GBps"] =
+        benchmark::Counter(bytes, benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
+    state.counters["TFLOPS"] =
+        benchmark::Counter(2.0 * static_cast<double>(parts_size), benchmark::Counter::kIsIterationInvariantRate,
+                           benchmark::Counter::kIs1000);
+    state.counters["tokens_per_sec"] = benchmark::Counter(
+        static_cast<double>(B), benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
 
     sycl::free(d_parts, q);
     sycl::free(d_weights, q);
@@ -179,15 +171,15 @@ static void BM_Xe2_MoE_DirectCombine(benchmark::State& state) {
     const size_t weights_size = static_cast<size_t>(B) * N_EXPERTS;
     const size_t out_size = static_cast<size_t>(B) * N_EMBD;
 
-    float* d_parts   = sycl::malloc_device<float>(parts_size, q);
+    float* d_parts = sycl::malloc_device<float>(parts_size, q);
     float* d_weights = sycl::malloc_device<float>(weights_size, q);
-    float* d_out     = sycl::malloc_device<float>(out_size, q);
+    float* d_out = sycl::malloc_device<float>(out_size, q);
 
     if (!d_parts || !d_weights || !d_out) {
         state.SkipWithError("Failed to allocate USM memory for MoE benchmark");
-        if (d_parts)   sycl::free(d_parts, q);
+        if (d_parts) sycl::free(d_parts, q);
         if (d_weights) sycl::free(d_weights, q);
-        if (d_out)     sycl::free(d_out, q);
+        if (d_out) sycl::free(d_out, q);
         return;
     }
 
@@ -200,11 +192,10 @@ static void BM_Xe2_MoE_DirectCombine(benchmark::State& state) {
     const size_t n_blocks = (N_EMBD + WG - 1) / WG;
 
     auto launch = [&](sycl::handler& cgh) {
-        cgh.parallel_for(
-            sycl::nd_range<2>(sycl::range<2>(B, n_blocks * WG), sycl::range<2>(1, WG)),
-            [=](sycl::nd_item<2> item) [[sycl::reqd_sub_group_size(16)]] {
-                moe_combine_kernel(item, d_parts, d_weights, d_out, N_EMBD, N_EXPERTS);
-            });
+        cgh.parallel_for(sycl::nd_range<2>(sycl::range<2>(B, n_blocks * WG), sycl::range<2>(1, WG)),
+                         [=](sycl::nd_item<2> item) [[sycl::reqd_sub_group_size(16)]] {
+                             moe_combine_kernel(item, d_parts, d_weights, d_out, N_EMBD, N_EXPERTS);
+                         });
     };
 
     // Warmup
@@ -221,9 +212,13 @@ static void BM_Xe2_MoE_DirectCombine(benchmark::State& state) {
     }
 
     const double bytes = static_cast<double>(parts_size + weights_size + out_size) * sizeof(float);
-    state.counters["Bandwidth_GBps"] = benchmark::Counter(bytes, benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
-    state.counters["TFLOPS"]         = benchmark::Counter(2.0 * static_cast<double>(parts_size), benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
-    state.counters["tokens_per_sec"] = benchmark::Counter(static_cast<double>(B), benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
+    state.counters["Bandwidth_GBps"] =
+        benchmark::Counter(bytes, benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
+    state.counters["TFLOPS"] =
+        benchmark::Counter(2.0 * static_cast<double>(parts_size), benchmark::Counter::kIsIterationInvariantRate,
+                           benchmark::Counter::kIs1000);
+    state.counters["tokens_per_sec"] = benchmark::Counter(
+        static_cast<double>(B), benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
 
     sycl::free(d_parts, q);
     sycl::free(d_weights, q);
@@ -238,15 +233,15 @@ static void BM_Xe2_MoE_SubgroupReduce(benchmark::State& state) {
     const size_t weights_size = static_cast<size_t>(B) * N_EXPERTS;
     const size_t out_size = static_cast<size_t>(B) * N_EMBD;
 
-    float* d_parts   = sycl::malloc_device<float>(parts_size, q);
+    float* d_parts = sycl::malloc_device<float>(parts_size, q);
     float* d_weights = sycl::malloc_device<float>(weights_size, q);
-    float* d_out     = sycl::malloc_device<float>(out_size, q);
+    float* d_out = sycl::malloc_device<float>(out_size, q);
 
     if (!d_parts || !d_weights || !d_out) {
         state.SkipWithError("Failed to allocate USM memory for MoE benchmark");
-        if (d_parts)   sycl::free(d_parts, q);
+        if (d_parts) sycl::free(d_parts, q);
         if (d_weights) sycl::free(d_weights, q);
-        if (d_out)     sycl::free(d_out, q);
+        if (d_out) sycl::free(d_out, q);
         return;
     }
 
@@ -260,11 +255,10 @@ static void BM_Xe2_MoE_SubgroupReduce(benchmark::State& state) {
     const size_t n_wgs = (total_cols + WG - 1) / WG;
 
     auto launch = [&](sycl::handler& cgh) {
-        cgh.parallel_for(
-            sycl::nd_range<1>(n_wgs * WG, WG),
-            [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
-                moe_subgroup_kernel(item, d_parts, d_weights, d_out, B, N_EMBD, N_EXPERTS);
-            });
+        cgh.parallel_for(sycl::nd_range<1>(n_wgs * WG, WG),
+                         [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
+                             moe_subgroup_kernel(item, d_parts, d_weights, d_out, B, N_EMBD, N_EXPERTS);
+                         });
     };
 
     // Warmup
@@ -281,9 +275,13 @@ static void BM_Xe2_MoE_SubgroupReduce(benchmark::State& state) {
     }
 
     const double bytes = static_cast<double>(parts_size + weights_size + out_size) * sizeof(float);
-    state.counters["Bandwidth_GBps"] = benchmark::Counter(bytes, benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
-    state.counters["TFLOPS"]         = benchmark::Counter(2.0 * static_cast<double>(parts_size), benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
-    state.counters["tokens_per_sec"] = benchmark::Counter(static_cast<double>(B), benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
+    state.counters["Bandwidth_GBps"] =
+        benchmark::Counter(bytes, benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
+    state.counters["TFLOPS"] =
+        benchmark::Counter(2.0 * static_cast<double>(parts_size), benchmark::Counter::kIsIterationInvariantRate,
+                           benchmark::Counter::kIs1000);
+    state.counters["tokens_per_sec"] = benchmark::Counter(
+        static_cast<double>(B), benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
 
     sycl::free(d_parts, q);
     sycl::free(d_weights, q);

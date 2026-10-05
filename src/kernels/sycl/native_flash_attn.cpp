@@ -54,19 +54,10 @@ inline float warp_max(sycl::sub_group sg, float x) {
 // D=256, ncols=1, F16/F16; 128 threads (4 warps of 32), nthreads_KQ=nthreads_V=8,
 // four values (float2) per load, four V columns per iteration. Padded length 256
 // gives ntiles_KV=ceil(256/D)=1, so the launcher selects grid.y=1.
-void attend(sycl::nd_item<2> item,
-            const float* __restrict__ q,
-            const sycl::half* __restrict__ k,
-            const sycl::half* __restrict__ v,
-            const int32_t* __restrict__ step,
-            int max_context,
-            int padded_length,
-            float scale,
-            float* __restrict__ out,
-            int32_t* __restrict__ status,
-            const sycl::half* __restrict__ mask,
-            sycl::local_accessor<float, 1> tile,
-            sycl::local_accessor<float, 1> max_shared,
+void attend(sycl::nd_item<2> item, const float* __restrict__ q, const sycl::half* __restrict__ k,
+            const sycl::half* __restrict__ v, const int32_t* __restrict__ step, int max_context, int padded_length,
+            float scale, float* __restrict__ out, int32_t* __restrict__ status, const sycl::half* __restrict__ mask,
+            sycl::local_accessor<float, 1> tile, sycl::local_accessor<float, 1> max_shared,
             sycl::local_accessor<float, 1> sum_shared) {
     const int lane = item.get_local_id(1);
     const int warp = item.get_local_id(0);
@@ -74,10 +65,9 @@ void attend(sycl::nd_item<2> item,
     const int head = item.get_group(0);
     const int kv = head / 12;
     const int width = step[kStepWidth], nkv = step[kStepNKv];
-    const bool valid = width >= 1 && width <= max_context && nkv == width &&
-                       step[kStepPos] == width - 1 && step[kStepNBid] == width / 4;
-    if (head == 0 && tid == 0)
-        *status = valid ? kNativeFlashAttnSuccess : kNativeFlashAttnUnsupportedStep;
+    const bool valid = width >= 1 && width <= max_context && nkv == width && step[kStepPos] == width - 1 &&
+                       step[kStepNBid] == width / 4;
+    if (head == 0 && tid == 0) *status = valid ? kNativeFlashAttnSuccess : kNativeFlashAttnUnsupportedStep;
     if (!valid) {
         out[head * 256 + tid] = sycl::bit_cast<float>(0x7fc00000u);
         out[head * 256 + tid + 128] = sycl::bit_cast<float>(0x7fc00000u);
@@ -93,8 +83,7 @@ void attend(sycl::nd_item<2> item,
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
             const int d = 2 * (i + j);
-            qreg[i0 / 8 + j] = sycl::float2(q[head * 256 + d] * scale,
-                                            q[head * 256 + d + 1] * scale);
+            qreg[i0 / 8 + j] = sycl::float2(q[head * 256 + d] * scale, q[head * 256 + d + 1] * scale);
         }
     }
     auto sg = item.get_sub_group();
@@ -160,7 +149,10 @@ void attend(sycl::nd_item<2> item,
             }
         }
     }
-    if (warp == 0) { max_shared[lane] = -FLT_MAX / 2.0f; sum_shared[lane] = 0.0f; }
+    if (warp == 0) {
+        max_shared[lane] = -FLT_MAX / 2.0f;
+        sum_shared[lane] = 0.0f;
+    }
     sycl::group_barrier(grp);
     if (lane == 0) max_shared[warp] = maximum;
     sycl::group_barrier(grp);
@@ -198,7 +190,10 @@ void attend(sycl::nd_item<2> item,
     }
 }
 
-struct Span { const void* p; std::size_t n, alignment; };
+struct Span {
+    const void* p;
+    std::size_t n, alignment;
+};
 void validate_spans(const Span* spans, int count) {
     for (int i = 0; i < count; ++i) {
         const auto a = reinterpret_cast<std::uintptr_t>(spans[i].p);
@@ -211,22 +206,19 @@ void validate_spans(const Span* spans, int count) {
         }
     }
 }
-} // namespace
+}  // namespace
 
-void native_flash_attn_short_step(const float* q, const uint16_t* k, const uint16_t* v,
-                                  const int32_t* step, int64_t capacity, int max_context,
-                                  const QsaShapes& shapes, float* output, int32_t* status,
-                                  const uint16_t* mask, void* stream) {
-    if (shapes.n_head != 24 || shapes.n_head_kv != 2 ||
-        shapes.head_dim != 256 || shapes.idx_block != 4 ||
+void native_flash_attn_short_step(const float* q, const uint16_t* k, const uint16_t* v, const int32_t* step,
+                                  int64_t capacity, int max_context, const QsaShapes& shapes, float* output,
+                                  int32_t* status, const uint16_t* mask, void* stream) {
+    if (shapes.n_head != 24 || shapes.n_head_kv != 2 || shapes.head_dim != 256 || shapes.idx_block != 4 ||
         shapes.idx_top_k < 256 || capacity < 256 ||
-        uint64_t(capacity) > std::numeric_limits<std::size_t>::max() / 1024 ||
-        max_context < 1 || max_context > 256)
-        throw std::invalid_argument("native FlashAttention supports only Q24x256/KV2x256, capacity>=256 and context1..256");
+        uint64_t(capacity) > std::numeric_limits<std::size_t>::max() / 1024 || max_context < 1 || max_context > 256)
+        throw std::invalid_argument(
+            "native FlashAttention supports only Q24x256/KV2x256, capacity>=256 and context1..256");
     const std::size_t kv_bytes = std::size_t(capacity) * 1024;
-    const Span spans[] = {{q, 24 * 256 * 4, 4}, {k, kv_bytes, 2}, {v, kv_bytes, 2},
-                          {step, kStepCount * 4, 4}, {output, 24 * 256 * 4, 4},
-                          {status, 4, 4}, {mask, 256 * 2, 2}};
+    const Span spans[] = {{q, 24 * 256 * 4, 4},      {k, kv_bytes, 2}, {v, kv_bytes, 2},  {step, kStepCount * 4, 4},
+                          {output, 24 * 256 * 4, 4}, {status, 4, 4},   {mask, 256 * 2, 2}};
     validate_spans(spans, mask ? 7 : 6);
 
     sycl::queue* q_ptr = stream ? static_cast<sycl::queue*>(stream) : &default_queue();
@@ -239,18 +231,13 @@ void native_flash_attn_short_step(const float* q, const uint16_t* k, const uint1
         sycl::local_accessor<float, 1> max_shared(sycl::range<1>(32), cgh);
         sycl::local_accessor<float, 1> sum_shared(sycl::range<1>(32), cgh);
 
-        cgh.parallel_for(
-            sycl::nd_range<2>(sycl::range<2>(24 * 4, 32), sycl::range<2>(4, 32)),
-            [=](sycl::nd_item<2> item) [[sycl::reqd_sub_group_size(32)]] {
-                attend(item, q,
-                       reinterpret_cast<const sycl::half*>(k),
-                       reinterpret_cast<const sycl::half*>(v),
-                       step, max_context, 256, 0.0625f,
-                       output, status,
-                       reinterpret_cast<const sycl::half*>(mask),
-                       tile, max_shared, sum_shared);
-            });
+        cgh.parallel_for(sycl::nd_range<2>(sycl::range<2>(24 * 4, 32), sycl::range<2>(4, 32)),
+                         [=](sycl::nd_item<2> item) [[sycl::reqd_sub_group_size(32)]] {
+                             attend(item, q, reinterpret_cast<const sycl::half*>(k),
+                                    reinterpret_cast<const sycl::half*>(v), step, max_context, 256, 0.0625f, output,
+                                    status, reinterpret_cast<const sycl::half*>(mask), tile, max_shared, sum_shared);
+                         });
     });
 }
 
-} // namespace strata::kernels
+}  // namespace strata::kernels

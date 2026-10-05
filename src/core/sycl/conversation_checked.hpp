@@ -24,11 +24,11 @@ inline bool product(size_t& out, std::initializer_list<uint64_t> factors) {
             /*
             DPCT1007:98: Migration of std::numeric_limits::max is not supported.
             */
-            (factor &&
-             value > std::numeric_limits<size_t>::max() / factor)) return false;
-        value *= (size_t) factor;
+            (factor && value > std::numeric_limits<size_t>::max() / factor))
+            return false;
+        value *= (size_t)factor;
     }
     out = value;
     return true;
 }
-} // namespace strata::core::conversation_detail
+}  // namespace strata::core::conversation_detail

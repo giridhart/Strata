@@ -32,26 +32,25 @@ inline sycl::queue& get_queue() {
     return q;
 }
 
-template <typename T> T *up(const std::vector<T> &h) {
-    sycl::queue &q_ct1 = get_queue();
-    T* d = (T *)sycl::malloc_device(h.size() * sizeof(T) + 64, q_ct1);
+template <typename T>
+T* up(const std::vector<T>& h) {
+    sycl::queue& q_ct1 = get_queue();
+    T* d = (T*)sycl::malloc_device(h.size() * sizeof(T) + 64, q_ct1);
     q_ct1.memcpy(d, h.data(), h.size() * sizeof(T)).wait();
     return d;
 }
 float h2f(uint16_t b) {
-    sycl::half h; *reinterpret_cast<uint16_t *>(&h) = b;
-    return sycl::vec<sycl::half, 1>(h)
-        .convert<float, sycl::rounding_mode::automatic>()[0];
+    sycl::half h;
+    *reinterpret_cast<uint16_t*>(&h) = b;
+    return sycl::vec<sycl::half, 1>(h).convert<float, sycl::rounding_mode::automatic>()[0];
 }
 uint16_t f2h(float f) {
-    sycl::half h =
-        sycl::vec<float, 1>(f)
-            .convert<sycl::half, sycl::rounding_mode::automatic>()[0];
-    return *reinterpret_cast<uint16_t *>(&h);
+    sycl::half h = sycl::vec<float, 1>(f).convert<sycl::half, sycl::rounding_mode::automatic>()[0];
+    return *reinterpret_cast<uint16_t*>(&h);
 }
 
 int run(int fmt, int64_t ctx, int64_t nq, int reps) {
-    sycl::queue &q_ct1 = get_queue(); // fmt 1 int8, 0 fp16
+    sycl::queue& q_ct1 = get_queue();  // fmt 1 int8, 0 fp16
     const k::QsaShapes s = k::qsa_real_shapes();
     const int64_t HD = s.head_dim, NKV = s.n_head_kv, NH = s.n_head, PS = s.page_size;
     const int64_t pages = (ctx + PS - 1) / PS, rows = pages * NKV * PS;
@@ -63,65 +62,86 @@ int run(int fmt, int64_t ctx, int64_t nq, int reps) {
     std::vector<int8_t> kq, vq;
     std::vector<uint16_t> ks, vs, kh, vh;
     if (fmt == 1) {
-        kq.resize(rows * HD); vq.resize(rows * HD); ks.resize(rows * 4); vs.resize(rows * 4);
-        for (auto& x : kq) x = (int8_t) code(rng);
-        for (auto& x : vq) x = (int8_t) code(rng);
-        for (auto& x : ks) x = f2h(sc(rng));
-        for (auto& x : vs) x = f2h(sc(rng));
+        kq.resize(rows * HD);
+        vq.resize(rows * HD);
+        ks.resize(rows * 4);
+        vs.resize(rows * 4);
+        for (auto& x : kq)
+            x = (int8_t)code(rng);
+        for (auto& x : vq)
+            x = (int8_t)code(rng);
+        for (auto& x : ks)
+            x = f2h(sc(rng));
+        for (auto& x : vs)
+            x = f2h(sc(rng));
     } else {
-        kh.resize(rows * HD); vh.resize(rows * HD);
-        for (auto& x : kh) x = f2h(nd(rng) * 1.5f);
-        for (auto& x : vh) x = f2h(nd(rng));
+        kh.resize(rows * HD);
+        vh.resize(rows * HD);
+        for (auto& x : kh)
+            x = f2h(nd(rng) * 1.5f);
+        for (auto& x : vh)
+            x = f2h(nd(rng));
     }
     std::vector<int32_t> table(pages);
-    for (int64_t i = 0; i < pages; ++i) table[i] = (int32_t) i;
+    for (int64_t i = 0; i < pages; ++i)
+        table[i] = (int32_t)i;
     std::shuffle(table.begin(), table.end(), rng);
     // queries at positions ctx - nq .. ctx - 1
     const int64_t cap = k::qsa_selection_width(ctx, s);
-    std::vector<int32_t> ids((size_t) (nq * cap), 0), steps((size_t) (nq * k::kStepCount), 0);
-    std::vector<float> q((size_t) (nq * NH * HD));
-    for (auto& x : q) x = nd(rng) * 2.0f;
+    std::vector<int32_t> ids((size_t)(nq * cap), 0), steps((size_t)(nq * k::kStepCount), 0);
+    std::vector<float> q((size_t)(nq * NH * HD));
+    for (auto& x : q)
+        x = nd(rng) * 2.0f;
     std::vector<int32_t> old_cells;
     for (int64_t i = 0; i < nq; ++i) {
         const int64_t pos = ctx - nq + i, nkv = pos + 1;
         const int64_t w = k::qsa_selection_width(nkv, s);
         int32_t* sel = ids.data() + i * cap;
-        steps[i * k::kStepCount + k::kStepWidth] = (int32_t) w;
+        steps[i * k::kStepCount + k::kStepWidth] = (int32_t)w;
         if (w == nkv) {
-            for (int64_t c = 0; c < w; ++c) sel[c] = (int32_t) c;
+            for (int64_t c = 0; c < w; ++c)
+                sel[c] = (int32_t)c;
             continue;
         }
         const int64_t recent = 512, older = w - recent;
-        if ((int64_t) old_cells.size() != older) {   // the older cells: a set that drifts ~3% per query
-            std::vector<int32_t> all((size_t) (nkv - recent));
-            for (int64_t c = 0; c < nkv - recent; ++c) all[c] = (int32_t) c;
+        if ((int64_t)old_cells.size() != older) {  // the older cells: a set that drifts ~3% per query
+            std::vector<int32_t> all((size_t)(nkv - recent));
+            for (int64_t c = 0; c < nkv - recent; ++c)
+                all[c] = (int32_t)c;
             std::shuffle(all.begin(), all.end(), rng);
             old_cells.assign(all.begin(), all.begin() + older);
         } else {
             std::uniform_int_distribution<int64_t> pick(0, older - 1), any(0, nkv - recent - 1);
             for (int r = 0; r < older / 32; ++r) {
-                const int32_t c = (int32_t) any(rng);
+                const int32_t c = (int32_t)any(rng);
                 if (std::find(old_cells.begin(), old_cells.end(), c) == old_cells.end()) old_cells[pick(rng)] = c;
             }
         }
         std::vector<int32_t> v(old_cells);
-        for (int64_t c = nkv - recent; c < nkv; ++c) v.push_back((int32_t) c);
+        for (int64_t c = nkv - recent; c < nkv; ++c)
+            v.push_back((int32_t)c);
         std::sort(v.begin(), v.end());
         std::copy(v.begin(), v.end(), sel);
     }
     k::QsaAttnPools pl;
-    if (fmt == 1) { pl.k_q = up(kq); pl.v_q = up(vq); pl.k_scale = up(ks); pl.v_scale = up(vs); }
-    else { pl.k_pool = up(kh); pl.v_pool = up(vh); }
+    if (fmt == 1) {
+        pl.k_q = up(kq);
+        pl.v_q = up(vq);
+        pl.k_scale = up(ks);
+        pl.v_scale = up(vs);
+    } else {
+        pl.k_pool = up(kh);
+        pl.v_pool = up(vh);
+    }
     pl.page_table = up(table);
     const int32_t* d_ids = up(ids);
     const int32_t* d_steps = up(steps);
     const float* d_q = up(q);
     float *d_old = nullptr, *d_new = nullptr, *scratch = nullptr;
-    d_old = (float *)sycl::malloc_device(nq * NH * HD * 4, q_ct1);
-    d_new = (float *)sycl::malloc_device(nq * NH * HD * 4, q_ct1);
+    d_old = (float*)sycl::malloc_device(nq * NH * HD * 4, q_ct1);
+    d_new = (float*)sycl::malloc_device(nq * NH * HD * 4, q_ct1);
     const int64_t batch = 32;
-    scratch = (float *)sycl::malloc_device(
-        batch * k::qsa_decode_attn_scratch_floats(cap, s) * 4, q_ct1);
+    scratch = (float*)sycl::malloc_device(batch * k::qsa_decode_attn_scratch_floats(cap, s) * 4, q_ct1);
     auto old_run = [&]() {
         for (int64_t t0 = 0; t0 < nq; t0 += batch)
             k::qsa_decode_attn_batch(d_q + t0 * NH * HD, pl, d_ids + t0 * cap, d_steps + t0 * k::kStepCount, cap, s,
@@ -136,7 +156,7 @@ int run(int fmt, int64_t ctx, int64_t nq, int reps) {
     old_run();
     new_run();
     q_ct1.wait_and_throw();
-    std::vector<float> o((size_t) (nq * NH * HD)), nw(o.size());
+    std::vector<float> o((size_t)(nq * NH * HD)), nw(o.size());
     q_ct1.memcpy(o.data(), d_old, o.size() * 4).wait();
     q_ct1.memcpy(nw.data(), d_new, nw.size() * 4).wait();
     // 1. FP64 reference on a sample of queries
@@ -146,29 +166,34 @@ int run(int fmt, int64_t ctx, int64_t nq, int reps) {
         const int32_t* sel = ids.data() + i * cap;
         for (int64_t h = 0; h < NH; ++h) {
             const int64_t kvh = h / (NH / NKV);
-            std::vector<double> sco((size_t) w);
+            std::vector<double> sco((size_t)w);
             double mx = -1e300;
             for (int64_t c = 0; c < w; ++c) {
-                const int64_t cell = sel[c], row = ((int64_t) table[cell / PS] * NKV + kvh) * PS + cell % PS;
+                const int64_t cell = sel[c], row = ((int64_t)table[cell / PS] * NKV + kvh) * PS + cell % PS;
                 double a = 0;
                 for (int64_t d = 0; d < HD; ++d) {
-                    const double kv = fmt == 1 ? (double) kq[row * HD + d] * h2f(ks[row * 4 + d / 64]) : h2f(kh[row * HD + d]);
-                    a += (double) q[(i * NH + h) * HD + d] * kv;
+                    const double kv =
+                        fmt == 1 ? (double)kq[row * HD + d] * h2f(ks[row * 4 + d / 64]) : h2f(kh[row * HD + d]);
+                    a += (double)q[(i * NH + h) * HD + d] * kv;
                 }
                 sco[c] = a / 16.0;
                 mx = std::max(mx, sco[c]);
             }
             double l = 0;
-            for (auto& x : sco) { x = std::exp(x - mx); l += x; }
+            for (auto& x : sco) {
+                x = std::exp(x - mx);
+                l += x;
+            }
             for (int64_t d = 0; d < HD; ++d) {
                 double a = 0;
                 for (int64_t c = 0; c < w; ++c) {
-                    const int64_t cell = sel[c], row = ((int64_t) table[cell / PS] * NKV + kvh) * PS + cell % PS;
-                    const double vv = fmt == 1 ? (double) vq[row * HD + d] * h2f(vs[row * 4 + d / 64]) : h2f(vh[row * HD + d]);
+                    const int64_t cell = sel[c], row = ((int64_t)table[cell / PS] * NKV + kvh) * PS + cell % PS;
+                    const double vv =
+                        fmt == 1 ? (double)vq[row * HD + d] * h2f(vs[row * 4 + d / 64]) : h2f(vh[row * HD + d]);
                     a += sco[c] * vv;
                 }
                 const double r = a / l;
-                const size_t at = (size_t) ((i * NH + h) * HD + d);
+                const size_t at = (size_t)((i * NH + h) * HD + d);
                 ref_scale = std::max(ref_scale, std::fabs(r));
                 err_old = std::max(err_old, std::fabs(o[at] - r));
                 err_new = std::max(err_new, std::fabs(nw[at] - r));
@@ -182,8 +207,8 @@ int run(int fmt, int64_t ctx, int64_t nq, int reps) {
         if (std::isnan(nw[i]) || std::isinf(nw[i])) {
             has_nan = true;
         }
-        diff = std::max(diff, (double) std::fabs(o[i] - nw[i]));
-        scale = std::max(scale, (double) std::fabs(o[i]));
+        diff = std::max(diff, (double)std::fabs(o[i] - nw[i]));
+        scale = std::max(scale, (double)std::fabs(o[i]));
     }
     if (has_nan) {
         err_new = 1e30;
@@ -192,30 +217,39 @@ int run(int fmt, int64_t ctx, int64_t nq, int reps) {
     // 3. speed
     q_ct1.wait();
     auto t0 = std::chrono::high_resolution_clock::now();
-    for (int r = 0; r < reps; ++r) old_run();
+    for (int r = 0; r < reps; ++r)
+        old_run();
     q_ct1.wait();
     auto t1 = std::chrono::high_resolution_clock::now();
     float ms_old = std::chrono::duration<float, std::milli>(t1 - t0).count();
 
     auto t2 = std::chrono::high_resolution_clock::now();
-    for (int r = 0; r < reps; ++r) new_run();
+    for (int r = 0; r < reps; ++r)
+        new_run();
     q_ct1.wait();
     auto t3 = std::chrono::high_resolution_clock::now();
     float ms_new = std::chrono::duration<float, std::milli>(t3 - t2).count();
     const bool ok1 = !has_nan && (err_new <= std::max(4.0 * err_old, 1e-6 * ref_scale));
     const bool ok2 = !has_nan && (diff <= 1e-4 * scale);
-    std::printf("%s %s ctx %lld, %lld queries: vs FP64 old %.3g new %.3g (output scale %.3g); new vs old %.3g (%.2g of "
-                "scale); %.3f -> %.3f ms per chunk (%.2fx)%s\n",
-                ok1 && ok2 ? "PASS" : "FAIL", fmt == 1 ? "int8" : "fp16", (long long) ctx, (long long) nq, err_old,
-                err_new, ref_scale, diff, diff / scale, ms_old / reps, ms_new / reps, ms_old / ms_new,
-                has_nan ? " [CONTAINS NAN/INF]" : "");
-    sycl::free((void*)d_ids, q_ct1); sycl::free((void*)d_steps, q_ct1);
-    sycl::free((void*)d_q, q_ct1); sycl::free((void*)d_old, q_ct1);
+    std::printf(
+        "%s %s ctx %lld, %lld queries: vs FP64 old %.3g new %.3g (output scale %.3g); new vs old %.3g (%.2g of "
+        "scale); %.3f -> %.3f ms per chunk (%.2fx)%s\n",
+        ok1 && ok2 ? "PASS" : "FAIL", fmt == 1 ? "int8" : "fp16", (long long)ctx, (long long)nq, err_old, err_new,
+        ref_scale, diff, diff / scale, ms_old / reps, ms_new / reps, ms_old / ms_new,
+        has_nan ? " [CONTAINS NAN/INF]" : "");
+    sycl::free((void*)d_ids, q_ct1);
+    sycl::free((void*)d_steps, q_ct1);
+    sycl::free((void*)d_q, q_ct1);
+    sycl::free((void*)d_old, q_ct1);
     sycl::free((void*)d_new, q_ct1);
     sycl::free((void*)scratch, q_ct1);
-    sycl::free((void*)pl.k_q, q_ct1); sycl::free((void*)pl.v_q, q_ct1);
-    sycl::free((void*)pl.k_scale, q_ct1); sycl::free((void*)pl.v_scale, q_ct1);
-    (void)pl.k_pool; sycl::free((void*)(void*)pl.k_pool, q_ct1); sycl::free((void*)(void*)pl.v_pool, q_ct1);
+    sycl::free((void*)pl.k_q, q_ct1);
+    sycl::free((void*)pl.v_q, q_ct1);
+    sycl::free((void*)pl.k_scale, q_ct1);
+    sycl::free((void*)pl.v_scale, q_ct1);
+    (void)pl.k_pool;
+    sycl::free((void*)(void*)pl.k_pool, q_ct1);
+    sycl::free((void*)(void*)pl.v_pool, q_ct1);
     sycl::free((void*)(void*)pl.page_table, q_ct1);
     return ok1 && ok2 ? 0 : 1;
 }
@@ -245,10 +279,10 @@ int main(int argc, char** argv) {
     int fails = 0;
     fails += run(1, ctx, nq, reps);
 #if !defined(__HIP_PLATFORM_AMD__)
-    fails += run(0, ctx, nq, reps);   // FP16 KV: the RDNA4 kernel takes int8 KV only
+    fails += run(0, ctx, nq, reps);  // FP16 KV: the RDNA4 kernel takes int8 KV only
 #endif
-    fails += run(1, 1500, std::min<int64_t>(nq, 1500), reps);   // short context: the selection is every cell
-    fails += run(1, 2100, std::min<int64_t>(nq, 256), reps);    // the identity-to-sparse edge
+    fails += run(1, 1500, std::min<int64_t>(nq, 1500), reps);  // short context: the selection is every cell
+    fails += run(1, 2100, std::min<int64_t>(nq, 256), reps);   // the identity-to-sparse edge
     std::printf("FAILURES: %d\n", fails);
     return fails;
 }

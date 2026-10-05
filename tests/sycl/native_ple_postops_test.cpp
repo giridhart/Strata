@@ -42,13 +42,14 @@ int test_native_ple_postops(sycl::queue& q) {
         norm_query[i] = 1.0f + 0.01f * dist(rng);
         norm_conv[i] = 1.0f + 0.01f * dist(rng);
         for (int k = 0; k < 4; ++k) {
-            sycl::half h = sycl::vec<float, 1>(dist(rng) * 0.2f)
-                               .convert<sycl::half, sycl::rounding_mode::rte>()[0];
+            sycl::half h = sycl::vec<float, 1>(dist(rng) * 0.2f).convert<sycl::half, sycl::rounding_mode::rte>()[0];
             conv1d_f16[i * 4 + k] = sycl::bit_cast<uint16_t>(h);
         }
     }
-    for (int i = 0; i < N; ++i) value[i] = dist(rng) * 0.1f;
-    for (size_t i = 0; i < history.size(); ++i) history[i] = dist(rng) * 0.05f;
+    for (int i = 0; i < N; ++i)
+        value[i] = dist(rng) * 0.1f;
+    for (size_t i = 0; i < history.size(); ++i)
+        history[i] = dist(rng) * 0.05f;
 
     // Host reference calculation
     std::vector<float> ref_key(D), ref_query(D), ref_gate(H), ref_gated(D);
@@ -79,8 +80,7 @@ int test_native_ple_postops(sycl::queue& q) {
         float sum = 0.0f;
         for (int k = 0; k < 4; ++k) {
             float x = (k == 3 ? ref_norm[c] : history[c * HISTORY + 3 * k]);
-            float w = sycl::vec<sycl::half, 1>(
-                          sycl::bit_cast<sycl::half>(conv1d_f16[c * 4 + k]))
+            float w = sycl::vec<sycl::half, 1>(sycl::bit_cast<sycl::half>(conv1d_f16[c * 4 + k]))
                           .convert<float, sycl::rounding_mode::automatic>()[0];
             sum += x * w;
         }
@@ -90,22 +90,22 @@ int test_native_ple_postops(sycl::queue& q) {
     }
 
     // Allocate GPU buffers
-    float *d_proj_key = sycl::malloc_device<float>(D, q);
-    float *d_hidden = sycl::malloc_device<float>(D, q);
-    float *d_value = sycl::malloc_device<float>(N, q);
-    float *d_history = sycl::malloc_device<float>(history.size(), q);
-    float *d_norm_key = sycl::malloc_device<float>(D, q);
-    float *d_norm_query = sycl::malloc_device<float>(D, q);
-    float *d_norm_conv = sycl::malloc_device<float>(D, q);
-    uint16_t *d_conv1d = sycl::malloc_device<uint16_t>(conv1d_f16.size(), q);
+    float* d_proj_key = sycl::malloc_device<float>(D, q);
+    float* d_hidden = sycl::malloc_device<float>(D, q);
+    float* d_value = sycl::malloc_device<float>(N, q);
+    float* d_history = sycl::malloc_device<float>(history.size(), q);
+    float* d_norm_key = sycl::malloc_device<float>(D, q);
+    float* d_norm_query = sycl::malloc_device<float>(D, q);
+    float* d_norm_conv = sycl::malloc_device<float>(D, q);
+    uint16_t* d_conv1d = sycl::malloc_device<uint16_t>(conv1d_f16.size(), q);
 
-    float *d_b_key = sycl::malloc_device<float>(D, q);
-    float *d_b_query = sycl::malloc_device<float>(D, q);
-    float *d_b_gate = sycl::malloc_device<float>(H, q);
-    float *d_b_gated = sycl::malloc_device<float>(D, q);
-    float *d_b_norm = sycl::malloc_device<float>(D, q);
-    float *d_b_conv = sycl::malloc_device<float>(D, q);
-    float *d_b_result = sycl::malloc_device<float>(D, q);
+    float* d_b_key = sycl::malloc_device<float>(D, q);
+    float* d_b_query = sycl::malloc_device<float>(D, q);
+    float* d_b_gate = sycl::malloc_device<float>(H, q);
+    float* d_b_gated = sycl::malloc_device<float>(D, q);
+    float* d_b_norm = sycl::malloc_device<float>(D, q);
+    float* d_b_conv = sycl::malloc_device<float>(D, q);
+    float* d_b_result = sycl::malloc_device<float>(D, q);
 
     q.memcpy(d_proj_key, proj_key.data(), D * sizeof(float)).wait();
     q.memcpy(d_hidden, hidden.data(), D * sizeof(float)).wait();
@@ -122,8 +122,7 @@ int test_native_ple_postops(sycl::queue& q) {
     w.norm_conv = d_norm_conv;
     w.conv1d_f16 = d_conv1d;
 
-    strata::kernels::NativePlePostopsBuffers b{
-        d_b_key, d_b_query, d_b_gate, d_b_gated, d_b_norm, d_b_conv, d_b_result};
+    strata::kernels::NativePlePostopsBuffers b{d_b_key, d_b_query, d_b_gate, d_b_gated, d_b_norm, d_b_conv, d_b_result};
 
     strata::kernels::native_ple_postops(d_proj_key, d_hidden, d_value, d_history, w, b, &q);
     q.wait();
@@ -165,8 +164,8 @@ int test_native_ple_postops_batch(sycl::queue& q, int T) {
     std::mt19937 rng(42);
     std::normal_distribution<float> dist(0.0f, 1.0f);
 
-    std::vector<float> key((size_t) T * D), hidden((size_t) T * D), value((size_t) T * N);
-    std::vector<float> history((size_t) D * HISTORY);
+    std::vector<float> key((size_t)T * D), hidden((size_t)T * D), value((size_t)T * N);
+    std::vector<float> history((size_t)D * HISTORY);
     std::vector<float> norm_key(D), norm_query(D), norm_conv(D);
     std::vector<uint16_t> conv1d_f16(D * 4);
 
@@ -175,28 +174,31 @@ int test_native_ple_postops_batch(sycl::queue& q, int T) {
         norm_query[i] = 1.0f + 0.01f * dist(rng);
         norm_conv[i] = 1.0f + 0.01f * dist(rng);
         for (int k = 0; k < 4; ++k) {
-            sycl::half h = sycl::vec<float, 1>(dist(rng) * 0.2f)
-                               .convert<sycl::half, sycl::rounding_mode::rte>()[0];
+            sycl::half h = sycl::vec<float, 1>(dist(rng) * 0.2f).convert<sycl::half, sycl::rounding_mode::rte>()[0];
             conv1d_f16[i * 4 + k] = sycl::bit_cast<uint16_t>(h);
         }
     }
-    for (size_t i = 0; i < key.size(); ++i) key[i] = dist(rng) * 0.1f;
-    for (size_t i = 0; i < hidden.size(); ++i) hidden[i] = dist(rng) * 0.1f;
-    for (size_t i = 0; i < value.size(); ++i) value[i] = dist(rng) * 0.1f;
-    for (size_t i = 0; i < history.size(); ++i) history[i] = dist(rng) * 0.05f;
+    for (size_t i = 0; i < key.size(); ++i)
+        key[i] = dist(rng) * 0.1f;
+    for (size_t i = 0; i < hidden.size(); ++i)
+        hidden[i] = dist(rng) * 0.1f;
+    for (size_t i = 0; i < value.size(); ++i)
+        value[i] = dist(rng) * 0.1f;
+    for (size_t i = 0; i < history.size(); ++i)
+        history[i] = dist(rng) * 0.05f;
 
-    float *d_key = sycl::malloc_device<float>(key.size(), q);
-    float *d_hidden = sycl::malloc_device<float>(hidden.size(), q);
-    float *d_value = sycl::malloc_device<float>(value.size(), q);
-    float *d_history = sycl::malloc_device<float>(history.size(), q);
-    float *d_query_norm = sycl::malloc_device<float>((size_t) T * D, q);
-    float *d_gated = sycl::malloc_device<float>((size_t) T * D, q);
-    float *d_gate = sycl::malloc_device<float>((size_t) T * H, q);
+    float* d_key = sycl::malloc_device<float>(key.size(), q);
+    float* d_hidden = sycl::malloc_device<float>(hidden.size(), q);
+    float* d_value = sycl::malloc_device<float>(value.size(), q);
+    float* d_history = sycl::malloc_device<float>(history.size(), q);
+    float* d_query_norm = sycl::malloc_device<float>((size_t)T * D, q);
+    float* d_gated = sycl::malloc_device<float>((size_t)T * D, q);
+    float* d_gate = sycl::malloc_device<float>((size_t)T * H, q);
 
-    float *d_norm_key = sycl::malloc_device<float>(D, q);
-    float *d_norm_query = sycl::malloc_device<float>(D, q);
-    float *d_norm_conv = sycl::malloc_device<float>(D, q);
-    uint16_t *d_conv1d = sycl::malloc_device<uint16_t>(conv1d_f16.size(), q);
+    float* d_norm_key = sycl::malloc_device<float>(D, q);
+    float* d_norm_query = sycl::malloc_device<float>(D, q);
+    float* d_norm_conv = sycl::malloc_device<float>(D, q);
+    uint16_t* d_conv1d = sycl::malloc_device<uint16_t>(conv1d_f16.size(), q);
 
     q.memcpy(d_key, key.data(), key.size() * sizeof(float)).wait();
     q.memcpy(d_hidden, hidden.data(), hidden.size() * sizeof(float)).wait();
@@ -213,8 +215,8 @@ int test_native_ple_postops_batch(sycl::queue& q, int T) {
     w.norm_conv = d_norm_conv;
     w.conv1d_f16 = d_conv1d;
 
-    strata::kernels::native_ple_postops_batch(
-        d_key, d_hidden, d_value, d_history, w, d_query_norm, d_gated, d_gate, T, &q);
+    strata::kernels::native_ple_postops_batch(d_key, d_hidden, d_value, d_history, w, d_query_norm, d_gated, d_gate, T,
+                                              &q);
     q.wait();
 
     std::vector<float> act_hidden(hidden.size());
@@ -241,7 +243,7 @@ int test_native_ple_postops_batch(sycl::queue& q, int T) {
     std::printf("  native_ple_postops_batch (T=%d): bad = %d / %zu\n", T, bad, act_hidden.size());
     return bad;
 }
-} // namespace
+}  // namespace
 
 int main() {
     sycl::queue q{sycl::property::queue::in_order()};

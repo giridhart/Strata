@@ -23,18 +23,22 @@ NativeHead::~NativeHead() {
     if (scratch_) {
         try {
             sycl::free((void*)scratch_, default_queue());
-        } catch (...) {}
+        } catch (...) {
+        }
     }
     if (weights_) {
         try {
             sycl::free((void*)weights_, default_queue());
-        } catch (...) {}
+        } catch (...) {
+        }
     }
 }
 
-bool NativeHead::load(const std::vector<std::string> &shards, int64_t n_in,
-                      int64_t n_out, std::string &err) {
-    if (loaded()) { err = "native head is already loaded"; return false; }
+bool NativeHead::load(const std::vector<std::string>& shards, int64_t n_in, int64_t n_out, std::string& err) {
+    if (loaded()) {
+        err = "native head is already loaded";
+        return false;
+    }
     if (n_in <= 0 || n_out <= 0 || n_in > INT_MAX || n_out > INT_MAX || n_in % 256) {
         err = "native head requires positive int32 dimensions and whole 256-value rows";
         return false;
@@ -46,12 +50,12 @@ bool NativeHead::load(const std::vector<std::string> &shards, int64_t n_in,
         size_t at = 0;
         const strata::TensorInfo* tensor = model.find("output.weight", &at);
         const strata::GgufFile& gguf = model.shard(at);
-        if (!tensor || !strata::kernels::native_mmvq_supported((int) tensor->type) || tensor->shape.size() != 2 ||
-            tensor->shape[0] != (uint64_t) n_in || tensor->shape[1] != (uint64_t) n_out) {
+        if (!tensor || !strata::kernels::native_mmvq_supported((int)tensor->type) || tensor->shape.size() != 2 ||
+            tensor->shape[0] != (uint64_t)n_in || tensor->shape[1] != (uint64_t)n_out) {
             err = "native head: expected a natively supported output.weight with the canonical head dimensions";
             return false;
         }
-        const uint64_t bytes = strata::kernels::native_mmvq_weight_bytes((int) tensor->type, (int) n_in, (int) n_out);
+        const uint64_t bytes = strata::kernels::native_mmvq_weight_bytes((int)tensor->type, (int)n_in, (int)n_out);
         const uint64_t payload = gguf.file_size() - gguf.data_start();
         if (tensor->offset > payload || bytes > payload - tensor->offset) {
             err = "native head: truncated output.weight payload";
@@ -83,9 +87,9 @@ bool NativeHead::load(const std::vector<std::string> &shards, int64_t n_in,
         weights_ = weights;
         scratch_ = scratch;
         bytes_ = bytes;
-        n_in_ = (int) n_in;
-        n_out_ = (int) n_out;
-        type_ = (int) tensor->type;
+        n_in_ = (int)n_in;
+        n_out_ = (int)n_out;
+        type_ = (int)tensor->type;
         return true;
     } catch (const std::exception& error) {
         err = std::string("native head: ") + error.what();
@@ -93,8 +97,7 @@ bool NativeHead::load(const std::vector<std::string> &shards, int64_t n_in,
     }
 }
 
-bool NativeHead::run(const float *mixed, float *logits, void *stream,
-                     std::string &err) const {
+bool NativeHead::run(const float* mixed, float* logits, void* stream, std::string& err) const {
     if (!loaded() || !mixed || !logits || !stream) {
         err = "native head requires loaded weights, device buffers and an explicit stream";
         return false;
@@ -125,32 +128,37 @@ NativeEmbed::~NativeEmbed() {
     if (host_) {
         try {
             sycl::free(host_, default_queue());
-        } catch (...) {}
+        } catch (...) {
+        }
     } else if (dev_) {
         try {
             sycl::free((void*)dev_, default_queue());
-        } catch (...) {}
+        } catch (...) {
+        }
     }
 }
 
-bool NativeEmbed::load(const std::vector<std::string> &shards, int64_t n_embd,
-                       int64_t n_vocab, std::string &err) {
+bool NativeEmbed::load(const std::vector<std::string>& shards, int64_t n_embd, int64_t n_vocab, std::string& err) {
     try {
         const strata::GgufModel model(shards);
         const strata::MetaValue* arch = model.meta().get("general.architecture");
         err = arch != nullptr && arch->s == "strata-embd" ? std::string() : strata::check_architecture(model.meta());
-        if (!err.empty()) { err = "native embedding: " + err; return false; }
+        if (!err.empty()) {
+            err = "native embedding: " + err;
+            return false;
+        }
         size_t at = 0;
         const strata::TensorInfo* t = model.find("token_embd.weight", &at);
         const strata::GgufFile& gguf = model.shard(at);
-        if (!t || t->shape.size() != 2 || t->shape[0] != (uint64_t) n_embd || t->shape[1] != (uint64_t) n_vocab ||
-            !strata::kernels::embed_type_supported((int) t->type) || n_embd % 256) {
-            err = "native embedding: token_embd.weight is absent, of another shape, or of a type without a GPU "
-                  "dequantizer";
+        if (!t || t->shape.size() != 2 || t->shape[0] != (uint64_t)n_embd || t->shape[1] != (uint64_t)n_vocab ||
+            !strata::kernels::embed_type_supported((int)t->type) || n_embd % 256) {
+            err =
+                "native embedding: token_embd.weight is absent, of another shape, or of a type without a GPU "
+                "dequantizer";
             return false;
         }
-        row_ = strata::kernels::iq_row_bytes((int) t->type, n_embd);
-        bytes_ = (uint64_t) row_ * (uint64_t) n_vocab;
+        row_ = strata::kernels::iq_row_bytes((int)t->type, n_embd);
+        bytes_ = (uint64_t)row_ * (uint64_t)n_vocab;
         if (!model.in_bounds(*t, at) || strata::tensor_payload_bytes(*t) != bytes_) {
             err = "native embedding: token_embd.weight's payload is truncated or not " + std::to_string(bytes_) +
                   " B (" + gguf.path() + ")";
@@ -174,12 +182,12 @@ bool NativeEmbed::load(const std::vector<std::string> &shards, int64_t n_embd,
                 return false;
             }
             std::fprintf(stderr, "strata: native embedding: kept in VRAM (%llu MiB)\n",
-                         (unsigned long long) (bytes_ >> 20));
+                         (unsigned long long)(bytes_ >> 20));
         } else {
             std::memcpy(host_, gguf.tensor_data(*t), bytes_);
             dev_ = host_;
         }
-        type_ = (int) t->type;
+        type_ = (int)t->type;
         n_embd_ = n_embd;
         n_vocab_ = n_vocab;
         return true;
@@ -194,7 +202,7 @@ void NativeEmbed::gather_dev(const int32_t* tokens, int64_t n_tok, float* out, v
 }
 
 void NativeEmbed::gather_one(int64_t token, float* out, void* stream) const {
-    strata::kernels::iq_dequant_f32(type_, (const uint8_t*) dev_ + (size_t) token * row_, n_embd_, out, stream);
+    strata::kernels::iq_dequant_f32(type_, (const uint8_t*)dev_ + (size_t)token * row_, n_embd_, out, stream);
 }
 
 }  // namespace strata::core
