@@ -61,7 +61,13 @@ The target model for these optimizations is **Qwen3.8-Flash-Next** (as well as `
 10. **`perf_prefill_gemm.cpp` (Done)**: Native Prefill Tiled GEMM: 1.17–3.00 TFLOPS on Lunar Lake, ready for 117 TFLOPS scaling on B580.
 11. **`perf_speculative_verify.cpp` (Done)**: MTP Multi-Token Speculative Verification: **6.6x throughput scaling** from $B=1$ (10.2k tok/s) to $B=8$ (68.0k tok/s).
 12. **`tools/bench_xe2_e2e.py` (Done)**: Automated Python CLI/HTTP end-to-end benchmark across prompt lengths (1K–128K) and models.
-13. **`tools/run_xe2_perf_benchmarks.py` (Done)**: Unified automated runner and reporter executing all 11 suites, generating `results_consolidated.json` and formatted Markdown tuning report (`report.md`) with B580 hardware comparisons.
+13. **`tools/run_xe2_perf_benchmarks.py` (Done)**: Unified automated runner and reporter executing all 15 suites, generating `results_consolidated.json` and formatted Markdown tuning report (`report.md`) with B580 hardware comparisons.
+
+### Tier 3 Multi-Operation & Data Movement Pipelines
+14. **`perf_residual_pipeline.cpp` (Done)**: Residual Stream Handover & Fused GR: eliminates 40.96 KB $R$ roundtrip, verifies L3 cache residency across 1–8 chained layers (~66.7 GB/s).
+15. **`perf_layer_pipeline.cpp` (Done)**: Full 9-Kernel Composite Layer Pipeline: measures end-to-end forward pass (1.06 ms pipelined vs 1.03 ms CapturedGraph execution).
+16. **`perf_moe_doorbell_stream.cpp` (Done)**: MoE Doorbell Handshake & Expert Streaming: 51.2 KB PCIe transfer in 11.1 µs; 160.6 µs positive overlap slack behind shared expert compute.
+17. **`perf_paged_kv_traffic.cpp` (Done)**: Paged KV Cache Traffic & Indirection Penalty: 56.45 GB/s paged gather at 16K context; INT8 quantization cuts latency by 27.1%.
 
 ---
 
