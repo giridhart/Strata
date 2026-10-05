@@ -36,4 +36,9 @@ make -C build_sycl -j$(nproc) check-sycl
 # Build and run Intel Xe2 performance tuning suite (Google Benchmark)
 cmake -B build_sycl -DSTRATA_BUILD_PERF=ON
 make -C build_sycl perf-sycl
+
+# Run automated Xe2 / Arc B580 benchmark runner and generate Markdown report
+make -C build_sycl perf-report
+# Or directly via Python:
+python3 tools/run_xe2_perf_benchmarks.py --quick --out-dir bench_results/smoke_test
 ```
