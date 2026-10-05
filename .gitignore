@@ -66,3 +66,4 @@ build-vision-cuda12.bat
 *_out/
 scratch/
 MainSourceFiles.yaml
+bench_results/
