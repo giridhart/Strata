@@ -1,7 +1,7 @@
 # Handover Document: Intel Arc B580 / Xe2 SYCL Optimization & Upstream Rebase
 
 **Date & Time**: 2026-10-04 23:45 (Local)  
-**Project**: Strata Engine (`/home/girtam/projects/Strata`)  
+**Project**: Strata Engine  
 **Current Branch**: `main` (cleanly rebased on upstream `origin/main` @ commit `41d50fd`, current HEAD @ commit `0e37fc5`)  
 **Backup Branch**: `backup-main-before-rebase` (points to pre-rebase HEAD `6e28497`, preserves full 84-commit history)
 
@@ -22,25 +22,25 @@ The target model for these optimizations is **Qwen3.8-Flash-Next** (as well as `
    - Preserved full 84-commit history on `backup-main-before-rebase`.
    - Build verified on live GPU: `check-sycl` passes 16/16 tests in ~3.8s with 0 warnings under `-Wall -Wextra`.
 2. **SIMD16 Quantized GEMV Optimization** (Commit `cbc2121`):
-   - [`src/kernels/sycl/s2_gemv.cpp`](file:///home/girtam/projects/Strata/src/kernels/sycl/s2_gemv.cpp): Added `s2_gemv_subgroup_kernel` using SIMD16 subgroup reduction with `sycl::reduce_over_group`.
-   - [`src/kernels/sycl/s_gemv.cpp`](file:///home/girtam/projects/Strata/src/kernels/sycl/s_gemv.cpp): Replaced 32-lane hardcoded CUDA warp shuffles with native `SG_SIZE = 16`, stride `SG_SIZE * QE`, and single-cycle hardware `sycl::reduce_over_group`.
-   - [`src/kernels/sycl/s2_gemv_fast.cpp`](file:///home/girtam/projects/Strata/src/kernels/sycl/s2_gemv_fast.cpp) & [`src/kernels/sycl/s2_gemv_quads.cpp`](file:///home/girtam/projects/Strata/src/kernels/sycl/s2_gemv_quads.cpp): Replaced shared memory tree reduction loops with hierarchical subgroup reductions.
+   - [`src/kernels/sycl/s2_gemv.cpp`](src/kernels/sycl/s2_gemv.cpp): Added `s2_gemv_subgroup_kernel` using SIMD16 subgroup reduction with `sycl::reduce_over_group`.
+   - [`src/kernels/sycl/s_gemv.cpp`](src/kernels/sycl/s_gemv.cpp): Replaced 32-lane hardcoded CUDA warp shuffles with native `SG_SIZE = 16`, stride `SG_SIZE * QE`, and single-cycle hardware `sycl::reduce_over_group`.
+   - [`src/kernels/sycl/s2_gemv_fast.cpp`](src/kernels/sycl/s2_gemv_fast.cpp) & [`src/kernels/sycl/s2_gemv_quads.cpp`](src/kernels/sycl/s2_gemv_quads.cpp): Replaced shared memory tree reduction loops with hierarchical subgroup reductions.
    - Verified on GPU: `s2_gemv_parity`, `s_gemv_parity`, `s_gemv_q8k_parity`, and `s2_gemv_q8_parity` all pass with 0 failures.
 3. **Documentation Consolidation** (Commits `a8fe5f9` & `0e37fc5`):
    - Merged scattered, redundant markdown files into canonical documents in `docs/`:
-     - [`docs/SYCL_STATUS.md`](file:///home/girtam/projects/Strata/docs/SYCL_STATUS.md): Master status, 2026.1 toolchain, and complete 44-kernel registry.
-     - [`docs/SYCL_PORTING_GUIDE.md`](file:///home/girtam/projects/Strata/docs/SYCL_PORTING_GUIDE.md): 6 translation directives, command graph specs, and AI/developer refactoring prompt rules.
-     - [`docs/INTEL_B580_OPTIMIZATION_PLAN.md`](file:///home/girtam/projects/Strata/docs/INTEL_B580_OPTIMIZATION_PLAN.md): B580 microarchitecture plan, SIMD16 status, XMX capabilities, and the full Section 6 microbenchmarking suite.
-     - [`STATUS.md`](file:///home/girtam/projects/Strata/STATUS.md): Clean root index pointing directly to `docs/`.
+     - [`docs/SYCL_STATUS.md`](docs/SYCL_STATUS.md): Master status, 2026.1 toolchain, and complete 44-kernel registry.
+     - [`docs/SYCL_PORTING_GUIDE.md`](docs/SYCL_PORTING_GUIDE.md): 6 translation directives, command graph specs, and AI/developer refactoring prompt rules.
+     - [`docs/INTEL_B580_OPTIMIZATION_PLAN.md`](docs/INTEL_B580_OPTIMIZATION_PLAN.md): B580 microarchitecture plan, SIMD16 status, XMX capabilities, and the full Section 6 microbenchmarking suite.
+     - [`STATUS.md`](STATUS.md): Clean root index pointing directly to `docs/`.
 4. **Google Benchmark Xe2 Performance Suite (`perf/sycl/`)**:
    - Added `STRATA_BUILD_PERF` CMake option with automated `FetchContent` Google Benchmark v1.8.3 integration and `perf-sycl` target.
    - Bypasses host CPU dispatch/queue jitter (150–280 µs overhead) using `benchmark::UseManualTime()` with SYCL event timestamps (`command_start` to `command_end`).
    - Implemented and benchmarked all 5 planned performance microbenchmarks on live Lunar Lake Xe2 GPU (`Intel Graphics [0x64a0]`):
-     1. [`perf_xe2_gemv.cpp`](file:///home/girtam/projects/Strata/perf/sycl/perf_xe2_gemv.cpp): All 8 Qwen projections, SIMD16 vs SIMD32, and SLM split reduction (+25.3% speedup on `ssm_alpha`).
-     2. [`perf_xe2_xmx_tiles.cpp`](file:///home/girtam/projects/Strata/perf/sycl/perf_xe2_xmx_tiles.cpp): Hardware XMX systolic tiles ($16 \times 16 \times 16$ achieves **1.23 TFLOPS**, 1.73x over Tile8).
-     3. [`perf_qsa_attention.cpp`](file:///home/girtam/projects/Strata/perf/sycl/perf_qsa_attention.cpp): FlashAttention throughput up to 611k tok/s and Top-K sparse gather bandwidth (22.2 GB/s).
-     4. [`perf_moe_accumulate.cpp`](file:///home/girtam/projects/Strata/perf/sycl/perf_moe_accumulate.cpp): MoE 10-expert reduction (Subgroup Reduce: **81.3 GB/s**, 3.40x faster than Atomic at $B=32$).
-     5. [`perf_dequant_dpas.cpp`](file:///home/girtam/projects/Strata/perf/sycl/perf_dequant_dpas.cpp): Direct-to-register 4-bit dequant + DPAS (**423.7 GFLOPS**, **+28.5% faster** than SLM buffering).
+     1. [`perf_xe2_gemv.cpp`](perf/sycl/perf_xe2_gemv.cpp): All 8 Qwen projections, SIMD16 vs SIMD32, and SLM split reduction (+25.3% speedup on `ssm_alpha`).
+     2. [`perf_xe2_xmx_tiles.cpp`](perf/sycl/perf_xe2_xmx_tiles.cpp): Hardware XMX systolic tiles ($16 \times 16 \times 16$ achieves **1.23 TFLOPS**, 1.73x over Tile8).
+     3. [`perf_qsa_attention.cpp`](perf/sycl/perf_qsa_attention.cpp): FlashAttention throughput up to 611k tok/s and Top-K sparse gather bandwidth (22.2 GB/s).
+     4. [`perf_moe_accumulate.cpp`](perf/sycl/perf_moe_accumulate.cpp): MoE 10-expert reduction (Subgroup Reduce: **81.3 GB/s**, 3.40x faster than Atomic at $B=32$).
+     5. [`perf_dequant_dpas.cpp`](perf/sycl/perf_dequant_dpas.cpp): Direct-to-register 4-bit dequant + DPAS (**423.7 GFLOPS**, **+28.5% faster** than SLM buffering).
 
 ---
 

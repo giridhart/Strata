@@ -142,7 +142,7 @@ flowchart TD
 
 **Objective**: Ensure prompt prefilling automatically routes large matrices to B580 XMX engines via optimized Intel OneMKL primitives.
 
-- **Current Implementation**: [`src/prefill/sycl/gemm.cpp`](file:///home/girtam/projects/Strata/src/prefill/sycl/gemm.cpp) uses `oneapi::mkl::blas::column_major::gemm`.
+- **Current Implementation**: [`src/prefill/sycl/gemm.cpp`](../src/prefill/sycl/gemm.cpp) uses `oneapi::mkl::blas::column_major::gemm`.
 - **Optimization**:
   - When compiled with `-Xs "-device bmg"`, OneMKL selects Xe2-specialized matrix kernels optimized for Adamantine L3 cache tiling.
   - Verify that workspace allocations use `sycl::malloc_device` and queue is configured with `sycl::property::queue::in_order()`.
@@ -180,30 +180,30 @@ flowchart TD
 
 | Priority | Task | Target File | Status | Impact |
 |---|---|---|---|---|
-| **P1** | Add Battlemage & Xe2 CMake flags (`STRATA_TARGET_XE2`, `STRATA_AOT_BMG`) | [`CMakeLists.txt`](file:///home/girtam/projects/Strata/CMakeLists.txt) | **COMPLETED** | Enables Xe2 ISA flags and optional direct `bmg` AOT compilation |
-| **P2** | Define architecture-aware subgroup sizing (`sycl_arch.hpp`) | [`include/strata/core/sycl_arch.hpp`](file:///home/girtam/projects/Strata/include/strata/core/sycl_arch.hpp) | **COMPLETED** | Sets native SIMD16 execution for Xe2 (B580/Lunar Lake); cuts register pressure |
-| **P3** | Port GEMV & Norm kernels to SIMD16 + `sycl::reduce_over_group` | [`src/kernels/sycl/bf16_gemv.cpp`](file:///home/girtam/projects/Strata/src/kernels/sycl/bf16_gemv.cpp), [`src/kernels/sycl/native_bf16.cpp`](file:///home/girtam/projects/Strata/src/kernels/sycl/native_bf16.cpp), [`src/kernels/sycl/native_gr_norm.cpp`](file:///home/girtam/projects/Strata/src/kernels/sycl/native_gr_norm.cpp) | **COMPLETED** | 100% test pass on live Xe2 GPU; direct hardware reduction primitives |
-| **P4** | Implement Joint Matrix (XMX) prompt attention | [`src/kernels/sycl/qsa_prompt_attn.cpp`](file:///home/girtam/projects/Strata/src/kernels/sycl/qsa_prompt_attn.cpp) | **COMPLETED** | Native SIMD16 XMX systolic pipeline; 0 NaNs/INFs; 0 failures on parity suite |
-| **P5** | Production SLM Split Reduction for Narrow GEMV | [`src/kernels/sycl/bf16_gemv.cpp`](file:///home/girtam/projects/Strata/src/kernels/sycl/bf16_gemv.cpp) | **COMPLETED** | +23.3% speedup on narrow shapes (`ssm_alpha` 19.35 µs, 12.97 GB/s); 0 failures |
-| **P6** | Native SIMD16 Retuning for GDN Step | [`src/kernels/sycl/native_gdn.cpp`](file:///home/girtam/projects/Strata/src/kernels/sycl/native_gdn.cpp) | **COMPLETED** | SIMD16 hardware reduction; 0 failures on `gdn_parity` (rel err $2.08 \times 10^{-7}$) |
-| **P7** | MoE Vectorized & Subgroup Reduce | [`src/kernels/sycl/native_moe.cpp`](file:///home/girtam/projects/Strata/src/kernels/sycl/native_moe.cpp) | **COMPLETED** | 2.0x faster at K=8, 3.4x faster at K=32 (81.4 GB/s); `shared_expert_parity` 0 failures |
-| **P8** | Direct-to-Register 4-bit Dequant + DPAS | [`src/kernels/sycl/s2_gemv_fast.cpp`](file:///home/girtam/projects/Strata/src/kernels/sycl/s2_gemv_fast.cpp), [`s2_gemv_q8.cpp`](file:///home/girtam/projects/Strata/src/kernels/sycl/s2_gemv_q8.cpp) | **COMPLETED** | 424.8 GFLOPS (+27.3% faster than SLM); `s2_gemv_parity` 0 failures |
-| **P9** | End-to-End Inference Verification (`strata`) | [`src/program/sycl/generate.cpp`](file:///home/girtam/projects/Strata/src/program/sycl/generate.cpp), [`src/prefill/sycl/gemm.cpp`](file:///home/girtam/projects/Strata/src/prefill/sycl/gemm.cpp) | **COMPLETED** | Decoupled from oneMKL; Lunar Lake GPU-only execution enabled; 100% CI pass rate |
-| **P10** | Benchmark Fused GDN Recurrence & SLM State Retention | [`perf/sycl/perf_fused_gdn.cpp`](file:///home/girtam/projects/Strata/perf/sycl/perf_fused_gdn.cpp) | **COMPLETED & COMPILED** | 2.66x speedup (95.9 µs -> 36.1 µs, 59.2 GB/s) in 64 KB Xe2 SLM |
-| **P11** | Benchmark PCIe Block Copy Engine (BCE) vs XMX Concurrency | [`perf/sycl/perf_pcie_overlap.cpp`](file:///home/girtam/projects/Strata/perf/sycl/perf_pcie_overlap.cpp) | **COMPLETED & COMPILED** | 98.7% compute throughput retention under concurrent 32 MB DMA streaming |
-| **P12** | Benchmark SYCL Command Graph Replay Latency | [`perf/sycl/perf_graph_replay.cpp`](file:///home/girtam/projects/Strata/perf/sycl/perf_graph_replay.cpp) | **COMPLETED & COMPILED** | 26.1x speedup (7.60 ms -> 0.29 ms, < 1.02 µs/node for 288-node DAG) |
-| **P13** | Benchmark Quantized KV Cache Flash-Decoding (up to 262K) | [`perf/sycl/perf_kv_decode.cpp`](file:///home/girtam/projects/Strata/perf/sycl/perf_kv_decode.cpp) | **COMPLETED & COMPILED** | Sweeps FP16 & INT8 attention across 1K–65K context lengths |
-| **P14** | Benchmark Prefill Native Tiled GEMM Scaling on Xe2 XMX | [`perf/sycl/perf_prefill_gemm.cpp`](file:///home/girtam/projects/Strata/perf/sycl/perf_prefill_gemm.cpp) | **COMPLETED & COMPILED** | Up to 3.00 TFLOPS on Lunar Lake; ready for 117 TFLOPS scaling on B580 |
-| **P15** | Benchmark MTP Multi-Token Speculative Verification | [`perf/sycl/perf_speculative_verify.cpp`](file:///home/girtam/projects/Strata/perf/sycl/perf_speculative_verify.cpp) | **COMPLETED & COMPILED** | 6.6x verification throughput scaling from B=1 (10.2k tok/s) to B=8 (68.0k tok/s) |
-| **P17** | Automated Xe2/B580 Benchmark Runner & Reporter | [`tools/run_xe2_perf_benchmarks.py`](file:///home/girtam/projects/Strata/tools/run_xe2_perf_benchmarks.py) | **COMPLETED** | Single-command execution of all 19 suites, consolidated JSON, and Markdown report generation |
-| **P18** | Benchmark Residual Stream Handover & Fused GR | [`perf/sycl/perf_residual_pipeline.cpp`](file:///home/girtam/projects/Strata/perf/sycl/perf_residual_pipeline.cpp) | **COMPLETED & COMPILED** | 40.96 KB R roundtrip elimination, L3 cache residency, and 1-to-8 layer chaining |
-| **P19** | Benchmark Full 9-Kernel Composite Layer Pipeline | [`perf/sycl/perf_layer_pipeline.cpp`](file:///home/girtam/projects/Strata/perf/sycl/perf_layer_pipeline.cpp) | **COMPLETED & COMPILED** | End-to-end forward pass simulation: 74.8 GB/s pipelined vs Command Graph execution |
-| **P20** | Benchmark MoE Doorbell Handshake & Expert Streaming | [`perf/sycl/perf_moe_doorbell_stream.cpp`](file:///home/girtam/projects/Strata/perf/sycl/perf_moe_doorbell_stream.cpp) | **COMPLETED & COMPILED** | 51.2 KB PCIe transfer in 11.1 µs; 160.6 µs positive overlap slack behind shared expert |
-| **P21** | Benchmark Paged KV Cache Memory Traffic & Indirection | [`perf/sycl/perf_paged_kv_traffic.cpp`](file:///home/girtam/projects/Strata/perf/sycl/perf_paged_kv_traffic.cpp) | **COMPLETED & COMPILED** | Non-contiguous paged gather (56.4 GB/s at 16K); page size sweep and INT8 quantization |
-| **P22** | Benchmark LM Head Projection & Parallel GPU Sampler | [`perf/sycl/perf_lmhead_sampler.cpp`](file:///home/girtam/projects/Strata/perf/sycl/perf_lmhead_sampler.cpp) | **COMPLETED & COMPILED** | 2560 -> 248,320 GEMV (89.8 GB/s); 248K parallel max + softmax (592.2 µs); 4-byte readback |
-| **P23** | Benchmark Fast Walsh-Hadamard Transform & Q4_0 KV | [`perf/sycl/perf_fwht_kv4.cpp`](file:///home/girtam/projects/Strata/perf/sycl/perf_fwht_kv4.cpp) | **COMPLETED & COMPILED** | 8-stage butterfly FWHT256 in SLM (11.5 µs); 7.11x Q4_0 compression; rotated decode attention |
-| **P24** | Benchmark Layer 1 Per-Layer Embedding & N-gram Shift | [`perf/sycl/perf_ple_ngram.cpp`](file:///home/girtam/projects/Strata/perf/sycl/perf_ple_ngram.cpp) | **COMPLETED & COMPILED** | Layer 1 unique block: 1,440 B row upload (12.6 µs); Conv1D history shift + projections (377.3 µs) |
-| **P25** | Benchmark Embedding Dequant & Readback Overlap | [`perf/sycl/perf_embed_overlap.cpp`](file:///home/girtam/projects/Strata/perf/sycl/perf_embed_overlap.cpp) | **COMPLETED & COMPILED** | Column dequant (12.5 µs); async chaining eliminates 148 µs host barrier (1.97x faster) |
+| **P1** | Add Battlemage & Xe2 CMake flags (`STRATA_TARGET_XE2`, `STRATA_AOT_BMG`) | [`CMakeLists.txt`](../CMakeLists.txt) | **COMPLETED** | Enables Xe2 ISA flags and optional direct `bmg` AOT compilation |
+| **P2** | Define architecture-aware subgroup sizing (`sycl_arch.hpp`) | [`include/strata/core/sycl_arch.hpp`](../include/strata/core/sycl_arch.hpp) | **COMPLETED** | Sets native SIMD16 execution for Xe2 (B580/Lunar Lake); cuts register pressure |
+| **P3** | Port GEMV & Norm kernels to SIMD16 + `sycl::reduce_over_group` | [`src/kernels/sycl/bf16_gemv.cpp`](../src/kernels/sycl/bf16_gemv.cpp), [`src/kernels/sycl/native_bf16.cpp`](../src/kernels/sycl/native_bf16.cpp), [`src/kernels/sycl/native_gr_norm.cpp`](../src/kernels/sycl/native_gr_norm.cpp) | **COMPLETED** | 100% test pass on live Xe2 GPU; direct hardware reduction primitives |
+| **P4** | Implement Joint Matrix (XMX) prompt attention | [`src/kernels/sycl/qsa_prompt_attn.cpp`](../src/kernels/sycl/qsa_prompt_attn.cpp) | **COMPLETED** | Native SIMD16 XMX systolic pipeline; 0 NaNs/INFs; 0 failures on parity suite |
+| **P5** | Production SLM Split Reduction for Narrow GEMV | [`src/kernels/sycl/bf16_gemv.cpp`](../src/kernels/sycl/bf16_gemv.cpp) | **COMPLETED** | +23.3% speedup on narrow shapes (`ssm_alpha` 19.35 µs, 12.97 GB/s); 0 failures |
+| **P6** | Native SIMD16 Retuning for GDN Step | [`src/kernels/sycl/native_gdn.cpp`](../src/kernels/sycl/native_gdn.cpp) | **COMPLETED** | SIMD16 hardware reduction; 0 failures on `gdn_parity` (rel err $2.08 \times 10^{-7}$) |
+| **P7** | MoE Vectorized & Subgroup Reduce | [`src/kernels/sycl/native_moe.cpp`](../src/kernels/sycl/native_moe.cpp) | **COMPLETED** | 2.0x faster at K=8, 3.4x faster at K=32 (81.4 GB/s); `shared_expert_parity` 0 failures |
+| **P8** | Direct-to-Register 4-bit Dequant + DPAS | [`src/kernels/sycl/s2_gemv_fast.cpp`](../src/kernels/sycl/s2_gemv_fast.cpp), [`s2_gemv_q8.cpp`](../src/kernels/sycl/s2_gemv_q8.cpp) | **COMPLETED** | 424.8 GFLOPS (+27.3% faster than SLM); `s2_gemv_parity` 0 failures |
+| **P9** | End-to-End Inference Verification (`strata`) | [`src/program/sycl/generate.cpp`](../src/program/sycl/generate.cpp), [`src/prefill/sycl/gemm.cpp`](../src/prefill/sycl/gemm.cpp) | **COMPLETED** | Decoupled from oneMKL; Lunar Lake GPU-only execution enabled; 100% CI pass rate |
+| **P10** | Benchmark Fused GDN Recurrence & SLM State Retention | [`perf/sycl/perf_fused_gdn.cpp`](../perf/sycl/perf_fused_gdn.cpp) | **COMPLETED & COMPILED** | 2.66x speedup (95.9 µs -> 36.1 µs, 59.2 GB/s) in 64 KB Xe2 SLM |
+| **P11** | Benchmark PCIe Block Copy Engine (BCE) vs XMX Concurrency | [`perf/sycl/perf_pcie_overlap.cpp`](../perf/sycl/perf_pcie_overlap.cpp) | **COMPLETED & COMPILED** | 98.7% compute throughput retention under concurrent 32 MB DMA streaming |
+| **P12** | Benchmark SYCL Command Graph Replay Latency | [`perf/sycl/perf_graph_replay.cpp`](../perf/sycl/perf_graph_replay.cpp) | **COMPLETED & COMPILED** | 26.1x speedup (7.60 ms -> 0.29 ms, < 1.02 µs/node for 288-node DAG) |
+| **P13** | Benchmark Quantized KV Cache Flash-Decoding (up to 262K) | [`perf/sycl/perf_kv_decode.cpp`](../perf/sycl/perf_kv_decode.cpp) | **COMPLETED & COMPILED** | Sweeps FP16 & INT8 attention across 1K–65K context lengths |
+| **P14** | Benchmark Prefill Native Tiled GEMM Scaling on Xe2 XMX | [`perf/sycl/perf_prefill_gemm.cpp`](../perf/sycl/perf_prefill_gemm.cpp) | **COMPLETED & COMPILED** | Up to 3.00 TFLOPS on Lunar Lake; ready for 117 TFLOPS scaling on B580 |
+| **P15** | Benchmark MTP Multi-Token Speculative Verification | [`perf/sycl/perf_speculative_verify.cpp`](../perf/sycl/perf_speculative_verify.cpp) | **COMPLETED & COMPILED** | 6.6x verification throughput scaling from B=1 (10.2k tok/s) to B=8 (68.0k tok/s) |
+| **P17** | Automated Xe2/B580 Benchmark Runner & Reporter | [`tools/run_xe2_perf_benchmarks.py`](../tools/run_xe2_perf_benchmarks.py) | **COMPLETED** | Single-command execution of all 19 suites, consolidated JSON, and Markdown report generation |
+| **P18** | Benchmark Residual Stream Handover & Fused GR | [`perf/sycl/perf_residual_pipeline.cpp`](../perf/sycl/perf_residual_pipeline.cpp) | **COMPLETED & COMPILED** | 40.96 KB R roundtrip elimination, L3 cache residency, and 1-to-8 layer chaining |
+| **P19** | Benchmark Full 9-Kernel Composite Layer Pipeline | [`perf/sycl/perf_layer_pipeline.cpp`](../perf/sycl/perf_layer_pipeline.cpp) | **COMPLETED & COMPILED** | End-to-end forward pass simulation: 74.8 GB/s pipelined vs Command Graph execution |
+| **P20** | Benchmark MoE Doorbell Handshake & Expert Streaming | [`perf/sycl/perf_moe_doorbell_stream.cpp`](../perf/sycl/perf_moe_doorbell_stream.cpp) | **COMPLETED & COMPILED** | 51.2 KB PCIe transfer in 11.1 µs; 160.6 µs positive overlap slack behind shared expert |
+| **P21** | Benchmark Paged KV Cache Memory Traffic & Indirection | [`perf/sycl/perf_paged_kv_traffic.cpp`](../perf/sycl/perf_paged_kv_traffic.cpp) | **COMPLETED & COMPILED** | Non-contiguous paged gather (56.4 GB/s at 16K); page size sweep and INT8 quantization |
+| **P22** | Benchmark LM Head Projection & Parallel GPU Sampler | [`perf/sycl/perf_lmhead_sampler.cpp`](../perf/sycl/perf_lmhead_sampler.cpp) | **COMPLETED & COMPILED** | 2560 -> 248,320 GEMV (89.8 GB/s); 248K parallel max + softmax (592.2 µs); 4-byte readback |
+| **P23** | Benchmark Fast Walsh-Hadamard Transform & Q4_0 KV | [`perf/sycl/perf_fwht_kv4.cpp`](../perf/sycl/perf_fwht_kv4.cpp) | **COMPLETED & COMPILED** | 8-stage butterfly FWHT256 in SLM (11.5 µs); 7.11x Q4_0 compression; rotated decode attention |
+| **P24** | Benchmark Layer 1 Per-Layer Embedding & N-gram Shift | [`perf/sycl/perf_ple_ngram.cpp`](../perf/sycl/perf_ple_ngram.cpp) | **COMPLETED & COMPILED** | Layer 1 unique block: 1,440 B row upload (12.6 µs); Conv1D history shift + projections (377.3 µs) |
+| **P25** | Benchmark Embedding Dequant & Readback Overlap | [`perf/sycl/perf_embed_overlap.cpp`](../perf/sycl/perf_embed_overlap.cpp) | **COMPLETED & COMPILED** | Column dequant (12.5 µs); async chaining eliminates 148 µs host barrier (1.97x faster) |
 
 ---
 
@@ -398,15 +398,15 @@ vtune -collect gpu-hotspots ./build_sycl/perf_xe2_gemv
 
 The initial optimization strategy targeted five critical decode bottlenecks on the Intel Xe2 architecture. Three of these have been resolved and benchmarked with live hardware measurements:
 
-1. **Weight-Only Dequantization + XMX DPAS** - **RESOLVED & MEASURED** in [`perf/sycl/perf_dequant_dpas.cpp`](file:///home/girtam/projects/Strata/perf/sycl/perf_dequant_dpas.cpp):
+1. **Weight-Only Dequantization + XMX DPAS** - **RESOLVED & MEASURED** in [`perf/sycl/perf_dequant_dpas.cpp`](../perf/sycl/perf_dequant_dpas.cpp):
    - Direct-to-register unpacking into SIMD16 registers achieved **423.7 GFLOPS** (594.0 µs, 15.29 GB/s) on Gate projection $[8, 2560, 6144]$ vs. 329.8 GFLOPS (763.1 µs, 11.91 GB/s) for SLM-buffered DPAS.
-   - Deployed to production in [`src/kernels/sycl/s2_gemv_fast.cpp`](file:///home/girtam/projects/Strata/src/kernels/sycl/s2_gemv_fast.cpp) and [`s2_gemv_q8.cpp`](file:///home/girtam/projects/Strata/src/kernels/sycl/s2_gemv_q8.cpp), yielding a measured **+27.3% speedup** with zero test failures.
-2. **QSA Sparse Gather** - **RESOLVED & MEASURED** in [`perf/sycl/perf_qsa_attention.cpp`](file:///home/girtam/projects/Strata/perf/sycl/perf_qsa_attention.cpp):
+   - Deployed to production in [`src/kernels/sycl/s2_gemv_fast.cpp`](../src/kernels/sycl/s2_gemv_fast.cpp) and [`s2_gemv_q8.cpp`](../src/kernels/sycl/s2_gemv_q8.cpp), yielding a measured **+27.3% speedup** with zero test failures.
+2. **QSA Sparse Gather** - **RESOLVED & MEASURED** in [`perf/sycl/perf_qsa_attention.cpp`](../perf/sycl/perf_qsa_attention.cpp):
    - Sparse non-contiguous KV block gathering sustained **16.7 to 22.2 GB/s** across 1k to 64k pooled context cells (94.6 µs for 1k cells, 125.3 µs for 64k cells).
-   - Full systolic attention pipeline verified in [`src/kernels/sycl/qsa_prompt_attn.cpp`](file:///home/girtam/projects/Strata/src/kernels/sycl/qsa_prompt_attn.cpp) at up to 611k tok/s.
-3. **MoE Expert Accumulation** - **RESOLVED & MEASURED** in [`perf/sycl/perf_moe_accumulate.cpp`](file:///home/girtam/projects/Strata/perf/sycl/perf_moe_accumulate.cpp):
+   - Full systolic attention pipeline verified in [`src/kernels/sycl/qsa_prompt_attn.cpp`](../src/kernels/sycl/qsa_prompt_attn.cpp) at up to 611k tok/s.
+3. **MoE Expert Accumulation** - **RESOLVED & MEASURED** in [`perf/sycl/perf_moe_accumulate.cpp`](../perf/sycl/perf_moe_accumulate.cpp):
    - Direct Combine and Subgroup Reduce achieved **81.3 GB/s** at $B=32$ (44.4 µs vs 150.8 µs for Atomic), delivering a **3.40x speedup** over global atomics.
-   - Deployed to production in [`src/kernels/sycl/native_moe.cpp`](file:///home/girtam/projects/Strata/src/kernels/sycl/native_moe.cpp) using 128-bit vectorized memory operations (`combine_vec4`).
+   - Deployed to production in [`src/kernels/sycl/native_moe.cpp`](../src/kernels/sycl/native_moe.cpp) using 128-bit vectorized memory operations (`combine_vec4`).
 
 The remaining two bottlenecks (Fused GDN State Recurrence and PCIe Async Copy Overlap) together with new system-level execution bottlenecks form the **Tier 2 Performance Benchmark Suite**.
 
@@ -445,13 +445,13 @@ flowchart TD
 
 | Benchmark | Target File | Target Subsystem | Measured Baseline (Lunar Lake `0x64a0`) | Status & Arc B580 Readiness |
 |---|---|---|---|---|
-| **BM 6: Fused GDN Recurrence** | [`perf/sycl/perf_fused_gdn.cpp`](file:///home/girtam/projects/Strata/perf/sycl/perf_fused_gdn.cpp) | Linear Attention Recurrence (36 layers) | **36.1 µs** (59.2 GB/s) vs 95.9 µs unfused (**2.66x faster**) | **BUILT & READY** for B580 tuning |
-| **BM 7: PCIe Copy vs XMX Overlap** | [`perf/sycl/perf_pcie_overlap.cpp`](file:///home/girtam/projects/Strata/perf/sycl/perf_pcie_overlap.cpp) | Asymmetric Memory Tiering (BCE Engine) | **98.7% compute retention** (1.209 TFLOPS vs 1.225 TFLOPS) | **BUILT & READY** for B580 tuning |
-| **BM 8: Command Graph Replay** | [`perf/sycl/perf_graph_replay.cpp`](file:///home/girtam/projects/Strata/perf/sycl/perf_graph_replay.cpp) | 48-Layer Decode Dispatch Engine | **0.29 ms vs 7.60 ms** (**26.1x speedup**, < 1.02 µs/node) | **BUILT & READY** for B580 tuning |
-| **BM 9: Quantized KV Decode Attention** | [`perf/sycl/perf_kv_decode.cpp`](file:///home/girtam/projects/Strata/perf/sycl/perf_kv_decode.cpp) | 12 QSA Layers (4K to 262K context) | **4.2–4.6 GB/s** (FP16) & **3.1–3.2 GB/s** (INT8) | **BUILT & READY** for B580 tuning |
-| **BM 10: Prefill Tiled GEMM Scaling** | [`perf/sycl/perf_prefill_gemm.cpp`](file:///home/girtam/projects/Strata/perf/sycl/perf_prefill_gemm.cpp) | Native Tiled GEMM ($M=128\dots8192$) | **1.17–3.00 TFLOPS** across chunk sizes $M=128\dots2048$ | **BUILT & READY** for B580 tuning |
-| **BM 11: MTP Speculative Verification** | [`perf/sycl/perf_speculative_verify.cpp`](file:///home/girtam/projects/Strata/perf/sycl/perf_speculative_verify.cpp) | Speculative Decode Verify ($B=1\dots5$) | **6.6x scaling**: 10.2k tok/s ($B=1$) to 68.0k tok/s ($B=8$) | **BUILT & READY** for B580 tuning |
-| **BM 12: End-to-End TTFT & Generation** | [`tools/bench_xe2_e2e.py`](file:///home/girtam/projects/Strata/tools/bench_xe2_e2e.py) | Full Engine Driver (`strata`) | Automated CLI/HTTP driver across 1K–128K context | **BUILT & READY** for B580 tuning |
+| **BM 6: Fused GDN Recurrence** | [`perf/sycl/perf_fused_gdn.cpp`](../perf/sycl/perf_fused_gdn.cpp) | Linear Attention Recurrence (36 layers) | **36.1 µs** (59.2 GB/s) vs 95.9 µs unfused (**2.66x faster**) | **BUILT & READY** for B580 tuning |
+| **BM 7: PCIe Copy vs XMX Overlap** | [`perf/sycl/perf_pcie_overlap.cpp`](../perf/sycl/perf_pcie_overlap.cpp) | Asymmetric Memory Tiering (BCE Engine) | **98.7% compute retention** (1.209 TFLOPS vs 1.225 TFLOPS) | **BUILT & READY** for B580 tuning |
+| **BM 8: Command Graph Replay** | [`perf/sycl/perf_graph_replay.cpp`](../perf/sycl/perf_graph_replay.cpp) | 48-Layer Decode Dispatch Engine | **0.29 ms vs 7.60 ms** (**26.1x speedup**, < 1.02 µs/node) | **BUILT & READY** for B580 tuning |
+| **BM 9: Quantized KV Decode Attention** | [`perf/sycl/perf_kv_decode.cpp`](../perf/sycl/perf_kv_decode.cpp) | 12 QSA Layers (4K to 262K context) | **4.2–4.6 GB/s** (FP16) & **3.1–3.2 GB/s** (INT8) | **BUILT & READY** for B580 tuning |
+| **BM 10: Prefill Tiled GEMM Scaling** | [`perf/sycl/perf_prefill_gemm.cpp`](../perf/sycl/perf_prefill_gemm.cpp) | Native Tiled GEMM ($M=128\dots8192$) | **1.17–3.00 TFLOPS** across chunk sizes $M=128\dots2048$ | **BUILT & READY** for B580 tuning |
+| **BM 11: MTP Speculative Verification** | [`perf/sycl/perf_speculative_verify.cpp`](../perf/sycl/perf_speculative_verify.cpp) | Speculative Decode Verify ($B=1\dots5$) | **6.6x scaling**: 10.2k tok/s ($B=1$) to 68.0k tok/s ($B=8$) | **BUILT & READY** for B580 tuning |
+| **BM 12: End-to-End TTFT & Generation** | [`tools/bench_xe2_e2e.py`](../tools/bench_xe2_e2e.py) | Full Engine Driver (`strata`) | Automated CLI/HTTP driver across 1K–128K context | **BUILT & READY** for B580 tuning |
 
 ---
 
@@ -664,7 +664,7 @@ A dedicated Python benchmark runner (`tools/bench_xe2_e2e.py`) automates repeata
 
 ### 7.9 CMake Target Registration Blueprint for Tier 2 Benchmarks
 
-The Tier 2 microbenchmarks will be integrated into [`CMakeLists.txt`](file:///home/girtam/projects/Strata/CMakeLists.txt) under the `STRATA_BUILD_PERF` option:
+The Tier 2 microbenchmarks will be integrated into [`CMakeLists.txt`](../CMakeLists.txt) under the `STRATA_BUILD_PERF` option:
 
 ```cmake
 if(STRATA_BUILD_PERF AND STRATA_ENABLE_SYCL)
@@ -760,7 +760,7 @@ To inspect hardware counter saturation on Intel Arc B580 systems, execute the fo
 
 ### 8.4 Automated Benchmark Runner & Tuning Report Generator
 
-To streamline tuning on target hardware (desktop Intel Arc B580 or integrated Lunar Lake), the automated benchmark suite runner [`tools/run_xe2_perf_benchmarks.py`](file:///home/girtam/projects/Strata/tools/run_xe2_perf_benchmarks.py) orchestrates all 11 Google Benchmark targets, auto-detects hardware features, and writes formatted JSON and Markdown performance reports:
+To streamline tuning on target hardware (desktop Intel Arc B580 or integrated Lunar Lake), the automated benchmark suite runner [`tools/run_xe2_perf_benchmarks.py`](../tools/run_xe2_perf_benchmarks.py) orchestrates all 11 Google Benchmark targets, auto-detects hardware features, and writes formatted JSON and Markdown performance reports:
 
 #### Quick Smoke Run (Validation):
 ```bash
@@ -888,13 +888,13 @@ To maintain absolute architectural parity with the latest upstream CUDA enhancem
 
 | Optimization | Kernel / File | CUDA Architecture Origin | SYCL 2020 Implementation Details | Performance Impact |
 |---|---|---|---|---|
-| **Fused SwiGLU + Q8_1 Quantize** | `native_swiglu_quantize_q8_1`<br>([`native_mmvq.cpp`](file:///home/girtam/projects/Strata/src/kernels/sycl/native_mmvq.cpp)) | Warp shuffles across FP32 Silu and Q8_1 scaling | Replaced separate SwiGLU intermediate global memory store with fused sub-group reduction and direct `Q81Block` output | Eliminates 1 global round-trip of $(n_{ff} \times n_{tok})$ floats (up to 20 KB/step) |
-| **Fused Sigmoid + Row Scaling** | `sigmoid_scale_rows_kernel`<br>([`shared_expert.cpp`](file:///home/girtam/projects/Strata/src/kernels/sycl/shared_expert.cpp)) | Fused scalar sigmoid on gate vector `g` with output row scaling | Computes `gt = 1.0f / (1.0f + exp(-g[t]))` directly inside row-scaling kernel; also supports `x_q8_1` pre-quantized input caching | Eliminates separate single-task sigmoid launch overhead |
-| **Resident-Aware Doorbell Publish** | `doorbell_publish_res`<br>([`elementwise.cpp`](file:///home/girtam/projects/Strata/src/kernels/sycl/elementwise.cpp)) | Sub-warp inspection of resident cache slots `d_res[ids[tid]]` | When all 10 selected MoE experts hit the GPU VRAM cache, the 10 KB activation copy across PCIe is bypassed, only fencing `ids_out` and advancing `seq` | Cuts PCIe traffic by 10 KB per token on cache hits |
-| **Pre-Projected PLE Evaluation** | `ple_block_projected`<br>([`ple.cpp`](file:///home/girtam/projects/Strata/src/kernels/sycl/ple.cpp)) | Direct postops invocation on pre-projected key and value | Takes device pointers `projected_key` and `projected_value`, prepares `NativePlePostopsBuffers`, and dispatches directly to `native_ple_postops` | Bypasses redundant GEMV projections when inputs are already in residual cache |
-| **Multi-Column Batched GEMV** | `bf16_gemv_fp32_mmvf_cols`<br>([`native_bf16.cpp`](file:///home/girtam/projects/Strata/src/kernels/sycl/native_bf16.cpp)) | Single weight read across up to 8 activation columns | Chunks contiguous columns into groups of up to 8, issuing `bf16_gemv_fp32_mmvf_multi` to read weights once | Reduces weight bandwidth pressure for verify windows and decode batches |
-| **Wide Top-K Selection Kernel** | `block_topk_wide_kernel`<br>([`qsa_select.cpp`](file:///home/girtam/projects/Strata/src/kernels/sycl/qsa_select.cpp)) | Radix Top-K on 1024 threads with per-warp histograms | Uses SYCL 2020 group algorithms (`permute_group_by_xor`, `shift_group_right`, `select_from_group`, `any_of_group`) when active blocks exceed register capacity ($> 135\text{K}$) | **9–12x speedup** over reference CPU fallback for context lengths up to 262K |
-| **Cooperative Resident Plan** | `resident_plan_kernel`<br>([`verify_kernels.cpp`](file:///home/girtam/projects/Strata/src/kernels/sycl/verify_kernels.cpp)) | 64-thread parallel plan generator with shared memory arrays | Replaced single-thread serial loop with 64-thread cooperative group sorting using local memory and atomic bad-slot detection | Cuts plan construction latency during speculative verification |
+| **Fused SwiGLU + Q8_1 Quantize** | `native_swiglu_quantize_q8_1`<br>([`native_mmvq.cpp`](../src/kernels/sycl/native_mmvq.cpp)) | Warp shuffles across FP32 Silu and Q8_1 scaling | Replaced separate SwiGLU intermediate global memory store with fused sub-group reduction and direct `Q81Block` output | Eliminates 1 global round-trip of $(n_{ff} \times n_{tok})$ floats (up to 20 KB/step) |
+| **Fused Sigmoid + Row Scaling** | `sigmoid_scale_rows_kernel`<br>([`shared_expert.cpp`](../src/kernels/sycl/shared_expert.cpp)) | Fused scalar sigmoid on gate vector `g` with output row scaling | Computes `gt = 1.0f / (1.0f + exp(-g[t]))` directly inside row-scaling kernel; also supports `x_q8_1` pre-quantized input caching | Eliminates separate single-task sigmoid launch overhead |
+| **Resident-Aware Doorbell Publish** | `doorbell_publish_res`<br>([`elementwise.cpp`](../src/kernels/sycl/elementwise.cpp)) | Sub-warp inspection of resident cache slots `d_res[ids[tid]]` | When all 10 selected MoE experts hit the GPU VRAM cache, the 10 KB activation copy across PCIe is bypassed, only fencing `ids_out` and advancing `seq` | Cuts PCIe traffic by 10 KB per token on cache hits |
+| **Pre-Projected PLE Evaluation** | `ple_block_projected`<br>([`ple.cpp`](../src/kernels/sycl/ple.cpp)) | Direct postops invocation on pre-projected key and value | Takes device pointers `projected_key` and `projected_value`, prepares `NativePlePostopsBuffers`, and dispatches directly to `native_ple_postops` | Bypasses redundant GEMV projections when inputs are already in residual cache |
+| **Multi-Column Batched GEMV** | `bf16_gemv_fp32_mmvf_cols`<br>([`native_bf16.cpp`](../src/kernels/sycl/native_bf16.cpp)) | Single weight read across up to 8 activation columns | Chunks contiguous columns into groups of up to 8, issuing `bf16_gemv_fp32_mmvf_multi` to read weights once | Reduces weight bandwidth pressure for verify windows and decode batches |
+| **Wide Top-K Selection Kernel** | `block_topk_wide_kernel`<br>([`qsa_select.cpp`](../src/kernels/sycl/qsa_select.cpp)) | Radix Top-K on 1024 threads with per-warp histograms | Uses SYCL 2020 group algorithms (`permute_group_by_xor`, `shift_group_right`, `select_from_group`, `any_of_group`) when active blocks exceed register capacity ($> 135\text{K}$) | **9–12x speedup** over reference CPU fallback for context lengths up to 262K |
+| **Cooperative Resident Plan** | `resident_plan_kernel`<br>([`verify_kernels.cpp`](../src/kernels/sycl/verify_kernels.cpp)) | 64-thread parallel plan generator with shared memory arrays | Replaced single-thread serial loop with 64-thread cooperative group sorting using local memory and atomic bad-slot detection | Cuts plan construction latency during speculative verification |
 
 #### Live Verification & Performance Benchmark Results
 - **Numerical Parity**: 16/16 SYCL test suites passed (100% pass rate in 3.86 seconds).

@@ -3,7 +3,7 @@
 > **Target Hardware**: Intel Core Ultra 5 226V (Lunar Lake Xe2-LPG `0x64a0`) & Intel Arc B580 (Battlemage Xe2-HPG)  
 > **Host OS**: Linux x86_64 (Kernel 6.14.0-33-generic, WSL2 / Native Ubuntu)  
 > **Toolchain**: Intel oneAPI 2026.1 (`icpx -fsycl -qmkl`)  
-> **Build Directory**: `/home/girtam/projects/Strata/build_sycl`  
+> **Build Directory**: `build_sycl`  
 > **Current Branch**: `main` (cleanly rebased on upstream `origin/main` @ `v0.1.39`)  
 > **Build Status**: Clean build exit 0 | **ZERO compiler warnings** under strict `-Wall -Wextra`  
 > **Production Kernels**: **44/44 Pure SYCL 2020 (100% - Zero DPCT artifacts)**  
@@ -104,47 +104,47 @@ flowchart TD
 
 | # | Kernel File | Primary Parity Target | Parity Status | Xe2 SIMD16 Optimization |
 |---|---|---|---|---|
-| 1 | [`bf16_gemv.cpp`](file:///home/girtam/projects/Strata/src/kernels/sycl/bf16_gemv.cpp) | `bf16_gemv_parity` | **PASS (0 fails)** | SIMD16 + `reduce_over_group` |
-| 2 | [`cvec.cpp`](file:///home/girtam/projects/Strata/src/kernels/sycl/cvec.cpp) | `cvec_parity` | **PASS (0 fails)** | Native 1D range |
-| 3 | [`dequant_bf16.cpp`](file:///home/girtam/projects/Strata/src/kernels/sycl/dequant_bf16.cpp) | `dequant_bf16_test` | **PASS (0 fails)** | Constexpr lookup tables |
-| 4 | [`dequant_s2.cpp`](file:///home/girtam/projects/Strata/src/kernels/sycl/dequant_s2.cpp) | `dequant_s2_parity` | **PASS (0 fails)** | Pure SYCL math built-ins |
-| 5 | [`elementwise.cpp`](file:///home/girtam/projects/Strata/src/kernels/sycl/elementwise.cpp) | `elementwise_parity` | **PASS (0 fails)** | 1D auto-tuned range |
-| 6 | [`fused_gdn.cpp`](file:///home/girtam/projects/Strata/src/kernels/sycl/fused_gdn.cpp) | `sycl_fused_gdn` | **PASS (0 fails)** | 2D row-group shuffles |
-| 7 | [`fused_gr.cpp`](file:///home/girtam/projects/Strata/src/kernels/sycl/fused_gr.cpp) | `gr_parity` | **PASS (0 fails)** | Subgroup shuffles |
-| 8 | [`gdn.cpp`](file:///home/girtam/projects/Strata/src/kernels/sycl/gdn.cpp) | `gdn_parity` | **PASS (0 fails)** | 2D local accessor, `shift_group_left` |
-| 9 | [`gr.cpp`](file:///home/girtam/projects/Strata/src/kernels/sycl/gr.cpp) | `gr_parity` | **PASS (0 fails)** | 1D ranges, subgroup reduction |
-| 10 | [`iq_kernels.cpp`](file:///home/girtam/projects/Strata/src/kernels/sycl/iq_kernels.cpp) | `iq_parity`, `iq_multi_parity` | **PASS (0 fails)** | Vectorized `dp4a`, byte permute |
-| 11 | [`kv_q4.cpp`](file:///home/girtam/projects/Strata/src/kernels/sycl/kv_q4.cpp) | `kv_q4_parity` | **PASS (0 fails)** | Native subgroup execution |
-| 12 | [`kv_q8.cpp`](file:///home/girtam/projects/Strata/src/kernels/sycl/kv_q8.cpp) | `kv_q8_parity` | **PASS (0 fails)** | 1D gather, local accessor |
-| 13 | [`kv_stream.cpp`](file:///home/girtam/projects/Strata/src/kernels/sycl/kv_stream.cpp) | `kv_stream_parity` | **PASS (0 fails)** | `sycl::atomic_ref` with memory scopes |
-| 14 | [`native_bf16.cpp`](file:///home/girtam/projects/Strata/src/kernels/sycl/native_bf16.cpp) | `sycl_native_bf16` | **PASS (0 fails)** | SIMD16 + `reduce_over_group` |
-| 15 | [`native_flash_attn.cpp`](file:///home/girtam/projects/Strata/src/kernels/sycl/native_flash_attn.cpp) | `sycl_native_flash_attn` | **PASS (0 fails)** | 2D head/warp-thread grid |
-| 16 | [`native_gdn.cpp`](file:///home/girtam/projects/Strata/src/kernels/sycl/native_gdn.cpp) | `sycl_native_gdn` | **PASS (0 fails)** | 2D head/col-warp range |
-| 17 | [`native_gdn_preprocess.cpp`](file:///home/girtam/projects/Strata/src/kernels/sycl/native_gdn_preprocess.cpp) | `sycl_native_gdn_preprocess` | **PASS (0 fails)** | Local memory norm reductions |
-| 18 | [`native_gr_norm.cpp`](file:///home/girtam/projects/Strata/src/kernels/sycl/native_gr_norm.cpp) | `sycl_native_gr_norm` | **PASS (0 fails)** | SIMD16 + `reduce_over_group` |
-| 19 | [`native_gr_postops.cpp`](file:///home/girtam/projects/Strata/src/kernels/sycl/native_gr_postops.cpp) | `gr_parity` | **PASS (0 fails)** | 1D ranges for `down_silu` & `post` |
-| 20 | [`native_mmvq.cpp`](file:///home/girtam/projects/Strata/src/kernels/sycl/native_mmvq.cpp) | `sycl_native_mmvq` | **PASS (0 fails)** | Vector `dp4a`, `byte_permute` |
-| 21 | [`native_moe.cpp`](file:///home/girtam/projects/Strata/src/kernels/sycl/native_moe.cpp) | `native_expert_parity` | **PASS (0 fails)** | 2D token-column ranges |
-| 22 | [`native_ple_postops.cpp`](file:///home/girtam/projects/Strata/src/kernels/sycl/native_ple_postops.cpp) | `sycl_native_ple_postops` | **PASS (0 fails)** | 1D ranges, subgroup shuffles |
-| 23 | [`native_qsa.cpp`](file:///home/girtam/projects/Strata/src/kernels/sycl/native_qsa.cpp) | `qsa_parity` | **PASS (0 fails)** | 2D row ranges, subgroup shuffles |
-| 24 | [`native_qsa_indexer.cpp`](file:///home/girtam/projects/Strata/src/kernels/sycl/native_qsa_indexer.cpp) | `qsa_parity` | **PASS (0 fails)** | 1D workgroup ranges |
-| 25 | [`native_qsa_score.cpp`](file:///home/girtam/projects/Strata/src/kernels/sycl/native_qsa_score.cpp) | `sycl_native_qsa_score` | **PASS (0 fails)** | Collective select broadcast |
-| 26 | [`native_rope.cpp`](file:///home/girtam/projects/Strata/src/kernels/sycl/native_rope.cpp) | `rope_parity` | **PASS (0 fails)** | 2D row/pair grid |
-| 27 | [`native_router.cpp`](file:///home/girtam/projects/Strata/src/kernels/sycl/native_router.cpp) | `sycl_native_router` | **PASS (0 fails)** | 1D workgroup per token |
-| 28 | [`ple.cpp`](file:///home/girtam/projects/Strata/src/kernels/sycl/ple.cpp) | `ple_parity` | **PASS (0 fails)** | In-order queues, subgroup shuffles |
-| 29 | [`qsa.cpp`](file:///home/girtam/projects/Strata/src/kernels/sycl/qsa.cpp) | `qsa_parity` | **PASS (0 fails)** | `permute_group_by_xor` |
-| 30 | [`qsa_decode_attn.cpp`](file:///home/girtam/projects/Strata/src/kernels/sycl/qsa_decode_attn.cpp) | `qsa_decode_attn_test` | **PASS (0 fails)** | 3D chunk range, KV_MODE templates |
-| 31 | [`qsa_prompt_attn.cpp`](file:///home/girtam/projects/Strata/src/kernels/sycl/qsa_prompt_attn.cpp) | `qsa_prompt_attn_parity` | **In Progress** | Porting to XMX `joint_matrix` |
-| 32 | [`qsa_select.cpp`](file:///home/girtam/projects/Strata/src/kernels/sycl/qsa_select.cpp) | `qsa_parity` | **PASS (0 fails)** | Workgroup atomic radix histogram |
-| 33 | [`quantize_act.cpp`](file:///home/girtam/projects/Strata/src/kernels/sycl/quantize_act.cpp) | `quantize_act_parity` | **PASS (0 fails)** | 1D flattened range |
-| 34 | [`rope.cpp`](file:///home/girtam/projects/Strata/src/kernels/sycl/rope.cpp) | `rope_parity` | **PASS (0 fails)** | 1D range, pure SYCL math |
-| 35 | [`router_top10.cpp`](file:///home/girtam/projects/Strata/src/kernels/sycl/router_top10.cpp) | `router_top10_parity` | **PASS (0 fails)** | Subgroup `shift_group_left` |
-| 36 | [`s2_expert_grouped.cpp`](file:///home/girtam/projects/Strata/src/kernels/sycl/s2_expert_grouped.cpp) | `s2_expert_grouped_parity` | **PASS (0 fails)** | Vector `dp4a`, bitwise permute |
-| 37 | [`s2_gemv.cpp`](file:///home/girtam/projects/Strata/src/kernels/sycl/s2_gemv.cpp) | `s2_gemv_parity` | **PASS (0 fails)** | SIMD16 subgroup reduction kernel |
-| 38 | [`s2_gemv_fast.cpp`](file:///home/girtam/projects/Strata/src/kernels/sycl/s2_gemv_fast.cpp) | `s2_gemv_parity` | **PASS (0 fails)** | Hierarchical SIMD16 reduction |
-| 39 | [`s2_gemv_q8.cpp`](file:///home/girtam/projects/Strata/src/kernels/sycl/s2_gemv_q8.cpp) | `s2_gemv_q8_parity` | **PASS (0 fails)** | Native 1D indexing |
-| 40 | [`s2_gemv_quads.cpp`](file:///home/girtam/projects/Strata/src/kernels/sycl/s2_gemv_quads.cpp) | `s2_gemv_parity` | **PASS (0 fails)** | Hierarchical SIMD16 reduction |
-| 41 | [`s_gemv.cpp`](file:///home/girtam/projects/Strata/src/kernels/sycl/s_gemv.cpp) | `s_gemv_parity`, `s_gemv_q8k_parity` | **PASS (0 fails)** | SIMD16 stride + `reduce_over_group` |
-| 42 | [`sampler.cpp`](file:///home/girtam/projects/Strata/src/kernels/sycl/sampler.cpp) | `sampler_parity` | **PASS (0 fails)** | Subgroup shuffles, local atomic_ref |
-| 43 | [`shared_expert.cpp`](file:///home/girtam/projects/Strata/src/kernels/sycl/shared_expert.cpp) | `shared_expert_parity` | **PASS (0 fails)** | 2D row-scaling range |
-| 44 | [`verify_kernels.cpp`](file:///home/girtam/projects/Strata/src/kernels/sycl/verify_kernels.cpp) | `sycl_verify_kernels` | **PASS (0 fails)** | 1D/2D ranges, subgroup shuffles |
+| 1 | [`bf16_gemv.cpp`](../src/kernels/sycl/bf16_gemv.cpp) | `bf16_gemv_parity` | **PASS (0 fails)** | SIMD16 + `reduce_over_group` |
+| 2 | [`cvec.cpp`](../src/kernels/sycl/cvec.cpp) | `cvec_parity` | **PASS (0 fails)** | Native 1D range |
+| 3 | [`dequant_bf16.cpp`](../src/kernels/sycl/dequant_bf16.cpp) | `dequant_bf16_test` | **PASS (0 fails)** | Constexpr lookup tables |
+| 4 | [`dequant_s2.cpp`](../src/kernels/sycl/dequant_s2.cpp) | `dequant_s2_parity` | **PASS (0 fails)** | Pure SYCL math built-ins |
+| 5 | [`elementwise.cpp`](../src/kernels/sycl/elementwise.cpp) | `elementwise_parity` | **PASS (0 fails)** | 1D auto-tuned range |
+| 6 | [`fused_gdn.cpp`](../src/kernels/sycl/fused_gdn.cpp) | `sycl_fused_gdn` | **PASS (0 fails)** | 2D row-group shuffles |
+| 7 | [`fused_gr.cpp`](../src/kernels/sycl/fused_gr.cpp) | `gr_parity` | **PASS (0 fails)** | Subgroup shuffles |
+| 8 | [`gdn.cpp`](../src/kernels/sycl/gdn.cpp) | `gdn_parity` | **PASS (0 fails)** | 2D local accessor, `shift_group_left` |
+| 9 | [`gr.cpp`](../src/kernels/sycl/gr.cpp) | `gr_parity` | **PASS (0 fails)** | 1D ranges, subgroup reduction |
+| 10 | [`iq_kernels.cpp`](../src/kernels/sycl/iq_kernels.cpp) | `iq_parity`, `iq_multi_parity` | **PASS (0 fails)** | Vectorized `dp4a`, byte permute |
+| 11 | [`kv_q4.cpp`](../src/kernels/sycl/kv_q4.cpp) | `kv_q4_parity` | **PASS (0 fails)** | Native subgroup execution |
+| 12 | [`kv_q8.cpp`](../src/kernels/sycl/kv_q8.cpp) | `kv_q8_parity` | **PASS (0 fails)** | 1D gather, local accessor |
+| 13 | [`kv_stream.cpp`](../src/kernels/sycl/kv_stream.cpp) | `kv_stream_parity` | **PASS (0 fails)** | `sycl::atomic_ref` with memory scopes |
+| 14 | [`native_bf16.cpp`](../src/kernels/sycl/native_bf16.cpp) | `sycl_native_bf16` | **PASS (0 fails)** | SIMD16 + `reduce_over_group` |
+| 15 | [`native_flash_attn.cpp`](../src/kernels/sycl/native_flash_attn.cpp) | `sycl_native_flash_attn` | **PASS (0 fails)** | 2D head/warp-thread grid |
+| 16 | [`native_gdn.cpp`](../src/kernels/sycl/native_gdn.cpp) | `sycl_native_gdn` | **PASS (0 fails)** | 2D head/col-warp range |
+| 17 | [`native_gdn_preprocess.cpp`](../src/kernels/sycl/native_gdn_preprocess.cpp) | `sycl_native_gdn_preprocess` | **PASS (0 fails)** | Local memory norm reductions |
+| 18 | [`native_gr_norm.cpp`](../src/kernels/sycl/native_gr_norm.cpp) | `sycl_native_gr_norm` | **PASS (0 fails)** | SIMD16 + `reduce_over_group` |
+| 19 | [`native_gr_postops.cpp`](../src/kernels/sycl/native_gr_postops.cpp) | `gr_parity` | **PASS (0 fails)** | 1D ranges for `down_silu` & `post` |
+| 20 | [`native_mmvq.cpp`](../src/kernels/sycl/native_mmvq.cpp) | `sycl_native_mmvq` | **PASS (0 fails)** | Vector `dp4a`, `byte_permute` |
+| 21 | [`native_moe.cpp`](../src/kernels/sycl/native_moe.cpp) | `native_expert_parity` | **PASS (0 fails)** | 2D token-column ranges |
+| 22 | [`native_ple_postops.cpp`](../src/kernels/sycl/native_ple_postops.cpp) | `sycl_native_ple_postops` | **PASS (0 fails)** | 1D ranges, subgroup shuffles |
+| 23 | [`native_qsa.cpp`](../src/kernels/sycl/native_qsa.cpp) | `qsa_parity` | **PASS (0 fails)** | 2D row ranges, subgroup shuffles |
+| 24 | [`native_qsa_indexer.cpp`](../src/kernels/sycl/native_qsa_indexer.cpp) | `qsa_parity` | **PASS (0 fails)** | 1D workgroup ranges |
+| 25 | [`native_qsa_score.cpp`](../src/kernels/sycl/native_qsa_score.cpp) | `sycl_native_qsa_score` | **PASS (0 fails)** | Collective select broadcast |
+| 26 | [`native_rope.cpp`](../src/kernels/sycl/native_rope.cpp) | `rope_parity` | **PASS (0 fails)** | 2D row/pair grid |
+| 27 | [`native_router.cpp`](../src/kernels/sycl/native_router.cpp) | `sycl_native_router` | **PASS (0 fails)** | 1D workgroup per token |
+| 28 | [`ple.cpp`](../src/kernels/sycl/ple.cpp) | `ple_parity` | **PASS (0 fails)** | In-order queues, subgroup shuffles |
+| 29 | [`qsa.cpp`](../src/kernels/sycl/qsa.cpp) | `qsa_parity` | **PASS (0 fails)** | `permute_group_by_xor` |
+| 30 | [`qsa_decode_attn.cpp`](../src/kernels/sycl/qsa_decode_attn.cpp) | `qsa_decode_attn_test` | **PASS (0 fails)** | 3D chunk range, KV_MODE templates |
+| 31 | [`qsa_prompt_attn.cpp`](../src/kernels/sycl/qsa_prompt_attn.cpp) | `qsa_prompt_attn_parity` | **In Progress** | Porting to XMX `joint_matrix` |
+| 32 | [`qsa_select.cpp`](../src/kernels/sycl/qsa_select.cpp) | `qsa_parity` | **PASS (0 fails)** | Workgroup atomic radix histogram |
+| 33 | [`quantize_act.cpp`](../src/kernels/sycl/quantize_act.cpp) | `quantize_act_parity` | **PASS (0 fails)** | 1D flattened range |
+| 34 | [`rope.cpp`](../src/kernels/sycl/rope.cpp) | `rope_parity` | **PASS (0 fails)** | 1D range, pure SYCL math |
+| 35 | [`router_top10.cpp`](../src/kernels/sycl/router_top10.cpp) | `router_top10_parity` | **PASS (0 fails)** | Subgroup `shift_group_left` |
+| 36 | [`s2_expert_grouped.cpp`](../src/kernels/sycl/s2_expert_grouped.cpp) | `s2_expert_grouped_parity` | **PASS (0 fails)** | Vector `dp4a`, bitwise permute |
+| 37 | [`s2_gemv.cpp`](../src/kernels/sycl/s2_gemv.cpp) | `s2_gemv_parity` | **PASS (0 fails)** | SIMD16 subgroup reduction kernel |
+| 38 | [`s2_gemv_fast.cpp`](../src/kernels/sycl/s2_gemv_fast.cpp) | `s2_gemv_parity` | **PASS (0 fails)** | Hierarchical SIMD16 reduction |
+| 39 | [`s2_gemv_q8.cpp`](../src/kernels/sycl/s2_gemv_q8.cpp) | `s2_gemv_q8_parity` | **PASS (0 fails)** | Native 1D indexing |
+| 40 | [`s2_gemv_quads.cpp`](../src/kernels/sycl/s2_gemv_quads.cpp) | `s2_gemv_parity` | **PASS (0 fails)** | Hierarchical SIMD16 reduction |
+| 41 | [`s_gemv.cpp`](../src/kernels/sycl/s_gemv.cpp) | `s_gemv_parity`, `s_gemv_q8k_parity` | **PASS (0 fails)** | SIMD16 stride + `reduce_over_group` |
+| 42 | [`sampler.cpp`](../src/kernels/sycl/sampler.cpp) | `sampler_parity` | **PASS (0 fails)** | Subgroup shuffles, local atomic_ref |
+| 43 | [`shared_expert.cpp`](../src/kernels/sycl/shared_expert.cpp) | `shared_expert_parity` | **PASS (0 fails)** | 2D row-scaling range |
+| 44 | [`verify_kernels.cpp`](../src/kernels/sycl/verify_kernels.cpp) | `sycl_verify_kernels` | **PASS (0 fails)** | 1D/2D ranges, subgroup shuffles |
