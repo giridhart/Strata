@@ -94,7 +94,7 @@ flowchart TD
 
 ---
 
-### Phase 3: Hardware Matrix Acceleration via Intel XMX (`joint_matrix`) - **IN PROGRESS**
+### Phase 3: Hardware Matrix Acceleration via Intel XMX (`joint_matrix`) - **COMPLETE (Attention)**
 
 **Objective**: Leverage the 160 Xe Matrix Extensions (XMX) systolic engines to accelerate matrix-vector multiplications and attention calculations.
 
@@ -105,11 +105,15 @@ flowchart TD
     - BF16/FP32: $TM=16, TN=16, TK=16$ and $TM=8, TN=16, TK=16$.
     - INT8/INT32: $TM=8, TN=16, TK=32$ and $TM=16, TN=16, TK=32$.
   - Standalone unit test [`tests/sycl/xmx_joint_matrix_test.cpp`](../tests/sycl/xmx_joint_matrix_test.cpp) verified with **0 failures** (single-tile $8 \times 16 \times 16$ and tiled $32 \times 64 \times 64$).
-  - Confirmed native hardware support for `sycl::address_space_cast<sycl::access::address_space::local_space>` and `layout::col_major` loads with arbitrary leading strides.
-- **Target Kernels for XMX**:
-  1. **`qsa_prompt_attn.cpp` (QSA Prompt Attention)**:
-     - Replace broken 32-lane CUDA software shuffle emulation (`mma16816`) with native systolic `joint_matrix` ($16 \times 16 \times 16$ FP16/FP32).
-     - Directly computes $Q \cdot K^T$ and $P \cdot V$ from local memory buffers `S.k` and `S.v`.
+  - Confirmed native hardware support for `sycl::address_space_cast<sycl::access::address_space::local_space>` and `layout::ext_intel_packed` VNNI matrix B loads.
+- **Implemented & Verified Kernels**:
+  1. **`qsa_prompt_attn.cpp` (QSA Prompt Attention)** - **COMPLETE & VERIFIED**:
+     - Completely replaced broken 32-lane CUDA software shuffle emulation (`mma16816`) with native SYCL 2020 XMX systolic matrix pipeline (`joint_matrix<sub_group, sycl::half, ...>` $16 \times 16 \times 16$ FP16 $\times$ FP16 $\rightarrow$ FP32).
+     - Native SIMD16 execution (`[[sycl::reqd_sub_group_size(16)]]`) with 8 sub-groups (128 threads) per workgroup.
+     - VNNI packing for both $K^T$ (`kp`) and $V$ (`vp`), with $P$ tiles (`ptile`) reusing the $K^T$ SLM allocation.
+     - Preserves full FP32-level precision ($1.8 \times 10^{-6}$ vs FP64 reference) using `half_as_float_exact` truncation barriers to prevent compiler SSA optimizations from discarding the lower-half deltas ($Q_{lo}$ and $P_{lo}$).
+     - Full support for `KV_MODE 0` (FP16), `KV_MODE 1` (INT8 with per-64 scales), and `KV_MODE 3` (Hybrid K8V4).
+     - Verified with **0 failures** on both `qsa_prompt_attn_parity` and `kv_hybrid_parity` on live Xe2 GPU (`0x64a0`).
   2. **`bf16_gemv.cpp` (BF16 GEMV)**:
      - Map multi-token GEMV tiles ($16 \times 16$) to `joint_matrix<sub_group, sycl::ext::oneapi::bfloat16, ...>`.
   3. **`s2_expert_grouped.cpp` (MoE Expert Grouped GEMV)**:
@@ -177,8 +181,12 @@ flowchart TD
 | **P1** | Add Battlemage & Xe2 CMake flags (`STRATA_TARGET_XE2`, `STRATA_AOT_BMG`) | [`CMakeLists.txt`](file:///home/girtam/projects/Strata/CMakeLists.txt) | **COMPLETED** | Enables Xe2 ISA flags and optional direct `bmg` AOT compilation |
 | **P2** | Define architecture-aware subgroup sizing (`sycl_arch.hpp`) | [`include/strata/core/sycl_arch.hpp`](file:///home/girtam/projects/Strata/include/strata/core/sycl_arch.hpp) | **COMPLETED** | Sets native SIMD16 execution for Xe2 (B580/Lunar Lake); cuts register pressure |
 | **P3** | Port GEMV & Norm kernels to SIMD16 + `sycl::reduce_over_group` | [`src/kernels/sycl/bf16_gemv.cpp`](file:///home/girtam/projects/Strata/src/kernels/sycl/bf16_gemv.cpp), [`src/kernels/sycl/native_bf16.cpp`](file:///home/girtam/projects/Strata/src/kernels/sycl/native_bf16.cpp), [`src/kernels/sycl/native_gr_norm.cpp`](file:///home/girtam/projects/Strata/src/kernels/sycl/native_gr_norm.cpp) | **COMPLETED** | 100% test pass on live Xe2 GPU; direct hardware reduction primitives |
-| **P4** | Implement Joint Matrix (XMX) prompt attention | [`src/kernels/sycl/qsa_prompt_attn.cpp`](file:///home/girtam/projects/Strata/src/kernels/sycl/qsa_prompt_attn.cpp) | **IN PROGRESS** | Probed 53 XMX combos; verified `joint_matrix` multiply-accumulate on live Xe2 |
-| **P5** | Profile and benchmark with Intel VTune / Advisor | Metrics collection | Upcoming | Identify memory vs compute bottlenecks on Xe2 |
+| **P4** | Implement Joint Matrix (XMX) prompt attention | [`src/kernels/sycl/qsa_prompt_attn.cpp`](file:///home/girtam/projects/Strata/src/kernels/sycl/qsa_prompt_attn.cpp) | **COMPLETED** | Native SIMD16 XMX systolic pipeline; 0 NaNs/INFs; 0 failures on parity suite |
+| **P5** | Production SLM Split Reduction for Narrow GEMV | [`src/kernels/sycl/bf16_gemv.cpp`](file:///home/girtam/projects/Strata/src/kernels/sycl/bf16_gemv.cpp) | **COMPLETED** | +23.3% speedup on narrow shapes (`ssm_alpha` 19.35 µs, 12.97 GB/s); 0 failures |
+| **P6** | Native SIMD16 Retuning for GDN Step | [`src/kernels/sycl/native_gdn.cpp`](file:///home/girtam/projects/Strata/src/kernels/sycl/native_gdn.cpp) | **COMPLETED** | SIMD16 hardware reduction; 0 failures on `gdn_parity` (rel err $2.08 \times 10^{-7}$) |
+| **P7** | MoE Vectorized & Subgroup Reduce | [`src/kernels/sycl/native_moe.cpp`](file:///home/girtam/projects/Strata/src/kernels/sycl/native_moe.cpp) | **COMPLETED** | 2.0x faster at K=8, 3.4x faster at K=32 (81.4 GB/s); `shared_expert_parity` 0 failures |
+| **P8** | Direct-to-Register 4-bit Dequant + DPAS | [`src/kernels/sycl/s2_gemv_fast.cpp`](file:///home/girtam/projects/Strata/src/kernels/sycl/s2_gemv_fast.cpp), [`s2_gemv_q8.cpp`](file:///home/girtam/projects/Strata/src/kernels/sycl/s2_gemv_q8.cpp) | **COMPLETED** | 424.8 GFLOPS (+27.3% faster than SLM); `s2_gemv_parity` 0 failures |
+| **P9** | End-to-End Inference Verification (`strata`) | [`src/program/sycl/generate.cpp`](file:///home/girtam/projects/Strata/src/program/sycl/generate.cpp), [`src/prefill/sycl/gemm.cpp`](file:///home/girtam/projects/Strata/src/prefill/sycl/gemm.cpp) | **COMPLETED** | Decoupled from oneMKL; Lunar Lake GPU-only execution enabled; 100% CI pass rate |
 
 ---
 

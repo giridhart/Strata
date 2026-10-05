@@ -23,7 +23,7 @@ inline sycl::queue& default_queue() {
     return q;
 }
 
-void s2_gemv_kernel(sycl::nd_item<1> item, const uint16_t* __restrict__ x, const uint8_t* __restrict__ codes,
+[[maybe_unused]] void s2_gemv_kernel(sycl::nd_item<1> item, const uint16_t* __restrict__ x, const uint8_t* __restrict__ codes,
                     const float* __restrict__ scales, float* __restrict__ y, long long n_in,
                     long long n_out) {
     const long long o =
@@ -109,23 +109,13 @@ void s2_gemv(const uint16_t *x, const uint8_t *codes, const float *scales,
         std::exit(1);
     }
     auto& q = default_queue();
-    if (n_out >= 64) {
-        constexpr int threads = 256;
-        const int sgs = threads / SG_SIZE;
-        const unsigned blocks = (unsigned) ((n_out + sgs - 1) / sgs);
-        q.parallel_for(
-            sycl::nd_range<1>(sycl::range<1>(blocks * threads), sycl::range<1>(threads)),
-            [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
-                s2_gemv_subgroup_kernel<SG_SIZE>(item, x, codes, scales, y, n_in, n_out);
-            });
-        return;
-    }
-    const int threads = 128;
-    const long long blocks = (n_out + threads - 1) / threads;
+    constexpr int threads = 256;
+    const int sgs = threads / SG_SIZE;
+    const unsigned blocks = (unsigned) ((n_out + sgs - 1) / sgs);
     q.parallel_for(
-        sycl::nd_range<1>(sycl::range<1>(((unsigned)blocks) * (threads)), sycl::range<1>(threads)),
-        [=](sycl::nd_item<1> item) {
-            s2_gemv_kernel(item, x, codes, scales, y, n_in, n_out);
+        sycl::nd_range<1>(sycl::range<1>(blocks * threads), sycl::range<1>(threads)),
+        [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
+            s2_gemv_subgroup_kernel<SG_SIZE>(item, x, codes, scales, y, n_in, n_out);
         });
 }
 

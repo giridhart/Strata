@@ -47,22 +47,8 @@ static sycl::queue& default_queue() {
     return q;
 }
 
-// Byte -> the four code values with the -1 bias already applied, in element order (bits 0,2,4,6).
-struct CodeLut {
-    sycl::float4 tbl[256];
-    constexpr CodeLut() : tbl{} {
-        for (int b = 0; b < 256; ++b) {
-            tbl[b] = sycl::float4(
-                (float) (((b >> 0) & 3) - 1),
-                (float) (((b >> 2) & 3) - 1),
-                (float) (((b >> 4) & 3) - 1),
-                (float) (((b >> 6) & 3) - 1)
-            );
-        }
-    }
-};
-
-static constexpr CodeLut kCodes{};
+// Direct-to-register dequantization computes the four code values with the -1 bias
+// directly in registers from bits 0, 2, 4, 6 without constant-memory table overhead.
 
 // One workgroup per output row. `STAGE_X` says whether x was copied to local memory.
 template <bool STAGE_X>
@@ -94,24 +80,28 @@ void s2_gemv_fast_kernel(const uint16_t *__restrict__ x,
     for (long long q = tid; q < n_quads; q += threads_per_row) {
         const uint8_t byte = c[q];                          // ONE load for four codes
         const float d = s[q >> 4];                          // (q*4) >> 6
-        const sycl::float4 cv = kCodes.tbl[byte];           // one broadcast load from constexpr LUT
+        // Direct-to-register dequantization: unpack codes without memory or table lookup
+        const float cv0 = static_cast<float>((int)(byte & 3) - 1);
+        const float cv1 = static_cast<float>((int)((byte >> 2) & 3) - 1);
+        const float cv2 = static_cast<float>((int)((byte >> 4) & 3) - 1);
+        const float cv3 = static_cast<float>((int)((byte >> 6) & 3) - 1);
         if (STAGE_X) {
             const sycl::half2 h01 =
                 *reinterpret_cast<const sycl::half2 *>(&sx[q * 4]);
             const sycl::half2 h23 =
                 *reinterpret_cast<const sycl::half2 *>(&sx[q * 4 + 2]);
-            a0 += cv.x() * d * h01[0];
-            a1 += cv.y() * d * h01[1];
-            a2 += cv.z() * d * h23[0];
-            a3 += cv.w() * d * h23[1];
+            a0 += cv0 * d * h01[0];
+            a1 += cv1 * d * h01[1];
+            a2 += cv2 * d * h23[0];
+            a3 += cv3 * d * h23[1];
         } else {
             const sycl::uint2 xw2 = *reinterpret_cast<const sycl::uint2 *>(x + q * 4);
             const sycl::half2 h01 = *reinterpret_cast<const sycl::half2 *>(&xw2.x());
             const sycl::half2 h23 = *reinterpret_cast<const sycl::half2 *>(&xw2.y());
-            a0 += cv.x() * d * h01[0];
-            a1 += cv.y() * d * h01[1];
-            a2 += cv.z() * d * h23[0];
-            a3 += cv.w() * d * h23[1];
+            a0 += cv0 * d * h01[0];
+            a1 += cv1 * d * h01[1];
+            a2 += cv2 * d * h23[0];
+            a3 += cv3 * d * h23[1];
         }
     }
     float acc_sum = (a0 + a1) + (a2 + a3);
@@ -156,7 +146,7 @@ void s2_gemv_fast(const uint16_t *x, const uint8_t *codes, const float *scales,
     if (stage_x) {
         q.submit([&](sycl::handler &cgh) {
             sycl::local_accessor<float, 1> smem_acc(sycl::range<1>(smem_floats), cgh);
-            cgh.parallel_for(range, [=](sycl::nd_item<1> item_ct1) {
+            cgh.parallel_for(range, [=](sycl::nd_item<1> item_ct1) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
                 s2_gemv_fast_kernel<true>(
                     x, codes, scales, y, n_in, n_out, threads_per_row,
                     item_ct1,
@@ -166,7 +156,7 @@ void s2_gemv_fast(const uint16_t *x, const uint8_t *codes, const float *scales,
     } else {
         q.submit([&](sycl::handler &cgh) {
             sycl::local_accessor<float, 1> smem_acc(sycl::range<1>(smem_floats), cgh);
-            cgh.parallel_for(range, [=](sycl::nd_item<1> item_ct1) {
+            cgh.parallel_for(range, [=](sycl::nd_item<1> item_ct1) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
                 s2_gemv_fast_kernel<false>(
                     x, codes, scales, y, n_in, n_out, threads_per_row,
                     item_ct1,
