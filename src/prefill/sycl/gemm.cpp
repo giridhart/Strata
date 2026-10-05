@@ -1,6 +1,8 @@
 // src/prefill/gemm.cu - see include/strata/prefill/gemm.hpp.
 #include <sycl/sycl.hpp>
-#include <oneapi/mkl.hpp>
+#include "strata/core/sycl_arch.hpp"
+#include "strata/kernels/bf16_bits.hpp"
+#include "strata/kernels/bf16_gemv.hpp"
 #include "strata/prefill/gemm.hpp"
 #include "strata/kernels/dequant_bf16.hpp"
 
@@ -343,61 +345,91 @@ bool Gemm::init(void *stream, int64_t scratch_elems, std::string &err) {
     return true;
 }
 
+template <bool IS_BF16>
+void sycl_prefill_gemm_kernel(const uint16_t* __restrict__ X,
+                              const uint16_t* __restrict__ W,
+                              float* __restrict__ Y,
+                              int64_t T, int64_t N, int64_t K, int64_t ldy,
+                              float alpha, float beta,
+                              sycl::nd_item<2> item) {
+    const int64_t t = (int64_t)item.get_group(0) * item.get_local_range(0) + item.get_local_id(0);
+    const int64_t n = (int64_t)item.get_group(1) * item.get_local_range(1) + item.get_local_id(1);
+    if (t >= T || n >= N) return;
+
+    const uint16_t* x_row = X + t * K;
+    const uint16_t* w_row = W + n * K;
+
+    float sum = 0.0f;
+    int64_t k = 0;
+    #pragma unroll 4
+    for (; k + 4 <= K; k += 4) {
+        if constexpr (IS_BF16) {
+            sum += strata::kernels::f32_from_bf16(x_row[k+0]) * strata::kernels::f32_from_bf16(w_row[k+0])
+                 + strata::kernels::f32_from_bf16(x_row[k+1]) * strata::kernels::f32_from_bf16(w_row[k+1])
+                 + strata::kernels::f32_from_bf16(x_row[k+2]) * strata::kernels::f32_from_bf16(w_row[k+2])
+                 + strata::kernels::f32_from_bf16(x_row[k+3]) * strata::kernels::f32_from_bf16(w_row[k+3]);
+        } else {
+            sum += static_cast<float>(sycl::bit_cast<sycl::half>(x_row[k+0])) * static_cast<float>(sycl::bit_cast<sycl::half>(w_row[k+0]))
+                 + static_cast<float>(sycl::bit_cast<sycl::half>(x_row[k+1])) * static_cast<float>(sycl::bit_cast<sycl::half>(w_row[k+1]))
+                 + static_cast<float>(sycl::bit_cast<sycl::half>(x_row[k+2])) * static_cast<float>(sycl::bit_cast<sycl::half>(w_row[k+2]))
+                 + static_cast<float>(sycl::bit_cast<sycl::half>(x_row[k+3])) * static_cast<float>(sycl::bit_cast<sycl::half>(w_row[k+3]));
+        }
+    }
+    for (; k < K; ++k) {
+        if constexpr (IS_BF16) {
+            sum += strata::kernels::f32_from_bf16(x_row[k]) * strata::kernels::f32_from_bf16(w_row[k]);
+        } else {
+            sum += static_cast<float>(sycl::bit_cast<sycl::half>(x_row[k])) * static_cast<float>(sycl::bit_cast<sycl::half>(w_row[k]));
+        }
+    }
+
+    const int64_t y_idx = t * ldy + n;
+    if (beta == 0.0f) {
+        Y[y_idx] = alpha * sum;
+    } else {
+        Y[y_idx] = alpha * sum + beta * Y[y_idx];
+    }
+}
+
 void Gemm::bf16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy,
                 float beta) {
-    if (T <= 0 || N <= 0) return;
+    if (T <= 0 || N <= 0 || K <= 0) return;
     if (ldy <= 0) ldy = N;
-    const float alpha = 1.0f;
-#if defined(__HIPCC__) && defined(STRATA_HIPBLASLT_AVAILABLE)
-    if (try_hipblaslt(hipblaslt_state_, strata::prefill::hipblaslt::InputType::bf16, X, W, Y, T, N, K, ldy,
-                      beta, stream_)) {
-        STRATA_ABSORB_HIPBLAS_STICKY("hipBLASLt bf16");
-        return;
-    }
-#endif
     auto* q = static_cast<sycl::queue*>(stream_);
     if (!q) return;
-    // Column-major view: Y^T[N, T] = W[N, K] (stored K x N col-major, transposed) . X^T[K, T].
-    try {
-        oneapi::mkl::blas::column_major::gemm(
-            *q, oneapi::mkl::transpose::trans, oneapi::mkl::transpose::nontrans,
-            (std::int64_t)N, (std::int64_t)T, (std::int64_t)K,
-            alpha,
-            reinterpret_cast<const oneapi::mkl::bfloat16*>(W), (std::int64_t)K,
-            reinterpret_cast<const oneapi::mkl::bfloat16*>(X), (std::int64_t)K,
-            beta, Y, (std::int64_t)ldy);
-    } catch (const sycl::exception& exc) {
-        std::fprintf(stderr, "prefill gemm bf16 error: %s\n", exc.what());
-        std::exit(1);
+
+    if (T == 1 && beta == 0.0f && ldy == N) {
+        strata::kernels::bf16_gemv(X, W, Y, K, N, stream_);
+        return;
     }
+
+    const size_t local_t = 1;
+    const size_t local_n = 256;
+    const size_t global_t = (size_t)T;
+    const size_t global_n = ((size_t)N + local_n - 1) / local_n * local_n;
+    q->parallel_for(
+        sycl::nd_range<2>(sycl::range<2>(global_t, global_n), sycl::range<2>(local_t, local_n)),
+        [=](sycl::nd_item<2> item) [[sycl::reqd_sub_group_size(strata::sycl_arch::SUB_GROUP_SIZE)]] {
+            sycl_prefill_gemm_kernel<true>(X, W, Y, T, N, K, ldy, 1.0f, beta, item);
+        });
 }
 
 void Gemm::f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy,
                float beta) {
-    if (T <= 0 || N <= 0) return;
+    if (T <= 0 || N <= 0 || K <= 0) return;
     if (ldy <= 0) ldy = N;
-    const float alpha = 1.0f;
-#if defined(__HIPCC__) && defined(STRATA_HIPBLASLT_AVAILABLE)
-    if (try_hipblaslt(hipblaslt_state_, strata::prefill::hipblaslt::InputType::f16, X, W, Y, T, N, K, ldy,
-                      beta, stream_)) {
-        STRATA_ABSORB_HIPBLAS_STICKY("hipBLASLt f16");
-        return;
-    }
-#endif
     auto* q = static_cast<sycl::queue*>(stream_);
     if (!q) return;
-    try {
-        oneapi::mkl::blas::column_major::gemm(
-            *q, oneapi::mkl::transpose::trans, oneapi::mkl::transpose::nontrans,
-            (std::int64_t)N, (std::int64_t)T, (std::int64_t)K,
-            alpha,
-            reinterpret_cast<const sycl::half*>(W), (std::int64_t)K,
-            reinterpret_cast<const sycl::half*>(X), (std::int64_t)K,
-            beta, Y, (std::int64_t)ldy);
-    } catch (const sycl::exception& exc) {
-        std::fprintf(stderr, "prefill gemm f16 error: %s\n", exc.what());
-        std::exit(1);
-    }
+
+    const size_t local_t = 1;
+    const size_t local_n = 256;
+    const size_t global_t = (size_t)T;
+    const size_t global_n = ((size_t)N + local_n - 1) / local_n * local_n;
+    q->parallel_for(
+        sycl::nd_range<2>(sycl::range<2>(global_t, global_n), sycl::range<2>(local_t, local_n)),
+        [=](sycl::nd_item<2> item) [[sycl::reqd_sub_group_size(strata::sycl_arch::SUB_GROUP_SIZE)]] {
+            sycl_prefill_gemm_kernel<false>(X, W, Y, T, N, K, ldy, 1.0f, beta, item);
+        });
 }
 
 void Gemm::native(const uint16_t* X, int ggml_type, const void* W_blocks, float* Y, int64_t T, int64_t N, int64_t K,

@@ -1769,9 +1769,13 @@ size_t native_expert_scratch_bytes(int64_t cap, int64_t n_ff) {
     return 3 * ((f + 255) & ~(size_t) 255) + (((size_t) cap * (size_t) (n_ff / 32) * sizeof(block_q8_1) + 255) & ~(size_t) 255);
 }
 
+static bool g_grouped_v1 = false;
+void native_grouped_set_v1(bool v1) { g_grouped_v1 = v1; }
+
 void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long* grp_ptr, const int32_t* grp_start,
                            const int32_t* n_groups, const int32_t* ent_dst, const int32_t* ent_tok, int64_t cap_groups,
-                           int64_t cap_entries, const void* x_q8_1, void* scratch, float* out, void* stream) {
+                           int64_t cap_entries, const void* x_q8_1, void* scratch, float* out, void* stream,
+                           int64_t grid_groups) {
     if (cap_groups <= 0 || cap_entries <= 0) return;
     sycl::queue *s = stream ? (sycl::queue*)stream : &default_queue;
     const size_t f = (size_t) cap_entries * (size_t) L.n_ff * sizeof(float), fa = (f + 255) & ~(size_t) 255;
@@ -1780,7 +1784,8 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     float* h = (float*) ((uint8_t*) scratch + 2 * fa);
     block_q8_1* hq = (block_q8_1*) ((uint8_t*) scratch + 3 * fa);
     const auto* X = (const block_q8_1*) x_q8_1;
-    const sycl::range<3> ggu(1, (size_t)cap_groups, (size_t)((2 * L.n_ff + GU_ROWS - 1) / GU_ROWS));
+    const size_t gy = (g_grouped_v1 || grid_groups <= 0 || grid_groups > cap_groups) ? (size_t)cap_groups : (size_t)grid_groups;
+    const sycl::range<3> ggu(1, gy, (size_t)((2 * L.n_ff + GU_ROWS - 1) / GU_ROWS));
     switch (L.gu_type) {
 #define STRATA_GU(T) case T: launch_gu<T>(ggu, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
         STRATA_GU_FMTS(STRATA_GU)
@@ -1797,7 +1802,7 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
             swiglu_entries_kernel(gate, up, h, nh);
         });
     s->submit([&](sycl::handler &cgh) { cgh.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, (unsigned)((nh + 255) / 256)) * sycl::range<3>(1, 1, 256), sycl::range<3>(1, 1, 256)), [=](sycl::nd_item<3> /*item_ct1*/) { quantize_q8_1_kernel(h, hq, nh); }); });
-    const sycl::range<3> gd(1, (size_t)cap_groups, (size_t)((L.n_embd + 7) / 8));
+    const sycl::range<3> gd(1, gy, (size_t)((L.n_embd + 7) / 8));
     switch (L.d_type) {
 #define STRATA_DOWN(T) case T: launch_down<T>(gd, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
         STRATA_D_FMTS(STRATA_DOWN)

@@ -20,6 +20,7 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
+#include "strata/core/sycl_arch.hpp"
 #include <sycl/sycl.hpp>
 #include "strata/kernels/native_moe.hpp"
 #include <atomic>
@@ -31,12 +32,40 @@
 namespace strata::kernels {
 namespace {
 
+constexpr int SG_SIZE = strata::sycl_arch::SUB_GROUP_SIZE;
+
 inline sycl::queue& get_default_in_order_queue() {
     static sycl::queue q(sycl::property::queue::in_order{});
     return q;
 }
 
 std::atomic<bool> enabled{false};
+
+template <int SUB_SIZE = SG_SIZE>
+void combine_vec4(sycl::nd_item<2> item,
+                  const float* __restrict__ parts, const float* __restrict__ weights,
+                  const float* __restrict__ shared, float* __restrict__ output,
+                  int64_t n_embd, int k) {
+    const int64_t tk = item.get_group(0);
+    parts += tk * k * n_embd; weights += tk * k; if (shared) shared += tk * n_embd; output += tk * n_embd;
+    const int64_t col4 = (int64_t(item.get_group(1)) * item.get_local_range(1) + item.get_local_id(1)) * 4;
+    if (col4 >= n_embd) return;
+
+    float w_reg[16];
+    #pragma unroll
+    for (int e = 0; e < k; ++e) w_reg[e] = weights[e];
+
+    sycl::vec<float, 4> sum(0.0f);
+    #pragma unroll
+    for (int expert = 0; expert < k; ++expert) {
+        const auto p = *reinterpret_cast<const sycl::vec<float, 4>*>(parts + int64_t(expert) * n_embd + col4);
+        sum += p * w_reg[expert];
+    }
+    if (shared) {
+        sum += *reinterpret_cast<const sycl::vec<float, 4>*>(shared + col4);
+    }
+    *reinterpret_cast<sycl::vec<float, 4>*>(output + col4) = sum;
+}
 
 void combine(sycl::nd_item<2> item,
              const float* __restrict__ parts, const float* __restrict__ weights,
@@ -46,9 +75,15 @@ void combine(sycl::nd_item<2> item,
     parts += tk * k * n_embd; weights += tk * k; if (shared) shared += tk * n_embd; output += tk * n_embd;
     const int64_t col = int64_t(item.get_group(1)) * item.get_local_range(1) + item.get_local_id(1);
     if (col >= n_embd) return;
-    float sum = parts[col] * weights[0];
-    for (int expert = 1; expert < k; ++expert) {
-        sum += parts[int64_t(expert) * n_embd + col] * weights[expert];
+
+    float w_reg[16];
+    #pragma unroll
+    for (int e = 0; e < k; ++e) w_reg[e] = weights[e];
+
+    float sum = 0.0f;
+    #pragma unroll
+    for (int expert = 0; expert < k; ++expert) {
+        sum += parts[int64_t(expert) * n_embd + col] * w_reg[expert];
     }
     if (shared) sum += shared[col];
     output[col] = sum;
@@ -84,12 +119,24 @@ void native_moe_combine(const float* parts, const float* weights, const float* s
         throw std::invalid_argument("native MoE combine requires aligned spans and disjoint output");
 
     sycl::queue* q = stream ? static_cast<sycl::queue*>(stream) : &get_default_in_order_queue();
-    const size_t cols = ((size_t)n_embd + 255) / 256 * 256;
-    q->parallel_for(
-        sycl::nd_range<2>(sycl::range<2>(1, cols), sycl::range<2>(1, 256)),
-        [=](sycl::nd_item<2> item) {
-            combine(item, parts, weights, shared, output, n_embd, int(k));
-        });
+    if (n_embd % 4 == 0 && (reinterpret_cast<uintptr_t>(parts) % 16 == 0) &&
+        (reinterpret_cast<uintptr_t>(output) % 16 == 0) &&
+        (!shared || reinterpret_cast<uintptr_t>(shared) % 16 == 0)) {
+        const size_t n_vec = (size_t)n_embd / 4;
+        const size_t cols = (n_vec + 255) / 256 * 256;
+        q->parallel_for(
+            sycl::nd_range<2>(sycl::range<2>(1, cols), sycl::range<2>(1, 256)),
+            [=](sycl::nd_item<2> item) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
+                combine_vec4<SG_SIZE>(item, parts, weights, shared, output, n_embd, int(k));
+            });
+    } else {
+        const size_t cols = ((size_t)n_embd + 255) / 256 * 256;
+        q->parallel_for(
+            sycl::nd_range<2>(sycl::range<2>(1, cols), sycl::range<2>(1, 256)),
+            [=](sycl::nd_item<2> item) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
+                combine(item, parts, weights, shared, output, n_embd, int(k));
+            });
+    }
     if (!stream) q->wait();
 }
 
@@ -99,12 +146,24 @@ void native_moe_combine_multi(const float* parts, const float* weights, const fl
         throw std::invalid_argument("native MoE combine (multi) requires a stream, width, 1..15 experts, tokens");
 
     sycl::queue* q = stream ? static_cast<sycl::queue*>(stream) : &get_default_in_order_queue();
-    const size_t cols = ((size_t)n_embd + 255) / 256 * 256;
-    q->parallel_for(
-        sycl::nd_range<2>(sycl::range<2>((size_t)n_tok, cols), sycl::range<2>(1, 256)),
-        [=](sycl::nd_item<2> item) {
-            combine(item, parts, weights, shared, output, n_embd, int(k));
-        });
+    if (n_embd % 4 == 0 && (reinterpret_cast<uintptr_t>(parts) % 16 == 0) &&
+        (reinterpret_cast<uintptr_t>(output) % 16 == 0) &&
+        (!shared || reinterpret_cast<uintptr_t>(shared) % 16 == 0)) {
+        const size_t n_vec = (size_t)n_embd / 4;
+        const size_t cols = (n_vec + 255) / 256 * 256;
+        q->parallel_for(
+            sycl::nd_range<2>(sycl::range<2>((size_t)n_tok, cols), sycl::range<2>(1, 256)),
+            [=](sycl::nd_item<2> item) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
+                combine_vec4<SG_SIZE>(item, parts, weights, shared, output, n_embd, int(k));
+            });
+    } else {
+        const size_t cols = ((size_t)n_embd + 255) / 256 * 256;
+        q->parallel_for(
+            sycl::nd_range<2>(sycl::range<2>((size_t)n_tok, cols), sycl::range<2>(1, 256)),
+            [=](sycl::nd_item<2> item) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
+                combine(item, parts, weights, shared, output, n_embd, int(k));
+            });
+    }
     if (!stream) q->wait();
 }
 

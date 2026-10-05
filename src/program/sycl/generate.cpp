@@ -1960,7 +1960,7 @@ int main(int argc, char **argv) try {
         }
     }
     // the canonical Q2_0 pack's CPU kernels are AVX-512 only; a native pack runs on AVX2 CPUs as well
-    if (!native_pack) strata::kernels::cpu::cpu_require_expert_support();
+    if (!native_pack && !o.no_pool && !o.gpu_only_full && !o.gpu_stages && !o.graph_only) strata::kernels::cpu::cpu_require_expert_support();
     else if (!strata::kernels::cpu::cpu_avx512_ok())
         std::fprintf(stderr, "strata generate: this CPU has no AVX-512: the expert kernels run on %s "
                              "(multi-token for the i-quant gate/up rows)\n",
