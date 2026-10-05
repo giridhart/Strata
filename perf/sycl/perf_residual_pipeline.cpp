@@ -1,0 +1,489 @@
+// perf/sycl/perf_residual_pipeline.cpp - Intel Xe2 Residual Stream Inter-Kernel Handover & Fusion Benchmark
+//
+// Benchmarks the high-traffic residual spine across attention and FFN halves:
+// R is (hc, n_embd) floats = 4 * 2560 * 4 bytes = 40.96 KB
+//
+// Every layer executes:
+//   gr_read(attn) -> mixer (GEMV) -> gr_write(attn) -> gr_read(ffn) -> MoE -> gr_write(ffn)
+//
+// Compares:
+// 1. BM_Xe2_Residual_Unfused: Separate global memory roundtrips for R between halves
+// 2. BM_Xe2_Residual_Fused: Folding write(attn) directly into read(ffn) in registers/SLM
+// 3. BM_Xe2_Residual_Chained_Layers: Simulating 1, 2, 4, 8 back-to-back layers to test L2/L3 cache residency
+
+#include <benchmark/benchmark.h>
+#include <sycl/sycl.hpp>
+
+#include "strata/core/sycl_arch.hpp"
+
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <vector>
+
+namespace {
+
+constexpr int HC = 4;
+constexpr int N_EMBD = 2560;
+constexpr int SUB_SIZE = 16;
+
+// ============================================================================
+// Computational Kernels for Residual Stream Pipeline
+// ============================================================================
+
+/// 1. Standalone gr_read / RMSNorm Kernel: Computes RMSNorm on R and combines streams into mixed
+void gr_norm_kernel(sycl::nd_item<1> item, const float* __restrict__ R, const float* __restrict__ w_norm,
+                    float* __restrict__ mixed, float* __restrict__ xn, float eps,
+                    float* __restrict__ local_sums) {
+    const int c = item.get_group(0); // Stream index (0..HC-1)
+    if (c >= HC) return;
+
+    const int tid = item.get_local_id(0);
+    const int bsize = item.get_local_range(0);
+    const float* Rc = R + (size_t)c * N_EMBD;
+    float* xnc = xn + (size_t)c * N_EMBD;
+
+    float ss = 0.0f;
+    for (int d = tid; d < N_EMBD; d += bsize) {
+        const float v = Rc[d];
+        ss += v * v;
+    }
+
+    auto sg = item.get_sub_group();
+    ss = sycl::reduce_over_group(sg, ss, sycl::plus<float>());
+
+    const int warp = tid / SUB_SIZE;
+    const int lane = tid % SUB_SIZE;
+    if (lane == 0) {
+        local_sums[warp] = ss;
+    }
+    sycl::group_barrier(item.get_group());
+
+    if (warp == 0) {
+        const int num_warps = bsize / SUB_SIZE;
+        float block_ss = (lane < num_warps) ? local_sums[lane] : 0.0f;
+        block_ss = sycl::reduce_over_group(sg, block_ss, sycl::plus<float>());
+        if (lane == 0) {
+            local_sums[0] = block_ss;
+        }
+    }
+    sycl::group_barrier(item.get_group());
+
+    const float ms = local_sums[0] / (float)N_EMBD;
+    const float rs = sycl::rsqrt(ms + eps);
+
+    for (int d = tid; d < N_EMBD; d += bsize) {
+        const float val = Rc[d] * rs * w_norm[(size_t)c * N_EMBD + d];
+        xnc[d] = val;
+        // Stream combine into mixed
+        sycl::atomic_ref<float, sycl::memory_order::relaxed, sycl::memory_scope::device> ref(mixed[d]);
+        ref.fetch_add(val * (1.0f / (float)HC));
+    }
+}
+
+/// 2. Synthetic GEMV Projection (simulating mixer projection)
+void residual_gemv_kernel(sycl::nd_item<1> item, const float* __restrict__ in,
+                          const sycl::ext::oneapi::bfloat16* __restrict__ weight,
+                          float* __restrict__ out) {
+    const int row = item.get_group(0);
+    if (row >= N_EMBD) return;
+
+    const int tid = item.get_local_id(0);
+    const int bsize = item.get_local_range(0);
+    const auto* w_row = weight + (size_t)row * N_EMBD;
+
+    float acc = 0.0f;
+    for (int col = tid; col < N_EMBD; col += bsize) {
+        acc += in[col] * (float)w_row[col];
+    }
+
+    auto sg = item.get_sub_group();
+    acc = sycl::reduce_over_group(sg, acc, sycl::plus<float>());
+
+    // Direct reduction over subgroup
+    if (tid == 0) {
+        out[row] = acc;
+    }
+}
+
+/// 3. Standalone gr_write Kernel: updates R with output vector across streams
+void gr_write_kernel(sycl::nd_item<1> item, float* __restrict__ R, const float* __restrict__ out,
+                     float alpha) {
+    const int idx = item.get_global_id(0);
+    const int total = HC * N_EMBD;
+    if (idx < total) {
+        const int d = idx % N_EMBD;
+        R[idx] += alpha * out[d];
+    }
+}
+
+/// 4. Fused gr_write + gr_read Kernel:
+/// Folds the previous half's residual write into the next half's read directly in registers/SLM,
+/// updating R and immediately computing the RMSNorm sum of squares without an extra memory roundtrip.
+void fused_gr_write_read_kernel(sycl::nd_item<1> item, float* __restrict__ R,
+                                const float* __restrict__ prev_out, const float* __restrict__ w_norm,
+                                float* __restrict__ mixed, float* __restrict__ xn,
+                                float alpha, float eps, float* __restrict__ local_sums) {
+    const int c = item.get_group(0);
+    if (c >= HC) return;
+
+    const int tid = item.get_local_id(0);
+    const int bsize = item.get_local_range(0);
+    float* Rc = R + (size_t)c * N_EMBD;
+    float* xnc = xn + (size_t)c * N_EMBD;
+
+    float ss = 0.0f;
+    for (int d = tid; d < N_EMBD; d += bsize) {
+        // Read, apply write in-register, store updated R
+        float v = Rc[d] + alpha * prev_out[d];
+        Rc[d] = v;
+        ss += v * v;
+    }
+
+    auto sg = item.get_sub_group();
+    ss = sycl::reduce_over_group(sg, ss, sycl::plus<float>());
+
+    const int warp = tid / SUB_SIZE;
+    const int lane = tid % SUB_SIZE;
+    if (lane == 0) {
+        local_sums[warp] = ss;
+    }
+    sycl::group_barrier(item.get_group());
+
+    if (warp == 0) {
+        const int num_warps = bsize / SUB_SIZE;
+        float block_ss = (lane < num_warps) ? local_sums[lane] : 0.0f;
+        block_ss = sycl::reduce_over_group(sg, block_ss, sycl::plus<float>());
+        if (lane == 0) {
+            local_sums[0] = block_ss;
+        }
+    }
+    sycl::group_barrier(item.get_group());
+
+    const float ms = local_sums[0] / (float)N_EMBD;
+    const float rs = sycl::rsqrt(ms + eps);
+
+    for (int d = tid; d < N_EMBD; d += bsize) {
+        const float val = Rc[d] * rs * w_norm[(size_t)c * N_EMBD + d];
+        xnc[d] = val;
+        sycl::atomic_ref<float, sycl::memory_order::relaxed, sycl::memory_scope::device> ref(mixed[d]);
+        ref.fetch_add(val * (1.0f / (float)HC));
+    }
+}
+
+} // namespace
+
+// ============================================================================
+// Benchmark 1: Unfused Residual Pipeline (Separate Kernels)
+// ============================================================================
+
+static void BM_Xe2_Residual_Unfused(benchmark::State& state) {
+    sycl::queue q{sycl::default_selector_v,
+                 {sycl::property::queue::in_order(), sycl::property::queue::enable_profiling()}};
+
+    const size_t r_elements = (size_t)HC * N_EMBD;
+    const size_t w_elements = (size_t)N_EMBD * N_EMBD;
+
+    auto* d_R       = sycl::malloc_device<float>(r_elements, q);
+    auto* d_wnorm   = sycl::malloc_device<float>(r_elements, q);
+    auto* d_mixed   = sycl::malloc_device<float>(N_EMBD, q);
+    auto* d_xn      = sycl::malloc_device<float>(r_elements, q);
+    auto* d_out     = sycl::malloc_device<float>(N_EMBD, q);
+    auto* d_weight  = sycl::malloc_device<sycl::ext::oneapi::bfloat16>(w_elements, q);
+
+    q.fill(d_R, 1.0f, r_elements);
+    q.fill(d_wnorm, 1.0f, r_elements);
+    q.fill(d_mixed, 0.0f, N_EMBD);
+    q.fill(d_out, 0.5f, N_EMBD);
+    q.fill(d_weight, sycl::ext::oneapi::bfloat16(0.01f), w_elements);
+    q.wait();
+
+    // Warmup
+    for (int w = 0; w < 3; ++w) {
+        q.submit([&](sycl::handler& cgh) {
+            sycl::local_accessor<float, 1> lsums(sycl::range<1>(16), cgh);
+            cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(HC * 256), sycl::range<1>(256)),
+                             [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
+                                 gr_norm_kernel(item, d_R, d_wnorm, d_mixed, d_xn, 1e-5f,
+                                                lsums.get_multi_ptr<sycl::access::decorated::no>().get());
+                             });
+        });
+        q.submit([&](sycl::handler& cgh) {
+            cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(N_EMBD * 16), sycl::range<1>(16)),
+                             [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
+                                 residual_gemv_kernel(item, d_mixed, d_weight, d_out);
+                             });
+        });
+        q.submit([&](sycl::handler& cgh) {
+            cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(r_elements), sycl::range<1>(256)),
+                             [=](sycl::nd_item<1> item) {
+                                 gr_write_kernel(item, d_R, d_out, 0.25f);
+                             });
+        });
+        q.wait();
+    }
+
+    for (auto _ : state) {
+        q.fill(d_mixed, 0.0f, N_EMBD);
+
+        // Half 1: gr_read -> GEMV -> gr_write
+        auto ev1 = q.submit([&](sycl::handler& cgh) {
+            sycl::local_accessor<float, 1> lsums(sycl::range<1>(16), cgh);
+            cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(HC * 256), sycl::range<1>(256)),
+                             [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
+                                 gr_norm_kernel(item, d_R, d_wnorm, d_mixed, d_xn, 1e-5f,
+                                                lsums.get_multi_ptr<sycl::access::decorated::no>().get());
+                             });
+        });
+        q.submit([&](sycl::handler& cgh) {
+            cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(N_EMBD * 16), sycl::range<1>(16)),
+                             [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
+                                 residual_gemv_kernel(item, d_mixed, d_weight, d_out);
+                             });
+        });
+        q.submit([&](sycl::handler& cgh) {
+            cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(r_elements), sycl::range<1>(256)),
+                             [=](sycl::nd_item<1> item) {
+                                 gr_write_kernel(item, d_R, d_out, 0.25f);
+                             });
+        });
+
+        // Half 2: gr_read -> GEMV -> gr_write
+        q.submit([&](sycl::handler& cgh) {
+            sycl::local_accessor<float, 1> lsums(sycl::range<1>(16), cgh);
+            cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(HC * 256), sycl::range<1>(256)),
+                             [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
+                                 gr_norm_kernel(item, d_R, d_wnorm, d_mixed, d_xn, 1e-5f,
+                                                lsums.get_multi_ptr<sycl::access::decorated::no>().get());
+                             });
+        });
+        q.submit([&](sycl::handler& cgh) {
+            cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(N_EMBD * 16), sycl::range<1>(16)),
+                             [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
+                                 residual_gemv_kernel(item, d_mixed, d_weight, d_out);
+                             });
+        });
+        auto ev_last = q.submit([&](sycl::handler& cgh) {
+            cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(r_elements), sycl::range<1>(256)),
+                             [=](sycl::nd_item<1> item) {
+                                 gr_write_kernel(item, d_R, d_out, 0.25f);
+                             });
+        });
+        ev_last.wait();
+
+        const auto t0 = ev1.get_profiling_info<sycl::info::event_profiling::command_start>();
+        const auto t1 = ev_last.get_profiling_info<sycl::info::event_profiling::command_end>();
+        state.SetIterationTime((t1 - t0) * 1e-9);
+    }
+
+    // Bytes transferred across 2 halves:
+    // Read R (2x), Write R (2x), Weights (2x), Activations
+    const double bytes_transferred = (double)(r_elements * 4 * sizeof(float) + w_elements * 2 * sizeof(uint16_t));
+    state.counters["Bandwidth_GBps"]         = benchmark::Counter(bytes_transferred, benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
+    state.counters["Roundtrips_Saved"]       = benchmark::Counter(0);
+    state.counters["L3_Working_Set_KB"]      = benchmark::Counter((r_elements * sizeof(float) + N_EMBD * 4 * sizeof(float)) / 1024.0);
+
+    sycl::free(d_R, q);
+    sycl::free(d_wnorm, q);
+    sycl::free(d_mixed, q);
+    sycl::free(d_xn, q);
+    sycl::free(d_out, q);
+    sycl::free(d_weight, q);
+}
+
+// ============================================================================
+// Benchmark 2: Fused Residual Pipeline (Folding Write into Read)
+// ============================================================================
+
+static void BM_Xe2_Residual_Fused(benchmark::State& state) {
+    sycl::queue q{sycl::default_selector_v,
+                 {sycl::property::queue::in_order(), sycl::property::queue::enable_profiling()}};
+
+    const size_t r_elements = (size_t)HC * N_EMBD;
+    const size_t w_elements = (size_t)N_EMBD * N_EMBD;
+
+    auto* d_R       = sycl::malloc_device<float>(r_elements, q);
+    auto* d_wnorm   = sycl::malloc_device<float>(r_elements, q);
+    auto* d_mixed   = sycl::malloc_device<float>(N_EMBD, q);
+    auto* d_xn      = sycl::malloc_device<float>(r_elements, q);
+    auto* d_out     = sycl::malloc_device<float>(N_EMBD, q);
+    auto* d_weight  = sycl::malloc_device<sycl::ext::oneapi::bfloat16>(w_elements, q);
+
+    q.fill(d_R, 1.0f, r_elements);
+    q.fill(d_wnorm, 1.0f, r_elements);
+    q.fill(d_mixed, 0.0f, N_EMBD);
+    q.fill(d_out, 0.5f, N_EMBD);
+    q.fill(d_weight, sycl::ext::oneapi::bfloat16(0.01f), w_elements);
+    q.wait();
+
+    // Warmup
+    for (int w = 0; w < 3; ++w) {
+        q.submit([&](sycl::handler& cgh) {
+            sycl::local_accessor<float, 1> lsums(sycl::range<1>(16), cgh);
+            cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(HC * 256), sycl::range<1>(256)),
+                             [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
+                                 gr_norm_kernel(item, d_R, d_wnorm, d_mixed, d_xn, 1e-5f,
+                                                lsums.get_multi_ptr<sycl::access::decorated::no>().get());
+                             });
+        });
+        q.submit([&](sycl::handler& cgh) {
+            cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(N_EMBD * 16), sycl::range<1>(16)),
+                             [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
+                                 residual_gemv_kernel(item, d_mixed, d_weight, d_out);
+                             });
+        });
+        q.submit([&](sycl::handler& cgh) {
+            sycl::local_accessor<float, 1> lsums(sycl::range<1>(16), cgh);
+            cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(HC * 256), sycl::range<1>(256)),
+                             [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
+                                 fused_gr_write_read_kernel(item, d_R, d_out, d_wnorm, d_mixed, d_xn, 0.25f, 1e-5f,
+                                                            lsums.get_multi_ptr<sycl::access::decorated::no>().get());
+                             });
+        });
+        q.wait();
+    }
+
+    for (auto _ : state) {
+        q.fill(d_mixed, 0.0f, N_EMBD);
+
+        // Half 1: gr_read -> GEMV
+        auto ev1 = q.submit([&](sycl::handler& cgh) {
+            sycl::local_accessor<float, 1> lsums(sycl::range<1>(16), cgh);
+            cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(HC * 256), sycl::range<1>(256)),
+                             [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
+                                 gr_norm_kernel(item, d_R, d_wnorm, d_mixed, d_xn, 1e-5f,
+                                                lsums.get_multi_ptr<sycl::access::decorated::no>().get());
+                             });
+        });
+        q.submit([&](sycl::handler& cgh) {
+            cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(N_EMBD * 16), sycl::range<1>(16)),
+                             [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
+                                 residual_gemv_kernel(item, d_mixed, d_weight, d_out);
+                             });
+        });
+
+        // Fused transition: write(attn) folded into read(ffn)
+        q.submit([&](sycl::handler& cgh) {
+            sycl::local_accessor<float, 1> lsums(sycl::range<1>(16), cgh);
+            cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(HC * 256), sycl::range<1>(256)),
+                             [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
+                                 fused_gr_write_read_kernel(item, d_R, d_out, d_wnorm, d_mixed, d_xn, 0.25f, 1e-5f,
+                                                            lsums.get_multi_ptr<sycl::access::decorated::no>().get());
+                             });
+        });
+
+        // Half 2 finish: GEMV -> gr_write
+        q.submit([&](sycl::handler& cgh) {
+            cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(N_EMBD * 16), sycl::range<1>(16)),
+                             [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
+                                 residual_gemv_kernel(item, d_mixed, d_weight, d_out);
+                             });
+        });
+        auto ev_last = q.submit([&](sycl::handler& cgh) {
+            cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(r_elements), sycl::range<1>(256)),
+                             [=](sycl::nd_item<1> item) {
+                                 gr_write_kernel(item, d_R, d_out, 0.25f);
+                             });
+        });
+        ev_last.wait();
+
+        const auto t0 = ev1.get_profiling_info<sycl::info::event_profiling::command_start>();
+        const auto t1 = ev_last.get_profiling_info<sycl::info::event_profiling::command_end>();
+        state.SetIterationTime((t1 - t0) * 1e-9);
+    }
+
+    // Saved 1 roundtrip of R (write + read eliminated)
+    const double bytes_transferred = (double)(r_elements * 3 * sizeof(float) + w_elements * 2 * sizeof(uint16_t));
+    state.counters["Bandwidth_GBps"]         = benchmark::Counter(bytes_transferred, benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
+    state.counters["Roundtrips_Saved"]       = benchmark::Counter(1);
+    state.counters["L3_Working_Set_KB"]      = benchmark::Counter((r_elements * sizeof(float) + N_EMBD * 4 * sizeof(float)) / 1024.0);
+
+    sycl::free(d_R, q);
+    sycl::free(d_wnorm, q);
+    sycl::free(d_mixed, q);
+    sycl::free(d_xn, q);
+    sycl::free(d_out, q);
+    sycl::free(d_weight, q);
+}
+
+// ============================================================================
+// Benchmark 3: Multi-Layer Chaining (Testing Cache Warmth across Layers)
+// ============================================================================
+
+static void BM_Xe2_Residual_Layer_Chaining(benchmark::State& state) {
+    const int num_layers = state.range(0);
+
+    sycl::queue q{sycl::default_selector_v,
+                 {sycl::property::queue::in_order(), sycl::property::queue::enable_profiling()}};
+
+    const size_t r_elements = (size_t)HC * N_EMBD;
+    const size_t w_elements = (size_t)N_EMBD * N_EMBD;
+
+    auto* d_R       = sycl::malloc_device<float>(r_elements, q);
+    auto* d_wnorm   = sycl::malloc_device<float>(r_elements, q);
+    auto* d_mixed   = sycl::malloc_device<float>(N_EMBD, q);
+    auto* d_xn      = sycl::malloc_device<float>(r_elements, q);
+    auto* d_out     = sycl::malloc_device<float>(N_EMBD, q);
+    auto* d_weight  = sycl::malloc_device<sycl::ext::oneapi::bfloat16>(w_elements, q);
+
+    q.fill(d_R, 1.0f, r_elements);
+    q.fill(d_wnorm, 1.0f, r_elements);
+    q.fill(d_mixed, 0.0f, N_EMBD);
+    q.fill(d_out, 0.5f, N_EMBD);
+    q.fill(d_weight, sycl::ext::oneapi::bfloat16(0.01f), w_elements);
+    q.wait();
+
+    for (auto _ : state) {
+        sycl::event first_ev, last_ev;
+
+        for (int l = 0; l < num_layers; ++l) {
+            auto ev = q.submit([&](sycl::handler& cgh) {
+                sycl::local_accessor<float, 1> lsums(sycl::range<1>(16), cgh);
+                cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(HC * 256), sycl::range<1>(256)),
+                                 [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
+                                     gr_norm_kernel(item, d_R, d_wnorm, d_mixed, d_xn, 1e-5f,
+                                                    lsums.get_multi_ptr<sycl::access::decorated::no>().get());
+                                 });
+            });
+            if (l == 0) first_ev = ev;
+
+            q.submit([&](sycl::handler& cgh) {
+                cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(N_EMBD * 16), sycl::range<1>(16)),
+                                 [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
+                                     residual_gemv_kernel(item, d_mixed, d_weight, d_out);
+                                 });
+            });
+
+            last_ev = q.submit([&](sycl::handler& cgh) {
+                cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(r_elements), sycl::range<1>(256)),
+                                 [=](sycl::nd_item<1> item) {
+                                     gr_write_kernel(item, d_R, d_out, 0.1f);
+                                 });
+            });
+        }
+        last_ev.wait();
+
+        const auto t0 = first_ev.get_profiling_info<sycl::info::event_profiling::command_start>();
+        const auto t1 = last_ev.get_profiling_info<sycl::info::event_profiling::command_end>();
+        state.SetIterationTime((t1 - t0) * 1e-9);
+    }
+
+    const double bytes_transferred = (double)num_layers * (r_elements * 2 * sizeof(float) + w_elements * sizeof(uint16_t));
+    state.counters["Bandwidth_GBps"] = benchmark::Counter(bytes_transferred, benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
+    state.counters["Chained_Layers"] = benchmark::Counter(num_layers);
+
+    sycl::free(d_R, q);
+    sycl::free(d_wnorm, q);
+    sycl::free(d_mixed, q);
+    sycl::free(d_xn, q);
+    sycl::free(d_out, q);
+    sycl::free(d_weight, q);
+}
+
+// Register Benchmarks
+BENCHMARK(BM_Xe2_Residual_Unfused)->UseManualTime();
+BENCHMARK(BM_Xe2_Residual_Fused)->UseManualTime();
+BENCHMARK(BM_Xe2_Residual_Layer_Chaining)->RangeMultiplier(2)->Range(1, 8)->UseManualTime();
+
+BENCHMARK_MAIN();

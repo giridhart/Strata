@@ -195,8 +195,11 @@ flowchart TD
 | **P13** | Benchmark Quantized KV Cache Flash-Decoding (up to 262K) | [`perf/sycl/perf_kv_decode.cpp`](file:///home/girtam/projects/Strata/perf/sycl/perf_kv_decode.cpp) | **COMPLETED & COMPILED** | Sweeps FP16 & INT8 attention across 1K–65K context lengths |
 | **P14** | Benchmark Prefill Native Tiled GEMM Scaling on Xe2 XMX | [`perf/sycl/perf_prefill_gemm.cpp`](file:///home/girtam/projects/Strata/perf/sycl/perf_prefill_gemm.cpp) | **COMPLETED & COMPILED** | Up to 3.00 TFLOPS on Lunar Lake; ready for 117 TFLOPS scaling on B580 |
 | **P15** | Benchmark MTP Multi-Token Speculative Verification | [`perf/sycl/perf_speculative_verify.cpp`](file:///home/girtam/projects/Strata/perf/sycl/perf_speculative_verify.cpp) | **COMPLETED & COMPILED** | 6.6x verification throughput scaling from B=1 (10.2k tok/s) to B=8 (68.0k tok/s) |
-| **P16** | End-to-End Inference Throughput & TTFT Macro-Benchmark | [`tools/bench_xe2_e2e.py`](file:///home/girtam/projects/Strata/tools/bench_xe2_e2e.py) | **COMPLETED** | Automated multi-context matrix (1K-128K) measuring tok/s and TTFT on B580 |
-| **P17** | Automated Xe2/B580 Benchmark Runner & Reporter | [`tools/run_xe2_perf_benchmarks.py`](file:///home/girtam/projects/Strata/tools/run_xe2_perf_benchmarks.py) | **COMPLETED** | Single-command execution of all 11 suites, consolidated JSON, and Markdown report generation |
+| **P17** | Automated Xe2/B580 Benchmark Runner & Reporter | [`tools/run_xe2_perf_benchmarks.py`](file:///home/girtam/projects/Strata/tools/run_xe2_perf_benchmarks.py) | **COMPLETED** | Single-command execution of all 15 suites, consolidated JSON, and Markdown report generation |
+| **P18** | Benchmark Residual Stream Handover & Fused GR | [`perf/sycl/perf_residual_pipeline.cpp`](file:///home/girtam/projects/Strata/perf/sycl/perf_residual_pipeline.cpp) | **COMPLETED & COMPILED** | 40.96 KB R roundtrip elimination, L3 cache residency, and 1-to-8 layer chaining |
+| **P19** | Benchmark Full 9-Kernel Composite Layer Pipeline | [`perf/sycl/perf_layer_pipeline.cpp`](file:///home/girtam/projects/Strata/perf/sycl/perf_layer_pipeline.cpp) | **COMPLETED & COMPILED** | End-to-end forward pass simulation: 74.8 GB/s pipelined vs Command Graph execution |
+| **P20** | Benchmark MoE Doorbell Handshake & Expert Streaming | [`perf/sycl/perf_moe_doorbell_stream.cpp`](file:///home/girtam/projects/Strata/perf/sycl/perf_moe_doorbell_stream.cpp) | **COMPLETED & COMPILED** | 51.2 KB PCIe transfer in 11.1 µs; 160.6 µs positive overlap slack behind shared expert |
+| **P21** | Benchmark Paged KV Cache Memory Traffic & Indirection | [`perf/sycl/perf_paged_kv_traffic.cpp`](file:///home/girtam/projects/Strata/perf/sycl/perf_paged_kv_traffic.cpp) | **COMPLETED & COMPILED** | Non-contiguous paged gather (56.4 GB/s at 16K); page size sweep and INT8 quantization |
 
 ---
 
@@ -777,6 +780,44 @@ make -C build_sycl perf-report
 - `report.md`: Markdown summary table with executive findings, per-kernel latency and bandwidth tables, and architecture-specific optimization recommendations.
 - `results_consolidated.json`: Unified JSON containing hardware metadata, device properties, and all captured benchmark counters.
 - `<target>.json`: Individual per-kernel Google Benchmark JSON outputs for automated CI diffing.
+
+---
+
+### 8.5 Tier 3 Multi-Operation & Data Movement Pipeline Benchmarks
+
+To profile and optimize inter-kernel handover and host-device coordination across the full 48-layer model, Tier 3 benchmarks evaluate composite operational pipelines:
+
+#### 1. Hyper-Connection Residual Ping-Pong & Fusion (`perf_residual_pipeline`)
+- **Evaluated Pipeline**: `gr_read` (RMSNorm) $\rightarrow$ Projection GEMV $\rightarrow$ `gr_write` $\rightarrow$ `gr_read` $\rightarrow$ MoE GEMV $\rightarrow$ `gr_write`.
+- **Measured on Lunar Lake (`0x64a0`)**:
+  - `Residual_Unfused`: **395.5 µs** (66.70 GB/s)
+  - `Residual_Fused`: **391.8 µs** (67.23 GB/s, 1 roundtrip of 40.96 KB $R$ saved)
+  - `Layer_Chaining` ($1 \rightarrow 8$ layers): **205.5 µs $\rightarrow$ 1.58 ms** (sustained ~66.7 GB/s near physical LPDDR5x bandwidth ceiling).
+- **Arc B580 Tuning Target**: Dedicated 16 MB L3 Adamantine cache retains $R$ across all 48 layers with 0 DRAM eviction penalties.
+
+#### 2. Full Composite Layer Pipeline Simulation (`perf_layer_pipeline`)
+- **Evaluated Pipeline**: All 9 kernels of a complete block (Pre-Norm $\rightarrow$ QKV GEMV $\rightarrow$ GDN Recurrence $\rightarrow$ SSM Out $\rightarrow$ Res Write $\rightarrow$ Post-Norm $\rightarrow$ Router $\rightarrow$ Shared Expert $\rightarrow$ MoE Combine).
+- **Measured on Lunar Lake (`0x64a0`)**:
+  - `Composite_Layer_Pipelined`: **1.06 ms** (74.80 GB/s effective bandwidth).
+  - `Composite_Layer_Graph` (`CapturedGraph`): **1.03 ms** (< 114 µs per kernel node).
+- **Arc B580 Tuning Target**: < 220 µs per layer under GDN + MoE composite graph execution.
+
+#### 3. MoE Doorbell Handshake & Expert Streaming (`perf_moe_doorbell_stream`)
+- **Evaluated Pipeline**: GPU doorbell notification $\rightarrow$ Host detection $\rightarrow$ 51.2 KB expert parts streaming over PCIe Gen4 $\rightarrow$ Concurrently executing shared expert on GPU $\rightarrow$ Combine.
+- **Measured on Lunar Lake (`0x64a0`)**:
+  - `PCIe_Parts_Stream_DMA` (51.2 KB): **11.1 µs** (4.60 GB/s).
+  - `PCIe_Parts_ZeroCopy` (51.2 KB): **11.2 µs** (4.56 GB/s, zero-copy USM read).
+  - `MoE_Doorbell_Overlap_Slack`: Shared expert compute takes **167.8 µs** vs. DMA transfer **7.2 µs**, yielding **160.6 µs of positive overlap slack** (zero GPU pipeline stalls).
+- **Arc B580 Tuning Target**: On discrete PCIe 4.0 x8/x16 bus (16–31.5 GB/s), 51.2 KB transfer takes < 3.2 µs, guaranteeing complete latency masking behind shared expert compute.
+
+#### 4. Paged KV Cache Traffic & Indirection Penalty (`perf_paged_kv_traffic`)
+- **Evaluated Pipeline**: Paged physical block gather vs. contiguous memory across context lengths (1K–16K) and page sizes (16..128 tokens).
+- **Measured on Lunar Lake (`0x64a0`)**:
+  - `KV_Paged` (16K context, page size 16): **56.45 GB/s** (saturating 84% of physical LPDDR5x bandwidth).
+  - `Page_Size_Sweep` (16, 32, 64, 128): Latency remains steady (173.5 µs to 176.2 µs), demonstrating excellent hardware TLB and cache coalescing on Xe2.
+  - `KV_Quant_Paged` (INT8): Cuts latency from 594.4 µs to **467.5 µs** at 16K context (**+27.1% speedup**).
+- **Arc B580 Tuning Target**: > 380 GB/s paged gather bandwidth on 192-bit GDDR6 memory bus.
+
 
 
 

@@ -2140,6 +2140,22 @@ if(STRATA_BUILD_PERF)
       endif()
     endforeach()
 
+    set(_strata_tier3_bms
+      perf_residual_pipeline
+      perf_layer_pipeline
+      perf_moe_doorbell_stream
+      perf_paged_kv_traffic
+    )
+
+    foreach(_bm ${_strata_tier3_bms})
+      if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/perf/sycl/${_bm}.cpp")
+        add_executable(${_bm} perf/sycl/${_bm}.cpp)
+        target_include_directories(${_bm} PRIVATE ${_strata_gpu_include_directories})
+        target_link_libraries(${_bm} PRIVATE strata_core strata_kernels benchmark::benchmark)
+        list(APPEND _strata_perf_targets ${_bm})
+      endif()
+    endforeach()
+
     add_custom_target(perf-sycl
       COMMAND perf_xe2_gemv
       DEPENDS ${_strata_perf_targets}
