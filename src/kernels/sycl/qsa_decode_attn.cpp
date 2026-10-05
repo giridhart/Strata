@@ -24,17 +24,11 @@ constexpr int THREADS = 256;
 constexpr int WARPS = THREADS / 32;
 
 inline float warp_sum(sycl::sub_group sg, float v) {
-#pragma unroll
-    for (int o = 16; o > 0; o >>= 1)
-        v += sycl::permute_group_by_xor(sg, v, o);
-    return v;
+    return sycl::reduce_over_group(sg, v, sycl::plus<float>());
 }
 
 inline float warp_max(sycl::sub_group sg, float v) {
-#pragma unroll
-    for (int o = 16; o > 0; o >>= 1)
-        v = sycl::fmax(v, sycl::permute_group_by_xor(sg, v, o));
-    return v;
+    return sycl::reduce_over_group(sg, v, sycl::maximum<float>());
 }
 
 inline void load8_f16(const QsaAttnPools& p, bool value, long long row, int d0, float* out) {

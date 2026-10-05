@@ -61,9 +61,9 @@ void s2_gemv_subgroup_kernel(sycl::nd_item<1> item, const uint16_t* __restrict__
     const uint8_t* c = codes + o * nb * (QK / 4);
     const float* s = scales + o * nb;
 
-    double acc = 0.0;
+    float acc = 0.0f;
     for (long long b = 0; b < nb; ++b) {
-        const double d = (double)s[b];
+        const float d = s[b];
         const uint8_t* cb = c + b * (QK / 4);
         const uint16_t* xb = x + b * QK;
 
@@ -80,14 +80,14 @@ void s2_gemv_subgroup_kernel(sycl::nd_item<1> item, const uint16_t* __restrict__
             const sycl::half h2 = sycl::bit_cast<sycl::half, unsigned short>(xb[base_j + 2]);
             const sycl::half h3 = sycl::bit_cast<sycl::half, unsigned short>(xb[base_j + 3]);
 
-            acc += (double)(c0 - 1) * d * (double)static_cast<float>(h0);
-            acc += (double)(c1 - 1) * d * (double)static_cast<float>(h1);
-            acc += (double)(c2 - 1) * d * (double)static_cast<float>(h2);
-            acc += (double)(c3 - 1) * d * (double)static_cast<float>(h3);
+            acc += (float)(c0 - 1) * d * static_cast<float>(h0);
+            acc += (float)(c1 - 1) * d * static_cast<float>(h1);
+            acc += (float)(c2 - 1) * d * static_cast<float>(h2);
+            acc += (float)(c3 - 1) * d * static_cast<float>(h3);
         }
     }
-    acc = sycl::reduce_over_group(sg, acc, sycl::plus<double>());
-    if (lane == 0) y[o] = (float)acc;
+    acc = sycl::reduce_over_group(sg, acc, sycl::plus<float>());
+    if (lane == 0) y[o] = acc;
 }
 
 }  // namespace
@@ -106,6 +106,7 @@ void s2_gemv(const uint16_t* x, const uint8_t* codes, const float* scales, float
                    [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
                        s2_gemv_subgroup_kernel<SG_SIZE>(item, x, codes, scales, y, n_in, n_out);
                    });
+    q.wait();
 }
 
 }  // namespace strata::kernels
