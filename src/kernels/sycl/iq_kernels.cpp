@@ -330,7 +330,7 @@ inline float vec_dot_iq4_xs_q8_1(const void* __restrict__ vbq, const block_q8_1*
 // Q4_K / Q5_K gate/up and Q5_1 / Q8_0 down: llama.cpp's vec_dot_*_q8_1 (vecdotq.cuh, VDR 2 each), transcribed; the
 // Q5_1 min term is the one departure (below).  Via eddoursul/Strata 8029fa9 (iq_dot.cuh) and #255 (Q8_0,
 // gopinath87607), which agree with llama.cpp and with each other.
-constexpr int VDR_Q4_K = 2, VDR_Q5_K = 2, VDR_Q5_1 = 2, VDR_Q8_0 = 2;
+constexpr int VDR_Q4_K = 2, VDR_Q5_K = 2, VDR_Q5_1 = 2, VDR_Q5_0 = 2, VDR_Q8_0 = 2;
 
 inline float vec_dot_q4_K_q8_1_impl_vmmq(const int* __restrict__ v, const int* __restrict__ u,
                                          const uint8_t* __restrict__ sc, const uint8_t* __restrict__ m,
@@ -454,6 +454,36 @@ inline float vec_dot_q5_K_q8_1(const void* __restrict__ vbq, const block_q8_1* _
         u[2 * i + 1] = q8[4];
     }
     return vec_dot_q5_K_q8_1_impl_vmmq(vl, vh, u, sc, m, bq5_K->dm, d8);
+}
+// Q5_0: llama.cpp's integer chain verbatim (vecdotq.cuh vec_dot_q5_0_q8_1_impl) -- symmetric (one delta, no
+// learned min), so unlike Q5_1 there is no min-term rounding choice to make: the constant -16 per-weight offset
+// is accounted for via the q8_1 block's `ds.y` (sum of the ORIGINAL activations), exactly as upstream.
+inline float vec_dot_q5_0_q8_1(const void* __restrict__ vbq, const block_q8_1* __restrict__ bq8_1,
+                               const int& kbx, const int& iqs) {
+    const block_q5_0* bq5_0 = (const block_q5_0*)vbq + kbx;
+    int sumi = 0;
+#pragma unroll
+    for (int i = 0; i < VDR_Q5_0; ++i) {
+        const int vl = get_int_b2(bq5_0->qs, iqs + i);
+        const int vh = get_int_b2(bq5_0->qh, 0) >> (4 * (iqs + i));
+        const int u0 = get_int_b4(bq8_1->qs, iqs + i), u1 = get_int_b4(bq8_1->qs, iqs + i + QI5_0);
+        int vi0 = (vl >> 0) & 0x0F0F0F0F;
+        vi0 |= (vh << 4) & 0x00000010;
+        vi0 |= (vh << 11) & 0x00001000;
+        vi0 |= (vh << 18) & 0x00100000;
+        vi0 |= (vh << 25) & 0x10000000;
+        sumi = ggml_cuda_dp4a(vi0, u0, sumi);
+        int vi1 = (vl >> 4) & 0x0F0F0F0F;
+        vi1 |= (vh >> 12) & 0x00000010;
+        vi1 |= (vh >> 5) & 0x00001000;
+        vi1 |= (vh << 2) & 0x00100000;
+        vi1 |= (vh << 9) & 0x10000000;
+        sumi = ggml_cuda_dp4a(vi1, u1, sumi);
+    }
+    const float d5 = sycl::vec<sycl::half, 1>(bq5_0->d).convert<float, sycl::rounding_mode::automatic>()[0];
+    const float d8 = (bq8_1->ds)[0];
+    const float s8 = (bq8_1->ds)[1];
+    return d5 * (sumi * d8 - (16.0f * VDR_Q5_0 / QI5_0) * s8);
 }
 // Q5_1: llama.cpp's integer chain, but the min term multiplies the sum of the QUANTIZED activations (dp4a with
 // 0x01010101, times d8) instead of the q8_1 block's `ds.y`, which our quantizer (like llama.cpp's) fills with the sum
@@ -595,6 +625,11 @@ struct Fmt<7> {
     static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_q5_1_q8_1(v, y, kbx, iqs); }
 };
 template <>
+struct Fmt<6> {
+    static constexpr int qk = 32, ipb = QI5_0 / VDR_Q5_0, step = VDR_Q5_0;
+    static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_q5_0_q8_1(v, y, kbx, iqs); }
+};
+template <>
 struct Fmt<8> {
     static constexpr int qk = 32, ipb = QI8_0 / VDR_Q8_0, step = VDR_Q8_0;
     static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_q8_0_q8_1(v, y, kbx, iqs); }
@@ -602,9 +637,9 @@ struct Fmt<8> {
 
 // The formats of each role, one list each so a type cannot be in one switch and missing from another.  Every
 // entry is a kernel template for each CUDA architecture of the build, hence two lists rather than one.
-#define STRATA_GU_FMTS(X) X(16) X(17) X(18) X(21) X(22) X(23) X(29) X(42) X(12) X(13) X(8)
-#define STRATA_D_FMTS(X) X(20) X(23) X(42) X(7) X(8)
-#define STRATA_MMVQ_FMTS(X) X(16) X(17) X(18) X(20) X(21) X(22) X(23) X(29) X(42) X(12) X(13) X(7) X(8)
+#define STRATA_GU_FMTS(X) X(16) X(17) X(18) X(21) X(22) X(23) X(29) X(42) X(12) X(13) X(6) X(8)
+#define STRATA_D_FMTS(X) X(20) X(23) X(42) X(7) X(6) X(8)
+#define STRATA_MMVQ_FMTS(X) X(16) X(17) X(18) X(20) X(21) X(22) X(23) X(29) X(42) X(12) X(13) X(7) X(6) X(8)
 
 inline float warp_sum(float v) {
     auto sg = sycl::ext::oneapi::this_work_item::get_sub_group();
@@ -1405,6 +1440,23 @@ void dq_q5_k(const void* vx, int64_t ibs, dst_t* yy, int tid) {
     }
 }
 template <typename dst_t>
+void dq_q5_0(const void* vx, int64_t ibs, dst_t* yy, int tid) {
+    // symmetric: one delta (no min), the high bit folded in then centered by the format's fixed -16 offset
+    const block_q5_0* x = (const block_q5_0*)vx + ibs * (QK_K / QK5_0);
+    const int ib = tid % 8, il = tid / 8;
+    const float d = sycl::vec<sycl::half, 1>(x[ib].d).convert<float, sycl::rounding_mode::automatic>()[0];
+    uint32_t qh;
+    memcpy(&qh, x[ib].qh, sizeof(qh));
+    dst_t* y = yy + 32 * ib;
+    for (int j = 0; j < 4; ++j) {
+        const int iqs = 4 * il + j;
+        const int xh_0 = ((qh >> (iqs + 0)) << 4) & 0x10;
+        const int xh_1 = ((qh >> (iqs + 12))) & 0x10;
+        y[iqs] = cvt<dst_t>(((float)((x[ib].qs[iqs] & 0xf) | xh_0) - 16.0f) * d);
+        y[iqs + 16] = cvt<dst_t>(((float)((x[ib].qs[iqs] >> 4) | xh_1) - 16.0f) * d);
+    }
+}
+template <typename dst_t>
 void dq_q5_1(const void* vx, int64_t ibs, dst_t* yy, int tid) {
     const block_q5_1* x = (const block_q5_1*)vx + ibs * (QK_K / QK5_1);
     const int ib = tid % 8, il = tid / 8;
@@ -1482,6 +1534,9 @@ inline void dq_dispatch(int ty, const void* vx, int64_t ibs, dst_t* y, int tid) 
         case 7:
             dq_q5_1(vx, ibs, y, tid);
             break;
+        case 6:
+            dq_q5_0(vx, ibs, y, tid);
+            break;
         case 8:
             dq_q8_0(vx, ibs, y, tid);
             break;
@@ -1514,7 +1569,7 @@ void dequant_gu_kernel(int ty, const void* __restrict__ gate, const void* __rest
 // the types dq_dispatch dequantizes
 bool is_iq(int t) {
     return t == 16 || t == 17 || t == 18 || t == 20 || t == 21 || t == 22 || t == 23 || t == 29 || t == 42 || t == 11 ||
-           t == 12 || t == 13 || t == 7 || t == 8;
+           t == 12 || t == 13 || t == 7 || t == 6 || t == 8;
 }
 // values per block of the types the grouped expert kernels take (0 = none)
 int gu_qk(int t) {
@@ -1689,6 +1744,8 @@ size_t iq_row_bytes(int t, int64_t n) noexcept {
             return (size_t)(n / 256) * sizeof(block_q5_K);
         case 7:
             return (size_t)(n / 32) * sizeof(block_q5_1);
+        case 6:
+            return (size_t)(n / 32) * sizeof(block_q5_0);
         case 8:
             return (size_t)(n / 32) * sizeof(block_q8_0);
         case 30:
