@@ -8,6 +8,8 @@ The opt-in gfx906 query-LDS swizzle improves the measured INT8 batched-QSA compo
 
 These results support a narrowly scoped, default-off upstream proposal. They do not establish a general speedup across workloads, model-level equivalence beyond the tested pairs, or production readiness.
 
+The final hardened combined engine also passes a 200,000-token capacity run and targeted API/cache regression checks. Those qualifications apply to the frozen experimental stack; they do not extend the clean upstream patch's component-only validation to full-model testing.
+
 ## Change and dispatch scope
 
 The change permutes only the shared-memory query layout in `attn_chunk_kernel`: `q(d) = d XOR ((d >> 3) & 4)`. The scoring loads invert the permutation. The mapping is bijective and self-inverse over the 256 dimensions, preserves 16-byte load alignment and the 12 KiB query tile, and leaves the logical floating-point operands and operation order unchanged. Score reduction, softmax, value accumulation and merge code are unchanged.
@@ -78,14 +80,33 @@ These fresh comparisons measure the complete HC + grouped-MMQ + PR #1525 dequant
 | 4,096 tokens | 347.622402 | 368.640369 | +6.046206% | −2.343515% | +0.188068% |
 | 65,536 tokens | 597.968207 | 624.674728 | +4.466211% | −3.664980% | +0.376379% |
 
-Each context has one matched pair with 1,024 output tokens and all token IDs equal within the pair. These use the final hardened candidate engine. The 4K pair ran control then candidate; the 64K pair ran candidate then control. Generation changes are noise-scale. The stable service was restored after the tests; the candidate was not deployed to production.
+Each context has one matched pair with 1,024 output tokens and all token IDs equal within the pair. These use the final hardened candidate engine. The 4K pair ran control then candidate; the 64K pair ran candidate then control. Generation changes are noise-scale. The stable service was restored after the tests; the candidate was not promoted to production.
 
 For all model tables, PP is the reported full prompt-token count divided by native prompt time; the last prompt token executes in the first decode window. TG is actual output count divided by native decode time. Request wall time is measured separately from model loading. No cross-quantization quality or equal-token claim is made.
+
+## Capacity and service qualification
+
+The final hardened engine (`3d2650fe62fdea24679ac90401eac505b541ccc47886e59885a639c438cb4c17`) completed a fresh **200,000-token prompt plus 256 generated tokens** with a configured capacity of 204,800 and INT8 KV. All 256 output IDs match the archived stable `ce794788…` control. This is a capacity and output-parity qualification against an archived control, **not a fresh speed comparison**. No incremental QSA or combined-stack speedup is inferred from this run.
+
+Targeted API testing verified the actual candidate executable hash and active candidate flags, including the QSA opt-in, then passed:
+
+- Synthetic forced tool call and tool-result roundtrip
+- Two synthetic image requests through CPU vision, followed by text
+- Unauthenticated-request HTTP 401 and root-route HTTP 404 checks
+- Synthetic A/auxiliary/A RAM prompt-cache restoration
+
+| Cache request | Elapsed time, s | Cached prompt tokens |
+|---|---:|---:|
+| A, cold | 14.3541 | 0 |
+| A, warm | 0.4073 | 6,423 |
+| A, restored after auxiliary request | 0.3868 | 6,423 |
+
+The three A requests returned the same result. This synthetic cache regression is not a replay of a client session or a general service benchmark. The original configuration and Compose files were restored byte-for-byte, and the stable `ce794788…` API was healthy afterward. No production promotion occurred.
 
 ## Provenance and limits
 
 - Hardware scope: two gfx906 wave64 GPUs; the runtime reports AMD Radeon Pro VII. Results are specific to the tested hardware and pinned build stack.
-- Model: `Qwen3.8-Flash-Next-GSQ-RCO-abliterated-IQ3_XXS-Q2_0`, engine version 0.1.40, INT8 KV. The configured capacity is 204,800 tokens; the new QSA candidate was tested only at the prompt lengths reported above.
+- Model: `Qwen3.8-Flash-Next-GSQ-RCO-abliterated-IQ3_XXS-Q2_0`, engine version 0.1.40, INT8 KV. The configured capacity is 204,800 tokens; the final candidate completed the 200,000-token qualification described above.
 - Experimental source HEAD: `f152172332693c933b8a3104ce193d8a4315c2b4`, plus campaign changes. It is a separate source scope from the clean PR.
 - Pinned llama.cpp revision: `3cf03257f219afbe7334045ff7c6a06ac68c627d`.
 - Clean upstream base: `fb58e0dbc8399662c0e47c76578c6e878b14f6cf`.
@@ -97,8 +118,10 @@ For all model tables, PP is the reported full prompt-token count divided by nati
 - Build image digest: `sha256:bccb7ee7e7a78274519db9a43ba63c34ddd2e74bb60f8764a8f50aaee1f2c646`. The clean probe uses Release, HIP gfx906, portable/native-expert settings, and grouped-MMQ build options disabled. No floating-point compiler-policy change is part of the QSA patch.
 - Compiler verified in that image: AMD Clang `23.0.0git`, ROCm llvm-project revision `46fcb339fb61119b337f973c7ca9e710a319fdd0`, patched revision `440716f8b87be9d8e20ed910e10e5b6d14d57cf6`. The ROCm distribution version is unrecorded because its version file is empty.
 
-The clean rebased PR has component and host-guard validation; the full-model comparisons belong to the experimental stack. No full-model run on rebased main, new 200K test, new API qualification, CI pass or production deployment is claimed. Earlier HC/MMQ 200K and API qualification does not qualify this new QSA candidate.
+The clean rebased patch has component and host-guard validation; the full-model comparisons, 200K capacity run and API/cache qualification belong to the frozen experimental stack. No full-model run on rebased main, upstream CI pass or production promotion is claimed. Single matched speed pairs and targeted synthetic service tests do not establish broader workload or service equivalence.
 
 The overlap review found no direct duplicate, but upstream PR #1402 introduces a third kernel-template argument `G`, conflicting with this patch's third boolean argument. The two changes require coordination before merging. PR #1535 concerns the separate top-k work.
 
-Evidence reviewed: final component/model/combined receipts, build receipts, the final clean patch, and the source/ISA and hardened-ISA audit records.
+The branch at commit `26f776a` is published. Creating the new PR returned HTTP 403, so no new PR exists; the accompanying PR text remains a draft.
+
+Evidence reviewed: final component/model/combined receipts, build receipts, the final clean patch, source/ISA and hardened-ISA audit records, and the sanitized capacity/API/cache qualification receipt.
