@@ -767,13 +767,44 @@ class OutputParser:
             p = self.buf.find(FUNC_START, p + 1)
         return -1, False
 
+    @property
+    def line(self) -> str:
+        """Materialize the current line only for a decision, newline, or state snapshot."""
+        if self._line_blocks is not None:
+            self._line_blocks.extend(self._line_parts)
+            self._line_parts = ["".join(self._line_blocks)]
+            self._line_blocks = None
+        elif len(self._line_parts) > 1:
+            self._line_parts = ["".join(self._line_parts)]
+        return self._line_parts[0] if self._line_parts else ""
+
+    @line.setter
+    def line(self, text: str):
+        self._line_parts = [text] if text else []
+        self._line_blocks = None
+
     def _track(self, text: str) -> str:
         """Follow the reasoning text that has gone out: the open code fence, the current line, and the backticks of
         the current paragraph.  Returns the text."""
+        # Most token fragments stay on the current line. Fence and paragraph
+        # bookkeeping happens only when a newline completes that line.
+        if "\n" not in text:
+            if text:
+                self._line_parts.append(text)
+                if len(self._line_parts) == 64:
+                    # Release small fragment objects in bounded groups. Completed
+                    # blocks are never recopied until the full line is requested.
+                    if self._line_blocks is None:
+                        self._line_blocks = []
+                    self._line_blocks.append("".join(self._line_parts))
+                    self._line_parts.clear()
+            return text
         parts = text.split("\n")
         for k, part in enumerate(parts):
             if k < len(parts) - 1:
-                line, self.line = self.line + part, ""
+                line = self.line + part if self._line_parts or self._line_blocks else part
+                self._line_parts.clear()
+                self._line_blocks = None
                 s = line.lstrip()
                 if self.fence:
                     if s.startswith(self.fence * 3):
@@ -785,7 +816,8 @@ class OutputParser:
                 else:
                     self.ticks += line.count("`")
             else:
-                self.line += part
+                if part:
+                    self._line_parts.append(part)
         return text
 
     def _opener_ok(self) -> bool:
