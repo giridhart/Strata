@@ -829,6 +829,19 @@ class OutputParser:
         """The text so far leaves the next character inside a code fence or inline code."""
         return bool(self.fence) or (self.ticks + self.line.count("`")) % 2 == 1
 
+    def _quoted_think_end(self, i: int) -> bool | None:
+        """#537: the `</think>` at self.buf[i] is the model quoting the tag while it thinks, not the end of the
+        thinking: written right after a quote or backtick and followed by anything but a line break, as in `</think>`
+        or "</think>...".  The end of the thinking is followed by a line break.  None while the character after the
+        tag has not arrived."""
+        before = self.buf[i - 1] if i else self.line[-1:]
+        if before not in ('"', "'", "`"):
+            return False
+        after = self.buf[i + len(THINK_END):]
+        if not after:
+            return None
+        return after[0] not in "\r\n"
+
     def _release(self, deliver: bool) -> list[Event]:
         """Settle the calls waiting in self.pending: events for real calls, or all of it back as reasoning text."""
         out = []
@@ -1037,6 +1050,16 @@ class OutputParser:
                         out.append(Event("reasoning", self._track(self.buf[:len(self.buf) - keep])))
                         self.buf = self.buf[len(self.buf) - keep:]
                     return out
+                quoted = self._quoted_think_end(i)
+                if quoted is None:                   # held like a partial tag until the character after it is here
+                    if i:
+                        out.append(Event("reasoning", self._track(self.buf[:i])))
+                        self.buf = self.buf[i:]
+                    return out
+                if quoted:                           # #537: a quoted `</think>` is reasoning text
+                    out.append(Event("reasoning", self._track(self.buf[:i + len(THINK_END)])))
+                    self.buf = self.buf[i + len(THINK_END):]
+                    continue
                 if i:
                     out.append(Event("reasoning", self._track(self.buf[:i])))
                 self.buf = self.buf[i + len(THINK_END):]
@@ -1199,6 +1222,8 @@ class OutputParser:
             self.buf = ""
             self._reset_scan()
             return out
+        if self.state == "reasoning" and self.buf == THINK_END:   # the output ends on a held `</think>`: its end
+            self.buf, self.state = "", "content"
         if self.buf:
             # an unfinished call inside the reasoning (#804) is reasoning text, never a call
             kind = {"reasoning": "reasoning", "rcall": "reasoning", "content": "content"}.get(self.state, "content")
