@@ -111,6 +111,10 @@ class Tokenizer:
         # token containing regex metacharacters (several do: `<|`, `[`, `(`) is matched literally.
         self._always_re = self._alt(always)
         self._special_re = self._alt(list(self.special_tokens))
+        # Initialize once, rather than allocating a default dict and looking it up
+        # through __dict__.setdefault on each encoded segment or decoded token.
+        self._piece_ids: dict[str, list[int]] = {}
+        self._bytes_cache: dict[int, bytes] = {}
 
     @staticmethod
     def _alt(literals: list[str]):
@@ -214,7 +218,7 @@ class Tokenizer:
         out: list[int] = []
         # A piece's ids depend on the piece alone, so repeated pieces (most of a resent conversation) are looked up
         # instead of merged again.  The ids are the ones _bpe gives: this only skips the work.
-        cache = self.__dict__.setdefault("_piece_ids", {})
+        cache = self._piece_ids
         for piece in self._re.findall(text):
             got = cache.get(piece)
             if got is None:
@@ -281,7 +285,7 @@ class Tokenizer:
 
     def token_bytes(self, i: int) -> bytes:
         """The raw bytes of one token (a multi-byte character can be split across tokens)."""
-        cache = self.__dict__.setdefault("_bytes_cache", {})
+        cache = self._bytes_cache
         b = cache.get(i)
         if b is None:
             if i < 0 or i >= len(self.tokens):
