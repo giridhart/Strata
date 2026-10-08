@@ -242,11 +242,27 @@ class Tokenizer:
             return self._encode_plain(text)
         out: list[int] = []
         pos = 0
+        # Matches arrive in text order. For reusable span sequences, consume each
+        # span once instead of scanning the entire list for every literal match.
+        # Sorting a copy handles unsorted/overlapping input without mutating it.
+        # Other iterables keep the original consumption semantics below.
+        span_sequence = isinstance(plain, (list, tuple)) and bool(plain)
+        if span_sequence:
+            spans = iter(sorted(plain))
+            upcoming = next(spans, None)
+            plain_end = 0
         for m in pat.finditer(text):
-            if plain and any(a <= m.start() < b for a, b in plain):
+            start = m.start()
+            if span_sequence:
+                while upcoming is not None and upcoming[0] <= start:
+                    plain_end = max(plain_end, upcoming[1])
+                    upcoming = next(spans, None)
+                if start < plain_end:
+                    continue
+            elif plain and any(a <= start < b for a, b in plain):
                 continue
-            if m.start() > pos:
-                out.extend(self._encode_plain(text[pos:m.start()]))
+            if start > pos:
+                out.extend(self._encode_plain(text[pos:start]))
             out.append(self.special_tokens[m.group(0)])
             pos = m.end()
         if pos < len(text):
