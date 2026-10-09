@@ -6700,6 +6700,19 @@ int main(int argc, char** argv) {
         strata::core::Verifier ver;
         strata::core::VerifyHits vh;
         vh.d_res = thits.d_res;
+        // STRATA_ROUTE_RESIDENT_MTP=1 (EXPERIMENTAL, with STRATA_ROUTE_RESIDENT=<margin>; changes the output): the MTP
+        // draft's router gets the same residency bias, with the last layer's residency row as its table (single GPU)
+        if (use_mtp && stages.empty() && thits.d_res != nullptr && std::getenv("STRATA_ROUTE_RESIDENT") != nullptr &&
+            std::getenv("STRATA_ROUTE_RESIDENT_MTP") != nullptr && std::atoi(std::getenv("STRATA_ROUTE_RESIDENT_MTP")) != 0) {
+            const float margin = (float) std::atof(std::getenv("STRATA_ROUTE_RESIDENT"));
+            int lo = 6, hi = 9;
+            if (const char* v = std::getenv("STRATA_ROUTE_RESIDENT_RANKS")) std::sscanf(v, "%d-%d", &lo, &hi);
+            if (margin > 0.0f) {
+                mtp.set_route_resident(thits.d_res + (size_t) (g.n_layers - 1) * (size_t) g.n_expert, margin, lo, hi);
+                std::fprintf(stderr, "strata generate: STRATA_ROUTE_RESIDENT_MTP: the MTP draft's router is biased toward layer %lld's resident experts (margin %g, ranks %d-%d; experimental)\n",
+                             (long long) (g.n_layers - 1), margin, lo, hi);
+            }
+        }
         vh.h_res = host_res.empty() ? nullptr : host_res.data();
         vh.cache_base = thits.cache_base;
         vh.blob = thits.blob;
@@ -8268,6 +8281,7 @@ int main(int argc, char** argv) {
                         e = "VRAM: refilling the cache failed: " + ferr;
                         return false;
                     }
+                    srcp->note_async_read(b, nullptr);   // #1237: the queued copy reads a stage buffer; it is not recycled under it
                     host_res[(size_t) pick] = slot;
                 }
                 vram_evicted.swap(keep_out);
@@ -9622,6 +9636,7 @@ int main(int argc, char** argv) {
                     if (b == nullptr || !(refill_blocking() ? p.cache->fill_slot_blocking(slot, b, e, nb)
                                                             : p.cache->fill_slot_queued(slot, b, e, nb)))
                         return false;
+                    if (!refill_blocking()) srcp->note_async_read(b, nullptr);   // #1237
                     host_res[(size_t) i] = slot;
                 }
                 return true;
@@ -11262,6 +11277,7 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "strata generate: refilling a lent slot failed: %s\n", err.c_str());
                     return 1;
                 }
+                if (!refill_blocking()) srcp->note_async_read(b, nullptr);   // #1237
                 host_res[(size_t) i] = slot;
             }
             if (!xcache.sync_queued(err)) {
