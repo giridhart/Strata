@@ -60,6 +60,7 @@
 #include "strata/core/native_dense.hpp"
 #include "strata/program/logits_selection.hpp"
 #include "strata/program/conv_cache.hpp"
+#include "strata/program/split_rules.hpp"
 #include "strata/program/message_boundary.hpp"
 #include "strata/spec/draft_policy.hpp"
 #include "strata/spec/draft_source.hpp"
@@ -3555,7 +3556,10 @@ int main(int argc, char** argv) {
             return parts;
         };
         bool gate_on = true;   // off only when no placement can start (below): then the best one is kept and a warning said
+        int64_t min_stage_layers = 1;   // #1616: 3 in the second pass below, when the first pick has a one- or two-layer stage
         auto consider = [&]() {
+            if (min_stage_layers > 1 && strata::program::split_rules::smallest_stage(at, g.n_layers) < min_stage_layers)
+                return;
             double hm = 0;
             int64_t held = 0;
             const double ms = predict(at, hm, held);
@@ -3647,6 +3651,8 @@ int main(int argc, char** argv) {
                         const double ms = miss_ms * (1.0 - hm / denom) +
                                           (double) k1 * layer_ms[0] + (double) (k2 - k1) * layer_ms[1] +
                                           (double) (k3 - k2) * layer_ms[2] + (double) (L - k3) * layer_ms[3];
+                        if (min_stage_layers > 1 &&
+                            strata::program::split_rules::smallest_stage({k1, k2, k3}, L) < min_stage_layers) continue;
                         ++tried;
                         const double mx = stage_max({k1, k2, k3});
                         if (!(ms < best_ms - tie_eps || (ms <= best_ms + tie_eps && mx < best_max - tie_eps))) continue;
@@ -3680,6 +3686,38 @@ int main(int argc, char** argv) {
         }
         };
         search();
+        // ---- #1616: a stage with one or two layers holds a handful of expert slots (a 12 GB 3060: 512), and the
+        // prompt chunk of every card is clamped to what the smallest cache can lend.  When the pick has such a
+        // stage, look again among placements that give every stage at least kMinStageLayers layers; keep the new
+        // pick if there is one, and say so.  Recommend, never force: with none startable the first pick stays.
+        if (!best.empty() && strata::program::split_rules::restriction_possible(g.n_layers, ns) &&
+            strata::program::split_rules::has_tiny_stage(best, g.n_layers)) {
+            const std::vector<int64_t> first = best;
+            const double first_ms = best_ms;
+            best.clear();
+            best_ms = 1e30; best_max = 1e30; best_mass = 0; best_held = 0;
+            min_stage_layers = strata::program::split_rules::kMinStageLayers;
+            search();
+            min_stage_layers = 1;
+            auto fmt = [](const std::vector<int64_t>& v) {
+                std::string s;
+                for (const int64_t k : v) s += (s.empty() ? "" : ",") + std::to_string(k);
+                return s;
+            };
+            if (best.empty()) {
+                best = first; best_ms = first_ms;
+                std::fprintf(stderr, "strata generate: layer split auto: K=%s gives a stage fewer than %lld layers (a "
+                                     "tiny expert cache clamps the prompt chunk, #1616), but no placement with at least "
+                                     "that many layers can start; keeping it\n", fmt(first).c_str(),
+                             (long long) strata::program::split_rules::kMinStageLayers);
+            } else {
+                std::fprintf(stderr, "strata generate: layer split auto: K=%s would give a stage fewer than %lld layers "
+                                     "(a tiny expert cache there clamps the prompt chunk of every card, #1616); chose "
+                                     "K=%s instead (%.1f ms per decode window, not %.1f)\n", fmt(first).c_str(),
+                             (long long) strata::program::split_rules::kMinStageLayers, fmt(best).c_str(), best_ms,
+                             first_ms);
+            }
+        }
         // ---- no startable placement: fall back to proportional, and if that too is impossible, say what is short
         auto split_diagnosis = [&](const std::vector<int64_t>& at) {
             const int64_t c = 512;
