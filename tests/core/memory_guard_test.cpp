@@ -177,7 +177,8 @@ int main() {
         f.put("cgroup/g/memory.max", "max\n");
         check(f.sample() && f.sample()->available == 25 * GiB, "no finite limit and no usage: the level is skipped");
         f.put("cgroup/g/memory.current", "max\n");
-        check(!f.sample(), "memory.current is never \"max\"");
+        check(f.sample() && f.sample()->source == MemorySource::meminfo, "memory.current is never \"max\": MemAvailable alone");
+        check(!f.sample(100 * GiB), "... unknown with the cap");
         f.put("cgroup/g/memory.current", 1ull);
         for (const char* text : {"", "MemAvailable: 12 MB\n", "MemAvailable: 1x kB\n", "MemTotal: 5 kB\n",
                                  "MemAvailable: 5 kB\nMemAvailable: 6 kB\n"}) {
