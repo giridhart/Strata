@@ -2083,6 +2083,12 @@ void FileExpertSource::warm(int64_t layer, const int64_t* experts, int64_t n) {
 #endif
 }
 
+static inline int la_pc64(uint64_t x) {   // (portable: no compiler builtin)
+    int n = 0;
+    for (; x != 0; x &= x - 1) ++n;
+    return n;
+}
+
 RouterLookahead::~RouterLookahead() {
     {
         std::lock_guard<std::mutex> lk(mu_);
@@ -2131,9 +2137,64 @@ void RouterLookahead::submit(int64_t layer, const float* x, int64_t n_tok, const
         std::memcpy(x_.data(), x, (size_t) (n_tok_ * n_embd_) * sizeof(float));
         layer_ = layer + 1;
         host_res_ = host_res;
+        sub_gen_ = gen_.load(std::memory_order_relaxed);
         pending_ = true;
     }
     cv_.notify_one();
+}
+
+void RouterLookahead::enable_stats(int64_t n_layers) {
+    words_ = (n_expert_ + 63) / 64;
+    pmask_.reset(new std::atomic<uint64_t>[(size_t) (n_layers * 3 * words_)]);
+    pstamp_.reset(new std::atomic<uint64_t>[(size_t) n_layers]);
+    for (int64_t i = 0; i < n_layers * 3 * words_; ++i) pmask_[(size_t) i].store(0, std::memory_order_relaxed);
+    for (int64_t i = 0; i < n_layers; ++i) pstamp_[(size_t) i].store(0, std::memory_order_relaxed);
+    stats_on_ = true;
+}
+
+// the dispatch thread: score the prediction made for `layer` against the experts it routes outside the GPU cache
+void RouterLookahead::stats_score(int64_t layer, const int32_t* ids, int64_t n, const int32_t* host_res) {
+    if (!stats_on_ || layer < 1 || layer >= (int64_t) routers_.size()) return;
+    ++st_layers_;
+    if (pstamp_[(size_t) layer].load(std::memory_order_acquire) != gen_.load(std::memory_order_relaxed) + 1) {
+        ++st_nopred_;
+        return;
+    }
+    std::vector<uint64_t> act((size_t) words_, 0);
+    for (int64_t i = 0; i < n; ++i) {
+        const int32_t e = ids[i];
+        if (e < 0 || e >= n_expert_) continue;
+        if (host_res != nullptr && host_res[(size_t) (layer * n_expert_ + e)] >= 0) continue;
+        act[(size_t) (e >> 6)] |= 1ull << (e & 63);
+    }
+    uint64_t na = 0;
+    for (int64_t w = 0; w < words_; ++w) na += (uint64_t) la_pc64(act[(size_t) w]);
+    st_actual_ += na;
+    for (int s = 0; s < 3; ++s) {
+        uint64_t hit = 0, np = 0;
+        for (int64_t w = 0; w < words_; ++w) {
+            const uint64_t pm = pmask_[(size_t) ((layer * 3 + s) * words_ + w)].load(std::memory_order_relaxed);
+            hit += (uint64_t) la_pc64(pm & act[(size_t) w]);
+            np += (uint64_t) la_pc64(pm);
+        }
+        st_hit_[s] += hit;
+        st_pred_[s] += np;
+    }
+    if (layer == (int64_t) routers_.size() - 1 && (++st_windows_ % 100) == 0) {
+        const uint64_t scored = st_layers_ - st_nopred_;
+        std::fprintf(stderr, "strata lookahead stats: %llu windows, %llu layers scored, %llu without a prediction (%.1f%%); "
+                     "%.2f actual non-resident experts/layer;",
+                     (unsigned long long) st_windows_, (unsigned long long) scored, (unsigned long long) st_nopred_,
+                     st_layers_ ? 100.0 * (double) st_nopred_ / (double) st_layers_ : 0.0,
+                     scored ? (double) st_actual_ / (double) scored : 0.0);
+        static const int add[3] = {0, 4, 10};
+        for (int s = 0; s < 3; ++s)
+            std::fprintf(stderr, " k=%d: recall %.3f precision %.3f (%.2f predicted/layer);", k_ + add[s],
+                         st_actual_ ? (double) st_hit_[s] / (double) st_actual_ : 0.0,
+                         st_pred_[s] ? (double) st_hit_[s] / (double) st_pred_[s] : 0.0,
+                         scored ? (double) st_pred_[s] / (double) scored : 0.0);
+        std::fprintf(stderr, "\n");
+    }
 }
 
 void RouterLookahead::run() {
@@ -2144,6 +2205,7 @@ void RouterLookahead::run() {
         int64_t layer, nt;
         const int32_t* host_res;
         ForesightSwap* fs;
+        uint64_t sgen;
         {
             std::unique_lock<std::mutex> lk(mu_);
             cv_.wait(lk, [&] { return quit_ || pending_; });
@@ -2154,6 +2216,7 @@ void RouterLookahead::run() {
             nt = n_tok_;
             host_res = host_res_;
             fs = fs_;
+            sgen = sub_gen_;
         }
         const auto t0 = std::chrono::steady_clock::now();
         const int64_t layer0 = layer;
@@ -2189,16 +2252,28 @@ void RouterLookahead::run() {
                 }
             }
         }
+        const int kmax = stats_on_ ? (int) std::min<int64_t>(k_ + 10, n_expert_) : k_;
+        const int ks[3] = {k_, (int) std::min<int64_t>(k_ + 4, n_expert_), kmax};
+        std::vector<uint64_t> sm;
+        if (stats_on_) sm.assign((size_t) (3 * words_), 0);
         for (int64_t t = 0; t < nt; ++t) {
             const float* lt = logits.data() + (size_t) (t * n_expert_);
             for (int64_t e = 0; e < n_expert_; ++e) order[(size_t) e] = (int32_t) e;
-            std::partial_sort(order.begin(), order.begin() + k_, order.end(),
+            std::partial_sort(order.begin(), order.begin() + kmax, order.end(),
                               [&](int32_t a, int32_t b) { return lt[(size_t) a] > lt[(size_t) b]; });
-            for (int j = 0; j < k_; ++j) {
+            for (int j = 0; j < kmax; ++j) {
                 const int64_t e = order[(size_t) j];
                 if (host_res != nullptr && host_res[(size_t) (layer * n_expert_ + e)] >= 0) continue;   // on the GPU
-                if (std::find(want.begin(), want.end(), e) == want.end()) want.push_back(e);
+                if (j < k_ && std::find(want.begin(), want.end(), e) == want.end()) want.push_back(e);
+                if (stats_on_ && dj == 0)
+                    for (int s = 0; s < 3; ++s)
+                        if (j < ks[s]) sm[(size_t) (s * words_ + (e >> 6))] |= 1ull << (e & 63);
             }
+        }
+        if (stats_on_ && dj == 0) {
+            for (int64_t i = 0; i < 3 * words_; ++i)
+                pmask_[(size_t) (layer * 3 * words_ + i)].store(sm[(size_t) i], std::memory_order_relaxed);
+            pstamp_[(size_t) layer].store(sgen + 1, std::memory_order_release);
         }
         src_->warm(layer, want.data(), (int64_t) want.size());
         if (fs != nullptr && dj == 0)   // the next layer only: a deeper guess is too often wrong to spend a copy on
@@ -3380,7 +3455,13 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         d.fail_layer = d.layers;
         return;
     }
-    if (d.lookahead != nullptr) d.lookahead->submit(d.layers, x_f, n_tok, d.host_res);   // CS-T: warm layer + 1
+    if (d.lookahead != nullptr) {
+        if (d.lookahead->stats_on()) {
+            if (d.layers == 0) d.lookahead->stats_window_start();
+            d.lookahead->stats_score(d.layers, ids, n_tok * k, d.host_res);
+        }
+        d.lookahead->submit(d.layers, x_f, n_tok, d.host_res);   // CS-T: warm layer + 1
+    }
     if (k < 1 || n_tok * k > kMaxWindowEntries) {
         d.failed = true;
         d.fail = "a verify window routes more entries than the expert pool's window tables hold";
