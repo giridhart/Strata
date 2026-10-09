@@ -138,6 +138,12 @@ inline IntelGpuGen intel_gpu_gen(const sycl::device& d) {
     std::string n;
     try { n = d.get_info<sycl::info::device::name>(); } catch (...) { return IntelGpuGen::Unknown; }
     if (n.find("Intel") == std::string::npos) return IntelGpuGen::Unknown;
+    // "Intel(R) Graphics [0xe223]": drivers that print the PCI id instead of a marketing name (the B70 on Linux)
+    if (const size_t b = n.find("[0x"); b != std::string::npos) {
+        const unsigned long id = std::strtoul(n.c_str() + b + 1, nullptr, 16);
+        if (id >= 0xE200 && id <= 0xE2FF) return IntelGpuGen::Battlemage;                 // BMG-G21 / G31
+        if ((id >= 0x5690 && id <= 0x56BF) || id == 0x56C0 || id == 0x56C1) return IntelGpuGen::Alchemist;   // DG2
+    }
     if (n.find("Battlemage") != std::string::npos) return IntelGpuGen::Battlemage;
     if (n.find("Alchemist") != std::string::npos) return IntelGpuGen::Alchemist;
     // "Arc(TM) Pro B70", "Arc(TM) B580", "Arc(TM) A750": a letter and 2-3 digits, as a whole word
