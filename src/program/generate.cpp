@@ -4617,7 +4617,7 @@ int main(int argc, char** argv) {
         // windows, the prompt path) comes out of the reserve.  0.1.40 ended a 20 GB RX 7900 XT with 2,170 MiB free
         // (its write-back check cut the cache); 0.1.40.2 passed that check with the default 700 MiB and ended with
         // 323 MiB, where Windows paged and decode fell from 52 to 21-25 tok/s.  --vram-reserve-mib 2600 fixed it.  So on
-        // Windows HIP an auto cache on a card of 16 GiB or more keeps a floor of kWddmAutoReserveMib.  CUDA on Windows is
+        // Windows HIP an auto cache on a card of 16 GB (15 GiB and up, #1709) keeps a floor of kWddmAutoReserveMib.  CUDA on Windows is
         // left as it was: the same 0.1.40 / 0.1.40.2 pair on an RTX 5070 ended with the same slots and free VRAM, and a
         // floor there would only cost 16 GB+ NVIDIA cards ~1.8 GiB of cache.  A reserve given on the command line is
         // kept as it is; a smaller card keeps its own sizing (#496 lowers the reserve further when the cache would not
@@ -4626,7 +4626,8 @@ int main(int argc, char** argv) {
         if (!o.vram_reserve_given && o.vram_reserve_mib < kWddmAutoReserveMib) {
 #if defined(_WIN32) && defined(STRATA_USE_HIP)
             size_t fb_now = 0, tb_now = 0;
-            if (cudaMemGetInfo(&fb_now, &tb_now) == cudaSuccess && tb_now >= (16ull << 30)) {
+            // #1709: a 16 GB card (RX 9070 XT, 7800 XT) reports 15.9 GiB, just under 16: the floor is for 15 GiB and up
+            if (cudaMemGetInfo(&fb_now, &tb_now) == cudaSuccess && tb_now >= (15ull << 30)) {
                 std::fprintf(stderr, "strata generate: expert cache auto: Windows keeps %d MiB free after the cache on a card "
                                      "this size (the default %d MiB left 323 MiB on a 20 GB card and Windows paged, #1376); "
                                      "--vram-reserve-mib N sets it\n", kWddmAutoReserveMib, o.vram_reserve_mib);
