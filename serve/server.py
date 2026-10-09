@@ -724,6 +724,12 @@ class StrataEngine:
         self.slot_gs = gs if groups > 1 and groups_run > 1 else 0
         self.slot_q = [queue.Queue() for _ in range(self.batch)]
         self.slot_busy = [False] * self.batch
+        # #1603: who owns a busy flag.  slot_claims: slots a request of this server picked or reserved and has not
+        # given back; slot_releasing: slots handed to the background BDONE wait.  A busy slot in neither has no owner
+        # (its flag leaked) and would keep every later request waiting for a slot that nothing will free.
+        self.slot_claims: set[int] = set()
+        self.slot_releasing: set[int] = set()
+        self._orphan_seen: dict[int, float] = {}
         # what each slot's sessions hold (prompt + every token a window fed), so a conversation's next turn goes to
         # the slot that has its start (the engine checks it again); when the slot was last used
         self.slot_held: list[list[int]] = [[] for _ in range(self.batch)]
@@ -736,6 +742,7 @@ class StrataEngine:
         if "slot_cv" not in self.__dict__:
             self.slot_cv = threading.Condition()
             self.waiting = 0                            # requests waiting for the control lines (ctl)
+            self.admitting = 0                          # #1603: ... and those that gave the lines back to wait for a slot
             self.wait_lens: list[list[int]] = []        # ... their prompt lengths (a long read gives way to short ones)
             self.ctl_epoch = 0                          # how often the control lines were taken
             self.ctl = threading.Lock()                 # one admission or solo request on the control lines at a time
@@ -1088,6 +1095,8 @@ class StrataEngine:
         except EngineDied:
             pass
         q, busy, held = self.slot_q[slot], self.slot_busy, self.slot_held   # this process's: restart() replaces them
+        releasing = self.slot_releasing
+        releasing.add(slot)
 
         def wait():
             end = time.monotonic() + 600.0
@@ -1110,8 +1119,34 @@ class StrataEngine:
             held[slot] = tail[:-1] if stream and tail else []
             with self.slot_cv:
                 busy[slot] = False
+                releasing.discard(slot)
                 self.slot_cv.notify_all()
         threading.Thread(target=wait, daemon=True).start()
+
+    ORPHAN_SLOT_S = 3.0   # #1603: a busy flag nobody owns this long is a leak and is given back
+
+    def _reap_orphan_slots(self) -> list[int]:
+        """#1603: free the slots whose busy flag has no owner (no request holds or reserves them and no BDONE wait is
+        running for them).  The caller holds slot_cv.  A flag that leaked kept every later request waiting for a slot
+        that nothing would free - with nothing running, nothing queued and nothing for the frozen-engine check to see.
+        A slot is only given back after it has looked ownerless for ORPHAN_SLOT_S, so a flag set a moment before its
+        owner registers is never taken."""
+        now = time.monotonic()
+        freed = []
+        for b, busy in enumerate(self.slot_busy):
+            if busy and b not in self.slot_claims and b not in self.slot_releasing:
+                first = self._orphan_seen.setdefault(b, now)
+                if now - first >= self.ORPHAN_SLOT_S:
+                    self.slot_busy[b] = False
+                    self._orphan_seen.pop(b, None)
+                    freed.append(b)
+            else:
+                self._orphan_seen.pop(b, None)
+        if freed:
+            print(f"[strata] parallel: slot(s) {', '.join(map(str, freed))} were marked busy with no request using them "
+                  "(issue #1603); freed, the waiting request goes on", flush=True)
+            self.slot_cv.notify_all()
+        return freed
 
     YIELDS_MAX = 2   # #656: how often one request's prompt read gives way to a shorter waiting one
 
@@ -1200,6 +1235,7 @@ class StrataEngine:
         phase = "none"            # solo -> (admit -> slot) ; "done" once the engine has finished with this request
         stop_sent = False
         yields, solo_again = 0, 0
+        admit_wait, admit_since, admit_said = False, 0.0, False   # #1603: waiting for a slot, since when, said
         try:
             while True:   # a request in a slot that is left alone goes back to the solo path
                 if not holding:
@@ -1230,6 +1266,7 @@ class StrataEngine:
                                     reserved = self.pick_slot(prompt)
                                     if reserved is not None:
                                         self.slot_busy[reserved] = True
+                                        self.slot_claims.add(reserved)
                                 if reserved is not None:
                                     self._send(f"BYIELD {reserved}")
                             yield None
@@ -1243,6 +1280,7 @@ class StrataEngine:
                     elif reserved is not None:              # it did not give way: the slot is free again
                         with self.slot_cv:
                             self.slot_busy[reserved] = False
+                            self.slot_claims.discard(reserved)
                             self.slot_cv.notify_all()
                         reserved = None
                     if slot is None:
@@ -1265,11 +1303,29 @@ class StrataEngine:
                                 slot = self.pick_slot(prompt)
                                 if slot is not None:
                                     self.slot_busy[slot] = True
+                                    self.slot_claims.add(slot)
+                                    if admit_wait:
+                                        admit_wait = False
+                                        self.admitting = max(0, self.admitting - 1)
                                     break
+                                if not admit_wait:          # #1603: counted while it waits for a slot (it holds no
+                                    admit_wait, admit_since = True, time.monotonic()   # control lines then)
+                                    self.admitting += 1
                             if holding:
                                 self.ctl.release()
                                 holding = False
                             with self.slot_cv:
+                                if self.pick_slot(prompt) is None:
+                                    if (ENGINE_STALL_S or 0) > 0 and time.monotonic() - admit_since >= ENGINE_STALL_S:
+                                        # the stall check of #1317 only watches a request on the control lines; one
+                                        # waiting here is covered by looking for a slot nobody owns, and by saying so
+                                        if not admit_said:
+                                            admit_said = True
+                                            busy = [b for b, v in enumerate(self.slot_busy) if v]
+                                            print(f"[strata] parallel: a request has waited {time.monotonic() - admit_since:.0f} s "
+                                                  f"for a free slot (busy: {busy}, in use: {sorted(self.slot_claims)}, "
+                                                  f"ending: {sorted(self.slot_releasing)}) (issue #1603)", flush=True)
+                                    self._reap_orphan_slots()
                                 if self.pick_slot(prompt) is None:
                                     self.slot_cv.wait(timeout=1.0)
                             if cancel.is_set():
@@ -1372,6 +1428,7 @@ class StrataEngine:
                             self.slot_used[slot] = time.time()
                             with self.slot_cv:
                                 self.slot_busy[slot] = False
+                                self.slot_claims.discard(slot)
                                 self.slot_cv.notify_all()
                             slot, gen0 = None, None
                             if reused0 is None:
@@ -1402,9 +1459,13 @@ class StrataEngine:
                 self.last = {**self.last, "reused": reused0}
             if holding:
                 self.ctl.release()
+            if admit_wait:
+                with self.slot_cv:
+                    self.admitting = max(0, self.admitting - 1)
             if reserved is not None:
                 with self.slot_cv:
                     self.slot_busy[reserved] = False
+                    self.slot_claims.discard(reserved)
                     self.slot_cv.notify_all()
             if slot is not None:
                 self.slot_live[slot] = None
@@ -1413,9 +1474,11 @@ class StrataEngine:
                     self.slot_held[slot] = []
                     stream = list(prompt) + out[gen0:] if gen0 is not None and len(out) > gen0 else None
                     self._release_slot_when_done(slot, stream)    # freed at its BDONE
+                    self.slot_claims.discard(slot)                # (the BDONE wait owns it now)
                 else:
                     with self.slot_cv:
                         self.slot_busy[slot] = False
+                        self.slot_claims.discard(slot)
                         self.slot_cv.notify_all()
 
     slot_groups = 1         # --batch-groups (set when the engine starts)
@@ -2912,19 +2975,30 @@ class Service:
             return
         trace = getattr(self.request_trace, "record", None)
         waiting = time.perf_counter()
-        with self.fifo:
-            loading = time.perf_counter()
-            if trace is not None:
+        with self.status_lock:                          # #1603: waiting for the fifo to start the engine is queued, not nothing
+            self.status["queued"] += 1
+        counted = True
+        try:
+            with self.fifo:
                 with self.status_lock:
-                    trace["queue_s"] += round(loading - waiting, 3)
-                    trace["state"] = "loading"
-            try:
-                self.ensure_loaded()
-            finally:
+                    self.status["queued"] -= 1
+                counted = False
+                loading = time.perf_counter()
                 if trace is not None:
                     with self.status_lock:
-                        trace["load_s"] += round(time.perf_counter() - loading, 3)
-                        trace["state"] = "queued"
+                        trace["queue_s"] += round(loading - waiting, 3)
+                        trace["state"] = "loading"
+                try:
+                    self.ensure_loaded()
+                finally:
+                    if trace is not None:
+                        with self.status_lock:
+                            trace["load_s"] += round(time.perf_counter() - loading, 3)
+                            trace["state"] = "queued"
+        finally:
+            if counted:
+                with self.status_lock:
+                    self.status["queued"] -= 1
 
     def unload(self, idle_for: float | None = None) -> str:
         """Stop the engine between requests: "unloaded", "not loaded", "busy" (a request is running or waiting, or
@@ -3118,7 +3192,8 @@ class Service:
             # the requests in flight that are not in a slot: the one alone on the solo path, or waiting their turn
             in_slots = sum(1 for x in slots if x["state"] != "idle")
             live.update(parallel=par, running=running, slots=slots, outside_slots=max(0, running - in_slots),
-                        waiting=int(getattr(self.engine, "waiting", 0) or 0))
+                        waiting=int(getattr(self.engine, "waiting", 0) or 0),
+                        admitting=int(getattr(self.engine, "admitting", 0) or 0))
             if running and state == "idle":
                 live["state"] = "generating"
         engine = {"model": self.model, "max_context": self.reported_ctx(), "images": self.vision is not None,
@@ -3495,12 +3570,27 @@ class Service:
                         if trace is not None:
                             trace["queue_s"] += round(time.perf_counter() - waiting, 3)
                             trace["state"] = "generating"
-                        self.status["queued"] -= 1
+                        if not par:
+                            self.status["queued"] -= 1
                     # issue #27: it died in an earlier request (or was unloaded) - start it again instead of failing
-                    # (parallel requests do not hold the fifo: one of them starts it, the others wait for that)
-                    with (self.fifo if par else contextlib.nullcontext()):
-                        self.ensure_loaded()
+                    # (parallel requests do not hold the fifo: one of them starts it, the others wait for that).
+                    # #1603: a parallel request stays counted as queued until it is registered as running below -
+                    # waiting here for the fifo (an image encode, a /v1/vram resize) left it neither - and one on a
+                    # loaded engine has nothing to start, so it does not wait for the fifo at all
+                    try:
+                        if not par:
+                            self.ensure_loaded()
+                        elif not (self.loaded() and not self._vision_down()):
+                            with self.fifo:
+                                self.ensure_loaded()
+                    except BaseException:
+                        if par:
+                            with self.status_lock:
+                                self.status["queued"] -= 1
+                        raise
                     with self.status_lock:
+                        if par:
+                            self.status["queued"] -= 1
                         st.update(busy=True, phase="reading the prompt", prompt_tokens=len(ids),
                                   generated=0, started=time.time(), first_token=None, tool=None, tail="",
                                   max_tokens=max_new, reasoning_recoveries=0)
