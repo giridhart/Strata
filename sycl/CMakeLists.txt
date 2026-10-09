@@ -37,6 +37,9 @@ if(STRATA_SYCL_SPIN_MAX)
   add_compile_definitions(STRATA_SYCL_SPIN_MAX=${STRATA_SYCL_SPIN_MAX}u)
 endif()
 set(_sycl_flags -fsycl)
+if(STRATA_SYCL_AOT MATCHES "^(bmg|lnl|pvc)")
+  add_compile_definitions(STRATA_NO_DG2_XMX=1)   # the grouped XMX kernels (sub-group 8, 8x8x16) do not compile for Xe2 / Xe-HPC
+endif()
 if(STRATA_SYCL_AOT)
   list(APPEND _sycl_flags -fsycl-targets=spir64_gen)
   # the divide/sqrt rounding option (below) must reach ocloc here: an AOT build has no spir64 backend to take it

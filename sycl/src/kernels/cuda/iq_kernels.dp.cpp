@@ -5213,6 +5213,7 @@ void launch(sycl::queue& q, int ty, bool gu, const sycl::half* X, float* Y, cons
     constexpr int BM = C::BM, BN = C::BN, KS = C::KS, WG = C::WG, SG = C::SG;
     constexpr int LDA = KS + 8, LDB = KS + 8;
     const int nb = N / BN;
+#ifndef STRATA_NO_DG2_XMX
     q.submit([&](sycl::handler& h) {
         sycl::local_accessor<sycl::half, 1> sa(BM * LDA, h), sb(BN * LDB, h);
         auto props = sycl::ext::oneapi::experimental::properties{sycl::ext::intel::experimental::grf_size<256>};
@@ -5298,6 +5299,11 @@ void launch(sycl::queue& q, int ty, bool gu, const sycl::half* X, float* Y, cons
             }
         });
     });
+#else
+    (void) q; (void) X; (void) Y; (void) gp; (void) ntiles; (void) N; (void) K;
+    std::fprintf(stderr, "grouped XMX: the 8x8x16 / sub-group 8 kernel is not built for this device (STRATA_NO_DG2_XMX)\n");
+    std::exit(1);
+#endif
 }
 class k_xg_small; class k_xg_big;
 using Small = Cfg<2, 8, 4, 2>;   // 64 x 128

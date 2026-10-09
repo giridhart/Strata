@@ -7,6 +7,7 @@
 #include <sycl/ext/oneapi/matrix/matrix.hpp>
 #include <sycl/ext/intel/experimental/grf_size_properties.hpp>
 #include <cstdlib>
+#include <cstdio>
 #include "strata/sycl_queue.hpp"
 #include "strata/prefill/xmx_moe.hpp"
 
@@ -34,6 +35,7 @@ void launch(sycl::queue& q, const half* X, float* Y, const Grp& gp, int ntiles, 
     constexpr int BM = C::BM, BN = C::BN, KS = C::KS, WG = C::WG, SG = C::SG;
     constexpr int LDA = KS + 8, LDB = KS + 8;
     const int nb = N / BN;
+#ifndef STRATA_NO_DG2_XMX
     q.submit([&](sycl::handler& h) {
         sycl::local_accessor<half, 1> sa(BM * LDA, h), sb(BN * LDB, h);
         auto props = sycl::ext::oneapi::experimental::properties{sycl::ext::intel::experimental::grf_size<256>};
@@ -107,6 +109,11 @@ void launch(sycl::queue& q, const half* X, float* Y, const Grp& gp, int ntiles, 
             }
         });
     });
+#else
+    (void) q; (void) X; (void) Y; (void) gp; (void) ntiles; (void) N; (void) K;
+    std::fprintf(stderr, "grouped XMX: the 8x8x16 / sub-group 8 kernel is not built for this device (STRATA_NO_DG2_XMX)\n");
+    std::exit(1);
+#endif
 }
 
 class k_small; class k_big;
@@ -126,7 +133,22 @@ int fill(Grp& gp, const int32_t* cnt, int n) {
 }  // namespace
 
 int mode() {
-    static const int v = [] { const char* e = std::getenv("STRATA_PF_XMX"); return e ? std::atoi(e) : 0; }();
+    // The kernels are joint_matrix 8x8x16 on sub-group 8: DG2 (Arc A-series) only. Battlemage has neither.
+    static const int v = [] {
+        const char* e = std::getenv("STRATA_PF_XMX");
+        const int want = e ? std::atoi(e) : 0;
+        if (want == 0) return 0;
+#ifdef STRATA_NO_DG2_XMX
+        std::fprintf(stderr, "STRATA_PF_XMX ignored: this build is AOT for a device without the sub-group 8 XMX kernels\n");
+        return 0;
+#else
+        if (strata::intel_gpu_gen(strata::q_of(nullptr)->get_device()) == strata::IntelGpuGen::Battlemage) {
+            std::fprintf(stderr, "STRATA_PF_XMX ignored: Battlemage has no sub-group 8 / 8x8x16 joint_matrix (Arc A-series only)\n");
+            return 0;
+        }
+        return want;
+#endif
+    }();
     return v;
 }
 bool enabled() { return mode() != 0; }

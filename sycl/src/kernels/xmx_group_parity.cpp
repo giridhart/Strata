@@ -2,6 +2,7 @@
 // oneMKL per expert, on random expert blobs of each format the native packs use.  Also times both.
 //   xmx_group_parity [mean_rows=160] [n=16]
 #include "strata/kernels/iq_kernels.hpp"
+#include "strata/sycl_queue.hpp"
 #include <sycl/sycl.hpp>
 #include <dpct/dpct.hpp>
 #include <dpct/blas_utils.hpp>
@@ -16,6 +17,15 @@ int main(int argc, char** argv) {
     const int mean = argc > 1 ? std::atoi(argv[1]) : 160;
     const int n = argc > 2 ? std::atoi(argv[2]) : 16;
     sycl::queue* q = &dpct::get_in_order_queue();
+#ifdef STRATA_NO_DG2_XMX
+    std::printf("xmx_group_parity: SKIP (the sub-group 8 / 8x8x16 kernels are not built for this AOT device)");
+    return 0;
+#else
+    if (strata::intel_gpu_gen(q->get_device()) == strata::IntelGpuGen::Battlemage) {
+        std::printf("xmx_group_parity: SKIP (Battlemage has no sub-group 8 / 8x8x16 joint_matrix)");
+        return 0;
+    }
+#endif
     dpct::blas::descriptor_ptr hd = new dpct::blas::descriptor();
     hd->set_queue(q);
     std::mt19937 rng(3);
