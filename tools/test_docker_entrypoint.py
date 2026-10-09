@@ -97,11 +97,8 @@ class Entrypoint(unittest.TestCase):
 
     def warning_for(self, flags):
         info = self.tmp / "cpuinfo"
-        info.write_text(f"processor	: 0
-flags		: {flags}
-")
-        (self.data / "config" / "strata-iq3_s.json").write_text('{"args": ["x"]}
-')
+        info.write_text(f"processor\t: 0\nflags\t\t: {flags}\n")
+        (self.data / "config" / "strata-iq3_s.json").write_text('{"args": ["x"]}\n')
         env = dict(os.environ, STRATA_DATA=str(self.data), MODEL="IQ3_S", REINSTALL="0", STRATA_CPUINFO=str(info))
         r = subprocess.run([SH, str(self.script)], env=env, capture_output=True, text=True, timeout=60)
         self.assertEqual(r.returncode, 0, r.stderr)     # a warning, never a stop (#1584)
