@@ -3376,6 +3376,27 @@ class ThinkingBudget(unittest.TestCase):
         self.assertIn("answering: 10 of max 6400 tokens", lines[1])
         self.assertIn("thinking: 10 of max 6400 tokens", lines[2])
 
+    def test_a_budget_above_max_tokens_is_capped_to_leave_room_for_the_answer(self):
+        """#984: max_tokens 300 and a budget of 5000 never fired: the reply ended while still thinking.  The thinking
+        is closed at max_tokens less the answer's reserve (max 512 or a quarter, at most half), with one log line."""
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code, b = self.openai(max_tokens=300, reasoning_budget_tokens=5000)
+        self.assertEqual(code, 200, b)
+        msg = b["choices"][0]["message"]
+        self.assertTrue(msg["reasoning_content"].startswith(ThinkingEngine.THOUGHT[:150] + "\n"), msg)
+        self.assertEqual((msg["content"], b["choices"][0]["finish_reason"]), (ThinkingEngine.ANSWER, "stop"))
+        self.assertEqual(len(self.engine.prompts), 2)
+        self.assertIn("thinking capped at 150 of max_tokens 300 to leave room for the answer (budget 5000)", out.getvalue())
+
+    def test_a_budget_well_below_max_tokens_is_not_capped(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code, b = self.openai(max_tokens=3000, reasoning_budget_tokens=20)
+        self.assertNotIn("thinking capped", out.getvalue())
+        self.assertEqual(len(self.engine.prompts), 2)
+        self.assertTrue(b["choices"][0]["message"]["reasoning_content"].startswith(ThinkingEngine.THOUGHT[:20] + "\n"))
+
     def test_a_shared_budget_reaches_a_request_that_sets_none(self):
         """The Chat settings shared with other apps may carry a thinking budget too, like max_tokens and the effort."""
         self.svc.set_shared({"reasoning_budget_tokens": 20})

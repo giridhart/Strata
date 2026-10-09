@@ -142,6 +142,7 @@ VISION_START = "<|vision_start|>"
 # broken state that answers one token forever (an issue saw 36,689 tokens of "!"). The config's "repeat_stop_tokens"
 # sets it; 0 turns it off.
 REPEAT_STOP_TOKENS = 256
+ANSWER_RESERVE_MIN = 512      # #984: the tokens kept for the answer when a thinking budget is cut down to fit max_tokens
 # #123: what closes the thinking when it reaches reasoning_budget_tokens (the model's own end-of-thinking tag after it)
 # #1053 (opt-in "reasoning_close_retry": true): a reply that ends on its stop token still inside <think>, with no answer
 # and no call, is continued once with the thinking closed (the same way the budget's wrap-up closes it)
@@ -3539,6 +3540,14 @@ class Service:
             sampling = {**defaults, **req_values}
         # #123: read after the merge, so a budget shared through POST /settings is seen like the other keys
         budget = self.reasoning_budget(sampling) if thinking else None
+        if budget and max_new and max_new > 0:
+            # #984: a budget at or near max_tokens never fires before the reply is cut off while still thinking, so
+            # it has no answer.  Close the thinking early enough to leave room for one.
+            reserve = min(max(ANSWER_RESERVE_MIN, max_new // 4), max_new // 2)
+            if budget > max_new - reserve:
+                print(f"[strata] thinking capped at {max_new - reserve} of max_tokens {max_new} to leave room for "
+                      f"the answer (budget {budget})", flush=True)
+                budget = max(1, max_new - reserve)
         parser = OutputParser(thinking=thinking, tools=tools, stream_tools=True, recover=self.tool_call_recovery)
         detok, n, finish = Detokenizer(self.tok), 0, "length"
         run_tok, run_len, repeated = None, 0, False     # #606: the current run of one repeated token
