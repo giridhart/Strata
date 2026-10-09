@@ -36,6 +36,8 @@ for line in sys.stdin:
 '''
 
 
+@unittest.skipIf(os.name == "nt", "the .cmd wrapper keeps the pipe open after the kill (only the wrapper dies), so the "
+                                  "close of its stdout waits for the sleeping child; a real engine is one process")
 class ReadyTimeout(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(); self.addCleanup(self.tmp.cleanup)
