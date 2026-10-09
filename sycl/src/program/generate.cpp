@@ -2190,6 +2190,9 @@ int main(int argc, char **argv) try {
                 // PCI device ids, the same table setup_intel.py uses: 56a0 A770, 56a1 A750, 56a2 A580, 56a5 A380,
                 // 56a6 A310, 5690 A770M
                 const unsigned id = dpct::get_current_device().get_info<sycl::ext::intel::info::device::device_id>();
+                // Only a card with room for an expert cache past 4 GiB can hit it: on an 8 GB A750 the cache was 0.34 GiB
+                // and the own-buffers reservation cost experts (prompt 72 -> 52 tok/s, decode -6%, 4K prompt, 4 rounds)
+                if (dpct::get_current_device().get_info<sycl::info::device::global_mem_size>() < (12ull << 30)) return false;
                 switch (id & 0xffffu) {
                 case 0x56a0: case 0x56a1: case 0x56a2: case 0x56a5: case 0x56a6: case 0x5690: return true;
                 default: return false;
