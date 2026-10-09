@@ -57,8 +57,13 @@ if(NOT STRATA_SYCL_AOT)
   # every expert in the cache's last 0.46 GiB dequantized to NaN in the prompt path, and every prompt answered "!!!!"
   # (token 0). This option keeps the kernels on 64-bit (stateless) addresses; with it the same prompts are right.
   # (One backend argument for both: CMake drops a repeated -Xsycl-target-backend=spir64.)
-  list(APPEND _sycl_link "-Xsycl-target-backend=spir64"
-       "-cl-fp32-correctly-rounded-divide-sqrt -ze-opt-greater-than-4GB-buffer-required")
+  option(STRATA_SYCL_JIT_STATELESS "JIT build: keep kernels on 64-bit addresses (-ze-opt-greater-than-4GB-buffer-required)" ON)
+  if(STRATA_SYCL_JIT_STATELESS)
+    list(APPEND _sycl_link "-Xsycl-target-backend=spir64"
+         "-cl-fp32-correctly-rounded-divide-sqrt -ze-opt-greater-than-4GB-buffer-required")
+  else()
+    list(APPEND _sycl_link "-Xsycl-target-backend=spir64" "-cl-fp32-correctly-rounded-divide-sqrt")
+  endif()
 endif()
 # Every translation unit gets -fsycl: the migrated host files construct queues and USM, not only the kernels.
 # icpx defaults to a fast floating-point model (reciprocal approximations, reassociation); the kernels are
