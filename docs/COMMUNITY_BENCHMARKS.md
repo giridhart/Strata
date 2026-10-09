@@ -12,6 +12,14 @@ and their limits. Report what you actually measured and label estimates separate
 
 ## Community reports
 
+- [2026-10-08: Tesla V100-SXM2-32GB (sm_70), Threadripper 2990WX without AVX-512, 96 GB RAM](../bench/results/2026-10-08-community-v100-sm70-table/README.md):
+  Strata `fb58e0d` (v0.1.41) source build for sm_70, Unsloth UD-IQ4_XS with a native-experts pack,
+  262,144-token context, `--kv int8`, `--prefill auto`; **confirms the opt-in Volta decode kernels**
+  (`STRATA_SM70_TABLE=1`) that [NVIDIA_V100.md](NVIDIA_V100.md) asks a V100 owner to check: decode
+  **+9.8% and +15.0%** in two order-swapped pairs (28.16/28.64 → 30.92/32.94 tok/s), prompt throughput
+  unchanged, and the generated tokens **bit-identical** in all four runs. Also notes that
+  `tools/ab_engine.py`'s three short chats are below this machine's noise floor (the long-prompt arm
+  points the same way, +5%).
 - [2026-09-30: RTX 5090, Core Ultra 9 285K, 64 GB RAM](../bench/results/2026-09-30-community-rtx-5090/README.md):
   Strata 0.1.29, original Flash-Next IQ2_XS, 131,072-token context; three runs
   each at 4,096, 32,768, and 128,000 prompt tokens, plus six recall checks.
