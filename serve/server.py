@@ -54,7 +54,7 @@ from urllib.parse import parse_qs, urlsplit
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a module
-from serve.frontend import (ChatTemplate, Event, OutputParser, anthropic_to_messages,  # noqa: E402
+from serve.frontend import (THINK_END, ChatTemplate, Event, OutputParser, anthropic_to_messages,  # noqa: E402
                             forced_call, images_of, literal_tags, mark_think_literals, openai_to_messages,
                             tool_choice_of, unmark_think_literals)
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
@@ -196,6 +196,7 @@ def focused_recovery_prompt(tok, ids, generated):
 
 
 LOOPBACK_NAMES = ("localhost", "127.0.0.1", "::1")
+QUEUE_BEAT_S = 10.0         # a request waiting for the single turn sends a keep-alive this often (#1619)
 CTX_SLACK = 8               # `strata --serve` rejects prompt + max_new + 8 > context: keep the same margin here
 # The live tok/s is a rate over a window, not a mean since the first token: a mean reads ~1/elapsed at the first
 # token (the Monitor showed five-digit numbers) and then undershoots for the first second of every answer.
@@ -690,8 +691,10 @@ class StrataEngine:
                 pass
             why = (f"the engine did not report READY within {ENGINE_READY_S:.0f} s" if timed_out else
                    "the engine exited before it was ready")
-            raise RuntimeError(why + (f" (see {log})" if log else "") +
-                               start_failure_hint(log, log_start) + start_log_tail(log, log_start))
+            # EngineDied, not bare RuntimeError: a request waiting on this load must end with a 503
+            # through the request path's handler - a RuntimeError there left the turn with no answer (#1527)
+            raise EngineDied(why + (f" (see {log})" if log else "") +
+                             start_failure_hint(log, log_start) + start_log_tail(log, log_start))
         self.known_ctx = self.max_context   # survives a failed restart: requests keep their limit and restart it
         # (from PR #41, midhatn) a locally built engine can sit next to another release's BUILD.json: engines that
         # report their own version (INFO engine=, 0.1.8+) win, the manifest stays the fallback for older ones
@@ -878,8 +881,10 @@ class StrataEngine:
                     time.sleep(self.RESTART_RETRY_S)
         finally:
             self.starting = False
-            with self.slot_cv:                   # #1012: wake the requests that waited through it: they go on with the
-                self.slot_cv.notify_all()        # new engine, or (it did not start) end with a clean EngineDied
+            # a lazy first start never reached the post-READY __init__ where slot_cv is made (#1527)
+            if "slot_cv" in self.__dict__:
+                with self.slot_cv:               # #1012: wake the requests that waited through it: they go on with the
+                    self.slot_cv.notify_all()    # new engine, or (it did not start) end with a clean EngineDied
         self.info = {**info, **self.info}
 
     def _parse_done(self, line):
@@ -3365,12 +3370,14 @@ class Service:
         room = ctx - CTX_SLACK - len(ids)
         if max_new is None or max_new <= 0 or (self.fit_max_tokens and room < 1):
             if room < 1:
-                raise ValueError(f"prompt ({len(ids)} tokens) leaves no room to answer in the context "
+                raise ValueError("request exceeds the context window: "
+                                 f"prompt ({len(ids)} tokens) leaves no room to answer in the context "
                                  f"({ctx}); requests are never truncated")
             max_new = room
         elif max_new > room:
             if not self.fit_max_tokens:
-                raise ValueError(f"prompt ({len(ids)} tokens) + max tokens ({max_new}) exceeds the context "
+                raise ValueError("request exceeds the context window: "
+                                 f"prompt ({len(ids)} tokens) + max tokens ({max_new}) exceeds the context "
                                  f"({ctx}); requests are never truncated. Send a smaller "
                                  f"max_tokens (at most {max(0, room)} here), or add \"fit_max_tokens\": true to the "
                                  "model's strata-<model>.json to shorten it to the room left (#545)")
@@ -3564,7 +3571,32 @@ class Service:
             self.status["queued"] += 1
         try:
             # --batch: the engine runs several requests at once (StrataEngine.generate_batched orders them)
-            with (contextlib.nullcontext() if getattr(self.engine, "batch", 0) else self.fifo):
+            turn = contextlib.ExitStack()
+            if not getattr(self.engine, "batch", 0):
+                # #1619: a request waiting for the single turn sends a keep-alive every QUEUE_BEAT_S, so a client with
+                # a stream idle timeout does not abort a healthy queued request (and its retry read the prompt again);
+                # a client that left while queued gives its place up instead of taking the turn only to cancel there
+                got = False
+                try:
+                    while not got:
+                        got = self.fifo.acquire(timeout=QUEUE_BEAT_S)
+                        if got:
+                            turn.callback(self.fifo.release)
+                        elif cancel.is_set():
+                            break
+                        else:
+                            yield "ping", None
+                except BaseException:                    # the consumer closed us at a ping: no longer queued
+                    with self.status_lock:
+                        self.status["queued"] -= 1
+                    raise
+                if not got:                              # cancelled while queued
+                    with self.status_lock:
+                        self.status["queued"] -= 1
+                    yield "done", {"finish": "cancel", "completion_tokens": 0, "reused": 0, "timings": None,
+                                   "reasoning_tokens": 0, "reasoning_recoveries": 0}
+                    return
+            with turn:
                 try:
                     with self.status_lock:
                         if trace is not None:
@@ -3622,6 +3654,9 @@ class Service:
                                     with self.status_lock:
                                         trace["first_token_s"] = round(time.perf_counter() - trace["_clock"], 3)
                                 if t in self.stop_ids:
+                                    if force and parser.state == "reasoning" and parser.buf == THINK_END:
+                                        opens = True    # #537: the held </think> was the end: the call opens there
+                                        break
                                     finish = "stop"
                                     raw_ids.append(t)
                                     break
@@ -3718,6 +3753,7 @@ class Service:
                             continue
                         if (self.reasoning_close_retry and thinking and finish == "stop" and not close_retried
                                 and not answered and not wrap and not opens and parser.state == "reasoning"
+                                and parser.buf != THINK_END         # #537: not after a held </think>, the end
                                 and (stops is None or stops.hit is None) and not cancel.is_set()):
                             # #1053: the model wrote its reasoning and stopped before </think>: the client would get
                             # an empty answer.  Close the thinking once and let it answer.
@@ -4362,10 +4398,13 @@ def make_handler(svc: Service):
                 if size < 0:
                     raise BadBody(400, "malformed chunk size in the request body")
                 if size == 0:
-                    for _ in range(64):                       # the trailers, up to the blank line
-                        if self.rfile.readline(8193).strip() == b"":
-                            break
-                    return b"".join(parts)
+                    for _ in range(64):                       # the trailers, including the final blank line
+                        trailer = self.rfile.readline(8193)
+                        if trailer == b"\r\n":
+                            return b"".join(parts)
+                        if not trailer.endswith(b"\r\n"):
+                            raise BadBody(400, "malformed or incomplete chunked request trailers")
+                    raise BadBody(400, "too many chunked request trailers")
                 total += size
                 if total > limit:
                     self.close_connection = True

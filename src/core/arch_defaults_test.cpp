@@ -30,6 +30,7 @@ int main() {
     CHECK(arch_default_env("gfx1100").empty());
     CHECK(arch_default_env("gfx1201:sramecc-:xnack-").empty());
     CHECK(arch_default_env("gfx1150").empty());
+    CHECK(arch_default_env("gfx1152").empty());
     CHECK(arch_default_env("gfx11510").empty());   // not a prefix match
     CHECK(arch_default_env("").empty());
     CHECK(arch_default_env(nullptr).empty());

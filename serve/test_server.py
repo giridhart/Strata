@@ -3243,6 +3243,15 @@ class ReasoningCloseRetry(unittest.TestCase):
         self.assertEqual(len(self.engine.prompts), 1)
         self.assertEqual(c["message"]["content"], "Fine.")
 
+    def test_a_reply_that_closed_its_thinking_right_after_a_quote_is_not_touched(self):
+        # #537: that </think> waits for the character after it; the end of the turn makes it the end of the thinking
+        self.svc.reasoning_close_retry = True
+        self.engine.THOUGHT = 'two plus two is "4"</think>'
+        c = self.chat()
+        self.assertEqual(len(self.engine.prompts), 1)
+        self.assertFalse(c["message"].get("content"))
+        self.assertEqual(c["message"]["reasoning_content"], 'two plus two is "4"')
+
 
 class ThinkingBudget(unittest.TestCase):
     """#123: reasoning_budget_tokens (opt-in): at the budget the thinking is wrapped up and the model answers,
@@ -3477,6 +3486,26 @@ class ForcedToolChoice(unittest.TestCase):
                     # where the thinking ended, after the blank line the template puts before a call
                     self.assertEqual(second, first + self.tok.encode(CallingEngine.THOUGHT + "</think>\n\n" + opening))
 
+    def test_a_thinking_that_ends_right_after_a_quote_opens_the_call(self):
+        # #537: that </think> waits for the character after it; the end of the turn makes it the end of the thinking
+        thought, calling = 'I will search for "2+2"', self.engine.generate
+
+        def generate(ids, max_new, sampling, cancel, embeddings=None):
+            if self.tok.decode(ids).endswith(("<function=", "<function=search>\n")):
+                yield from calling(ids, max_new, sampling, cancel)
+                return
+            self.engine.prompts.append(list(ids))
+            yield from self.tok.encode(thought + "</think>") + self.tok.encode("<|im_end|>", parse_special=True)
+        self.engine.generate = generate
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                self.engine.prompts = []
+                code, b = self.openai(tool_choice="required", stream=stream)
+                finish, calls, reasoning = self.call_of(code, b, stream)
+                self.assertEqual((finish, calls, reasoning), ("tool_calls", [("search", {"q": "2+2"})], thought))
+                first, second = self.engine.prompts
+                self.assertEqual(second, first + self.tok.encode(thought + "</think>\n\n<tool_call>\n<function="))
+
     def test_without_thinking_the_prompt_ends_with_the_opening(self):
         for choice in ("required", self.NAMED):
             for stream in (False, True):
@@ -3587,20 +3616,20 @@ class StatusHandover(unittest.TestCase):
             def __init__(self):
                 self.lock, self.armed = threading.Lock(), False
 
-            def acquire(self, blocking=True):
-                return self.lock.acquire(blocking)
+            def acquire(self, blocking=True, timeout=-1):
+                return self.lock.acquire(blocking, timeout)
 
             def __enter__(self):
                 self.lock.acquire()
 
             def __exit__(self, *exc):
+                self.release()
+
+            def release(self):
                 self.lock.release()
                 if self.armed:
                     self.armed = False
                     second_running.wait(5)
-
-            def release(self):
-                self.lock.release()
 
         svc = Service(Engine(tok, "</think>\n\n" + "y" * 40, max_context=CTX), tok,
                       ChatTemplate(ROOT / "serve/chat_template.jinja"))
@@ -3920,6 +3949,31 @@ class AmdTelemetry(unittest.TestCase):
             self.tree(d)
             with mock.patch.object(telemetry, "SYSFS", d):
                 self.assertEqual(svc.free_vram_mib(), 26 << 10)
+
+
+class TelemetryNoDisks(unittest.TestCase):
+    """psutil.disk_io_counters() returns None where it finds no disk (a gVisor container; Windows with its disk counters
+    off): the sampler goes on without a disk reading instead of its thread ending at the first sample, which left
+    /metrics' hardware empty and the frozen-engine check's GPU reading at 0."""
+
+    def test_sampler_runs_without_disk_counters(self):
+        from serve import telemetry
+        vm = SimpleNamespace(total=64 * 2**30, available=40 * 2**30)
+        fake = SimpleNamespace(cpu_count=lambda logical=True: 8, cpu_percent=lambda interval=None: 12.5,
+                               virtual_memory=lambda: vm, disk_io_counters=lambda: None)
+        with mock.patch.dict(sys.modules, {"psutil": fake}):
+            t = telemetry.Telemetry(extra=lambda: {"tok_s": 1.5})
+            try:
+                deadline = time.monotonic() + 5.0
+                while not t.snapshot()["now"] and time.monotonic() < deadline:
+                    time.sleep(0.05)
+                now = t.snapshot()["now"]
+                self.assertEqual(now.get("tok_s"), 1.5)
+                self.assertEqual(now.get("ram_used"), 24 * 2**30)
+                self.assertIsNone(now.get("disk_read_mb"))
+                self.assertIsNone(t.sample()["disk_write_mb"])
+            finally:
+                t.close()
 
 
 class SilentEngine(unittest.TestCase):

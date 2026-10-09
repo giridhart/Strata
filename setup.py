@@ -1013,11 +1013,16 @@ def start_gpus(text):
     are the ones Strata can use, AMD cards as setup lists them ("all": every supported AMD card)."""
     if not text:
         return None
-    if str(text).strip().lower() == "all" and not WIN and not together_ok(gpus()):
+    found = gpus()
+    if str(text).strip().lower() == "all" and not WIN and not together_ok(found):
         amd = amd_gpus()
         if len([g for g in amd if amd_problem(g) is None]) >= 2:
             return [g["index"] for g in amd_parse_gpus("all", amd)]
-    return parse_gpus(text, gpus())
+    if not found and not WIN:                          # #1594: no NVIDIA card, AMD ones: "1,0" names those, as setup lists them
+        amd = amd_gpus()
+        if amd:
+            return [g["index"] for g in amd_parse_gpus(text, amd)]
+    return parse_gpus(text, found)
 
 
 def choose_gpus(a, found) -> list:
@@ -1100,13 +1105,15 @@ def unsloth_split_need_gb(model="UD-Q4_K_XL") -> float:
 
 
 def split_budget(cfg: dict, yes: bool = False, explicit: bool = False) -> bool:
-    """#498: a UD-Q4_K_XL config (its RAM budget, --resident-budget-gib) started on several GPUs.  The engine refuses
+    """#498: a UD-Q4_K_XL config (its RAM budget, --resident-budget-gib) started on several GPUs.  The engine refused
     the budget with a layer split (it exited with code 2), so the split runs without it - all the experts loaded into
     RAM at start - where the RAM holds the GGUFs and 24 GB more; else setup says so and asks (#737: a recommendation,
     not a wall - 128 GB ran it fine): a "no" stops, before the config is saved; `explicit` (--gpus) with --yes goes on.
-    True when the config changed."""
+    #642: the engines from RESIDENT_SPLIT_ENGINE keep the resident RAM copy on a split - every card's cache left out
+    of it, the rest ranked by the whole expert profile - and the budget is that copy's size, so it is kept, as
+    split_mmap keeps --resident-experts.  True when the config changed."""
     a = cfg.get("args", [])
-    if "--resident-budget-gib" not in a:
+    if "--resident-budget-gib" not in a or resident_split():
         return False
     model = budget_model(cfg)
     need, ram = unsloth_split_need_gb(model), ram_gb()
@@ -1174,9 +1181,11 @@ def offer_together(cfg_path: Path, cfg: dict, yes: bool) -> dict:
     can = together_ok(found)
     if not can:
         return cfg
-    # #498: UD-Q4_K_XL's RAM budget has no layer split; without it the RAM must hold the GGUFs and 24 GB more
+    # #498: UD-Q4_K_XL's RAM budget had no layer split; without it the RAM must hold the GGUFs and 24 GB more.  #642:
+    # the engines from RESIDENT_SPLIT_ENGINE keep the budget on both cards, so any RAM is offered them (one GPU stays
+    # the recommendation, the tested setup)
     budget = "--resident-budget-gib" in cfg.get("args", [])
-    if budget and ram_gb() < unsloth_split_need_gb(budget_model(cfg)):
+    if budget and not resident_split() and ram_gb() < unsloth_split_need_gb(budget_model(cfg)):
         return cfg
     pair = can[:2]
     cfg["gpus_asked"] = True
@@ -1190,7 +1199,11 @@ def offer_together(cfg_path: Path, cfg: dict, yes: bool) -> dict:
         say("  This model runs in the low-RAM mode with its experts kept in RAM, on one GPU (recommended: steady RAM")
         say("  use). On both, the experts the GPUs do not hold are read through the OS file cache instead: faster in")
         say("  two reports (#364, #384), but RAM can fill up to 0 free during long prompts.")
-    if budget:
+    if budget and resident_split():
+        say(f"  This model ({budget_model(cfg)}) runs on one GPU with a RAM budget of its experts (recommended: the tested")
+        say("  setup). On both it keeps the budget: each card caches the experts of its own layers, and the RAM holds")
+        say("  the hottest of the rest (#642).")
+    elif budget:
         say(f"  This model ({budget_model(cfg)}) runs on one GPU with a RAM budget of its experts (recommended: the tested")
         say("  setup). On both it has no budget: all its experts are loaded into RAM at start, which this PC's RAM")
         say("  holds - about twice as fast in #498 (2x RTX 3090: 31 -> 64-78 tokens/s).")
@@ -1285,10 +1298,15 @@ def find_vcvars(cuda_v=None):
 
 
 def find_tool(name):
-    """A tool on PATH, or the one pip installed next to this Python (cmake, ninja)."""
+    """A tool on PATH, or the one pip installed next to this Python (cmake, ninja).  A PATH copy that does not run
+    (a pip launcher whose Python is gone) is skipped for the one next to this Python."""
     p = shutil.which(name)
     if p:
-        return p
+        try:
+            if subprocess.run([p, "--version"], capture_output=True, timeout=30).returncode == 0:
+                return p
+        except (OSError, subprocess.SubprocessError):
+            pass
     for d in (Path(sys.executable).parent / "Scripts", Path(sys.executable).parent,
               Path.home() / ".local" / "bin"):
         c = d / (name + (".exe" if WIN else ""))
@@ -2892,6 +2910,30 @@ def get_prebuilt(url_base, gpu, vision, updating=False, toolkit=13) -> Path | No
     return eng
 
 
+def update_engine_gpu(toolkit=13):
+    """#1485: the card an engine update is for.  Not simply the one with the most VRAM: a Tesla V100 (32 GB) beside two
+    RTX 4090s was taken, and CUDA 13 cannot compile for it.  The cards the installed models are set up for come
+    first (their "gpu"); for the CUDA 13 engine a card it cannot compile for is left out when another can.  An
+    explicit --gpu (GPU_PICK) still wins.  None when there is no NVIDIA GPU."""
+    if GPU_PICK is not None:
+        return gpu_info()
+    found = gpus()
+    if not found:
+        return None
+    named = set()
+    for c in installed_configs():
+        try:
+            g = json.loads(c.read_text(encoding="utf-8-sig")).get("gpu")
+        except (OSError, ValueError):
+            continue
+        named.update(i for i in (g if isinstance(g, list) else [g]) if isinstance(i, int) and not isinstance(i, bool))
+    pool = [g for g in found if g["index"] in named] or found
+    if int(toolkit) != 12:
+        pool = [g for g in pool if int(g["arch"]) >= CUDA13_MIN_ARCH] or pool
+    g = max(pool, key=lambda x: (round(x["vram_gb"]), -x["index"]))
+    return {**g, "count": len(found)}
+
+
 def update_installed_engine(url_base, toolkit=None) -> None:
     """An installed ready-made engine older than MIN_ENGINE is replaced before the model starts, so a plain
     START-HERE.bat on an existing install picks up a new release.  If that cannot happen (no internet, the model
@@ -2954,7 +2996,7 @@ def update_installed_engine(url_base, toolkit=None) -> None:
     except OSError:
         warn(f"engine {meta.get('version') or ''} is in use: close the model window and run this again to update it")
         return
-    gpu = gpu_info()
+    gpu = update_engine_gpu(toolkit)
     if local:
         try:                                           # a failed compile must not stop the model from starting
             if gpu is None:
@@ -3386,8 +3428,27 @@ def unsloth_together(a, model, ram, gpu, chosen) -> bool:
     split runs without it: all its experts loaded into RAM from the GGUFs at start, as with the 2-3-bit models - only
     where the RAM holds the GGUF files and 24 GB more (unsloth_split_need_gb; 165 GiB, 2x RTX 3090: 31 -> 64-78
     tok/s).  An explicit --gpus is honoured there; otherwise asked, one GPU by default (--yes: one GPU, as before); an
-    explicit --resident-budget-gib keeps one GPU.  True: all of them."""
+    explicit --resident-budget-gib keeps one GPU.  #642: the engines from RESIDENT_SPLIT_ENGINE keep the budget on a
+    split (the experts no card holds, the hottest by the whole profile), so there the cards go together with it, at
+    any RAM: --gpus, or "2" when asked; one GPU stays the recommendation (--yes alone: one GPU, as before).  True: all
+    of them."""
     names = " + ".join(gpu_name(g) for g in chosen)
+    if resident_split():
+        note = "with its RAM budget (each card caches its own layers' experts, the RAM the hottest of the rest; #642)"
+        if a.gpus:
+            ok(f"{model} on {names}, as you chose (--gpus), {note}")
+            return True
+        if not a.yes:
+            say()
+            say(f"  {model} runs with a RAM budget of its experts, on one GPU or on {names} together:")
+            say(f"  1) {gpu_name(gpu)} only   (recommended: the tested setup)")
+            say(f"  2) {names} together: each card caches the experts of its own layers (#642)")
+            if ask(f"{model}: which GPUs?", ["1", "2"], "1", a.yes) == "2":
+                ok(f"{model} on {names}, {note}")
+                return True
+        warn(f"{model} runs on one GPU: using {gpu_name(gpu)} only (--gpus " + ",".join(str(g["index"]) for g in chosen)
+             + f" shares it across {names}, with its RAM budget)")
+        return False
     need = unsloth_split_need_gb(model)
     if ram < need:
         note = (f"{model} on several GPUs has no RAM budget and needs ~{need:.0f} GB of RAM (its GGUF files and "
@@ -4594,7 +4655,7 @@ def main() -> int:
                     help="EXPERIMENTAL, off by default: the control vector in data/experimental-speed-projection "
                          "(or another GGUF) as a projection on layers 4-44; see docs/DETAILS.md")
     ap.add_argument("--port", type=int, help="the server's port (default: the one the install was set up with, 8080 for a new one)")
-    ap.add_argument("--gpu", help="one GPU, numbered as nvidia-smi numbers them (default: asked when several can be "
+    ap.add_argument("--gpu", help="one GPU, numbered as nvidia-smi numbers them (AMD: as setup lists them) (default: asked when several can be "
                                   "used; with --setup it is saved, when starting it is for that start only)")
     ap.add_argument("--gpus", help="several GPUs sharing one model, as nvidia-smi numbers them (AMD: as setup lists "
                                    "them): \"0,2\", or \"all\" (every card that can); the first is the main one. "
@@ -4990,8 +5051,9 @@ def main() -> int:
     budget, q4_split = None, False
     if MODELS[model].get("budget"):
         # Unsloth's UD-Q4_K_XL: a RAM budget of experts, the rest from the GGUF on the SSD - not the low-RAM mode (no
-        # experts.bin: it would be another 77 GB on the disk), and one GPU (the budget mode has no layer split) unless
-        # the RAM holds the GGUFs and 24 GB more: then several, without the budget, if asked for (#498)
+        # experts.bin: it would be another 77 GB on the disk), and one GPU (the budget mode had no layer split) unless
+        # the RAM holds the GGUFs and 24 GB more: then several, without the budget, if asked for (#498).  #642: from
+        # RESIDENT_SPLIT_ENGINE several GPUs, when asked for, keep the budget (unsloth_together)
         if MODELS[model].get("experimental"):
             warn(f"{model} is EXPERIMENTAL (docs/UNSLOTH_Q4.md): most of its experts are read from the SSD while it "
                  "answers, so it is several times slower than the 2-3-bit models; quality checked against llama.cpp")
@@ -5014,7 +5076,7 @@ def main() -> int:
         budget = budget_choice(model, ram, a.resident_budget_gib)
         if multi and not unsloth_together(a, model, ram, gpu, chosen):
             multi, sel, chosen = [], [gpu["index"]], [gpu]
-        q4_split = bool(multi)                         # #498: on several GPUs without the RAM budget
+        q4_split = bool(multi) and not resident_split()   # #498: on several GPUs without the RAM budget (#642: kept)
         if not q4_split:
             ok(f"RAM budget: {budget:g} GiB of {model}'s experts in RAM, the rest read from the model files on the SSD")
         if a.low_ram not in ("auto", "off"):
@@ -5411,7 +5473,7 @@ def main() -> int:
     elif a.kv_streaming == "on":
         warn("--kv-streaming on: a context under 64K is not streamed (the attention's window holds all of it): off")
     if budget is not None and not q4_split:   # UD-Q4_K_XL: the experts read from the GGUF in place, the most-used N
-        args += ["--resident-budget-gib", f"{budget:g}"]   # GiB kept in RAM (#498: a layer split has no budget)
+        args += ["--resident-budget-gib", f"{budget:g}"]   # GiB kept in RAM (#498: a layer split had no budget)
     if vision != "none":
         args += ["--vision", "--vram-reserve-mib", str(VISION[vision]["reserve_mib"])]
         if vision == "gpu" and a.vram_reserve_mib is None and 0 < gpu.get("vram_gb", 0.0) <= 12.5:

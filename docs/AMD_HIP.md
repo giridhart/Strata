@@ -441,6 +441,10 @@ run it; the report below is from a community machine: an RX 6900 XT 16 GB (gfx10
   [bench/results/2026-10-07-community-gfx1150](../bench/results/2026-10-07-community-gfx1150/README.md).
   Setup does not install for it yet (an integrated Radeon other than Strix Halo is named and not supported): build by hand with `-DCMAKE_HIP_ARCHITECTURES=gfx1150`
   and point `STRATA_HIPBLASLT_TUNING` at the table yourself.
+- **gfx1152** (Radeon 860M / 840M, Ryzen AI 300 "Krackan", #1625): in CMake's unvalidated list like gfx1150, so
+  `-DCMAKE_HIP_ARCHITECTURES=gfx1152` builds with a warning. It runs the portable kernels (the matrix-core guards name
+  gfx1150 and gfx1151 only), no card has reported on it, and setup does not install for it (an integrated Radeon other
+  than Strix Halo is named and not supported). A report from a real 860M is welcome.
 - **Not validated:** gfx1032 (the same `dp4a` path, no hardware report), setup's own build path and the
   `gfx103X-all` wheels on gfx1030, images, answer-quality benchmarks. RDNA1 (gfx1012, RX 5500 XT) builds by hand:
   [OLDER_GPUS.md](OLDER_GPUS.md#amd-building-gfx906-and-gfx1012).
