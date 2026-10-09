@@ -1,0 +1,183 @@
+[
+  {
+    "label": "before",
+    "request": {
+      "model": "bias-validation",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Reply with one English greeting, one word only."
+        }
+      ],
+      "max_tokens": 8,
+      "temperature": 0,
+      "reasoning_effort": "none"
+    },
+    "response": {
+      "id": "chatcmpl-1256d19d63974dfb8877966e",
+      "object": "chat.completion",
+      "created": 1791513786,
+      "model": "bias-validation",
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "Hello"
+          },
+          "finish_reason": "stop"
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 22,
+        "completion_tokens": 2,
+        "total_tokens": 24,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        }
+      }
+    },
+    "token_ids": [
+      9419,
+      248046
+    ]
+  },
+  {
+    "label": "after-object",
+    "request": {
+      "model": "bias-validation",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Reply with one English greeting, one word only."
+        }
+      ],
+      "max_tokens": 8,
+      "temperature": 0,
+      "reasoning_effort": "none",
+      "logit_bias": {
+        "9419": -100
+      }
+    },
+    "response": {
+      "id": "chatcmpl-f2875c84e1e54bea835d92d2",
+      "object": "chat.completion",
+      "created": 1791513787,
+      "model": "bias-validation",
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "Hi"
+          },
+          "finish_reason": "stop"
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 22,
+        "completion_tokens": 2,
+        "total_tokens": 24,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        }
+      }
+    },
+    "token_ids": [
+      12675,
+      248046
+    ]
+  },
+  {
+    "label": "after-pairs",
+    "request": {
+      "model": "bias-validation",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Reply with one English greeting, one word only."
+        }
+      ],
+      "max_tokens": 8,
+      "temperature": 0,
+      "reasoning_effort": "none",
+      "logit_bias": [
+        [
+          9419,
+          false
+        ]
+      ]
+    },
+    "response": {
+      "id": "chatcmpl-3a8d472f863a452da5e9ef97",
+      "object": "chat.completion",
+      "created": 1791513787,
+      "model": "bias-validation",
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "Hi"
+          },
+          "finish_reason": "stop"
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 22,
+        "completion_tokens": 2,
+        "total_tokens": 24,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        }
+      }
+    },
+    "token_ids": [
+      12675,
+      248046
+    ]
+  },
+  {
+    "label": "cleared",
+    "request": {
+      "model": "bias-validation",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Reply with one English greeting, one word only."
+        }
+      ],
+      "max_tokens": 8,
+      "temperature": 0,
+      "reasoning_effort": "none"
+    },
+    "response": {
+      "id": "chatcmpl-d4d2f5c8350842409157f12b",
+      "object": "chat.completion",
+      "created": 1791513787,
+      "model": "bias-validation",
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "Hello"
+          },
+          "finish_reason": "stop"
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 22,
+        "completion_tokens": 2,
+        "total_tokens": 24,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        }
+      }
+    },
+    "token_ids": [
+      9419,
+      248046
+    ]
+  }
+]

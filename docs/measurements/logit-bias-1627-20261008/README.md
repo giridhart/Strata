@@ -11,7 +11,16 @@ work is included in this branch.
 main binary, the candidate without MTP, and the candidate with MTP. All requests used a loopback HTTP server and
 recorded emitted token IDs at the native-engine boundary.
 
-For the prompt "Write the Chinese word for hello. Only the word.":
+The primary usage example is now English: **Hello → Hi**, with an explanation of
+why token 9419 was selected and full before/after requests in
+[LOGIT_BIAS.md](../../LOGIT_BIAS.md#example-hello-becomes-hi).
+Four additional CUDA requests passed: no bias gives `Hello`, object and pair-list
+bans of 9419 give `Hi`, then omitting the field restores `Hello`.
+These are [separate receipts](english/rows.json) from the 52-check CUDA/HIP matrix,
+with a [completion receipt](english/complete.json) and [engine log](english/engine.txt).
+
+The original issue reproduction is preserved below. For the prompt
+"Write the Chinese word for hello. Only the word.":
 
 | Request | Output | First token | Result |
 |---|---|---:|---|
