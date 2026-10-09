@@ -100,6 +100,28 @@ The engine flags behind it: `--layer-split K1[,K2..]|auto` and `--split-device D
 devices; default the next visible ones). `--layer-split K --split-device 0` runs both stages on one card sharing
 everything - the bit-exact check of the hand-off, not a speed mode.
 
+**The draft layer's prompt K/V in batches on a split (opt-in, `STRATA_SPLIT_MTP_BATCH=1`).** With `--mtp` the draft
+layer sits on the last card, and each prompt chunk ends by filling that layer's K/V for the chunk's rows. On one card the
+prompt path does it in batches (`Prefill::draft_kv`, a few large matrix products per chunk); on a split the drafter's own
+pass always did it, one graph launch and four device copies per group of 8 rows (1,024 groups per 8,192-token chunk).
+With the variable set, the last card's prompt path batches it as it does on one card. Restart-only; default off, so the
+default start is unchanged. It needs a `--native` pack (the GGUF-form token table) and a paged or ring (`--kv-resident`)
+draft K/V (`STRATA_MTP_BATCH_RING=0` sends a ring back to the old pass); otherwise it says why once and keeps the old pass:
+`strata serve: draft layer prompt K/V batched on CUDA<d> ...` or `strata serve: STRATA_SPLIT_MTP_BATCH=1 declined, the
+drafter's own pass runs: <reason>`. The draft layer's K/V come out of Q8_1 x Q8_0 MMQ instead of its own mmvq, so the
+drafts, and how many are accepted, can move; the target's tokens are decided by the verify window.
+`tools/split_mtp_batch_parity.py` compares the greedy texts of the two arms. Measured on one machine (2x RTX 3080 20 GB
+at 220 W, Xeon E5-2696 v4, UD-Q4_K_XL, `--layer-split 23`, `--batch-mtp`, two slots, `--prefill auto:16384`), two full
+restarts per arm in the order off, on, off, on, the same binary in every arm: pooled medians of the prompt read were 1,996
+tok/s without and 2,129 with at 25K tokens (+6.7%), 2,448 and 2,553 at 51K (+4.3%), 2,846 and 2,940 at 104K (+3.3%); all 8
+on/off ratios of medians are above 1 (1.03 to 1.08), and the two off restarts differ by at most 2% at 25K and 0.3% at the
+other sizes. The host's "after each chunk" time per request fell from 0.9-1.3 s to 0.1-0.25 s (one restart per arm). Greedy
+output (`--adapt-every 0 --suffix-draft 0`, five prompts of 256 tokens and one 25.5K-token prompt) was identical in 6 of 6
+prompts in all five comparisons, the two runs inside one process (A/A) included, and the drafts accepted were 826 of 1,210
+in every run, so no difference in acceptance was visible. Decode is not shown to be unchanged: the medians with the variable
+set were about 3% lower (pooled solo 82.6 -> 80.2 tok/s, two streams 93.2 -> 90.8), and the same configuration restarted
+twice moved up to 4.7%, so two restarts per arm can neither confirm nor exclude it; the change touches only the prompt path.
+
 **Each card loads only its own layers' dense weights** (0.1.39, PR #639) with explicit split points (`--layer-split
 27`, not `auto`): every card used to keep a full copy (~3.4 GB for the Coder) though its stage reads only its own
 layers, and the VRAM it frees goes to that card's expert cache (2x MI50 16 GB, Coder: 8,819 -> 10,626 experts in
@@ -127,6 +149,29 @@ i9-14900KF, 32 GB of RAM, Windows 11, four greedy prompts at a time, decode tok/
 The split with `--mmap-experts` catches up once the OS file cache holds the experts, on a PC with nothing else
 running; the resident copy is there from the first request and stays locked when other programs need the RAM. With
 `--pcie-frac 0 --adapt-every 0` the split's greedy output is the same with either mode.
+
+**The prompt path's loan on a split and its streamed ring (`STRATA_SPLIT_RING`).** Under a split the prompt path borrows
+the tail slots of each card's expert cache for its buffers (they are given back after the prompt), and the resident RAM
+copy keeps those experts too, so a borrowed expert is not read back from the model file during a prompt. How many slots
+are borrowed depends on the prompt path's streamed ring: a split uses 96 ring slots when at least 75% of the (layer,
+expert) pairs sit in some card's cache, and `STRATA_SPLIT_RING=N` sets N slots (`0` goes back to the pinned-share rule).
+The ring used to be chosen after the RAM copy's regions were sized, so the regions were sized for a different ring than
+the prompt path then used: with `STRATA_SPLIT_RING=384` it borrowed 5,396 slots and the copy kept 4,662, and the
+other 734 were read from the model file in every chunk. The ring is now chosen first (`Prefill::set_ring_override`
+says it must be set before the buffers are counted). The start-up line `strata serve: lend sizing: the prompt path
+borrows N slots (ring R slots at chunk C), K of them keep their experts in RAM too` shows both numbers, and a
+`WARNING` follows when K is below N. Without a split, or without `--resident-experts`, nothing changes. With a split
+the order of the two steps changed for every ring choice, the 96-slot rule included: its regions used to be sized for
+the larger default ring, so there the copy probably kept more slots than were borrowed (not measured). The 5,396 /
+4,662 figures were measured on the test machine (2x RTX 3080 20 GB at 220 W, Xeon E5-2696 v4, UD-Q4_K_XL,
+`--layer-split 23`, resident RAM mode, `--prefill auto:16384`, 2 slots), one restart per arm, with `STRATA_SPLIT_RING=384`
+and `STRATA_PREFILL_RING` unset. Before the change a 104K-token prompt made 413 blob reads and read 10.3 GB of experts
+from the model file per request; after it, 0, with all 5,396 borrowed slots kept in RAM, for 2.15 GiB more pinned RAM
+(13.61 -> 15.76 GiB). 25K and 51K prompts read nothing from the file in either case. With the override unset and
+`STRATA_PREFILL_RING=384` the lend lines are identical before and after (5,396 / 5,396, 15.76 GiB). No speed gain is
+shown: the medians of three 104K reads were 2,803 tok/s before and 2,907 after, but the spread before is 2,540-2,897
+(its first read faulted 4.2 GB in from NVMe) and there is no A/A restart. Here the page cache absorbed the 10 GB per
+request; with less spare page cache it would be disk traffic. Not measured: both ring variables unset.
 
 **A separate VRAM reserve for the later cards:** `--vram-reserve-later-mib N` (default: `--vram-reserve-mib`'s value).
 The card that drives the monitors needs more headroom than one that drives none; with the display on the last card,

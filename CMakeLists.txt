@@ -499,6 +499,21 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_link_libraries(vmm_test PRIVATE strata_engine)
     add_test(NAME vmm_test COMMAND vmm_test)
     set_tests_properties(vmm_test PROPERTIES TIMEOUT 60)
+    # The resident RAM mode with a layer split: the copy keeps each stage's lend region, and the experts the
+    # prompt path borrows are served from RAM (the file source reads none of them).  The device calls are
+    # wrapped - conversation_transfer_test's pattern - and `pin = false` keeps the copy pageable, so this
+    # runs on a CPU-only PC.
+    if(NOT STRATA_ENABLE_HIP AND UNIX AND NOT APPLE AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+      add_executable(split_lend_complement_test tests/core/split_lend_complement_test.cpp)
+      target_link_libraries(split_lend_complement_test PRIVATE strata_engine)
+      target_link_options(split_lend_complement_test PRIVATE
+        -Wl,--wrap=cudaMalloc -Wl,--wrap=cudaFree -Wl,--wrap=cudaMemset -Wl,--wrap=cudaMemcpy
+        -Wl,--wrap=cudaMemcpyAsync -Wl,--wrap=cudaStreamSynchronize -Wl,--wrap=cudaDeviceSynchronize
+        -Wl,--wrap=cudaGetLastError -Wl,--wrap=cudaGetDevice -Wl,--wrap=cudaSetDevice
+        -Wl,--wrap=cudaMemGetInfo -Wl,--wrap=cudaHostAlloc -Wl,--wrap=cudaFreeHost)
+      add_test(NAME split_lend_complement_test COMMAND split_lend_complement_test)
+      set_tests_properties(split_lend_complement_test PROPERTIES ENVIRONMENT "CUDA_VISIBLE_DEVICES=-1" TIMEOUT 120)
+    endif()
   endif()
   # #477: the learned expert profile (--expert-profile-save): its order and make_profile.py's file format (CPU only)
   if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/core/expert_profile_save_test.cpp")
@@ -1091,10 +1106,18 @@ if(STRATA_BUILD_TESTS OR STRATA_BUILD_CONVERSATION_TESTS)
   add_executable(message_boundary_test src/program/message_boundary_test.cpp)
   target_include_directories(message_boundary_test PRIVATE include)
   add_test(NAME message_boundary_test COMMAND message_boundary_test)
+  # a layer split's ring override and the lend slots sized with it: the RAM copy must keep every borrowed slot (CPU)
+  add_executable(split_ring_test src/program/split_ring_test.cpp)
+  target_include_directories(split_ring_test PRIVATE include)
+  add_test(NAME split_ring_test COMMAND split_ring_test)
   # the serve loop's conversation-cache retention policy (header-only, no library to link)
   add_executable(conv_cache_test src/program/conv_cache_test.cpp)
   target_include_directories(conv_cache_test PRIVATE include)
   add_test(NAME conv_cache_test COMMAND conv_cache_test)
+  # which path computes the draft layer's prompt K/V, and STRATA_SPLIT_MTP_BATCH's parsing (header-only, CPU)
+  add_executable(draft_kv_plan_test src/program/draft_kv_plan_test.cpp)
+  target_include_directories(draft_kv_plan_test PRIVATE include)
+  add_test(NAME draft_kv_plan_test COMMAND draft_kv_plan_test)
   # coupled draft sampling's counter and penalty-ring arithmetic (header-only, CPU)
   add_executable(coupled_draft_test src/core/coupled_draft_test.cpp)
   target_include_directories(coupled_draft_test PRIVATE include)
@@ -1551,6 +1574,11 @@ if(STRATA_BUILD_TESTS)
     target_link_libraries(direct_file_async_test PRIVATE Threads::Threads)
     add_test(NAME direct_file_async_test COMMAND direct_file_async_test)
   endif()
+  # --aux-cpus: the CPU-set derivation (pure) and the placement of live threads; header-only, no GPU
+  add_executable(aux_cpus_test tests/platform/aux_cpus_test.cpp)
+  target_include_directories(aux_cpus_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_link_libraries(aux_cpus_test PRIVATE Threads::Threads)
+  add_test(NAME aux_cpus_test COMMAND aux_cpus_test)
 endif()
 
 if(STRATA_BUILD_TESTS)

@@ -1560,6 +1560,48 @@ the pairs in which the switched arm won). They are here so you can try them on y
 - **`STRATA_ADAPT_LAG=2`: the adaptive tier's copies are waited for one window later** (#764). Decode, 6 pairs: Tesla P100
   (PCIe 3.0 x16) +3.5% (6/6 pairs faster), RTX 5070 +0.2% (4/6), RTX 3060 -1.3% (0/6), so it stays opt-in.
 
+## Thread placement: `--aux-cpus` (Linux, off by default)
+
+The CPU pool pins its workers (one logical CPU per physical core) and the host thread pins itself to the pool's reserved
+core. A thread the engine starts after that inherits the host's one CPU: the adaptive tier's job thread, the prefill
+helpers, the router look-ahead. The threads the CUDA driver starts are free to run on any CPU, the workers' included.
+`--aux-cpus` puts every thread that is neither a pool worker nor the host thread on spare CPUs. It moves threads only and
+never changes a result.
+
+- **Which CPUs.** `--aux-cpus auto` (or `STRATA_AUX_CPUS=auto`): the SMT siblings of the host's core first, then the CPUs of
+  physical cores that have no pool worker. A CPU that shares a core with a worker is never taken; when no CPU is spare
+  the feature does nothing and the start-up line says so. A list (`--aux-cpus 24,26` or `24-27`) is used as given, minus
+  the host's CPU and the workers' CPUs, and only CPUs the process may run on. `--aux-cpus off` is the default.
+- **How.** Threads the engine starts pin themselves first thing: the adaptive tier's job thread and its per-round
+  threads, the prefill copy threads and helpers, the router look-ahead, the PLE reader, the file readers, the stdin reader
+  and the watchdog. The threads someone else started (the CUDA driver's) are moved by a sweep over `/proc/self/task`
+  once the pool exists and again at the start of every request. The pool's workers and the host thread are never moved,
+  and neither is a thread somebody pinned to one CPU. An explicit `STRATA_ADAPT_JOB_CPU` still wins for the adaptive tier's
+  job thread. `STRATA_AUX_STAGER=0` leaves the prefill copy threads where they were started: with a one-CPU spare set up
+  to 32 of them (`STRATA_STAGER_THREADS`) would share that CPU, which can slow the read of a long prompt.
+- **Per request.** `"strata_tune": {"aux_cpus": 1}` (`serve/server.py` forwards `1`, `0`, `true` and `false`) moves the
+  threads to the set; `0` puts every moved thread back to the placement it had. A request without the key goes back to the
+  start-up setting. With `--batch` the most recently admitted request's value holds, as for the other `strata_tune` keys.
+  An engine started without `--aux-cpus` plans the set anyway, so `1` takes `auto`.
+- **What it prints.** At start: `strata aux cpus: threads that are neither pool workers nor the host go to CPUs 24 (on;
+  N threads placed so far)`, or `(off at start; a request's aux_cpus=1 turns it on)`. A request that changes the state
+  prints `strata serve: aux cpus ON/off for this request`.
+- **Not covered.** Other processes (the Python launcher, a container runtime) and the engine's host thread.
+- **Measured.** One machine: 2x RTX 3080 20 GB at 220 W, Xeon E5-2696 v4 (24 logical CPUs in the container, 16 pool
+  workers each on its own CPU), UD-Q4_K_XL, layer split 23, `--batch-mtp`, two slots, adaptive tier on. `auto` put the
+  host thread on CPU 2 and the helper threads on CPU 24. Same binary in every arm, only the flag differs. Two pairs of
+  whole engine restarts in the order `auto`, off, `auto`, off (12 solo decodes and 10 two-stream rounds per restart,
+  medians): solo decode 79.7 and 80.4 tok/s with `auto` against 72.1 and 72.4 off (off / `auto` = 0.904 and 0.900), two
+  streams in aggregate 90.8 and 90.7 against 80.8 and 82.8 (0.890 and 0.912). The same configuration restarted twice
+  moved solo by 1.009 and 1.005 and two streams by 0.999 and 1.024. Live on one engine, switching per request with
+  `strata_tune` and rotating the order (20 solo requests per arm, 16 two-stream rounds): off / on = 0.888 solo and
+  0.917 two streams, against 0.985 and 0.990 for an A/A control of the same setting. The host thread's involuntary
+  context switches over a bench of about ten minutes were 43.8k and 42.8k with the flag off and 3.9k and 2.8k with
+  `auto`. Prompt reads (24K, 25K, 51K, 104K) do not depend on the flag: off is +0.7% to +1.5% against `auto`, inside the
+  restart noise. The mean and the p99 of the doorbell-to-flag time are not worse without the flag; what appears is rare
+  stalls above 100 us, in 7 and 8 of 12 requests off against 0 or 1 with `auto`. That preemption of the host causes the
+  loss is an inference; the counters do not prove it. The warm-up requests of each run were discarded.
+
 ---
 
 ## Experimental speed projection (EXPERIMENTAL, off by default)

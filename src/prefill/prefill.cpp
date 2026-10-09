@@ -9,6 +9,7 @@
 #include "strata/core/mtp.hpp"
 #include "strata/core/progress.hpp"
 #include "strata/core/on_device.hpp"
+#include "strata/platform/aux_cpus.hpp"
 
 #include "strata/core/layout.hpp"
 #include "strata/kernels/cpu/expert.hpp"
@@ -446,7 +447,15 @@ struct Stager {
                                                                       : cudaEventDisableTiming) != cudaSuccess) return false;
         }
         cudaGetDevice(&device);
-        for (int t = 0; t < nthreads; ++t) threads.emplace_back([this] { work(); });
+        for (int t = 0; t < nthreads; ++t)
+            threads.emplace_back([this] {
+                // --aux-cpus: the copy threads go to the spare CPUs with the other helpers; STRATA_AUX_STAGER=0 leaves them where
+                // they were created (a small spare set would then hold all of them: it limits the copy rate of a long read)
+                static const bool keep = [] { const char* v = std::getenv("STRATA_AUX_STAGER"); return v != nullptr && std::atoi(v) == 0; }();
+                if (keep) strata::aux_cpus::note_owned_thread();
+                else strata::aux_cpus::pin_current_thread();
+                work();
+            });
         return true;
     }
     ~Stager() {
@@ -1282,8 +1291,10 @@ bool Prefill::relayout(int64_t chunk, void* borrow, uint64_t borrow_bytes, std::
 int64_t Prefill::chunk() const { return impl_->T; }
 
 bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t* next_tokens, int64_t n, int64_t cell0,
-                       std::string& err) {
+                       std::string& err, const char** why) {
     Impl& m = *impl_;
+    const core::OnDevice on_device(m.device);   // the stage's own GPU current (a layer split's drafter: the last stage)
+    auto decline = [&](const char* reason) { if (why != nullptr) *why = reason; return false; };
     static const bool off = [] { const char* v = std::getenv("STRATA_MTP_BATCH"); return v != nullptr && v[0] == '0'; }();
     // A ring (KV streaming: the drafter's window, page p in slot p % n_slots over a host copy) takes the same appends
     // with its own page table and host copy, as a streamed main layer does; the cells written are those the window can
@@ -1291,9 +1302,12 @@ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t
     // drafter's own pass for a ring (the A/B).
     static const bool ring_ok = [] { const char* v = std::getenv("STRATA_MTP_BATCH_RING"); return v == nullptr || v[0] != '0'; }();
     core::QsaState& st = mtp.kv_state_rw();
-    if (off || n <= 0 || m.g == nullptr || m.region == nullptr || (st.kv_mode != 0 && !(st.kv_mode == 2 && ring_ok)) ||
-        st.kv_hybrid || mtp.device() != m.device)
-        return false;
+    if (off) return decline("STRATA_MTP_BATCH=0");
+    if (n <= 0 || m.g == nullptr || m.region == nullptr) return decline("no prompt scratch region on this path");
+    if (st.kv_mode != 0 && !(st.kv_mode == 2 && ring_ok))
+        return decline(st.kv_mode == 2 ? "the drafter's K/V is a ring and STRATA_MTP_BATCH_RING=0" : "the drafter's K/V mode is not paged/ring");
+    if (st.kv_hybrid) return decline("the drafter's K/V is hybrid (kv_hybrid)");
+    if (mtp.device() != m.device) return decline("the drafter is on another device than this prefill path");
     const auto t0 = Clock::now();
     const core::ModelGeometry& g = *m.g;
     const int64_t Nn = g.n_embd, HCN = g.hc * g.n_embd, KV = g.n_head_kv * g.head_dim;
@@ -1308,12 +1322,13 @@ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t
     const void* w_k = mtp.tensor_q8("self_attn.k_proj.weight");
     const void* w_v = mtp.tensor_q8("self_attn.v_proj.weight");
     const float* w_kn = mtp.tensor_f32("self_attn.k_norm.weight");
-    if (!w_ne || !w_fe || !w_nh || !w_fh || !w_hn || !w_dn || !w_up || !w_k || !w_v || !w_kn) return false;
+    if (!w_ne || !w_fe || !w_nh || !w_fh || !w_hn || !w_dn || !w_up || !w_k || !w_v || !w_kn)
+        return decline("a drafter tensor is missing (Q8_0 projections / norms)");
     const core::NativeEmbed* nemb = core::native_embed();
     const core::WeightRef* wemb = nemb ? nullptr : m.wt->find("token_embd.weight");
     if (!nemb && (wemb == nullptr || wemb->codebook_iq4nl || wemb->ne0 != g.n_embd || wemb->group_elems <= 0 ||
                   (wemb->code_bits != 2 && wemb->code_bits != 4 && wemb->code_bits != 8)))
-        return false;
+        return decline("the token embedding is not gatherable on this path");
     // the cells the drafter's window can still reach
     const int64_t r0 = std::max<int64_t>(0, mtp.first_needed() - cell0);
     if (r0 >= n) return true;
@@ -1328,7 +1343,7 @@ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t
     int64_t B = std::min<int64_t>(n - r0, (int64_t) (m.region_bytes / per_row) & ~(int64_t) 63);
     if (st.kv_mode == 2)   // a ring: one batch's cells must not share a slot (a batch can straddle one page more)
         B = std::min<int64_t>(B, ((st.n_slots - 1) * strata::kernels::qsa_real_shapes().page_size) & ~(int64_t) 63);
-    if (B < 64) return false;
+    if (B < 64) return decline("too little scratch for a 64-row batch");
     uint8_t* q = m.region;
     auto carve = [&](size_t bytes) { void* p = q; q += (bytes + 255) & ~(size_t) 255; return p; };
     float* emb = (float*) carve((size_t) B * Nn * 4);
@@ -1351,7 +1366,7 @@ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t
     void* xq = q8 ? carve(mmq::q8_bytes(B * g.hc, Nn)) : nullptr;
     int32_t* ident = q8 ? (int32_t*) carve((size_t) B * g.hc * 4) : nullptr;
     int32_t* bnd = q8 ? (int32_t*) carve(16) : nullptr;
-    if ((uint64_t) (q - m.region) > m.region_bytes) return false;
+    if ((uint64_t) (q - m.region) > m.region_bytes) return decline("the batch buffers do not fit the scratch region");
     static const bool timing = std::getenv("STRATA_DRAFT_TIMING") != nullptr;   // debug: where this pass's time goes
     if (timing) cudaStreamSynchronize(m.cs);
     const auto ti0 = Clock::now();
@@ -2134,6 +2149,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         // layer 1 on, and gathering them here first left the GPU idle for the whole read (~0.4 s of a 32K prompt)
         if (ple_on && !ple_next.valid())
             ple_next = std::async(std::launch::async, [&ple_gather, &ple_next_err, c0, b = ple_buf] {
+                strata::aux_cpus::pin_current_thread();
                 return ple_gather(c0, b, ple_next_err);
             });
         bool ple_pending = ple_on;
@@ -2159,6 +2175,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     return false;
                 }
                 ple_next = std::async(std::launch::async, [&ple_gather, &ple_next_err, c1 = c0 + m.T, b = ple_buf ^ 1] {
+                    strata::aux_cpus::pin_current_thread();
                     return ple_gather(c1, b, ple_next_err);
                 });
             }
@@ -2342,6 +2359,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         const bool threaded_issue = stream_all && issuer_on;
         if (threaded_issue) {
             issuer = std::thread([&] {
+                strata::aux_cpus::pin_current_thread();
                 const core::OnDevice od(m.device);
                 for (size_t idx = 0; idx < seq.size(); ++idx) {
                     while (idx >= a_consumed.load(std::memory_order_acquire) + (size_t) m.ring) {
@@ -3920,6 +3938,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             next_->hand_in_ = h;
             next_->single_chunk_ = single_chunk;
             next_run_ = std::async(std::launch::async, [this, tokens, c0, T, p0] {
+                strata::aux_cpus::pin_current_thread();
                 return next_->run_impl(tokens + c0, T, p0, next_err_);
             });
             hand_buf_ ^= 1;
