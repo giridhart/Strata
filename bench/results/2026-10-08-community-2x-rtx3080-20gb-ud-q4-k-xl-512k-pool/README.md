@@ -362,5 +362,3 @@ Measured on this box the same day; none of these changed the configuration:
   [engine-requests.log](engine-requests.log): the per-request lines (prompt, parking, hit rates) from that start to
   the end of the `ab.py` run
 - `images/`: the two Monitor screenshots, resized to 1,200 px wide (original pixel content, no edits)
-
-Prepared with an AI assistant (Claude Code) from the raw measurements; the numbers are the engine's and the client's own output, unedited.
