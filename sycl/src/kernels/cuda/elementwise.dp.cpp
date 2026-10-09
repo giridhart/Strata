@@ -601,7 +601,14 @@ __dpct_inline__ void dbx_ring_commit(uint32_t* seq, uint32_t part, bool group_ok
         strata::sys_store(seq, ring);
     }
 }
+// The payload store (strata::sys_store_mapped(plain, ...)): uncached (sycl_doorbell.hpp) so a host that polls the ring while the kernel still runs reads a
+// whole payload, or a plain store when every reader waits for the kernel to end (doorbell_plain_payload: the stepped
+// verify window reads a segment's payload only after the segment has drained, and the end of a kernel makes its
+// stores visible). The host checksum (doorbell_payload_ready) still guards every read.
+std::atomic<bool> g_plain_payload{false};
 }  // namespace
+
+void doorbell_plain_payload(bool on) { g_plain_payload.store(on, std::memory_order_relaxed); }
 
 __dpct_inline__ void doorbell_publish_kernel(const float *__restrict__ x,
                                              const int32_t *__restrict__ ids,
@@ -723,7 +730,7 @@ void doorbell_publish_value(const float* x, const int32_t* ids, const float* wei
                             float* x_out, int32_t* ids_out, float* weights_out, uint32_t* d_seq, uint32_t value,
                             void* stream) {
     if (k > 1024) { std::fprintf(stderr, "doorbell_publish: k too large\n"); std::exit(1); }
-    const bool plain = strata::doorbell_plain_payload();
+    const bool plain = strata::doorbell_plain_payload() || g_plain_payload.load(std::memory_order_relaxed);
     /*
     DPCT1049: The work-group size passed to the SYCL kernel may exceed the
     limit. To get the device limit, query info::device::max_work_group_size.
@@ -733,6 +740,7 @@ void doorbell_publish_value(const float* x, const int32_t* ids, const float* wei
         auto exp_props = sycl::ext::oneapi::experimental::properties{
             sycl::ext::oneapi::experimental::use_root_sync};
 
+        const bool plain = g_plain_payload.load(std::memory_order_relaxed);
         strata::q_of(stream)
             ->parallel_for<
                 dpct_kernel_name<class doorbell_publish_value_kernel_9bdb22>>(
@@ -749,7 +757,7 @@ void doorbell_publish_value(const float* x, const int32_t* ids, const float* wei
 void doorbell_publish(const float* x, const int32_t* ids, const float* weights, int64_t n, int64_t k, float* x_out,
                       int32_t* ids_out, float* weights_out, uint32_t* d_seq, void* stream) {
     if (k > 1024) { std::fprintf(stderr, "doorbell_publish: k too large\n"); std::exit(1); }
-    const bool plain = strata::doorbell_plain_payload();
+    const bool plain = strata::doorbell_plain_payload() || g_plain_payload.load(std::memory_order_relaxed);
     /*
     DPCT1049: The work-group size passed to the SYCL kernel may exceed the
     limit. To get the device limit, query info::device::max_work_group_size.
@@ -759,6 +767,7 @@ void doorbell_publish(const float* x, const int32_t* ids, const float* weights, 
         auto exp_props = sycl::ext::oneapi::experimental::properties{
             sycl::ext::oneapi::experimental::use_root_sync};
 
+        const bool plain = g_plain_payload.load(std::memory_order_relaxed);
         strata::q_of(stream)
             ->parallel_for<
                 dpct_kernel_name<class doorbell_publish_kernel_8b5bad>>(
@@ -777,7 +786,7 @@ void doorbell_publish_res(const float* x, const int32_t* ids, const int32_t* d_r
     if (k > 1024) { std::fprintf(stderr, "doorbell_publish_res: k too large\n"); std::exit(1); }
     static const bool full = [] { const char* v = std::getenv("STRATA_DOORBELL_CHECK"); return v != nullptr && v[0] == '1'; }();
     const bool fl = full;
-    const bool plain = strata::doorbell_plain_payload();
+    const bool plain = strata::doorbell_plain_payload() || g_plain_payload.load(std::memory_order_relaxed);
     /*
     DPCT1049: The work-group size passed to the SYCL kernel may exceed the
     limit. To get the device limit, query info::device::max_work_group_size.
@@ -787,6 +796,7 @@ void doorbell_publish_res(const float* x, const int32_t* ids, const int32_t* d_r
         auto exp_props = sycl::ext::oneapi::experimental::properties{
             sycl::ext::oneapi::experimental::use_root_sync};
 
+        const bool plain = g_plain_payload.load(std::memory_order_relaxed);
         strata::q_of(stream)
             ->parallel_for<
                 dpct_kernel_name<class doorbell_publish_res_kernel_85b9b3>>(
