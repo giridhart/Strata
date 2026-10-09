@@ -4661,6 +4661,10 @@ def main() -> int:
     ap.add_argument("--parallel", type=int, metavar="N",
                     help="up to N requests decode together (batch slots, opt-in; default: one at a time, the others "
                          "wait). Each slot takes VRAM from the expert cache; setup says what it recommends")
+    ap.add_argument("--replicas", type=int, metavar="N",
+                    help="several GPUs: run N independent engines, each on its own equal group of the chosen cards (2 "
+                         "replicas on 4 cards = two 2-card engines), requests spread over them (opt-in; more total "
+                         "throughput for a model that fits fewer cards; each replica holds its own copy of the model)")
     ap.add_argument("--kv-streaming", choices=["auto", "on", "off"], default="auto",
                     help="from a 64K context: keep the KV cache in RAM and only the attention's window in VRAM (more "
                          "experts fit on the GPU); auto: when the RAM has room for it")
@@ -5476,6 +5480,20 @@ def main() -> int:
         cfg["layer_split"] = a.layer_split or "auto"
         ok(f"layer split across GPUs {multi} ({cfg['layer_split']})")
         recommend_remote_expert_opt(cfg, off=a.no_remote_expert_opt)
+    if a.replicas is not None and a.replicas >= 2:      # data-parallel replicas (serve/replicas.py), opt-in
+        cards = multi if multi else []
+        if not cards or len(cards) % a.replicas:
+            warn(f"--replicas {a.replicas}: needs the chosen GPUs ({cards or 'one'}) to divide into {a.replicas} equal "
+                 "groups; not set (choose the cards with --gpu 0,1,2,3, or write the groups into the config: "
+                 '"replicas": [{"gpus": [0, 1]}, {"gpus": [2, 3]}])')
+        else:
+            cfg["replicas"] = a.replicas
+            per = len(cards) // a.replicas
+            ok(f"{a.replicas} replicas of {per} GPU(s) each: {' | '.join(','.join(map(str, cards[i * per:(i + 1) * per])) for i in range(a.replicas))}")
+            if per > 1 and a.layer_split not in (None, "auto"):
+                warn("--layer-split is one engine's value; with replicas every group would get it: leave it at auto")
+            if (os.cpu_count() or 0) < 8 * a.replicas:
+                warn("each replica loads its own copy of the model into RAM and runs its own host threads: check the RAM")
     if a.host:
         cfg["host"] = a.host
     if a.api_key:
