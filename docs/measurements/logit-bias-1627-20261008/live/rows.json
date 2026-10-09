@@ -1,0 +1,700 @@
+[
+  {
+    "mode": "baseline",
+    "label": "unchanged-greedy",
+    "status": 200,
+    "seconds": 0.1951256380416453,
+    "request_bytes": 186,
+    "token_ids": [
+      109266,
+      248046
+    ],
+    "response": "{\"id\": \"chatcmpl-bb8c1d2423554efd83a93a4e\", \"object\": \"chat.completion\", \"created\": 1791510981, \"model\": \"bias-validation\", \"choices\": [{\"index\": 0, \"message\": {\"role\": \"assistant\", \"content\": \"你好\"}, \"finish_reason\": \"stop\"}], \"usage\": {\"prompt_tokens\": 23, \"completion_tokens\": 2, \"total_tokens\": 25, \"prompt_tokens_details\": {\"cached_tokens\": 0}}}",
+    "engine": {
+      "generated": 2,
+      "prompt_tokens": 23,
+      "prompt_ms": 164.4,
+      "decode_ms": 19.7,
+      "finish": "stop",
+      "drafts_accepted": 0,
+      "drafts_offered": 0,
+      "reused": 0,
+      "hits": 0,
+      "lookups": 0,
+      "ram_blobs": 0,
+      "file_blobs": 0,
+      "file_mb": 0.0,
+      "prompt_read": 23,
+      "offloaded": 0
+    }
+  },
+  {
+    "mode": "baseline",
+    "label": "unchanged-sampled",
+    "status": 200,
+    "seconds": 0.16908849799074233,
+    "request_bytes": 197,
+    "token_ids": [
+      29292,
+      369,
+      264,
+      1496,
+      11258,
+      11,
+      31233,
+      15019
+    ],
+    "response": "{\"id\": \"chatcmpl-955e36d1775942e3807d8e5c\", \"object\": \"chat.completion\", \"created\": 1791510982, \"model\": \"bias-validation\", \"choices\": [{\"index\": 0, \"message\": {\"role\": \"assistant\", \"content\": \"Python is a high-level, interpreted programming\"}, \"finish_reason\": \"length\"}], \"usage\": {\"prompt_tokens\": 18, \"completion_tokens\": 8, \"total_tokens\": 26, \"prompt_tokens_details\": {\"cached_tokens\": 0}}, \"timings\": {\"cache_n\": 0, \"prompt_n\": 18, \"prompt_ms\": 115.5, \"prompt_per_token_ms\": 6.417, \"prompt_per_second\": 155.8, \"predicted_n\": 8, \"predicted_ms\": 52.0, \"predicted_per_token_ms\": 6.5, \"predicted_per_second\": 153.8, \"draft_n\": 0, \"draft_n_accepted\": 0}}",
+    "engine": {
+      "generated": 8,
+      "prompt_tokens": 18,
+      "prompt_ms": 115.5,
+      "decode_ms": 52.0,
+      "finish": "length",
+      "drafts_accepted": 0,
+      "drafts_offered": 0,
+      "reused": 0,
+      "hits": 0,
+      "lookups": 0,
+      "ram_blobs": 0,
+      "file_blobs": 0,
+      "file_mb": 0.0,
+      "prompt_read": 18,
+      "offloaded": 0
+    }
+  },
+  {
+    "mode": "off",
+    "label": "unchanged-greedy",
+    "status": 200,
+    "seconds": 0.1535931039834395,
+    "request_bytes": 186,
+    "token_ids": [
+      109266,
+      248046
+    ],
+    "response": "{\"id\": \"chatcmpl-dbadc35216554333bb0f1d78\", \"object\": \"chat.completion\", \"created\": 1791510994, \"model\": \"bias-validation\", \"choices\": [{\"index\": 0, \"message\": {\"role\": \"assistant\", \"content\": \"你好\"}, \"finish_reason\": \"stop\"}], \"usage\": {\"prompt_tokens\": 23, \"completion_tokens\": 2, \"total_tokens\": 25, \"prompt_tokens_details\": {\"cached_tokens\": 0}}}",
+    "engine": {
+      "generated": 2,
+      "prompt_tokens": 23,
+      "prompt_ms": 132.5,
+      "decode_ms": 19.4,
+      "finish": "stop",
+      "drafts_accepted": 0,
+      "drafts_offered": 0,
+      "reused": 0,
+      "hits": 0,
+      "lookups": 0,
+      "ram_blobs": 0,
+      "file_blobs": 0,
+      "file_mb": 0.0,
+      "prompt_read": 23,
+      "offloaded": 0
+    }
+  },
+  {
+    "mode": "off",
+    "label": "unchanged-sampled",
+    "status": 200,
+    "seconds": 0.1688350880285725,
+    "request_bytes": 197,
+    "token_ids": [
+      29292,
+      369,
+      264,
+      1496,
+      11258,
+      11,
+      31233,
+      15019
+    ],
+    "response": "{\"id\": \"chatcmpl-9630f34bc9074799804541d7\", \"object\": \"chat.completion\", \"created\": 1791510994, \"model\": \"bias-validation\", \"choices\": [{\"index\": 0, \"message\": {\"role\": \"assistant\", \"content\": \"Python is a high-level, interpreted programming\"}, \"finish_reason\": \"length\"}], \"usage\": {\"prompt_tokens\": 18, \"completion_tokens\": 8, \"total_tokens\": 26, \"prompt_tokens_details\": {\"cached_tokens\": 0}}, \"timings\": {\"cache_n\": 0, \"prompt_n\": 18, \"prompt_ms\": 115.6, \"prompt_per_token_ms\": 6.422, \"prompt_per_second\": 155.7, \"predicted_n\": 8, \"predicted_ms\": 51.8, \"predicted_per_token_ms\": 6.475, \"predicted_per_second\": 154.4, \"draft_n\": 0, \"draft_n_accepted\": 0}}",
+    "engine": {
+      "generated": 8,
+      "prompt_tokens": 18,
+      "prompt_ms": 115.6,
+      "decode_ms": 51.8,
+      "finish": "length",
+      "drafts_accepted": 0,
+      "drafts_offered": 0,
+      "reused": 0,
+      "hits": 0,
+      "lookups": 0,
+      "ram_blobs": 0,
+      "file_blobs": 0,
+      "file_mb": 0.0,
+      "prompt_read": 18,
+      "offloaded": 0
+    }
+  },
+  {
+    "mode": "off",
+    "label": "ban-object",
+    "status": 200,
+    "seconds": 0.1425097290193662,
+    "request_bytes": 218,
+    "token_ids": [
+      109430,
+      248046
+    ],
+    "response": "{\"id\": \"chatcmpl-3e2c079dc09a4f3981d3fdd7\", \"object\": \"chat.completion\", \"created\": 1791510994, \"model\": \"bias-validation\", \"choices\": [{\"index\": 0, \"message\": {\"role\": \"assistant\", \"content\": \"您好\"}, \"finish_reason\": \"stop\"}], \"usage\": {\"prompt_tokens\": 23, \"completion_tokens\": 2, \"total_tokens\": 25, \"prompt_tokens_details\": {\"cached_tokens\": 0}}}",
+    "engine": {
+      "generated": 2,
+      "prompt_tokens": 23,
+      "prompt_ms": 128.1,
+      "decode_ms": 12.8,
+      "finish": "stop",
+      "drafts_accepted": 0,
+      "drafts_offered": 0,
+      "reused": 0,
+      "hits": 0,
+      "lookups": 0,
+      "ram_blobs": 0,
+      "file_blobs": 0,
+      "file_mb": 0.0,
+      "prompt_read": 23,
+      "offloaded": 0
+    }
+  },
+  {
+    "mode": "off",
+    "label": "ban-pairs",
+    "status": 200,
+    "seconds": 0.043887006933800876,
+    "request_bytes": 219,
+    "token_ids": [
+      109430,
+      248046
+    ],
+    "response": "{\"id\": \"chatcmpl-7fe05ffe34cc4e2c860bfb00\", \"object\": \"chat.completion\", \"created\": 1791510994, \"model\": \"bias-validation\", \"choices\": [{\"index\": 0, \"message\": {\"role\": \"assistant\", \"content\": \"您好\"}, \"finish_reason\": \"stop\"}], \"usage\": {\"prompt_tokens\": 23, \"completion_tokens\": 2, \"total_tokens\": 25, \"prompt_tokens_details\": {\"cached_tokens\": 0}}}",
+    "engine": {
+      "generated": 2,
+      "prompt_tokens": 23,
+      "prompt_ms": 30.0,
+      "decode_ms": 12.4,
+      "finish": "stop",
+      "drafts_accepted": 0,
+      "drafts_offered": 0,
+      "reused": 16,
+      "hits": 0,
+      "lookups": 0,
+      "ram_blobs": 0,
+      "file_blobs": 0,
+      "file_mb": 0.0,
+      "prompt_read": 7,
+      "offloaded": 0
+    }
+  },
+  {
+    "mode": "off",
+    "label": "positive-bias",
+    "status": 200,
+    "seconds": 0.05068232398480177,
+    "request_bytes": 216,
+    "token_ids": [
+      41674,
+      41674,
+      41674
+    ],
+    "response": "{\"id\": \"chatcmpl-31bf334e1a6040e8878b2fd8\", \"object\": \"chat.completion\", \"created\": 1791510994, \"model\": \"bias-validation\", \"choices\": [{\"index\": 0, \"message\": {\"role\": \"assistant\", \"content\": \" banana banana banana\"}, \"finish_reason\": \"length\"}], \"usage\": {\"prompt_tokens\": 23, \"completion_tokens\": 3, \"total_tokens\": 26, \"prompt_tokens_details\": {\"cached_tokens\": 16}}, \"timings\": {\"cache_n\": 16, \"prompt_n\": 7, \"prompt_ms\": 29.9, \"prompt_per_token_ms\": 4.271, \"prompt_per_second\": 234.1, \"predicted_n\": 3, \"predicted_ms\": 19.4, \"predicted_per_token_ms\": 6.467, \"predicted_per_second\": 154.6, \"draft_n\": 0, \"draft_n_accepted\": 0}}",
+    "engine": {
+      "generated": 3,
+      "prompt_tokens": 23,
+      "prompt_ms": 29.9,
+      "decode_ms": 19.4,
+      "finish": "length",
+      "drafts_accepted": 0,
+      "drafts_offered": 0,
+      "reused": 16,
+      "hits": 0,
+      "lookups": 0,
+      "ram_blobs": 0,
+      "file_blobs": 0,
+      "file_mb": 0.0,
+      "prompt_read": 7,
+      "offloaded": 0
+    }
+  },
+  {
+    "mode": "off",
+    "label": "invalid-id",
+    "status": 400,
+    "seconds": 0.0005646139616146684,
+    "request_bytes": 231,
+    "token_ids": [],
+    "response": "{\"error\": {\"type\": \"invalid_request_error\", \"message\": \"logit_bias: token ID outside the model vocabulary\"}}",
+    "engine": {}
+  },
+  {
+    "mode": "off",
+    "label": "invalid-value",
+    "status": 400,
+    "seconds": 0.0005740519845858216,
+    "request_bytes": 228,
+    "token_ids": [],
+    "response": "{\"error\": {\"type\": \"invalid_request_error\", \"message\": \"logit_bias: biases must be finite numbers between -100 and 100; false is a pair-list ban\"}}",
+    "engine": {}
+  },
+  {
+    "mode": "off",
+    "label": "cleared-bias",
+    "status": 200,
+    "seconds": 0.04308531200513244,
+    "request_bytes": 186,
+    "token_ids": [
+      109266,
+      248046
+    ],
+    "response": "{\"id\": \"chatcmpl-5626fd6eb7074aafa50d1abe\", \"object\": \"chat.completion\", \"created\": 1791510994, \"model\": \"bias-validation\", \"choices\": [{\"index\": 0, \"message\": {\"role\": \"assistant\", \"content\": \"你好\"}, \"finish_reason\": \"stop\"}], \"usage\": {\"prompt_tokens\": 23, \"completion_tokens\": 2, \"total_tokens\": 25, \"prompt_tokens_details\": {\"cached_tokens\": 0}}}",
+    "engine": {
+      "generated": 2,
+      "prompt_tokens": 23,
+      "prompt_ms": 29.8,
+      "decode_ms": 12.3,
+      "finish": "stop",
+      "drafts_accepted": 0,
+      "drafts_offered": 0,
+      "reused": 16,
+      "hits": 0,
+      "lookups": 0,
+      "ram_blobs": 0,
+      "file_blobs": 0,
+      "file_mb": 0.0,
+      "prompt_read": 7,
+      "offloaded": 0
+    }
+  },
+  {
+    "mode": "off",
+    "label": "empty-bias",
+    "status": 200,
+    "seconds": 0.04322411597240716,
+    "request_bytes": 204,
+    "token_ids": [
+      109266,
+      248046
+    ],
+    "response": "{\"id\": \"chatcmpl-c3fa8241f25e42ba9faba692\", \"object\": \"chat.completion\", \"created\": 1791510994, \"model\": \"bias-validation\", \"choices\": [{\"index\": 0, \"message\": {\"role\": \"assistant\", \"content\": \"你好\"}, \"finish_reason\": \"stop\"}], \"usage\": {\"prompt_tokens\": 23, \"completion_tokens\": 2, \"total_tokens\": 25, \"prompt_tokens_details\": {\"cached_tokens\": 0}}}",
+    "engine": {
+      "generated": 2,
+      "prompt_tokens": 23,
+      "prompt_ms": 29.7,
+      "decode_ms": 12.2,
+      "finish": "stop",
+      "drafts_accepted": 0,
+      "drafts_offered": 0,
+      "reused": 16,
+      "hits": 0,
+      "lookups": 0,
+      "ram_blobs": 0,
+      "file_blobs": 0,
+      "file_mb": 0.0,
+      "prompt_read": 7,
+      "offloaded": 0
+    }
+  },
+  {
+    "mode": "off",
+    "label": "103215-bans",
+    "status": 200,
+    "seconds": 0.36902957293204963,
+    "request_bytes": 1643747,
+    "token_ids": [
+      109430,
+      248046
+    ],
+    "response": "{\"id\": \"chatcmpl-ebb62a05f448496abc36ea7a\", \"object\": \"chat.completion\", \"created\": 1791510994, \"model\": \"bias-validation\", \"choices\": [{\"index\": 0, \"message\": {\"role\": \"assistant\", \"content\": \"您好\"}, \"finish_reason\": \"stop\"}], \"usage\": {\"prompt_tokens\": 23, \"completion_tokens\": 2, \"total_tokens\": 25, \"prompt_tokens_details\": {\"cached_tokens\": 0}}}",
+    "engine": {
+      "generated": 2,
+      "prompt_tokens": 23,
+      "prompt_ms": 30.7,
+      "decode_ms": 12.4,
+      "finish": "stop",
+      "drafts_accepted": 0,
+      "drafts_offered": 0,
+      "reused": 16,
+      "hits": 0,
+      "lookups": 0,
+      "ram_blobs": 0,
+      "file_blobs": 0,
+      "file_mb": 0.0,
+      "prompt_read": 7,
+      "offloaded": 0
+    }
+  },
+  {
+    "mode": "off",
+    "label": "stream-ban",
+    "status": 200,
+    "seconds": 0.04445838404353708,
+    "request_bytes": 234,
+    "token_ids": [
+      109430,
+      248046
+    ],
+    "response": "data: {\"id\": \"chatcmpl-deb53e5346a64c35ab96f03e\", \"object\": \"chat.completion.chunk\", \"created\": 1791510995, \"model\": \"bias-validation\", \"choices\": [{\"index\": 0, \"delta\": {\"role\": \"assistant\", \"content\": \"\"}, \"finish_reason\": null}]}\n\n: keep-alive\n\ndata: {\"id\": \"chatcmpl-deb53e5346a64c35ab96f03e\", \"object\": \"chat.completion.chunk\", \"created\": 1791510995, \"model\": \"bias-validation\", \"choices\": [{\"index\": 0, \"delta\": {\"content\": \"您好\"}, \"finish_reason\": null}]}\n\ndata: {\"id\": \"chatcmpl-deb53e5346a64c35ab96f03e\", \"object\": \"chat.completion.chunk\", \"created\": 1791510995, \"model\": \"bias-validation\", \"choices\": [{\"index\": 0, \"delta\": {}, \"finish_reason\": \"stop\"}], \"usage\": {\"prompt_tokens\": 23, \"completion_tokens\": 2, \"total_tokens\": 25, \"prompt_tokens_details\": {\"cached_tokens\": 0}}}\n\ndata: [DONE]\n\n",
+    "engine": {
+      "generated": 2,
+      "prompt_tokens": 23,
+      "prompt_ms": 30.6,
+      "decode_ms": 12.4,
+      "finish": "stop",
+      "drafts_accepted": 0,
+      "drafts_offered": 0,
+      "reused": 16,
+      "hits": 0,
+      "lookups": 0,
+      "ram_blobs": 0,
+      "file_blobs": 0,
+      "file_mb": 0.0,
+      "prompt_read": 7,
+      "offloaded": 0
+    }
+  },
+  {
+    "mode": "off",
+    "label": "sampled-ban",
+    "status": 200,
+    "seconds": 0.043780705076642334,
+    "request_bytes": 233,
+    "token_ids": [
+      109430,
+      248046
+    ],
+    "response": "{\"id\": \"chatcmpl-2db508f195fc491686670f86\", \"object\": \"chat.completion\", \"created\": 1791510995, \"model\": \"bias-validation\", \"choices\": [{\"index\": 0, \"message\": {\"role\": \"assistant\", \"content\": \"您好\"}, \"finish_reason\": \"stop\"}], \"usage\": {\"prompt_tokens\": 23, \"completion_tokens\": 2, \"total_tokens\": 25, \"prompt_tokens_details\": {\"cached_tokens\": 0}}}",
+    "engine": {
+      "generated": 2,
+      "prompt_tokens": 23,
+      "prompt_ms": 30.2,
+      "decode_ms": 12.3,
+      "finish": "stop",
+      "drafts_accepted": 0,
+      "drafts_offered": 0,
+      "reused": 16,
+      "hits": 0,
+      "lookups": 0,
+      "ram_blobs": 0,
+      "file_blobs": 0,
+      "file_mb": 0.0,
+      "prompt_read": 7,
+      "offloaded": 0
+    }
+  },
+  {
+    "mode": "mtp",
+    "label": "unchanged-greedy",
+    "status": 200,
+    "seconds": 0.1719587140250951,
+    "request_bytes": 186,
+    "token_ids": [
+      109266,
+      248046
+    ],
+    "response": "{\"id\": \"chatcmpl-839ee5d10b4d4930a1909380\", \"object\": \"chat.completion\", \"created\": 1791511007, \"model\": \"bias-validation\", \"choices\": [{\"index\": 0, \"message\": {\"role\": \"assistant\", \"content\": \"你好\"}, \"finish_reason\": \"stop\"}], \"usage\": {\"prompt_tokens\": 23, \"completion_tokens\": 2, \"total_tokens\": 25, \"prompt_tokens_details\": {\"cached_tokens\": 0}}}",
+    "engine": {
+      "generated": 2,
+      "prompt_tokens": 23,
+      "prompt_ms": 146.7,
+      "decode_ms": 23.4,
+      "finish": "stop",
+      "drafts_accepted": 3,
+      "drafts_offered": 3,
+      "reused": 0,
+      "hits": 0,
+      "lookups": 0,
+      "ram_blobs": 0,
+      "file_blobs": 0,
+      "file_mb": 0.0,
+      "prompt_read": 23,
+      "offloaded": 0
+    }
+  },
+  {
+    "mode": "mtp",
+    "label": "unchanged-sampled",
+    "status": 200,
+    "seconds": 0.13977801497094333,
+    "request_bytes": 197,
+    "token_ids": [
+      29292,
+      369,
+      264,
+      1496,
+      11258,
+      11,
+      31233,
+      15019
+    ],
+    "response": "{\"id\": \"chatcmpl-cfc3cfd29d614cccb9e34d8b\", \"object\": \"chat.completion\", \"created\": 1791511007, \"model\": \"bias-validation\", \"choices\": [{\"index\": 0, \"message\": {\"role\": \"assistant\", \"content\": \"Python is a high-level, interpreted programming\"}, \"finish_reason\": \"length\"}], \"usage\": {\"prompt_tokens\": 18, \"completion_tokens\": 8, \"total_tokens\": 26, \"prompt_tokens_details\": {\"cached_tokens\": 0}}, \"timings\": {\"cache_n\": 0, \"prompt_n\": 18, \"prompt_ms\": 102.3, \"prompt_per_token_ms\": 5.683, \"prompt_per_second\": 176.0, \"predicted_n\": 8, \"predicted_ms\": 36.1, \"predicted_per_token_ms\": 4.513, \"predicted_per_second\": 221.6, \"draft_n\": 9, \"draft_n_accepted\": 4}}",
+    "engine": {
+      "generated": 8,
+      "prompt_tokens": 18,
+      "prompt_ms": 102.3,
+      "decode_ms": 36.1,
+      "finish": "length",
+      "drafts_accepted": 4,
+      "drafts_offered": 9,
+      "reused": 0,
+      "hits": 0,
+      "lookups": 0,
+      "ram_blobs": 0,
+      "file_blobs": 0,
+      "file_mb": 0.0,
+      "prompt_read": 18,
+      "offloaded": 0
+    }
+  },
+  {
+    "mode": "mtp",
+    "label": "ban-object",
+    "status": 200,
+    "seconds": 0.12640270090196282,
+    "request_bytes": 218,
+    "token_ids": [
+      109430,
+      248046
+    ],
+    "response": "{\"id\": \"chatcmpl-7f36f57b5c75443d99a4f95a\", \"object\": \"chat.completion\", \"created\": 1791511007, \"model\": \"bias-validation\", \"choices\": [{\"index\": 0, \"message\": {\"role\": \"assistant\", \"content\": \"您好\"}, \"finish_reason\": \"stop\"}], \"usage\": {\"prompt_tokens\": 23, \"completion_tokens\": 2, \"total_tokens\": 25, \"prompt_tokens_details\": {\"cached_tokens\": 0}}}",
+    "engine": {
+      "generated": 2,
+      "prompt_tokens": 23,
+      "prompt_ms": 108.1,
+      "decode_ms": 16.2,
+      "finish": "stop",
+      "drafts_accepted": 3,
+      "drafts_offered": 3,
+      "reused": 0,
+      "hits": 0,
+      "lookups": 0,
+      "ram_blobs": 0,
+      "file_blobs": 0,
+      "file_mb": 0.0,
+      "prompt_read": 23,
+      "offloaded": 0
+    }
+  },
+  {
+    "mode": "mtp",
+    "label": "ban-pairs",
+    "status": 200,
+    "seconds": 0.04322266404051334,
+    "request_bytes": 219,
+    "token_ids": [
+      109430,
+      248046
+    ],
+    "response": "{\"id\": \"chatcmpl-017a2d3854564643b57c7a7d\", \"object\": \"chat.completion\", \"created\": 1791511007, \"model\": \"bias-validation\", \"choices\": [{\"index\": 0, \"message\": {\"role\": \"assistant\", \"content\": \"您好\"}, \"finish_reason\": \"stop\"}], \"usage\": {\"prompt_tokens\": 23, \"completion_tokens\": 2, \"total_tokens\": 25, \"prompt_tokens_details\": {\"cached_tokens\": 0}}}",
+    "engine": {
+      "generated": 2,
+      "prompt_tokens": 23,
+      "prompt_ms": 25.7,
+      "decode_ms": 16.2,
+      "finish": "stop",
+      "drafts_accepted": 3,
+      "drafts_offered": 3,
+      "reused": 16,
+      "hits": 0,
+      "lookups": 0,
+      "ram_blobs": 0,
+      "file_blobs": 0,
+      "file_mb": 0.0,
+      "prompt_read": 7,
+      "offloaded": 0
+    }
+  },
+  {
+    "mode": "mtp",
+    "label": "positive-bias",
+    "status": 200,
+    "seconds": 0.05351781891658902,
+    "request_bytes": 216,
+    "token_ids": [
+      41674,
+      41674,
+      41674
+    ],
+    "response": "{\"id\": \"chatcmpl-d5e1637066954e85be573881\", \"object\": \"chat.completion\", \"created\": 1791511007, \"model\": \"bias-validation\", \"choices\": [{\"index\": 0, \"message\": {\"role\": \"assistant\", \"content\": \" banana banana banana\"}, \"finish_reason\": \"length\"}], \"usage\": {\"prompt_tokens\": 23, \"completion_tokens\": 3, \"total_tokens\": 26, \"prompt_tokens_details\": {\"cached_tokens\": 16}}, \"timings\": {\"cache_n\": 16, \"prompt_n\": 7, \"prompt_ms\": 26.2, \"prompt_per_token_ms\": 3.743, \"prompt_per_second\": 267.2, \"predicted_n\": 3, \"predicted_ms\": 26.2, \"predicted_per_token_ms\": 8.733, \"predicted_per_second\": 114.5, \"draft_n\": 6, \"draft_n_accepted\": 0}}",
+    "engine": {
+      "generated": 3,
+      "prompt_tokens": 23,
+      "prompt_ms": 26.2,
+      "decode_ms": 26.2,
+      "finish": "length",
+      "drafts_accepted": 0,
+      "drafts_offered": 6,
+      "reused": 16,
+      "hits": 0,
+      "lookups": 0,
+      "ram_blobs": 0,
+      "file_blobs": 0,
+      "file_mb": 0.0,
+      "prompt_read": 7,
+      "offloaded": 0
+    }
+  },
+  {
+    "mode": "mtp",
+    "label": "invalid-id",
+    "status": 400,
+    "seconds": 0.0005792119773104787,
+    "request_bytes": 231,
+    "token_ids": [],
+    "response": "{\"error\": {\"type\": \"invalid_request_error\", \"message\": \"logit_bias: token ID outside the model vocabulary\"}}",
+    "engine": {}
+  },
+  {
+    "mode": "mtp",
+    "label": "invalid-value",
+    "status": 400,
+    "seconds": 0.0004201789852231741,
+    "request_bytes": 228,
+    "token_ids": [],
+    "response": "{\"error\": {\"type\": \"invalid_request_error\", \"message\": \"logit_bias: biases must be finite numbers between -100 and 100; false is a pair-list ban\"}}",
+    "engine": {}
+  },
+  {
+    "mode": "mtp",
+    "label": "cleared-bias",
+    "status": 200,
+    "seconds": 0.04269790602847934,
+    "request_bytes": 186,
+    "token_ids": [
+      109266,
+      248046
+    ],
+    "response": "{\"id\": \"chatcmpl-faae84a173284e308ed223a7\", \"object\": \"chat.completion\", \"created\": 1791511007, \"model\": \"bias-validation\", \"choices\": [{\"index\": 0, \"message\": {\"role\": \"assistant\", \"content\": \"你好\"}, \"finish_reason\": \"stop\"}], \"usage\": {\"prompt_tokens\": 23, \"completion_tokens\": 2, \"total_tokens\": 25, \"prompt_tokens_details\": {\"cached_tokens\": 0}}}",
+    "engine": {
+      "generated": 2,
+      "prompt_tokens": 23,
+      "prompt_ms": 25.7,
+      "decode_ms": 16.0,
+      "finish": "stop",
+      "drafts_accepted": 3,
+      "drafts_offered": 3,
+      "reused": 16,
+      "hits": 0,
+      "lookups": 0,
+      "ram_blobs": 0,
+      "file_blobs": 0,
+      "file_mb": 0.0,
+      "prompt_read": 7,
+      "offloaded": 0
+    }
+  },
+  {
+    "mode": "mtp",
+    "label": "empty-bias",
+    "status": 200,
+    "seconds": 0.04329926997888833,
+    "request_bytes": 204,
+    "token_ids": [
+      109266,
+      248046
+    ],
+    "response": "{\"id\": \"chatcmpl-cf0ae6c0dce547fb83ea27e9\", \"object\": \"chat.completion\", \"created\": 1791511007, \"model\": \"bias-validation\", \"choices\": [{\"index\": 0, \"message\": {\"role\": \"assistant\", \"content\": \"你好\"}, \"finish_reason\": \"stop\"}], \"usage\": {\"prompt_tokens\": 23, \"completion_tokens\": 2, \"total_tokens\": 25, \"prompt_tokens_details\": {\"cached_tokens\": 0}}}",
+    "engine": {
+      "generated": 2,
+      "prompt_tokens": 23,
+      "prompt_ms": 25.9,
+      "decode_ms": 16.0,
+      "finish": "stop",
+      "drafts_accepted": 3,
+      "drafts_offered": 3,
+      "reused": 16,
+      "hits": 0,
+      "lookups": 0,
+      "ram_blobs": 0,
+      "file_blobs": 0,
+      "file_mb": 0.0,
+      "prompt_read": 7,
+      "offloaded": 0
+    }
+  },
+  {
+    "mode": "mtp",
+    "label": "103215-bans",
+    "status": 200,
+    "seconds": 0.3682536829728633,
+    "request_bytes": 1643747,
+    "token_ids": [
+      109430,
+      248046
+    ],
+    "response": "{\"id\": \"chatcmpl-9b6b4dbe3063474e90f0abe9\", \"object\": \"chat.completion\", \"created\": 1791511008, \"model\": \"bias-validation\", \"choices\": [{\"index\": 0, \"message\": {\"role\": \"assistant\", \"content\": \"您好\"}, \"finish_reason\": \"stop\"}], \"usage\": {\"prompt_tokens\": 23, \"completion_tokens\": 2, \"total_tokens\": 25, \"prompt_tokens_details\": {\"cached_tokens\": 0}}}",
+    "engine": {
+      "generated": 2,
+      "prompt_tokens": 23,
+      "prompt_ms": 25.2,
+      "decode_ms": 16.2,
+      "finish": "stop",
+      "drafts_accepted": 1,
+      "drafts_offered": 3,
+      "reused": 16,
+      "hits": 0,
+      "lookups": 0,
+      "ram_blobs": 0,
+      "file_blobs": 0,
+      "file_mb": 0.0,
+      "prompt_read": 7,
+      "offloaded": 0
+    }
+  },
+  {
+    "mode": "mtp",
+    "label": "stream-ban",
+    "status": 200,
+    "seconds": 0.043203829089179635,
+    "request_bytes": 234,
+    "token_ids": [
+      109430,
+      248046
+    ],
+    "response": "data: {\"id\": \"chatcmpl-095f818c294e4dac8ec68712\", \"object\": \"chat.completion.chunk\", \"created\": 1791511008, \"model\": \"bias-validation\", \"choices\": [{\"index\": 0, \"delta\": {\"role\": \"assistant\", \"content\": \"\"}, \"finish_reason\": null}]}\n\n: keep-alive\n\ndata: {\"id\": \"chatcmpl-095f818c294e4dac8ec68712\", \"object\": \"chat.completion.chunk\", \"created\": 1791511008, \"model\": \"bias-validation\", \"choices\": [{\"index\": 0, \"delta\": {\"content\": \"您好\"}, \"finish_reason\": null}]}\n\ndata: {\"id\": \"chatcmpl-095f818c294e4dac8ec68712\", \"object\": \"chat.completion.chunk\", \"created\": 1791511008, \"model\": \"bias-validation\", \"choices\": [{\"index\": 0, \"delta\": {}, \"finish_reason\": \"stop\"}], \"usage\": {\"prompt_tokens\": 23, \"completion_tokens\": 2, \"total_tokens\": 25, \"prompt_tokens_details\": {\"cached_tokens\": 0}}}\n\ndata: [DONE]\n\n",
+    "engine": {
+      "generated": 2,
+      "prompt_tokens": 23,
+      "prompt_ms": 25.1,
+      "decode_ms": 16.2,
+      "finish": "stop",
+      "drafts_accepted": 3,
+      "drafts_offered": 3,
+      "reused": 16,
+      "hits": 0,
+      "lookups": 0,
+      "ram_blobs": 0,
+      "file_blobs": 0,
+      "file_mb": 0.0,
+      "prompt_read": 7,
+      "offloaded": 0
+    }
+  },
+  {
+    "mode": "mtp",
+    "label": "sampled-ban",
+    "status": 200,
+    "seconds": 0.042190782027319074,
+    "request_bytes": 233,
+    "token_ids": [
+      109430,
+      248046
+    ],
+    "response": "{\"id\": \"chatcmpl-33a65d3e68f64006b75c43a7\", \"object\": \"chat.completion\", \"created\": 1791511008, \"model\": \"bias-validation\", \"choices\": [{\"index\": 0, \"message\": {\"role\": \"assistant\", \"content\": \"您好\"}, \"finish_reason\": \"stop\"}], \"usage\": {\"prompt_tokens\": 23, \"completion_tokens\": 2, \"total_tokens\": 25, \"prompt_tokens_details\": {\"cached_tokens\": 0}}}",
+    "engine": {
+      "generated": 2,
+      "prompt_tokens": 23,
+      "prompt_ms": 24.6,
+      "decode_ms": 16.1,
+      "finish": "stop",
+      "drafts_accepted": 3,
+      "drafts_offered": 3,
+      "reused": 16,
+      "hits": 0,
+      "lookups": 0,
+      "ram_blobs": 0,
+      "file_blobs": 0,
+      "file_mb": 0.0,
+      "prompt_read": 7,
+      "offloaded": 0
+    }
+  }
+]
