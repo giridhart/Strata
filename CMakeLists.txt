@@ -255,6 +255,11 @@ if(STRATA_BUILD_TESTS)
   add_executable(split_rules_test tests/program/split_rules_test.cpp)
   target_include_directories(split_rules_test PRIVATE include)
   add_test(NAME split_rules_test COMMAND split_rules_test)
+
+  # the default CPU prefill share is not armed when every expert is resident (#1595): header-only rule, no GPU
+  add_executable(share_rules_test tests/prefill/share_rules_test.cpp)
+  target_include_directories(share_rules_test PRIVATE include)
+  add_test(NAME share_rules_test COMMAND share_rules_test)
 endif()
 
 # ---- strata_plan ----------------------------------------------------------

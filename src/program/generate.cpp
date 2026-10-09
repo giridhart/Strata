@@ -61,6 +61,7 @@
 #include "strata/program/logits_selection.hpp"
 #include "strata/program/conv_cache.hpp"
 #include "strata/program/split_rules.hpp"
+#include "strata/prefill/share_rules.hpp"
 #include "strata/program/message_boundary.hpp"
 #include "strata/spec/draft_policy.hpp"
 #include "strata/spec/draft_source.hpp"
@@ -6247,7 +6248,13 @@ int main(int argc, char** argv) {
         // the pool is idle while a prompt is read unless batch slots decode between its parts; with
         // STRATA_PREFILL_CPU_SHARE the staged-chunk limit before the chunk below sizes the loans (bytes_needed reads it)
         const bool share_pool = o.batch <= 0 && !o.no_pool;
-        strata::prefill::Prefill::arm_cpu_share(share_pool, share_pool && stages.empty() && !multi_gpu);
+        const bool share_has_work = strata::prefill::share_rules::default_share_has_work(
+            (int64_t) xcache.slots(), (int64_t) (g.n_layers * g.n_expert));   // #1595
+        if (!share_has_work)
+            std::fprintf(stderr, "strata serve: every expert is in the GPU cache (%lld of %lld): the CPU prefill share has "
+                                 "nothing to take, so it is not armed by default (STRATA_PREFILL_CPU_SHARE=auto forces it)\n",
+                         (long long) xcache.slots(), (long long) (g.n_layers * g.n_expert));
+        strata::prefill::Prefill::arm_cpu_share(share_pool, share_pool && stages.empty() && !multi_gpu && share_has_work);
         void* borrow = nullptr;
         uint64_t borrow_bytes = 0;
         int32_t lend_first = -1;          // the first slot the prompt path may borrow (its largest chunk)
@@ -11166,7 +11173,10 @@ int main(int argc, char** argv) {
     int64_t pos_start = 0;
     int64_t spec_pos = 0;   // plan v0.3 P6: where the speculative loop starts (0 = not used)
     strata::prefill::Prefill prefill;
-    strata::prefill::Prefill::arm_cpu_share(!multi_gpu && !o.no_pool, !multi_gpu && !o.no_pool && o.batch <= 0);   // before the chunk below sizes the loan
+    // #1595: not by default when the cache holds every expert (nothing to take)
+    strata::prefill::Prefill::arm_cpu_share(!multi_gpu && !o.no_pool,
+        !multi_gpu && !o.no_pool && o.batch <= 0 &&
+        strata::prefill::share_rules::default_share_has_work((int64_t) xcache.slots(), (int64_t) (g.n_layers * g.n_expert)));   // before the chunk below sizes the loan
     bool kvg_started = false;   // the elastic K/V took this run's cells
     double prefill_batched_ms = 0;
     std::FILE* final_r = o.dump_final_r.empty() ? nullptr : std::fopen(o.dump_final_r.c_str(), "wb");
