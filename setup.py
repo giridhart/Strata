@@ -2910,6 +2910,30 @@ def get_prebuilt(url_base, gpu, vision, updating=False, toolkit=13) -> Path | No
     return eng
 
 
+def update_engine_gpu(toolkit=13):
+    """#1485: the card an engine update is for.  Not simply the one with the most VRAM: a Tesla V100 (32 GB) beside two
+    RTX 4090s was taken, and CUDA 13 cannot compile for it.  The cards the installed models are set up for come
+    first (their "gpu"); for the CUDA 13 engine a card it cannot compile for is left out when another can.  An
+    explicit --gpu (GPU_PICK) still wins.  None when there is no NVIDIA GPU."""
+    if GPU_PICK is not None:
+        return gpu_info()
+    found = gpus()
+    if not found:
+        return None
+    named = set()
+    for c in installed_configs():
+        try:
+            g = json.loads(c.read_text(encoding="utf-8-sig")).get("gpu")
+        except (OSError, ValueError):
+            continue
+        named.update(i for i in (g if isinstance(g, list) else [g]) if isinstance(i, int) and not isinstance(i, bool))
+    pool = [g for g in found if g["index"] in named] or found
+    if int(toolkit) != 12:
+        pool = [g for g in pool if int(g["arch"]) >= CUDA13_MIN_ARCH] or pool
+    g = max(pool, key=lambda x: (round(x["vram_gb"]), -x["index"]))
+    return {**g, "count": len(found)}
+
+
 def update_installed_engine(url_base, toolkit=None) -> None:
     """An installed ready-made engine older than MIN_ENGINE is replaced before the model starts, so a plain
     START-HERE.bat on an existing install picks up a new release.  If that cannot happen (no internet, the model
@@ -2972,7 +2996,7 @@ def update_installed_engine(url_base, toolkit=None) -> None:
     except OSError:
         warn(f"engine {meta.get('version') or ''} is in use: close the model window and run this again to update it")
         return
-    gpu = gpu_info()
+    gpu = update_engine_gpu(toolkit)
     if local:
         try:                                           # a failed compile must not stop the model from starting
             if gpu is None:
