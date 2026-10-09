@@ -244,6 +244,10 @@ if(STRATA_BUILD_TESTS)
   add_executable(gguf_split_test tests/core/gguf_split_test.cpp)
   target_link_libraries(gguf_split_test PRIVATE strata_artifact)
   add_test(NAME gguf_split_test COMMAND gguf_split_test)
+  # how --batch cuts a prompt read into pieces (a layer split with no slot decoding must still reach a BYIELD)
+  add_executable(batch_read_test tests/program/batch_read_test.cpp)
+  target_include_directories(batch_read_test PRIVATE include)
+  add_test(NAME batch_read_test COMMAND batch_read_test)
 
   # the hipBLASLt tuning header's architecture gate: RDNA4 siblings share solution IDs, RDNA3 siblings share
   # theirs, cross-family pairs and version mismatches stay rejected (synthetic tables: no model, no GPU)

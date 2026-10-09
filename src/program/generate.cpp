@@ -58,6 +58,7 @@
 #include "strata/core/mtp.hpp"
 #include "strata/prefill/prefill.hpp"
 #include "strata/core/native_dense.hpp"
+#include "strata/program/batch_read.hpp"
 #include "strata/program/logits_selection.hpp"
 #include "strata/program/conv_cache.hpp"
 #include "strata/program/message_boundary.hpp"
@@ -9702,11 +9703,17 @@ int main(int argc, char** argv) {
             // the request ends with `YIELDED <slot> <tokens>` + DONE cancel, and the server sends it again later: it
             // continues from the slot with the same chunks.  #656's cooperative preemption, with a slot as the park.
             auto read_part = [&](int64_t a0, int64_t b0, std::string& e) -> bool {
-                // (a layer split reads its stages as a pipeline over one run's chunks: in pieces only beside slots)
-                if (o.batch <= 0 || piped || (!stages.empty() && !batch_on())) return sp.run(ids.data() + a0, b0 - a0, a0, e);
+                // (a layer split reads its stages as a pipeline over one run's chunks: beside slots a chunk at a time, with
+                // none decoding in pieces of STRATA_BATCH_YIELD_CHUNKS chunks (default 8; 0 = one run) so a BYIELD is taken)
+                static const int64_t yield_chunks = [] {
+                    const char* v = std::getenv("STRATA_BATCH_YIELD_CHUNKS");
+                    return v != nullptr ? (int64_t) std::max(0, std::atoi(v)) : (int64_t) 8;
+                }();
                 const int64_t C = std::max<int64_t>(sp.chunk(), 1);
+                const int64_t piece = strata::program::batch_read_piece(o.batch > 0, piped, !stages.empty(), batch_on(), C, yield_chunks);
+                if (piece <= 0) return sp.run(ids.data() + a0, b0 - a0, a0, e);
                 for (int64_t q = a0; q < b0;) {
-                    const int64_t r = std::min(b0, q + C);
+                    const int64_t r = std::min(b0, q + piece);
                     const auto tq = Clock::now();
                     if (!sp.run(ids.data() + q, r - q, q, e)) return false;
                     q = r;
