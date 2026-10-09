@@ -3577,20 +3577,20 @@ class StatusHandover(unittest.TestCase):
             def __init__(self):
                 self.lock, self.armed = threading.Lock(), False
 
-            def acquire(self, blocking=True):
-                return self.lock.acquire(blocking)
+            def acquire(self, blocking=True, timeout=-1):
+                return self.lock.acquire(blocking, timeout)
 
             def __enter__(self):
                 self.lock.acquire()
 
             def __exit__(self, *exc):
+                self.release()
+
+            def release(self):
                 self.lock.release()
                 if self.armed:
                     self.armed = False
                     second_running.wait(5)
-
-            def release(self):
-                self.lock.release()
 
         svc = Service(Engine(tok, "</think>\n\n" + "y" * 40, max_context=CTX), tok,
                       ChatTemplate(ROOT / "serve/chat_template.jinja"))

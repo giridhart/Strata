@@ -196,6 +196,7 @@ def focused_recovery_prompt(tok, ids, generated):
 
 
 LOOPBACK_NAMES = ("localhost", "127.0.0.1", "::1")
+QUEUE_BEAT_S = 10.0         # a request waiting for the single turn sends a keep-alive this often (#1619)
 CTX_SLACK = 8               # `strata --serve` rejects prompt + max_new + 8 > context: keep the same margin here
 # The live tok/s is a rate over a window, not a mean since the first token: a mean reads ~1/elapsed at the first
 # token (the Monitor showed five-digit numbers) and then undershoots for the first second of every answer.
@@ -3469,7 +3470,32 @@ class Service:
             self.status["queued"] += 1
         try:
             # --batch: the engine runs several requests at once (StrataEngine.generate_batched orders them)
-            with (contextlib.nullcontext() if getattr(self.engine, "batch", 0) else self.fifo):
+            turn = contextlib.ExitStack()
+            if not getattr(self.engine, "batch", 0):
+                # #1619: a request waiting for the single turn sends a keep-alive every QUEUE_BEAT_S, so a client with
+                # a stream idle timeout does not abort a healthy queued request (and its retry read the prompt again);
+                # a client that left while queued gives its place up instead of taking the turn only to cancel there
+                got = False
+                try:
+                    while not got:
+                        got = self.fifo.acquire(timeout=QUEUE_BEAT_S)
+                        if got:
+                            turn.callback(self.fifo.release)
+                        elif cancel.is_set():
+                            break
+                        else:
+                            yield "ping", None
+                except BaseException:                    # the consumer closed us at a ping: no longer queued
+                    with self.status_lock:
+                        self.status["queued"] -= 1
+                    raise
+                if not got:                              # cancelled while queued
+                    with self.status_lock:
+                        self.status["queued"] -= 1
+                    yield "done", {"finish": "cancel", "completion_tokens": 0, "reused": 0, "timings": None,
+                                   "reasoning_tokens": 0, "reasoning_recoveries": 0}
+                    return
+            with turn:
                 try:
                     with self.status_lock:
                         if trace is not None:
