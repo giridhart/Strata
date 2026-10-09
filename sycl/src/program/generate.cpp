@@ -1500,24 +1500,20 @@ bool load_control_vectors(const Options& o, const strata::core::ModelGeometry& g
 // median would still follow a disturbance that lasts through half the bursts).  Each burst takes ~10 ms on an x16
 // PCIe 4 link, so the probe takes no longer than the one 1 GiB burst did.  `samples`, when given, gets every
 // burst's reading for the log.
-double probe_pcie_h2d_gbps(std::string *samples = nullptr) try {
+double probe_pcie_h2d_gbps(std::string *samples = nullptr, bool pin_source = false) try {
     constexpr size_t kBytes = 256ull << 20;
     constexpr int kBursts = 4;
     void* h = nullptr;
     void* d = nullptr;
-    if (DPCT_CHECK_ERROR(h = (void *)malloc(kBytes)) != 0) return -1.0;
+    // PR #1669: a pageable source made the copy engine fault on a layer split (VM_NOT_FOUND), so a split pins it. A single card keeps the
+    // pageable source of 0.1.41: pinned reads 1.7x faster, which moves the default pcie_frac (A750 0.28 -> 0.47, 10% slower decode).
+    if (DPCT_CHECK_ERROR(h = pin_source ? (void *)sycl::malloc_host(kBytes, dpct::get_in_order_queue()) : (void *)malloc(kBytes)) != 0 || h == nullptr) return -1.0;
     if (DPCT_CHECK_ERROR(d = (void *)sycl::malloc_device(
                              kBytes, dpct::get_in_order_queue())) != 0) {
-        free(h);
+        if (pin_source) sycl::free(h, dpct::get_in_order_queue()); else free(h);
         return -1.0;
     }
     std::memset(h, 0, kBytes);   // fault the pages in before timing
-    /*
-    DPCT1124: cudaMemcpyAsync is migrated to asynchronous memcpy API. While
-    the origin API might be synchronous, it depends on the type of operand
-    memory, so you may need to call wait() on event return by memcpy API to
-    ensure synchronization behavior.
-    */
     dpct::get_in_order_queue().memcpy(
         d, h, kBytes).wait(); // warmup: context up, copy engine primed
     float ms[kBursts] = {};
@@ -1583,7 +1579,7 @@ double probe_pcie_h2d_gbps(std::string *samples = nullptr) try {
     */
     if (!ok)(void) 0;
     sycl::free(d, dpct::get_in_order_queue());
-    free(h);
+    if (pin_source) sycl::free(h, dpct::get_in_order_queue()); else free(h);
     return bw;
 }
 catch (sycl::exception const &exc) {
@@ -2543,7 +2539,7 @@ int main(int argc, char **argv) try {
     if (o.pcie_frac < 0.0) {
         const double base = native_pack ? 0.55 : 0.2;
         std::string bursts;
-        const double bw = native_pack ? probe_pcie_h2d_gbps(&bursts) : -1.0;
+        const double bw = native_pack ? probe_pcie_h2d_gbps(&bursts, multi_gpu) : -1.0;
         if (!native_pack) {
             o.pcie_frac = base;
         } else if (bw > 0.0) {
@@ -3343,7 +3339,7 @@ int main(int argc, char **argv) try {
         st.pcie_frac = o.pcie_frac;
         if (!pcie_given && native_pack) {
             std::string bursts;
-            const double bw = probe_pcie_h2d_gbps(&bursts);
+            const double bw = probe_pcie_h2d_gbps(&bursts, true);
             if (bw > 0.0) st.pcie_frac = pcie_frac_for_gbps(bw, 0.55);
             std::fprintf(stderr, "strata generate: layer split: CUDA%d PCIe probe %.1f GB/s (best of %s) -> pcie_frac "
                                  "%.2f\n", st.dev, bw, bursts.c_str(), st.pcie_frac);
@@ -4820,11 +4816,20 @@ int main(int argc, char **argv) try {
         }
         unmirrored_misses = (int64_t) miss.size() - (int64_t) (gguf_src.mirrored_bytes() ? std::count_if(miss.begin(), miss.end(),
             [&](const std::pair<int64_t, int64_t>& pr) { return gguf_src.pinned(pr.first, pr.second); }) : 0);
-        if (unmirrored_misses > 0 && [] { const char* v = std::getenv("STRATA_VERIFY_NO_HOST"); return v && *v && std::strcmp(v, "0") != 0; }()) {
+        const bool no_host = [] { const char* v = std::getenv("STRATA_VERIFY_NO_HOST"); return v && *v && std::strcmp(v, "0") != 0; }();
+        if (unmirrored_misses > 0 && no_host) {
             std::fprintf(stderr, "strata generate: REFUSED: %lld experts are neither in VRAM nor mirrored; with STRATA_VERIFY_NO_HOST "
                                  "the device plan cannot run them and generation would lack a safe host fallback - raise "
                                  "STRATA_MIRROR_MIB or the free RAM, or lower --max-context\n", (long long) unmirrored_misses);
             return 2;
+        }
+        // The same rule after the start: the mirror holds the start's misses only, so an expert an adaptive swap moves
+        // out of VRAM would be in neither, and the device plan would wait for a host that never serves it (every token
+        // 0 after a --batch window had counted misses and the tier swapped).
+        if (!miss.empty() && no_host && o.adapt_every > 0 && o.adapt_swaps > 0) {
+            std::fprintf(stderr, "strata generate: adaptive swaps off: with STRATA_VERIFY_NO_HOST an expert they move out of "
+                                 "VRAM would be neither there nor mirrored\n");
+            o.adapt_every = 0;
         }
     }
 
