@@ -3556,11 +3556,15 @@ int main(int argc, char** argv) {
             return parts;
         };
         bool gate_on = true;   // off only when no placement can start (below): then the best one is kept and a warning said
+        // #1428: 2 and 3 GPUs - every placement priced, kept (a few hundred) so the near-tie warning below can name the
+        // best placement that is really a different one (not the neighbour one layer over)
+        std::vector<std::pair<double, std::vector<int64_t>>> priced;
         auto consider = [&]() {
             double hm = 0;
             int64_t held = 0;
             const double ms = predict(at, hm, held);
             ++tried;
+            if (ns <= 3) priced.emplace_back(ms, at);
             const double mx = stage_max(at);
             if (ms < best_ms - tie_eps || (ms <= best_ms + tie_eps && mx < best_max - tie_eps)) {
                 // feasibility gate: mirrors the serve path (`fits_one` + own_fits) for the 512-token last resort;
@@ -3584,6 +3588,7 @@ int main(int argc, char** argv) {
             consider();
         };
         auto search = [&]() {
+        priced.clear();
         if (ns == 2) {
             for (int64_t k = 2; k < L; ++k) { at[0] = k; consider(); }
             // a model with fewer than three layers enumerates nothing: keep the proportional guess rather than
@@ -3721,6 +3726,39 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata generate: layer split auto: K=%s - predicted %.1f ms per decode window; the caches "
                              "hold %lld of %zu profiled pairs (~%.1f%% of the routed mass), best of %lld placements\n",
                      ks.c_str(), best_ms, (long long) best_held, profile.size(), 100.0 * best_mass, (long long) tried);
+        // #1428: a near tie on a mixed pair.  The model prices a decode window only (the prompt path is not in it), and on
+        // cards of different speed or link the winner can flip within a few percent of error: say which other split is
+        // almost as good, so the user can try it.  Recommend, never force: this only prints.
+        {
+            const double lo = *std::min_element(layer_ms.begin(), layer_ms.end());
+            const double hi = *std::max_element(layer_ms.begin(), layer_ms.end());
+            const double llo = *std::min_element(link_scale.begin(), link_scale.end());
+            const double lhi = *std::max_element(link_scale.begin(), link_scale.end());
+            const bool mixed = hi > lo * 1.10 || lhi > llo * 1.10;
+            const double near_pct = std::getenv("STRATA_SPLIT_NEAR_TIE_PCT") ? std::atof(std::getenv("STRATA_SPLIT_NEAR_TIE_PCT")) : 4.0;
+            if (mixed && near_pct > 0 && ns <= 3 && best_ms > 0 && !priced.empty()) {
+                const std::vector<int64_t>* alt = nullptr;
+                double alt_ms = 1e30;
+                for (const auto& pc : priced) {
+                    if (pc.first > best_ms * (1.0 + near_pct / 100.0) || pc.first >= alt_ms) continue;
+                    int64_t dist = 0;   // how far the other split's boundaries lie from the chosen one's
+                    for (size_t i = 0; i < pc.second.size() && i < best.size(); ++i)
+                        dist = std::max<int64_t>(dist, std::llabs(pc.second[i] - best[i]));
+                    if (dist < 3) continue;   // the neighbour one layer over is not a different split
+                    if (gate_on && !can_start(parts_of(pc.second))) continue;
+                    alt = &pc.second;
+                    alt_ms = pc.first;
+                }
+                if (alt != nullptr) {
+                    std::string as;
+                    for (const int64_t k : *alt) as += (as.empty() ? "" : ",") + std::to_string(k);
+                    std::fprintf(stderr, "strata generate: layer split auto: NEAR TIE - K=%s is predicted %.1f ms per decode "
+                                         "window, within %.1f%% of K=%s (%.1f ms); the cards differ, so the prediction may not "
+                                         "rank them (it prices decode, not the prompt). To try the other: --layer-split %s\n",
+                                 as.c_str(), alt_ms, 100.0 * (alt_ms / best_ms - 1.0), ks.c_str(), best_ms, as.c_str());
+                }
+            }
+        }
     }
     for (size_t i = 0; i < split_at.size(); ++i)
         if (split_at[i] >= g.n_layers) {
