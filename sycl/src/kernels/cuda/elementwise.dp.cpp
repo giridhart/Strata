@@ -788,6 +788,11 @@ bool doorbell_payload_ready(const uint32_t* h_seq, const float* h_x, int64_t n, 
 
 bool doorbell_wait_payload(const uint32_t* h_seq, const float* h_x, int64_t n, const int32_t* h_ids,
                            const float* h_weights, int64_t k, uint32_t want, int timeout_ms) {
+    // Opt-in (STRATA_DOORBELL_CHECK=1): on an Arc A750 (i915) the host-side checksum of the whole payload, read from
+    // uncached host memory twice per CPU-expert layer, cost 15-20% of decode (5 interleaved rounds), and the stale
+    // payload it guards against was not seen there. The ring tag is still published by the GPU.
+    static const bool check = [] { const char* v = std::getenv("STRATA_DOORBELL_CHECK"); return v != nullptr && v[0] == '1'; }();
+    if (!check) return true;
     if (doorbell_payload_ready(h_seq, h_x, n, h_ids, h_weights, k, want)) return true;
     const auto t0 = std::chrono::steady_clock::now();
     while (!doorbell_payload_ready(h_seq, h_x, n, h_ids, h_weights, k, want)) {
