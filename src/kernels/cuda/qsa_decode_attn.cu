@@ -84,7 +84,37 @@ __device__ __forceinline__ void load8(const QsaAttnPools& p, bool value, long lo
     } else load8_q4(p, value, row, d0, out);
 }
 
-template <int KV_MODE, bool LANE_CELL = false, bool QUERY_SWIZZLE = false>
+// Exact-intent score reduce-scatter: the same butterfly pairs as twelve warp_sum calls,
+// with 16 shuffle exchanges instead of 60. Used only by the opt-in gfx906 INT8
+// query-swizzled specialization; softmax, value accumulation and merge are unchanged.
+__device__ __forceinline__ float reduce12_gfx906(const float (&part)[16], int lane) {
+    float r8[8];
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        const bool hi = (lane & 16) != 0;
+        r8[i] = (hi ? part[i + 8] : part[i]) + __shfl_xor_sync(0xffffffffu, hi ? part[i] : part[i + 8], 16);
+    }
+    float r4[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const bool hi = (lane & 8) != 0;
+        r4[i] = (hi ? r8[i + 4] : r8[i]) + __shfl_xor_sync(0xffffffffu, hi ? r8[i] : r8[i + 4], 8);
+    }
+    float r2[2];
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        const bool hi = (lane & 4) != 0;
+        r2[i] = (hi ? r4[i + 2] : r4[i]) + __shfl_xor_sync(0xffffffffu, hi ? r4[i] : r4[i + 2], 4);
+    }
+    const bool hi2 = (lane & 2) != 0;
+    const float r1 = (hi2 ? r2[1] : r2[0]) + __shfl_xor_sync(0xffffffffu, hi2 ? r2[0] : r2[1], 2);
+    return r1 + __shfl_xor_sync(0xffffffffu, r1, 1);
+}
+__device__ __forceinline__ int reduce12_head_of_lane(int lane) {
+    return ((lane >> 4) & 1) * 8 + ((lane >> 3) & 1) * 4 + ((lane >> 2) & 1) * 2 + ((lane >> 1) & 1);
+}
+
+template <int KV_MODE, bool LANE_CELL = false, bool QUERY_SWIZZLE = false, bool REDUCE12 = false>
 __global__ void __launch_bounds__(THREADS) attn_chunk_kernel(const float* __restrict__ q, QsaAttnPools p,
                                                              const int32_t* __restrict__ ids,
                                                              const int32_t* __restrict__ step, int n_kv_heads,
@@ -173,6 +203,25 @@ __global__ void __launch_bounds__(THREADS) attn_chunk_kernel(const float* __rest
             if (lane < G) sp[lane][c] = -FLT_MAX;
             continue;
         }
+        if constexpr (REDUCE12) {
+        float k8[8];
+        load8<KV_MODE>(p, false, srow[c], lane * 8, k8);
+        float part[16];
+#pragma unroll
+        for (int h = 0; h < G; ++h) {
+            const int qflip = QUERY_SWIZZLE ? (lane & 4) : 0;
+            const float4 qa = *reinterpret_cast<const float4*>(&sq[h][lane * 8 + qflip]);
+            const float4 qb = *reinterpret_cast<const float4*>(&sq[h][lane * 8 + (qflip ^ 4)]);
+            float s = k8[0] * qa.x + k8[1] * qa.y + k8[2] * qa.z + k8[3] * qa.w +
+                      k8[4] * qb.x + k8[5] * qb.y + k8[6] * qb.z + k8[7] * qb.w;
+            part[h] = s;
+        }
+#pragma unroll
+        for (int h = G; h < 16; ++h) part[h] = 0.0f;
+        const float score = reduce12_gfx906(part, lane);
+        const int head = reduce12_head_of_lane(lane);
+        if ((lane & 1) == 0 && head < G) sp[head][c] = score * scale;
+        } else {
         float k8[8];
         load8<KV_MODE>(p, false, srow[c], lane * 8, k8);
 #pragma unroll
@@ -184,6 +233,7 @@ __global__ void __launch_bounds__(THREADS) attn_chunk_kernel(const float* __rest
                       k8[4] * qb.x + k8[5] * qb.y + k8[6] * qb.z + k8[7] * qb.w;
             s = warp_sum(s);
             if (lane == 0) sp[h][c] = s * scale;
+        }
         }
     }
     __syncthreads();
@@ -612,8 +662,29 @@ void qsa_decode_attn_batch(const float* q, const QsaAttnPools& pools, const int3
     // Other pool formats and lane-cell scoring keep their paths; qsa_decode_attn_step is unchanged.
     // A k8v4 model's MTP drafter uses INT8 pools and can therefore take this path.
     if (use_query_swizzle) {
-        attn_chunk_kernel<1, false, true><<<grid, THREADS, 0, st>>>(q, pools, ids, steps,
-            (int) s.n_head_kv, (int) s.page_size, scale, part_acc, part_m, part_l, n_chunks, (int) cap, stride);
+        // use_query_swizzle already requires INT8, warp scoring, and the calling
+        // thread's current device to be exactly gfx906 with a 64-lane wavefront.
+        static const bool reduce12 = [] {
+            const char* v = std::getenv("STRATA_GFX906_ATTN_REDUCE12");
+            return v && v[0] == '1' && v[1] == '\0';
+        }();
+        if (reduce12) {
+            attn_chunk_kernel<1, false, true, true><<<grid, THREADS, 0, st>>>(q, pools, ids, steps,
+                (int) s.n_head_kv, (int) s.page_size, scale, part_acc, part_m, part_l, n_chunks, (int) cap, stride);
+            static const bool trace = [] {
+                const char* v = std::getenv("STRATA_GFX906_ATTN_REDUCE12_TRACE");
+                return v && v[0] == '1' && v[1] == '\0';
+            }();
+            static thread_local bool said = false;
+            if (trace && !said) {
+                said = true;
+                std::fprintf(stderr, "strata attn-reduce12: selected=1 query_swizzle=1 kv_mode=1 nq=%lld cap=%lld\n",
+                             (long long) n_q, (long long) cap);
+            }
+        } else {
+            attn_chunk_kernel<1, false, true><<<grid, THREADS, 0, st>>>(q, pools, ids, steps,
+                (int) s.n_head_kv, (int) s.page_size, scale, part_acc, part_m, part_l, n_chunks, (int) cap, stride);
+        }
     } else
 #endif
     if (kv_mode == 3)
