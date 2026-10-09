@@ -51,7 +51,19 @@ endif()
 # SYCL_PROGRAM_COMPILE_OPTIONS=-cl-fp32-correctly-rounded-divide-sqrt at run time.) The AOT build passes it to
 # ocloc above; without that the 303k mismatches came back on 2026-09-30, unnoticed since the AOT switch.
 if(NOT STRATA_SYCL_AOT)
-  list(APPEND _sycl_link "-Xsycl-target-backend=spir64" "-cl-fp32-correctly-rounded-divide-sqrt")
+  # The JIT build is the Alchemist (Arc A-series) build. There IGC turns a kernel's pointer arguments into surface
+  # accesses with a 32-bit offset from the allocation's base, so a kernel misreads bytes more than 4 GiB into an
+  # allocation while copies of the same bytes are right. Measured on an Arc A770 (Coder IQ1_M, 4.46 GiB expert cache):
+  # every expert in the cache's last 0.46 GiB dequantized to NaN in the prompt path, and every prompt answered "!!!!"
+  # (token 0). This option keeps the kernels on 64-bit (stateless) addresses; with it the same prompts are right.
+  # (One backend argument for both: CMake drops a repeated -Xsycl-target-backend=spir64.)
+  option(STRATA_SYCL_JIT_STATELESS "JIT build: keep kernels on 64-bit addresses (-ze-opt-greater-than-4GB-buffer-required)" ON)
+  if(STRATA_SYCL_JIT_STATELESS)
+    list(APPEND _sycl_link "-Xsycl-target-backend=spir64"
+         "-cl-fp32-correctly-rounded-divide-sqrt -ze-opt-greater-than-4GB-buffer-required")
+  else()
+    list(APPEND _sycl_link "-Xsycl-target-backend=spir64" "-cl-fp32-correctly-rounded-divide-sqrt")
+  endif()
 endif()
 # Every translation unit gets -fsycl: the migrated host files construct queues and USM, not only the kernels.
 # icpx defaults to a fast floating-point model (reciprocal approximations, reassociation); the kernels are

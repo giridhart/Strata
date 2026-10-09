@@ -25,6 +25,7 @@
 #include <sycl/sycl.hpp>
 #include <dpct/dpct.hpp>
 #include "strata/sycl_queue.hpp"
+#include "strata/sycl_doorbell.hpp"
 #include "strata/core/arch_defaults.hpp"
 #include "strata/core/dma_batch.hpp"
 #include "strata/core/device.hpp"
@@ -428,6 +429,7 @@ struct Options {
     std::string embd_gguf;
     /// Plan v0.3 P2: how the n-gram table is read. Direct (default) = unbuffered SSD reads, table never in RAM.
     std::string ple_io = "direct";
+    bool ple_io_explicit = false;      ///< --ple-io was given: the engine only warns when direct measures slow
     int64_t ple_row_cache = 1 << 20;   ///< bounded row cache (rows of 90 B); 0 disables
     int ple_inflight = 256;   // the prompt path reads a chunk's rows at once: 64 left the SSD half idle (32K: 303 -> 189 ms)
     double ple_delay_us = 0;           ///< fault injection: every row read completes no earlier than this
@@ -1601,6 +1603,31 @@ double pcie_frac_for_gbps(double gbps, double base) {
 
 }  // namespace
 
+// #1425 #1549 #1629: --ple-io direct (the default) does unbuffered random reads of the n-gram table; on some drives
+// (DRAM-less NVMe, Windows unbuffered I/O) they run at 34 MB/s or 4-8 tok/s and a prompt reads layer 1 for minutes.
+// Rows per second of a short cold probe: a few batches of random rows through the same batched reader a prompt chunk
+// uses, stopped after ~0.6 s. Returns <= 0 when nothing could be measured.
+static double ple_direct_rows_per_s(strata::kernels::PleTable& t) {
+    const uint64_t n = t.rows();
+    if (n < 4096) return -1.0;
+    constexpr size_t kTok = 4;   // 64 rows a batch
+    std::vector<uint32_t> rows(kTok * 16);
+    std::vector<float> out(kTok * 2560);
+    uint64_t x = 0x9E3779B97F4A7C15ull ^ n;
+    const auto t0 = std::chrono::steady_clock::now();
+    uint64_t done = 0;
+    double el = 0;
+    for (int b = 0; b < 64; ++b) {
+        for (auto& r : rows) { x ^= x << 13; x ^= x >> 7; x ^= x << 17; r = (uint32_t) (x % n); }
+        std::string e;
+        if (!t.gather_batch(rows.data(), kTok, out.data(), e)) return -1.0;
+        done += rows.size();
+        el = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        if (el > 0.6) break;
+    }
+    return el > 0 ? (double) done / el : -1.0;
+}
+
 int main(int argc, char **argv) try {
     // **UNBUFFERED, BECAUSE THE INTERESTING OUTPUT IS THE OUTPUT BEFORE A CRASH.**  `stdout` redirected to a
     // pipe or a file is block-buffered, so a program that dies loses every line it had already printed - which
@@ -1687,7 +1714,7 @@ int main(int argc, char **argv) try {
         else if (a == "--dump-routing") o.dump_routing = next("--dump-routing");
         else if (a == "--ple-gguf") o.ple_gguf = next("--ple-gguf");
         else if (a == "--no-ple") o.no_ple = true;
-        else if (a == "--ple-io") o.ple_io = next("--ple-io");
+        else if (a == "--ple-io") { o.ple_io = next("--ple-io"); o.ple_io_explicit = true; }
         else if (a == "--ple-row-cache") o.ple_row_cache = std::atoll(next("--ple-row-cache"));
         else if (a == "--ple-inflight") o.ple_inflight = std::atoi(next("--ple-inflight"));
         else if (a == "--ple-delay-us") o.ple_delay_us = std::atof(next("--ple-delay-us"));
@@ -2143,12 +2170,42 @@ int main(int argc, char **argv) try {
     // SYCL port (the B70, 2026-09-30): lending cache slots to the prompt path costs ~1 s per prompt (2,184 tokens:
     // 610 vs 792 tok/s) but is what keeps every expert in VRAM at a long context - 80,000 tokens without it: the
     // reserve for the KV and the chunk buffers evicts ~1,900 experts, prompt 790 tok/s and decode 2 tok/s after it;
-    // with it: 1,062 tok/s and 39.5 tok/s. So by default only above a 32K context; the flags still decide.
+    // with it: 1,062 tok/s and 39.5 tok/s after it. So by default only above a 32K context; the flags still decide.
     // (0.1.31-0.1.32: borrowing hung in the first chunk of a long prompt; the prompt path's stager waited on the copy
     // queue's events from its own threads, which the Level Zero v2 adapter did not survive once its ring wrapped -
     // prefill.cpp, Stager::issued_one. Fixed 2026-10-01: a 40K prompt borrowing reads at 1,144 tok/s and decodes at
     // 69 tok/s after it, against 1,201 / 65 with its own buffers.)
-    if (!borrow_explicit) o.no_prefill_borrow = o.max_context <= 32768;
+    //
+    // 2026-10-08 (the A770): borrowing is BROKEN on Alchemist. Its prompt buffers are carved from the top of the
+    // ~10 GiB expert-cache allocation, and oneMKL's BF16 GEMM reads a wrong tile when an operand lies more than 4 GiB
+    // into its allocation (docs/INTEL.md); the borrowed operands hit that, so from the first full prefill chunk the
+    // router read garbage and prefill failed ("prefill: routed id out of range") or the engine segfaulted (measured:
+    // a 236-token prompt, mirrored and mmap configs alike). Keep Alchemist's prompt path on its own buffers (its own
+    // allocation, reserved exactly by owned_prefill_mib) and keep an automatic chunk under 4 GiB, until the SYCL BLAS
+    // stages operands as the CUDA/HIP shims do. Battlemage keeps the old default (its long prompts were measured
+    // correct with borrowing). --prefill-borrow overrides, for testing the staging fix. A layer split keeps its rule.
+    if (!borrow_explicit) {
+        static const bool alchemist = [] {
+            try {
+                // PCI device ids, the same table setup_intel.py uses: 56a0 A770, 56a1 A750, 56a2 A580, 56a5 A380,
+                // 56a6 A310, 5690 A770M
+                const unsigned id = dpct::get_current_device().get_info<sycl::ext::intel::info::device::device_id>();
+                // Only a card with room for an expert cache past 4 GiB can hit it: on an 8 GB A750 the cache was 0.34 GiB
+                // and the own-buffers reservation cost experts (prompt 72 -> 52 tok/s, decode -6%, 4K prompt, 4 rounds)
+                if (dpct::get_current_device().get_info<sycl::info::device::global_mem_size>() < (12ull << 30)) return false;
+                switch (id & 0xffffu) {
+                case 0x56a0: case 0x56a1: case 0x56a2: case 0x56a5: case 0x56a6: case 0x5690: return true;
+                default: return false;
+                }
+            } catch (...) { return false; }
+        }();
+        if (!multi_gpu && alchemist) {
+            o.no_prefill_borrow = true;
+            if (o.prefill_auto && o.prefill_chunk > 2048) o.prefill_chunk = o.prefill_auto_max = 2048;
+        } else {
+            o.no_prefill_borrow = o.max_context <= 32768;
+        }
+    }
 #if defined(STRATA_USE_HIP)
     {
         // every GPU this run uses must be an architecture the binary has code for (a gfx1100 build on a gfx1201
@@ -2224,6 +2281,7 @@ int main(int argc, char **argv) try {
         if (o.mtp_max_t == 0) o.mtp_max_t = o.spec;
         o.spec = std::max(o.spec, std::min(o.mtp_max_t + o.lookup_chain, 8));   // kVerifyMaxT
     }
+    strata::spin_drafts_need_long_bound(o.spec >= 2 && o.mtp.empty());   // spin_max: drafting without MTP waits long
     strata::core::layer_set_shared_early(!o.shared_late);
     if (!o.native_preset.empty()) {
         try {
@@ -2940,6 +2998,34 @@ int main(int argc, char **argv) try {
         if (!ple_table.open(o.ple_gguf, err, pio)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
+        }
+        // Recommend, never force: when the default direct reads measure slow, switch to the mapped reads (40-100x
+        // faster on the reporters' drives); an explicit --ple-io direct is kept and only warned about.
+        if (pio.mode == strata::kernels::PleIo::Direct && std::getenv("STRATA_PLE_PROBE") == nullptr) {
+            constexpr double kSlowRowsPerS = 15000.0;   // ~60 MB/s of 4 KiB pages; a healthy NVMe is >100k
+            const double rps = ple_direct_rows_per_s(ple_table);
+            if (rps >= kSlowRowsPerS)
+                std::fprintf(stderr, "strata generate: PLE direct read probe: %.0f rows/s (fine)\n", rps);
+            if (rps > 0 && rps < kSlowRowsPerS) {
+                if (!o.ple_io_explicit) {
+                    std::fprintf(stderr, "strata generate: --ple-io direct measures slow here (%.0f rows/s, about %.0f MB/s of "
+                                         "random 4 KiB reads): using --ple-io mmap instead (the OS file cache holds the pages; "
+                                         "--ple-io direct forces the old mode, --ple-io ram keeps the table in RAM)\n",
+                                 rps, rps * 4096.0 / 1e6);
+                    ple_table.close();
+                    pio.mode = strata::kernels::PleIo::Mmap;
+                    pio.keepalive_ms = 0;
+                    if (!ple_table.open(o.ple_gguf, err, pio)) {
+                        std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+                        return 1;
+                    }
+                } else {
+                    std::fprintf(stderr, "strata generate: WARNING: --ple-io direct measures slow here (%.0f rows/s, about %.0f "
+                                         "MB/s of random 4 KiB reads): a prompt can spend minutes reading layer 1 and trip the "
+                                         "stall watchdog (#1425, #1629). --ple-io mmap was 40-100x faster on such drives; "
+                                         "--ple-io ram needs the RAM for the table\n", rps, rps * 4096.0 / 1e6);
+                }
+            }
         }
 #if !defined(_WIN32)
         if (pio.mode == strata::kernels::PleIo::Direct) {
