@@ -122,13 +122,20 @@ def static_oracle(windows, slots):
 
 if __name__ == "__main__":
     tr, prof, slots = sys.argv[1], sys.argv[2], int(sys.argv[3])
+
+    def opt(name, default, cast=float):
+        return cast(sys.argv[sys.argv.index(name) + 1]) if name in sys.argv else default
+
+    pol = Policy(every=opt("--every", 4, int), decay=opt("--decay", 0.7), swaps=opt("--swaps", 96, int),
+                 margin=opt("--margin", 1.5), mincand=opt("--mincand", 2.0))
     windows, k = load_trace(tr)
     print("windows", len(windows), "k", k, "tokens/window", np.mean([len(w[0][1]) for w in windows]))
     init = load_profile(prof, slots)
     print("static oracle (top-%d by this trace's own counts): %.4f" % (slots, static_oracle(windows, slots)))
     base = simulate(windows, init, Policy(every=10**9))
     print("profile only, no adaptation: %.4f" % base["share"])
-    cur = simulate(windows, init, Policy())
-    print("current policy: share %.4f swaps %d (%.2f/window); miss entries %d, distinct misses %d (%.1f%% fewer reads)"
-          % (cur["share"], cur["swaps"], cur["swaps"] / cur["windows"], cur["miss_ent"], cur["miss_dist"],
-             100 * (1 - cur["miss_dist"] / max(1, cur["miss_ent"]))))
+    cur = simulate(windows, init, pol)
+    print("policy every %d, swaps %d, decay %.2f: share %.4f, swaps %d (%.2f/window); miss entries %d, distinct misses %d "
+          "(%.1f%% fewer reads)" % (pol.every, pol.swaps, pol.decay, cur["share"], cur["swaps"], cur["swaps"] / cur["windows"],
+                                    cur["miss_ent"], cur["miss_dist"],
+                                    100 * (1 - cur["miss_dist"] / max(1, cur["miss_ent"]))))
