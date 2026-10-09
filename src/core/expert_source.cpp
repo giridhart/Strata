@@ -2187,6 +2187,8 @@ void RouterLookahead::stats_score(int64_t layer, const int32_t* ids, int64_t n, 
                      (unsigned long long) st_windows_, (unsigned long long) scored, (unsigned long long) st_nopred_,
                      st_layers_ ? 100.0 * (double) st_nopred_ / (double) st_layers_ : 0.0,
                      scored ? (double) st_actual_ / (double) scored : 0.0);
+        std::fprintf(stderr, " predictor thread %.2f ms/window;",
+                     (double) busy_us_.load(std::memory_order_relaxed) / 1000.0 / (double) st_windows_);
         static const int add[3] = {0, 4, 10};
         for (int s = 0; s < 3; ++s)
             std::fprintf(stderr, " k=%d: recall %.3f precision %.3f (%.2f predicted/layer);", k_ + add[s],
