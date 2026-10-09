@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdio>
 #include <charconv>
 #include <filesystem>
 #include <fstream>
@@ -263,7 +264,16 @@ std::optional<HostMemoryReading> sample_host_memory(const MemoryProbePaths& path
     std::optional<uint64_t> total;
     if (total_file) total = meminfo_kb_bytes(total_file, "MemTotal:");
     CgroupScan cg;
-    if (!scan_cgroups(paths, cg)) return {};
+    if (!scan_cgroups(paths, cg)) {
+        // Without an operator cap the cgroup files are only an extra: the guard falls back to MemAvailable alone (what
+        // 0.1.41 used), once-warned.  With a cap the usage cannot be told, so the sample stays unknown.
+        if (explicit_limit != 0) return {};
+        static std::atomic<bool> warned{false};
+        if (!warned.exchange(true))
+            std::fprintf(stderr, "[strata] memory guard: the cgroup memory files could not be read or parsed, using "
+                                 "MemAvailable; set --memory-limit-mib to the container's limit\n");
+        cg = CgroupScan{};
+    }
     return combine(available, total, cg, explicit_limit);
 }
 

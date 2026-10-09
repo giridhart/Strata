@@ -958,7 +958,8 @@ room afterwards):
    minus `memory.current`; cgroup v1 `memory.limit_in_bytes` minus
    `memory.usage_in_bytes` (both less the clean inactive file cache, below). `max` and v1's "unlimited" count as no limit; a file that is
    absent (no memory controller at that level) is skipped; a file that is there but
-   cannot be read or parsed makes the sample unknown, and unknown skips parking.
+   cannot be read or parsed makes the cgroup terms unusable: without `--memory-limit-mib` the guard then uses
+   `MemAvailable` alone, as 0.1.41 did, and prints one warning per process; with the flag the sample is unknown, and unknown skips parking.
 3. `--memory-limit-mib N` (or `STRATA_MEMORY_LIMIT_MIB=N`; the flag wins, `0` = none):
    N MiB is the total this engine's container or cgroup may use, minus what that
    container uses now. Use it when the container cannot see its own limit. The usage
@@ -1001,7 +1002,7 @@ is checked against the cgroup-aware `host_available_memory`) keep their own prob
 #1250), and `--memory-limit-mib` does not reach them. This figure is for what runs after the start: parking a
 conversation and saving or restoring a session file, which read `MemAvailable` alone. `host_available_memory`
 (expert_source.cpp) and this figure both read the cgroup limits; this one also reads `memory.high` and the operator's
-cap, and an unreadable cgroup file makes it unknown.
+cap; an unreadable cgroup file makes it fall back to `MemAvailable` (one warning), or unknown when a cap is set.
 
 Earlier measurement on a Proxmox LXC where the engine's container cannot see its limit (a 100 GiB cap on the parent
 cgroup, outside the container's namespace; the container's own `memory.max` and `memory.high` read `max`):

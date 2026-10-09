@@ -144,7 +144,8 @@ int main() {
         check(!f.sample(100 * GiB), "cap with unknown usage is unknown");
         check(f.sample().has_value(), "no cap, no usage needed");
     }
-    // malformed or unusable files: the sample is unknown (admission refuses), never a guess
+    // malformed or unusable files: without a cap the guard falls back to MemAvailable alone (meminfo source, once-warned);
+    // with a cap the sample is unknown (admission refuses), never a guess
     {
         const char* bad_values[] = {"garbage\n", "", "\n", "-5\n", "+5\n", "12x\n", "1 2\n", "18446744073709551616\n",
                                     "0x10\n", "MAX\n"};
@@ -156,7 +157,11 @@ int main() {
                 f.put("cgroup/g/memory.max", 100 * GiB); f.put("cgroup/g/memory.high", "max\n");
                 f.put("cgroup/g/memory.current", 50 * GiB);
                 f.put(std::string("cgroup/g/") + file, text);
-                check(!f.sample(), "malformed cgroup file is unknown");
+                {
+                    const auto r = f.sample();
+                    check(r && r->available == 25 * GiB && r->source == MemorySource::meminfo,
+                          "malformed cgroup file without a cap: MemAvailable alone");
+                }
                 check(!f.sample(100 * GiB), "malformed cgroup file is unknown with the cap too");
             }
         }
@@ -166,7 +171,9 @@ int main() {
         f.meminfo(120 * GiB, 25 * GiB);
         check(f.sample() && f.sample()->available == 25 * GiB, "the fixture itself is sound");
         fs::remove(f.dir / "cgroup/g/memory.current");
-        check(!f.sample(), "a finite limit with no usage beside it is unknown");
+        check(f.sample() && f.sample()->available == 25 * GiB && f.sample()->source == MemorySource::meminfo,
+              "a finite limit with no usage beside it, no cap: MemAvailable alone");
+        check(!f.sample(100 * GiB), "... and with the cap it is unknown");
         f.put("cgroup/g/memory.max", "max\n");
         check(f.sample() && f.sample()->available == 25 * GiB, "no finite limit and no usage: the level is skipped");
         f.put("cgroup/g/memory.current", "max\n");
@@ -227,7 +234,8 @@ int main() {
         r = f.sample(92 * GiB);
         check(r && r->available == 2 * GiB && r->source == MemorySource::flag && r->current == 90 * GiB, "v1 with a tighter cap: the v1 root's usage");
         f.put("cgroup/memory/m/memory.limit_in_bytes", "junk\n");
-        check(!f.sample(), "v1 malformed limit is unknown");
+        check(f.sample() && f.sample()->source == MemorySource::meminfo, "v1 malformed limit, no cap: MemAvailable alone");
+        check(!f.sample(100 * GiB), "v1 malformed limit with the cap is unknown");
     }
     // hybrid: a v2 line, but the memory controller lives in the v1 tree
     {
