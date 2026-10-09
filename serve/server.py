@@ -5933,6 +5933,19 @@ def check_request_sampling(req) -> None:
         value = (req or {}).get(key)
         if value is None:
             continue
+        if isinstance(value, str) and value.strip():      # some clients send numbers as strings: read and used
+            try:
+                num = float(value)
+                num = int(num) if integer and num == int(num) else (num if not integer else None)
+                if integer and num is None:
+                    raise ValueError
+                if not integer and re.fullmatch(r"\s*[+-]?\d+\s*", value):
+                    num = int(value)
+            except (ValueError, OverflowError):
+                raise ValueError(f"{key}: {'an integer' if integer else 'a number'}") from None
+            if num != num or num in (float("inf"), float("-inf")):
+                raise ValueError(f"{key}: {'an integer' if integer else 'a number'}")
+            req[key] = value = num
         if isinstance(value, bool) or not isinstance(value, int if integer else (int, float)):
             raise ValueError(f"{key}: {'an integer' if integer else 'a number'}")
 

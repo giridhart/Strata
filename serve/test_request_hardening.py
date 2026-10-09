@@ -98,22 +98,37 @@ class Hardening(unittest.TestCase):
         chat = {"messages": [{"role": "user", "content": "hi"}], "max_tokens": 8}
         responses = {"model": "m", "input": "hi", "store": False, "max_output_tokens": 8}
         for path, body, field in (
-                ("/v1/chat/completions", {**chat, "temperature": "0.7"}, "temperature"),
+                ("/v1/chat/completions", {**chat, "temperature": "abc"}, "temperature"),
                 ("/v1/chat/completions", {**chat, "top_k": 40.0}, "top_k"),
-                ("/v1/chat/completions", {**chat, "seed": "7"}, "seed"),
-                ("/v1/messages", {**chat, "top_k": "40"}, "top_k"),
-                ("/v1/messages", {**chat, "repetition_penalty": "1.1"}, "repetition_penalty"),
+                ("/v1/chat/completions", {**chat, "seed": "x7"}, "seed"),
+                ("/v1/messages", {**chat, "top_k": [40]}, "top_k"),
+                ("/v1/messages", {**chat, "repetition_penalty": {"a": 1}}, "repetition_penalty"),
                 ("/v1/messages", {**chat, "presence_penalty": True}, "presence_penalty"),
                 ("/v1/responses", {**responses, "top_p": True}, "top_p"),
-                ("/v1/responses", {**responses, "temperature": "0.7"}, "temperature"),
+                ("/v1/responses", {**responses, "temperature": "hot"}, "temperature"),
                 ("/v1/responses", {**responses, "seed": 7.5}, "seed"),
-                ("/v1/messages/count_tokens", {"messages": chat["messages"], "temperature": "0.7"},
+                ("/v1/messages/count_tokens", {"messages": chat["messages"], "temperature": "abc"},
                  "temperature")):
             with self.subTest(path=path, field=field):
                 with mock.patch("builtins.print"):
                     code, out = self.post(path, body)
                 self.assertEqual(code, 400, (path, body, out))
                 self.assertIn(field, json.dumps(out))
+
+    def test_numeric_strings_are_read_and_used(self):
+        from serve.server import check_request_sampling
+        req = {"temperature": "0.7", "top_p": " 1 ", "top_k": "40", "seed": "7", "top_k_x": "keep", "min_p": "0"}
+        check_request_sampling(req)
+        self.assertEqual((req["temperature"], req["top_p"], req["top_k"], req["seed"], req["min_p"]),
+                         (0.7, 1, 40, 7, 0))
+        self.assertEqual(req["top_k_x"], "keep")
+        for bad in ({"top_k": "40.5"}, {"top_k": "abc"}, {"temperature": "nan"}, {"temperature": "true"},
+                    {"seed": ""}, {"temperature": [1]}):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                check_request_sampling(dict(bad))
+        code, out = self.post("/v1/chat/completions", {"messages": [{"role": "user", "content": "hi"}],
+                                                       "max_tokens": 8, "temperature": "0.7", "top_k": "40"})
+        self.assertEqual(code, 200, out)
 
     def test_in_type_values_and_nulls_still_answer(self):
         chat = {"messages": [{"role": "user", "content": "hi"}], "max_tokens": 8, "temperature": 0, "top_k": 0,
