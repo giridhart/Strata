@@ -900,6 +900,11 @@ bool MtpDrafter::record_rest(int step_row, cudaStream_t cs, std::string& err) {
             else router_top10(logits_ + t * g.n_expert, 1, (int) g.n_expert, (int) K, ids_ + t * K, w_ + t * K, cs);
         }
         }
+        if (rr_res_ != nullptr && rr_margin_ > 0.0f && g.n_expert == 512 && K == 10) {
+            try {
+                native_route_resident(logits_, ids_, w_, rr_res_, T, rr_margin_, rr_lo_, rr_hi_, nullptr, cs);
+            } catch (const std::exception& e) { err = std::string("mtp route-resident: ") + e.what(); return false; }
+        }
         moe_group_resident(ids_, (int) (T * K), (int) K, experts_, (int64_t) strata::kernels::cpu::BLOB, grp_ptr_,
                            grp_start_, grp_counts_, hit_dst_, hit_slot_, cs);
         quantize_q8_0_scaled(mixed_, hit_xq_, hit_xs_, (int64_t) T * N, cs);

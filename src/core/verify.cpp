@@ -45,6 +45,7 @@
 #include <algorithm>
 #include <atomic>
 #include <map>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -70,32 +71,60 @@ RouteResidentCfg& route_resident_cfg();
 struct RouteResidentCfg {
     float margin = 0.0f;
     int lo = 6, hi = 9;
-    unsigned long long* d_stats = nullptr;
-    unsigned long long* stats() {
-        if (d_stats == nullptr && margin > 0.0f) {
-            cudaMalloc((void**) &d_stats, 8 * sizeof(unsigned long long));
-            cudaMemset(d_stats, 0, 8 * sizeof(unsigned long long));
+    // #1578: one counter block per GPU.  A layer split inits a verifier per stage; a block allocated on whichever device
+    // was current at the first init is unreachable from the other stage's kernels without P2P (illegal memory access).
+    // The Verifier asks for its device's block in init (outside graph capture) and keeps the pointer: a launch never
+    // picks the block by the host thread's current device.  nullptr (the allocation failed): the kernel runs without counters.
+    std::mutex mu;
+    std::map<int, unsigned long long*> blocks;
+    unsigned long long* stats_on(int dev) {
+        if (margin <= 0.0f || dev < 0) return nullptr;
+        std::lock_guard<std::mutex> lk(mu);
+        const auto it = blocks.find(dev);
+        if (it != blocks.end()) return it->second;
+        unsigned long long* p = nullptr;
+        {
+            const OnDevice on(dev);
+            if (cudaMalloc((void**) &p, 8 * sizeof(unsigned long long)) != cudaSuccess ||
+                cudaMemset(p, 0, 8 * sizeof(unsigned long long)) != cudaSuccess) {
+                (void) cudaGetLastError();
+                if (p != nullptr) cudaFree(p);
+                p = nullptr;
+                std::fprintf(stderr, "route-resident: the counters could not be allocated on GPU %d; it runs without them\n", dev);
+            }
+        }
+        if (blocks.empty()) {
             std::atexit([] {
-                unsigned long long h[8] = {};
                 RouteResidentCfg& c = route_resident_cfg();
-                cudaDeviceSynchronize();
-                cudaMemcpy(h, c.d_stats, sizeof(h), cudaMemcpyDeviceToHost);
-                std::fprintf(stderr, "route-resident: margin=%g ranks=%d-%d windows T>8 (prompt reads): tail_nonres=%llu swaps=%llu (%.1f%%) nonres_entries before=%llu after=%llu\n",
-                             c.margin, c.lo, c.hi, h[0], h[1], h[0] ? 100.0 * h[1] / h[0] : 0.0, h[2], h[3]);
-                std::fprintf(stderr, "route-resident: margin=%g ranks=%d-%d windows T<=8 (decode): tail_nonres=%llu swaps=%llu (%.1f%%) nonres_entries before=%llu after=%llu\n",
-                             c.margin, c.lo, c.hi, h[4], h[5], h[4] ? 100.0 * h[5] / h[4] : 0.0, h[6], h[7]);
+                for (const auto& kv : c.blocks) {
+                    if (kv.second == nullptr) continue;
+                    unsigned long long h[8] = {};
+                    if (cudaSetDevice(kv.first) != cudaSuccess || cudaDeviceSynchronize() != cudaSuccess ||
+                        cudaMemcpy(h, kv.second, sizeof(h), cudaMemcpyDeviceToHost) != cudaSuccess) {
+                        (void) cudaGetLastError();
+                        continue;
+                    }
+                    char who[32] = "";
+                    if (c.blocks.size() > 1) std::snprintf(who, sizeof who, " (GPU %d)", kv.first);
+                    std::fprintf(stderr, "route-resident%s: margin=%g ranks=%d-%d windows T>8 (prompt reads): tail_nonres=%llu swaps=%llu (%.1f%%) nonres_entries before=%llu after=%llu\n",
+                                 who, c.margin, c.lo, c.hi, h[0], h[1], h[0] ? 100.0 * h[1] / h[0] : 0.0, h[2], h[3]);
+                    std::fprintf(stderr, "route-resident%s: margin=%g ranks=%d-%d windows T<=8 (decode): tail_nonres=%llu swaps=%llu (%.1f%%) nonres_entries before=%llu after=%llu\n",
+                                 who, c.margin, c.lo, c.hi, h[4], h[5], h[4] ? 100.0 * h[5] / h[4] : 0.0, h[6], h[7]);
+                }
             });
         }
-        return d_stats;
+        blocks[dev] = p;
+        return p;
     }
 };
 RouteResidentCfg& route_resident_cfg() {
-    static RouteResidentCfg c = [] {
-        RouteResidentCfg r;
-        if (const char* v = std::getenv("STRATA_ROUTE_RESIDENT")) r.margin = (float) std::atof(v);
-        if (const char* v = std::getenv("STRATA_ROUTE_RESIDENT_RANKS")) std::sscanf(v, "%d-%d", &r.lo, &r.hi);
-        return r;
+    static RouteResidentCfg c;
+    static const bool parsed = [] {
+        if (const char* v = std::getenv("STRATA_ROUTE_RESIDENT")) c.margin = (float) std::atof(v);
+        if (const char* v = std::getenv("STRATA_ROUTE_RESIDENT_RANKS")) std::sscanf(v, "%d-%d", &c.lo, &c.hi);
+        return true;
     }();
+    (void) parsed;
     return c;
 }
 inline bool g_lfuse_gate() { static const bool on = [] { const char* v = std::getenv("STRATA_LFUSE_GATE"); return v == nullptr || v[0] != '0'; }(); return on; }
@@ -412,7 +441,6 @@ Verifier::~Verifier() {
 bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState& ss, const VerifyHits& hits,
                     const NativeHead* head, int max_t, std::string& err) {
     g_diag_verifier.store(this);
-    (void) route_resident_cfg().stats();   // STRATA_ROUTE_RESIDENT: the counters are allocated outside graph capture
     diag_verify_fn().store(&diag_active_verifier);
     for (auto& slot : g_live) {
         Verifier* none = nullptr;
@@ -420,6 +448,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     }
     release_gpu_fn().store(&release_live_verifiers);
     cudaGetDevice(&device_);   // a layer split's stage on another GPU: its streams, graphs and buffers live there
+    rr_stats_ = route_resident_cfg().stats_on(device_);   // STRATA_ROUTE_RESIDENT: this GPU's counters, outside graph capture
     strata::kernels::fused_gr_check();   // once per card: which bitwise-equal hyper-connection read runs there
     wt_ = &wt;
     g_ = &g;
@@ -1322,7 +1351,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             try {
                 native_route_resident(logits_ + tb * NE, ids_ + tb * K, w_ + tb * K, hits_.d_res + l * g.n_expert, n,
                                       route_resident_cfg().margin, route_resident_cfg().lo, route_resident_cfg().hi,
-                                      route_resident_cfg().stats() + (n <= 8 ? 4 : 0), cs);
+                                      rr_stats_ != nullptr ? rr_stats_ + (n <= 8 ? 4 : 0) : nullptr, cs);
             } catch (const std::exception& e) { err = "verify route-resident: " + std::string(e.what()); return false; }
         }
         if (ar_on()) {

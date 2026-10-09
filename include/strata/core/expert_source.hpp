@@ -146,6 +146,11 @@ public:
     /// A blob pointer that stays valid (not recycled) for as long as the source is open: for a copy that runs
     /// asynchronously long after the call (the adaptive tier's swap-ins).  Defaults to `blob`.
     virtual const uint8_t* blob_stable(int64_t layer, int64_t expert) { return blob(layer, expert); }
+    /// The caller has queued an asynchronous copy out of `blob` (a pointer this source handed out) on `stream` (a
+    /// cudaStream_t): the source must not overwrite or recycle that memory until the copy has finished.  A source whose
+    /// pointers are never recycled ignores it.  (#1237: a page-locked stage buffer is read by the DMA after the copy call
+    /// returned, where a pageable one is staged by the driver before it returns.)
+    virtual void note_async_read(const uint8_t* blob, void* stream) { (void) blob; (void) stream; }
 
     /// Blobs touched, for the driver to report.  A source that does not count returns 0.
     virtual int64_t reads() const { return 0; }
@@ -603,6 +608,7 @@ public:
     const uint8_t* blob(int64_t layer, int64_t expert) override;
     /// With io prefetch in the experts.bin tier, the mapping itself (blob() may hand out a recycled staging buffer).
     const uint8_t* blob_stable(int64_t layer, int64_t expert) override;
+    void note_async_read(const uint8_t* blob, void* stream) override;
     /// Windows, opt-in with STRATA_FILE_RELEASE=1: trim the file mapping's full pages after their expert reaches
     /// VRAM. Never touches the resident complement or staging buffers. Disabled by default.
     uint64_t release(int64_t layer, int64_t expert) override;
@@ -728,6 +734,13 @@ private:
     int64_t last_layer_ = -1;
     bool stage_grew_ = false;
     bool stage_pin_said_ = false, stage_pin_failed_said_ = false;   ///< the one-time notes in claim_stage
+    // #1237: per stage buffer, the event recorded after the last asynchronous copy out of it (note_async_read); a
+    // buffer is refilled only once that event has completed.  cudaEvent_t, stored untyped (no cuda_runtime.h here).
+    std::vector<void*> stage_ev_;
+    std::vector<char> stage_ev_live_;                 ///< a copy was queued since the buffer was last waited for
+    std::unordered_map<const uint8_t*, size_t> stage_idx_;   ///< buffer address -> index (the buffers never move)
+    void stage_free_events();
+    std::atomic<uint64_t> stage_fence_waits_{0};      ///< refills that had to wait for a queued copy
     std::atomic<int64_t> ram_reads_{0};
     std::atomic<uint64_t> file_read_bytes_{0};
     // ---- the Linux I/O path (set_io_prefetch)

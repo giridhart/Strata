@@ -342,6 +342,7 @@ private:
     int hist_len_ = 0;
     bool head_sampling_ = true;          ///< set_head_sampling
     int device_ = -1;                    ///< the device `init` ran on: run/commit switch to it (layer split)
+    unsigned long long* rr_stats_ = nullptr;   ///< STRATA_ROUTE_RESIDENT's counters on device_ (#1578); null: none
     std::atomic<bool> released_{false};  ///< #267: release_gpu_waits ran (maybe on the watchdog thread): no more windows
     bool all_resident_ = false;           ///< 100% of experts in [lb_, le_) resident in VRAM: zero-doorbell graph
     /// #871: the zero-doorbell graph plans from the device residency table alone, so it is only right while every

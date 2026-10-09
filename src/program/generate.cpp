@@ -58,6 +58,7 @@
 #include "strata/core/mtp.hpp"
 #include "strata/prefill/prefill.hpp"
 #include "strata/core/native_dense.hpp"
+#include "strata/program/batch_read.hpp"
 #include "strata/program/logits_selection.hpp"
 #include "strata/program/conv_cache.hpp"
 #include "strata/program/split_rules.hpp"
@@ -3586,6 +3587,9 @@ int main(int argc, char** argv) {
         };
         bool gate_on = true;   // off only when no placement can start (below): then the best one is kept and a warning said
         int64_t min_stage_layers = 1;   // #1616: 3 in the second pass below, when the first pick has a one- or two-layer stage
+        // #1428: 2 and 3 GPUs - every placement priced, kept (a few hundred) so the near-tie warning below can name the
+        // best placement that is really a different one (not the neighbour one layer over)
+        std::vector<std::pair<double, std::vector<int64_t>>> priced;
         auto consider = [&]() {
             if (min_stage_layers > 1 && strata::program::split_rules::smallest_stage(at, g.n_layers) < min_stage_layers)
                 return;
@@ -3593,6 +3597,7 @@ int main(int argc, char** argv) {
             int64_t held = 0;
             const double ms = predict(at, hm, held);
             ++tried;
+            if (ns <= 3) priced.emplace_back(ms, at);
             const double mx = stage_max(at);
             if (ms < best_ms - tie_eps || (ms <= best_ms + tie_eps && mx < best_max - tie_eps)) {
                 // feasibility gate: mirrors the serve path (`fits_one` + own_fits) for the 512-token last resort;
@@ -3616,6 +3621,7 @@ int main(int argc, char** argv) {
             consider();
         };
         auto search = [&]() {
+        priced.clear();
         if (ns == 2) {
             for (int64_t k = 2; k < L; ++k) { at[0] = k; consider(); }
             // a model with fewer than three layers enumerates nothing: keep the proportional guess rather than
@@ -3787,6 +3793,39 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata generate: layer split auto: K=%s - predicted %.1f ms per decode window; the caches "
                              "hold %lld of %zu profiled pairs (~%.1f%% of the routed mass), best of %lld placements\n",
                      ks.c_str(), best_ms, (long long) best_held, profile.size(), 100.0 * best_mass, (long long) tried);
+        // #1428: a near tie on a mixed pair.  The model prices a decode window only (the prompt path is not in it), and on
+        // cards of different speed or link the winner can flip within a few percent of error: say which other split is
+        // almost as good, so the user can try it.  Recommend, never force: this only prints.
+        {
+            const double lo = *std::min_element(layer_ms.begin(), layer_ms.end());
+            const double hi = *std::max_element(layer_ms.begin(), layer_ms.end());
+            const double llo = *std::min_element(link_scale.begin(), link_scale.end());
+            const double lhi = *std::max_element(link_scale.begin(), link_scale.end());
+            const bool mixed = hi > lo * 1.10 || lhi > llo * 1.10;
+            const double near_pct = std::getenv("STRATA_SPLIT_NEAR_TIE_PCT") ? std::atof(std::getenv("STRATA_SPLIT_NEAR_TIE_PCT")) : 4.0;
+            if (mixed && near_pct > 0 && ns <= 3 && best_ms > 0 && !priced.empty()) {
+                const std::vector<int64_t>* alt = nullptr;
+                double alt_ms = 1e30;
+                for (const auto& pc : priced) {
+                    if (pc.first > best_ms * (1.0 + near_pct / 100.0) || pc.first >= alt_ms) continue;
+                    int64_t dist = 0;   // how far the other split's boundaries lie from the chosen one's
+                    for (size_t i = 0; i < pc.second.size() && i < best.size(); ++i)
+                        dist = std::max<int64_t>(dist, std::llabs(pc.second[i] - best[i]));
+                    if (dist < 3) continue;   // the neighbour one layer over is not a different split
+                    if (gate_on && !can_start(parts_of(pc.second))) continue;
+                    alt = &pc.second;
+                    alt_ms = pc.first;
+                }
+                if (alt != nullptr) {
+                    std::string as;
+                    for (const int64_t k : *alt) as += (as.empty() ? "" : ",") + std::to_string(k);
+                    std::fprintf(stderr, "strata generate: layer split auto: NEAR TIE - K=%s is predicted %.1f ms per decode "
+                                         "window, within %.1f%% of K=%s (%.1f ms); the cards differ, so the prediction may not "
+                                         "rank them (it prices decode, not the prompt). To try the other: --layer-split %s\n",
+                                 as.c_str(), alt_ms, 100.0 * (alt_ms / best_ms - 1.0), ks.c_str(), best_ms, as.c_str());
+                }
+            }
+        }
     }
     for (size_t i = 0; i < split_at.size(); ++i)
         if (split_at[i] >= g.n_layers) {
@@ -4364,7 +4403,7 @@ int main(int argc, char** argv) {
         if (!(o.prefill_chunk > 0 && !pf_borrow)) return 0;
         static const bool exact = [] { const char* v = std::getenv("STRATA_OWNED_PRICE"); return v != nullptr && std::string(v) == "exact"; }();
         if (!exact) return 160 + (o.prefill_chunk * 680) / 1024;
-        const int64_t mib = ((int64_t) strata::prefill::Prefill::bytes_needed_owned(g, ss, o.prefill_chunk) + (1 << 20) - 1) >> 20;
+        const int64_t mib = ((int64_t) strata::prefill::Prefill::bytes_needed_owned(g, ss, o.prefill_chunk, srcp != nullptr) + (1 << 20) - 1) >> 20;
         std::fprintf(stderr, "strata generate: STRATA_OWNED_PRICE=exact: the prompt path's own buffers for a %lld-token chunk: %lld MiB (the 0.1.39 rule: %lld MiB)\n",
                      (long long) o.prefill_chunk, (long long) mib, (long long) (160 + (o.prefill_chunk * 680) / 1024));
         return mib + 64;   // a margin for the allocator
@@ -5777,7 +5816,7 @@ int main(int argc, char** argv) {
         return (uint64_t) k * (uint64_t) strata::kernels::cpu::expert_layout().max_blob;
     };
     auto lend_slots = [&](int64_t c) -> int64_t {
-        return slots_from_bytes(strata::prefill::Prefill::bytes_needed(g, ss, c));
+        return slots_from_bytes(strata::prefill::Prefill::bytes_needed(g, ss, c, srcp != nullptr));
     };
     // `lend_bytes` went with the single-cache serve loan: a participant's loan is priced by `part_bytes` from its
     // OWN cache, and the only other user of the old helper was the serve path's own relayout.
@@ -5884,7 +5923,7 @@ int main(int argc, char** argv) {
             const int64_t blob = (int64_t) strata::kernels::cpu::expert_layout().max_blob;
             const uint64_t avail = bytes_from_slots(budget);
             auto room_of = [&](int64_t t) -> int64_t {
-                const uint64_t nonring = strata::prefill::Prefill::bytes_needed_no_ring(g, ss, t);
+                const uint64_t nonring = strata::prefill::Prefill::bytes_needed_no_ring(g, ss, t, srcp != nullptr);
                 return std::min((int64_t) ((avail - std::min(avail, nonring)) / (uint64_t) blob), ring_max);
             };
             // `room_of` is capped at ring_max, so "the ring is full" is exactly room == ring_max, and both that
@@ -6339,7 +6378,7 @@ int main(int argc, char** argv) {
             return (int64_t) ((need + (uint64_t) blob - 1) / (uint64_t) blob);
         };
         auto part_slots = [&](const PfPart& p, int64_t c) -> int64_t {
-            return cache_slots_for(*p.cache, strata::prefill::Prefill::bytes_needed(g, *p.ses, c));
+            return cache_slots_for(*p.cache, strata::prefill::Prefill::bytes_needed(g, *p.ses, c, srcp != nullptr));
         };
         auto part_bytes = [&](const PfPart& p, int32_t first) -> uint64_t {
             strata::core::ExpertCache& xc = *p.cache;
@@ -6412,7 +6451,7 @@ int main(int argc, char** argv) {
                     const int64_t budget = std::max<int64_t>(0, std::min(p.cache->slots() - 128,
                                                                         kAutoLendPct * p.cache->slots() / 100));
                     const uint64_t avail = part_bytes(p, (int32_t) (p.cache->slots() - budget));
-                    const uint64_t nonring = strata::prefill::Prefill::bytes_needed_no_ring(g, *p.ses, c);
+                    const uint64_t nonring = strata::prefill::Prefill::bytes_needed_no_ring(g, *p.ses, c, srcp != nullptr);
                     room = std::min(room, (int64_t) ((avail - std::min(avail, nonring)) / (uint64_t) kBlob));
                 }
                 return room;
@@ -6526,7 +6565,7 @@ int main(int argc, char** argv) {
                         const strata::core::OnDevice on(p.dev);
                         size_t fb = 0, tb = 0;
                         if (cudaMemGetInfo(&fb, &tb) != cudaSuccess) { (void) cudaGetLastError(); continue; }
-                        const uint64_t need = strata::prefill::Prefill::bytes_needed(g, *p.ses, chunk);
+                        const uint64_t need = strata::prefill::Prefill::bytes_needed(g, *p.ses, chunk, srcp != nullptr);
                         if ((uint64_t) fb >= need + (3ull << 29)) {
                             std::fprintf(stderr, "strata serve:   CUDA%d keeps its own prompt buffers (%.2f GiB of "
                                                  "%.2f GiB free): no loan\n", p.dev < 0 ? 0 : p.dev,
@@ -6616,7 +6655,7 @@ int main(int argc, char** argv) {
                     const strata::core::OnDevice on(dev);
                     size_t fb = 0, tb = 0;
                     cudaMemGetInfo(&fb, &tb);
-                    const int64_t need = (int64_t) strata::prefill::Prefill::bytes_needed(g, i == 0 ? ss : stages[i - 1]->ss, c);
+                    const int64_t need = (int64_t) strata::prefill::Prefill::bytes_needed(g, i == 0 ? ss : stages[i - 1]->ss, c, srcp != nullptr);
                     if (need + kHeadroom > (int64_t) fb) {
                         dev_out = dev < 0 ? 0 : dev; need_out = need; free_out = (int64_t) fb;
                         return false;
@@ -6754,6 +6793,19 @@ int main(int argc, char** argv) {
         strata::core::Verifier ver;
         strata::core::VerifyHits vh;
         vh.d_res = thits.d_res;
+        // STRATA_ROUTE_RESIDENT_MTP=1 (EXPERIMENTAL, with STRATA_ROUTE_RESIDENT=<margin>; changes the output): the MTP
+        // draft's router gets the same residency bias, with the last layer's residency row as its table (single GPU)
+        if (use_mtp && stages.empty() && thits.d_res != nullptr && std::getenv("STRATA_ROUTE_RESIDENT") != nullptr &&
+            std::getenv("STRATA_ROUTE_RESIDENT_MTP") != nullptr && std::atoi(std::getenv("STRATA_ROUTE_RESIDENT_MTP")) != 0) {
+            const float margin = (float) std::atof(std::getenv("STRATA_ROUTE_RESIDENT"));
+            int lo = 6, hi = 9;
+            if (const char* v = std::getenv("STRATA_ROUTE_RESIDENT_RANKS")) std::sscanf(v, "%d-%d", &lo, &hi);
+            if (margin > 0.0f) {
+                mtp.set_route_resident(thits.d_res + (size_t) (g.n_layers - 1) * (size_t) g.n_expert, margin, lo, hi);
+                std::fprintf(stderr, "strata generate: STRATA_ROUTE_RESIDENT_MTP: the MTP draft's router is biased toward layer %lld's resident experts (margin %g, ranks %d-%d; experimental)\n",
+                             (long long) (g.n_layers - 1), margin, lo, hi);
+            }
+        }
         vh.h_res = host_res.empty() ? nullptr : host_res.data();
         vh.cache_base = thits.cache_base;
         vh.blob = thits.blob;
@@ -8334,6 +8386,7 @@ int main(int argc, char** argv) {
                         e = "VRAM: refilling the cache failed: " + ferr;
                         return false;
                     }
+                    srcp->note_async_read(b, nullptr);   // #1237: the queued copy reads a stage buffer; it is not recycled under it
                     host_res[(size_t) pick] = slot;
                 }
                 vram_evicted.swap(keep_out);
@@ -9688,6 +9741,7 @@ int main(int argc, char** argv) {
                     if (b == nullptr || !(refill_blocking() ? p.cache->fill_slot_blocking(slot, b, e, nb)
                                                             : p.cache->fill_slot_queued(slot, b, e, nb)))
                         return false;
+                    if (!refill_blocking()) srcp->note_async_read(b, nullptr);   // #1237
                     host_res[(size_t) i] = slot;
                 }
                 return true;
@@ -9807,11 +9861,17 @@ int main(int argc, char** argv) {
             // the request ends with `YIELDED <slot> <tokens>` + DONE cancel, and the server sends it again later: it
             // continues from the slot with the same chunks.  #656's cooperative preemption, with a slot as the park.
             auto read_part = [&](int64_t a0, int64_t b0, std::string& e) -> bool {
-                // (a layer split reads its stages as a pipeline over one run's chunks: in pieces only beside slots)
-                if (o.batch <= 0 || piped || (!stages.empty() && !batch_on())) return sp.run(ids.data() + a0, b0 - a0, a0, e);
+                // (a layer split reads its stages as a pipeline over one run's chunks: beside slots a chunk at a time, with
+                // none decoding in pieces of STRATA_BATCH_YIELD_CHUNKS chunks (default 8; 0 = one run) so a BYIELD is taken)
+                static const int64_t yield_chunks = [] {
+                    const char* v = std::getenv("STRATA_BATCH_YIELD_CHUNKS");
+                    return v != nullptr ? (int64_t) std::max(0, std::atoi(v)) : (int64_t) 8;
+                }();
                 const int64_t C = std::max<int64_t>(sp.chunk(), 1);
+                const int64_t piece = strata::program::batch_read_piece(o.batch > 0, piped, !stages.empty(), batch_on(), C, yield_chunks);
+                if (piece <= 0) return sp.run(ids.data() + a0, b0 - a0, a0, e);
                 for (int64_t q = a0; q < b0;) {
-                    const int64_t r = std::min(b0, q + C);
+                    const int64_t r = std::min(b0, q + piece);
                     const auto tq = Clock::now();
                     if (!sp.run(ids.data() + q, r - q, q, e)) return false;
                     q = r;
@@ -11325,6 +11385,7 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "strata generate: refilling a lent slot failed: %s\n", err.c_str());
                     return 1;
                 }
+                if (!refill_blocking()) srcp->note_async_read(b, nullptr);   // #1237
                 host_res[(size_t) i] = slot;
             }
             if (!xcache.sync_queued(err)) {
