@@ -63,6 +63,8 @@ dominate; with long reads arriving beside decodes the pipelined groups can be th
 than two stages (the report on #1253 found no gain at four stages), more than two slots, sampled decoding, an
 upstream-main binary (the pipelined arm is our build, started with the flags 0.1.41 resolves to).
 
+Our measurement of `--batch-mtp` on a layer split with 2x R9700 and all experts in VRAM: 80.2 -> 62.7 tok/s (-21.9%, 0/5 pairs faster) against the pipelined default, so it pays only when the experts do not all fit in VRAM.
+
 Earlier, on engine 0.1.40.3 with this change and the same two cards, two concurrent streams: UD-Q4_K_XL 39.9 to 43.5
 tok/s without and 44.5 to 51.3 with `--batch-mtp` (2 runs per arm), and a small Coder IQ1_M test model with all
 experts in VRAM 84.0 without and 101.2 with it, the greedy text of both streams identical.
