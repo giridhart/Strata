@@ -1548,6 +1548,58 @@ expert here: none was page-locked):
 A coding agent's recorded conversation on the two cards (a 100K-token start, then 8 turns of 1-5K tokens of code, 128
 tokens written a turn, the same tokens read by both): 137.4 s off, 130.6 s auto (reading 121.1 -> 114.3 s).
 
+## Missed experts in a verify window: the tail is skipped (on by default on CUDA, `STRATA_ROUTE_TAIL_SKIP`)
+
+When a card cannot hold every routed expert, most of a decode token's waiting time is spent on the experts that are not in VRAM:
+their copy over PCIe or their rows on the CPU pool. In a verify window of several tokens, an expert that **every** token of the window
+routes at the bottom of its top 10 (rank 7 or lower, the smallest weights) adds little to any of them. **0.1.42: on by default on CUDA builds**:
+such a missed expert is neither copied nor computed, its contribution is zero, and the other experts keep the weight the router gave them
+(no renormalisation). An expert that any token ranks above 7, and every expert already in VRAM, is served as before.
+
+**`STRATA_ROUTE_TAIL_SKIP=0` turns it off** and restores the answers of a build without it byte for byte (checked: `mg_norepeat` 10 of 10 and `exact_pp` 4096 and 20000
+tokens identical to 0.1.42 without the change, on the RTX 3060, the RTX A4000 alone and as a 2-GPU split, and the Tesla P100). Another rank
+(`STRATA_ROUTE_TAIL_SKIP=8`, `=9`; 1-9 are accepted) is taken as given. The start-up line
+`STRATA_ROUTE_TAIL_SKIP=7 is ON (default)` names the opt-out.
+
+Where it applies: serve on a CUDA build with one GPU or a layer split (every stage skips by itself). Not applied, and no line printed: when every expert is
+in VRAM (nothing is missed), with `--batch` / `parallel` slots (a window then mixes requests, and one request's skip would depend on another's
+tokens: kept off until measured), with a peer-expert tier or a helper GPU, on HIP and SYCL builds. The request log gets
+`route tail skip: N missed experts skipped` (cumulative) while it is active.
+
+**Answers differ slightly from 0.1.41** (`STRATA_ROUTE_TAIL_SKIP=0` brings them back). Teacher-forced KL of the decode path (the default's own greedy text and the default sampled at T=0.8, 28 chat prompts of code,
+reasoning, chat, six languages and long-document summaries, 220 tokens each, about 6,000 scored tokens per set, through the real verify windows with the MTP drafts;
+`phaseA-tests/cuda-route-kl.md`):
+
+| | RTX 3060 12 GB, IQ3_XXS | RTX A4000 16 GB, Q2_0 |
+|---|---|---|
+| KL(0.1.41 behaviour \|\| tail skip), mean, greedy / sampled text | 0.0058 / 0.0056 | 0.0032 / 0.0030 |
+| p99, max (greedy) | 0.061, 0.29 | 0.035, 0.32 |
+| top-1 token agreement | 97.7% / 97.5% | 98.2% / 98.2% |
+| perplexity of the forced text, skip / no skip | x1.011 / x1.007 | x1.005 / x1.003 |
+| KL of the first token after the prompt | 0.024 / 0.033 | 0.015 / 0.016 |
+| the same engine run twice (the floor; adaptive tier and CPU/GPU split depend on timing) | 0.0006-0.0007 | 0.0007 |
+| `STRATA_PREFILL_CPU_SHARE` on / off (already the default) | 0.0006-0.0007 (first token 0.002-0.0035) | 0.0005-0.0007 (first token 0.002-0.004) |
+| Q2_0 against IQ3_XXS, the same text | - | 0.1006 (p99 1.08, top-1 90.6%) |
+
+The effect is not even: code and reasoning prompts have a KL of 0.002-0.004, chat and non-English prompts 0.004-0.009.
+Task check, greedy, thinking off (HumanEval every second problem, 82; 30 generated reasoning tasks), default / tail skip:
+RTX 3060 76 and 78 of 82 / 78 of 82, reasoning 27 and 27 / 29; RTX A4000 76 and 76 / 76, reasoning 27 and 30 / 27. The runs do not separate the settings
+(one run each; a change of 3 reasoning tasks is noise).
+
+Decode speed, `STRATA_ROUTE_TAIL_SKIP` default against `=0`, 5 interleaved rounds on fresh engines, a story, a code answer and a 6K-token document, 200 tokens each,
+median over the rounds (ratio of tokens/s, default over `=0`; rounds in which the default was faster):
+
+| machine | story | code | 6K document | all three |
+|---|---|---|---|---|
+| RTX 3060 12 GB, IQ3_XXS, resident experts | 1.104 (5/5) | 1.197 (5/5) | 1.241 (5/5) | **1.156 (5/5)** |
+| RTX A4000 16 GB alone, Q2_0 | 1.151 (5/5) | 1.135 (5/5) | 1.101 (5/5) | **1.129 (5/5)** |
+| Tesla P100 16 GB, IQ3_XXS, `--pcie-frac 0.29` | 1.149 (5/5) | 1.182 (5/5) | 1.118 (5/5) | **1.146 (5/5)** |
+| two RTX A4000, layer split (hit rate 99.7%) | 0.987 (0/5) | 1.004 (5/5) | 1.002 (3/5) | 0.998 (1/5) |
+
+The gain follows how much of a token is spent waiting for missed experts (hit rate 75-90% on the single cards in the profile, `phaseA-tests/cuda-profile.md`); a 2-GPU
+split that holds nearly every expert (hit rate 99.7%) gains nothing. It does not touch prompt reading. Switches that stay opt-in and are not part of this:
+`STRATA_ROUTE_PRIOR` (adds speed, doubles the KL), `STRATA_ROUTE_RESIDENT` and `STRATA_ROUTE_RESIDENT_MTP` (the latter is not faster than the former).
+
 ## More opt-in switches measured for 0.1.41 (all off unless you set them)
 
 None of these changes the default answers; each was measured against the default with interleaved off/on pairs of whole
