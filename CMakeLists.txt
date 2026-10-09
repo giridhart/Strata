@@ -114,6 +114,9 @@ if(STRATA_BUILD_CONVERSATION_TESTS)
   add_executable(conversation_file_test src/core/conversation_file_test.cpp src/core/conversation_file.cpp)
   target_include_directories(conversation_file_test PRIVATE include)
   add_test(NAME conversation_file_test COMMAND conversation_file_test)
+  add_executable(session_save_reclaim_test src/core/session_save_reclaim_test.cpp src/core/conversation_file.cpp)
+  target_include_directories(session_save_reclaim_test PRIVATE include)
+  add_test(NAME session_save_reclaim_test COMMAND session_save_reclaim_test)
 endif()
 
 if(STRATA_HIP_GFX906)
@@ -475,6 +478,15 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_link_libraries(exchange_storage_test PRIVATE Threads::Threads)
     add_test(NAME exchange_storage_test COMMAND exchange_storage_test)
     set_tests_properties(exchange_storage_test PROPERTIES TIMEOUT 60)
+  endif()
+
+  # available_host_bytes(): MemAvailable, cgroup limits and the operator's --memory-limit-mib cap on fixture directories
+  # - no GPU, no CUDA
+  if(STRATA_BUILD_TESTS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/core/memory_guard_test.cpp")
+    add_executable(memory_guard_test tests/core/memory_guard_test.cpp src/core/conversation_memory.cpp)
+    target_include_directories(memory_guard_test PRIVATE include)
+    add_test(NAME memory_guard_test COMMAND memory_guard_test)
+    set_tests_properties(memory_guard_test PROPERTIES TIMEOUT 60)
   endif()
 
   if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/core/file_expert_source_test.cpp")

@@ -941,11 +941,89 @@ nothing and stores nothing; the log line is `conversation cache: skip parking (N
 parked=P)`. 0 is the pre-flag behaviour and the flag leaves the answers untouched - it only decides which
 conversations keep a slot.
 `--conversation-cache-min-free-mib N` (default 2560) additionally requires that
-physical-RAM headroom remain available: the engine checks before allocation and
-again after capture. Unknown telemetry or insufficient RAM skips parking. Windows
-uses `GlobalMemoryStatusEx`, Linux uses `MemAvailable`; these are host-level samples,
-not a reservation or enforcement of container/job memory limits. An 8 GiB budget
+RAM headroom remain available: the engine checks before allocation (against the
+snapshot's estimated size, less the K/V it already retains) and again after capture.
+Unknown telemetry or insufficient RAM skips parking, and the same figure and floor
+decide whether a session file may be saved or restored (below). An 8 GiB budget
 is a cap, not a recommendation for every machine.
+
+**The RAM figure (`available_host_bytes()`).** The headroom is the smallest of three
+numbers, sampled each time it is asked and not a reservation (other writers can take the
+room afterwards):
+
+1. `MemAvailable` (Windows: `GlobalMemoryStatusEx`'s available physical memory).
+2. The room under each memory limit of the engine's own cgroup and of every ancestor
+   visible under `/sys/fs/cgroup` (the group named in `/proc/self/cgroup`, or the deepest
+   part of that path this mount shows): cgroup v2 `memory.max` and `memory.high`, each
+   minus `memory.current`; cgroup v1 `memory.limit_in_bytes` minus
+   `memory.usage_in_bytes` (both less the clean inactive file cache, below). `max` and v1's "unlimited" count as no limit; a file that is
+   absent (no memory controller at that level) is skipped; a file that is there but
+   cannot be read or parsed makes the cgroup terms unusable: without `--memory-limit-mib` the guard then uses
+   `MemAvailable` alone, as 0.1.41 did, and prints one warning per process; with the flag the sample is unknown, and unknown skips parking.
+3. `--memory-limit-mib N` (or `STRATA_MEMORY_LIMIT_MIB=N`; the flag wins, `0` = none):
+   N MiB is the total this engine's container or cgroup may use, minus what that
+   container uses now. Use it when the container cannot see its own limit. The usage
+   is `memory.current` of the top cgroup this mount shows (the container's own, in a
+   container with its own cgroup namespace); if that file cannot be read it is
+   `MemTotal - MemAvailable`, which is a weaker figure (it is only as true as the
+   container's `/proc/meminfo`), and if `MemTotal` is missing too the sample is
+   unknown. The cap is taken in addition to 1 and 2, never instead of them: whichever
+   number is smallest decides. It is an engine argument, so the server config carries it in
+   `args` (`"--memory-limit-mib", "102400"`); the variable also works from the config's
+   `"env"`.
+
+Usage is `memory.current` as the kernel reports it, **less one reclaimable kind: clean
+inactive file cache**. That is the group's own `memory.stat` `inactive_file` (cgroup v1:
+`total_inactive_file`), less its dirty and writeback pages when `memory.stat` lists them
+(`file_dirty`, `file_writeback`; v1 `total_dirty`, `total_writeback`), and never more than
+`memory.current`. The kernel gives such pages back at `memory.high` or the limit before
+it kills anything, and a loaded model's file reads leave a lot of them behind. Nothing
+else is credited: `active_file` (it holds the mlocked pages), `shmem` (pinned expert
+complements, the KV pool) and anonymous memory stay charged in full, since a kill at a
+hard limit is worse than a skipped park. For each limit the room is
+`limit - (memory.current - credit)`, so it never exceeds the limit. A `memory.stat` that is missing or cannot be
+parsed gives no credit; it does not make the sample unknown. The operator's cap uses the
+`memory.stat` of the same top group whose `memory.current` it reads. A parked
+conversation is part of the engine's own usage once captured; the check before
+capture is what stops it from growing past the cap.
+
+The startup log has one line for it, `strata generate: memory guard: limit X GiB
+(source: flag|cgroup|meminfo), current Y GiB, reclaimable cache credited Z GiB;
+available ...`, where `source` names the
+number that was smallest at that moment (`meminfo`: MemTotal and `MemTotal -
+MemAvailable`), and a skipped park or a refused save/restore says how much it had and
+from which source. The line is printed before the model is loaded, so its credit is the
+cache at that moment, not at the time of a park. Without a cgroup limit and without `--memory-limit-mib` the figure is
+plain `MemAvailable`, as before.
+
+What it does not touch: the startup sizing of the expert arena, the file tier's resident budget, the Windows commit
+check and `STRATA_PIN_GUARD` (#1250: whether to page-lock the expert copy in steps follows `MemFree`, and each step
+is checked against the cgroup-aware `host_available_memory`) keep their own probes (`--resident-budget-gib`, #633,
+#1250), and `--memory-limit-mib` does not reach them. This figure is for what runs after the start: parking a
+conversation and saving or restoring a session file, which read `MemAvailable` alone. `host_available_memory`
+(expert_source.cpp) and this figure both read the cgroup limits; this one also reads `memory.high` and the operator's
+cap; an unreadable cgroup file makes it fall back to `MemAvailable` (one warning), or unknown when a cap is set.
+
+Earlier measurement on a Proxmox LXC where the engine's container cannot see its limit (a 100 GiB cap on the parent
+cgroup, outside the container's namespace; the container's own `memory.max` and `memory.high` read `max`):
+`/proc/meminfo` showed about 25 GiB `MemAvailable` while about 1 GiB was really left, and right after the engine had
+loaded the container's `memory.current` was 98.29 GiB with `anon` 1.29 GiB, `shmem` 65.51 GiB, `inactive_file`
+3.81 GiB (clean page cache left from reading the model files) and `active_file` 0.01 GiB, of which the 3.8 GiB of
+clean cache is what the credit gives back. There `--memory-limit-mib 102400` is the cap, and the floor
+(`--conversation-cache-min-free-mib`) is measured against what is left under it: with the engine already near the cap,
+a floor of several GiB refuses every park; a few hundred MiB keeps a margin for the allocator and the kernel while
+letting a snapshot that really fits go through.
+
+Measured on the test machine (2x RTX 3080 20 GB, UD-Q4_K_XL, a 90 GiB container, resident RAM mode, 2 slots), one restart
+per arm, `--conversation-cache-min-free-mib 2048`. With `--memory-limit-mib 101376` (the cap our deployment runs with)
+the engine parked on every attempt: 135 parks and 0 skips over one run of 308 requests. With `--memory-limit-mib 78000`
+the start line read `limit 76.2 GiB (source: flag) ... available 73.0 GiB (MemAvailable 88.6 GiB)`, and 8 of 8 parking
+attempts were skipped (`skip parking (physical RAM admission; need 226 MiB plus 2048 MiB floor, 0 MiB available, source
+flag)`), none parked. The container's `memory.current` sat at 89.7-89.9 GiB, above the 76.2 GiB cap, so the headroom
+under the cap is 0, while `MemAvailable` read 15.7-15.9 GiB in the same samples; a check on `MemAvailable` alone would
+have let those parks through (the old check was not run). The requests were served normally (median of 6 decodes
+79.6 tok/s); only parking is refused, and the log says so. The unit test `memory_guard_test` (CPU only, no model) passes
+130 checks. Not measured: a cap between 78000 and 101376, a run without the flag, any effect on throughput.
 
 The shared snapshot core validates all layers and checkpoints before applying any
 state. Invalid entries are discarded; transfer/synchronization failure is fatal
@@ -979,6 +1057,26 @@ replaces a file, whose space comes back only after the rename. This is a preflig
 NAME may
 not contain a path, a drive, a stream (`:`), a Windows device name (`NUL`, `CON.bin`, `COM1`...), a control character,
 a leading dot or a trailing dot or space.
+
+`--session-save-reclaim` (an engine argument in the config's `args`, off by default) lets a SAVE that fails its
+RAM preflight first release reconstructible host caches: retained K/V buffers, oldest unpinned parked
+conversations, then unpinned checkpoints other than the one selected for the file. It stops as soon as measured
+available RAM meets the original allocation estimate plus `--conversation-cache-min-free-mib`; it does not lower
+that floor or assume that freed allocations have reached the OS. Pinned prefixes and the selected checkpoint
+stay intact, including their order and tie preference. Unknown RAM telemetry or an unknown allocation estimate
+does not evict anything. The usual admission check still runs before copying state.
+
+With this option the HTTP server also allows up to 30 seconds for physical RAM accounting to catch up after
+cache reclamation. Only an unpublished `memory` refusal from the SAVE RAM preflight is retried, at most three
+times, when measured available RAM reaches the reported estimate plus the original floor and 2 MiB for rounding.
+The same live engine process and service FIFO are held throughout; a process change, death, unknown telemetry
+or missing estimate ends the wait. This does not unload a model or trim another process's working set. Persistent
+pressure still returns the last refusal. The wait is outside the engine's reported `save_ms`.
+
+This can trade later prefix-cache hits for room to save. Released caches stay released even if admission or file
+I/O later fails; the current tokens, images, steering and live device state are unchanged. It cannot guarantee a
+SAVE under arbitrary memory pressure. With the option off, or enough RAM at the first probe, cache retention and
+the session file format are unchanged. RESTORE is unchanged.
 
 The request must be `Content-Type: application/json` (else `415`) and come from no browser page, Strata's own or a
 trusted origin (another site's `Origin` gets `403`, also with an API key); the Host and API-key checks apply as
