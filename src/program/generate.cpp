@@ -7217,6 +7217,9 @@ int main(int argc, char** argv) {
         // #471: the position the prompt pass has read up to (a chunk's or a window's end): what a request cancelled
         // mid-read reports as read, instead of the whole prompt
         int64_t pp_reached = 0;
+        // #1620: the session holds exactly the tokens [0, pp_reached) of the prompt (no chunk or window is in flight, none
+        // failed): a request cancelled here keeps them as the live conversation instead of dropping what it restored
+        bool pp_exact = false;
         Clock::time_point pp_t0 = Clock::now();
         auto imgs_below = [&](const std::vector<ImgKey>& all, int64_t L) {
             std::vector<ImgKey> v;
@@ -9394,6 +9397,7 @@ int main(int argc, char** argv) {
             pp_total = n;
             pp_from = read_from;
             pp_reached = read_from;
+            pp_exact = true;   // a restore, a checkpoint mount or a zeroed session: the state is exactly at read_from
             pp_t0 = r0;
             pp_next_check = reread_to > 0 || !req_ckpt ? INT64_MAX : resume + o.prompt_cache_every;   // ckpt=0: none
             pp_tail_saved = reread_to > 0 || !req_ckpt;   // ckpt=0 (#861): no tail checkpoint either
@@ -9547,8 +9551,10 @@ int main(int argc, char** argv) {
                     ~NoHeadSampling() { v.set_head_sampling(true); }
                 } no_head_sampling(ver);
                 std::vector<int32_t> win((size_t) S), outw((size_t) S), nxt((size_t) S);
+                pp_exact = true;   // between windows the session is exactly at `a`
                 for (int64_t q = a; q < b;) {
                     if (stop_req.load()) { e = "cancelled"; return false; }
+                    pp_exact = false;   // until this window and the drafter's rows are in
                     const int T = (int) std::min<int64_t>(S, b - q);
                     for (int t = 0; t < T; ++t) {
                         win[(size_t) t] = (int32_t) cur[(size_t) (q + t)];
@@ -9578,6 +9584,7 @@ int main(int argc, char** argv) {
                     if (!ver.commit(T, e) || (use_mtp && !mtp.prefill(ver.final_R_all(), nxt.data(), T, q, e))) return false;
                     q += T;
                     pp_reached = q;   // #471
+                    pp_exact = true;
                 }
                 // the batched prompt path (other streams), checkpoints and snapshots may follow: the last commit first
                 if (!ver.wait_commit(e)) return false;
@@ -9910,7 +9917,9 @@ int main(int argc, char** argv) {
                     return 1;
                 }
                 const auto tsp = Clock::now();
+                pp_exact = false;   // a batched or pipelined part is in flight: a cancel may leave the state past pp_reached
                 const bool sp_ok = win ? read_windows(at, to, err) : read_part(at, to, err);
+                if (sp_ok) pp_exact = true;
                 if (trace) {
                     std::fprintf(stderr, "strata trace: read %lld tokens (%s) in %.1f ms\n", (long long) (to - at),
                                  win ? "windows" : "batched",
@@ -10823,6 +10832,15 @@ int main(int argc, char** argv) {
                 live.swap(consumed);
                 live_imgs = imgs_below(req_imgs, (int64_t) live.size());
                 live_ok = o.prompt_cache > 0 && req_ckpt;   // ckpt=0: nothing to continue or park (#830)
+            } else if (pp_exact && pp_reached > 0 && o.prompt_cache > 0 && req_ckpt && pp_reached <= (int64_t) cur.size()) {
+                // #1620: stopped between two windows (or before the first token was read): the session is exactly at
+                // pp_reached, so it stays the live conversation - the next request continues from it or parks it.
+                // Without this a cancelled request that had restored a parked conversation dropped it.
+                live.assign(cur.begin(), cur.begin() + pp_reached);
+                live_imgs = imgs_below(req_imgs, pp_reached);
+                live_ok = true;
+                std::fprintf(stderr, "strata serve: cancelled request keeps its conversation: %lld tokens live\n",
+                             (long long) pp_reached);
             }
             static const bool state_hash = std::getenv("STRATA_STATE_HASH") != nullptr;
             if (state_hash && !cancelled && o.prompt_cache > 0) {   // every finished request, ckpt=0 too (parity gates)
