@@ -67,14 +67,6 @@ How to read the table:
 | [2026-10-05-community-2x-rx-6900xt](2026-10-05-community-2x-rx-6900xt/) | 2x RX 6900 XT 16 GB (gfx1030), Ryzen 5 5600X, 128 GB | IQ3_S, 131K | one card stock 457 / 474 / 459, with #835 + #849 + #854 868 / 1,100 / 1,023; layer split with them 853 / 1,616 / 1,823 | 40-43 one card, 57-61 layer split | 0.1.39 stock and with #835, #849, #854 | #927 |
 | [2026-10-05-community-gfx1151](2026-10-05-community-gfx1151/) | Radeon 8060S (gfx1151), Ryzen AI Max+ 395, 128 GB unified memory | Q2_0, UD-IQ4_XS | 250.9 to 528.9 with the hipBLASLt table (matched synthetic prompts) | 45.6 to 46.8 (shared-expert stream on) | 0.1.39 + #895, #820 | #917 |
 | [2026-10-05-community-arc-b65](2026-10-05-community-arc-b65/) | Intel Arc Pro B65 32 GB (SYCL), Core i5-12600K, 128 GB | IQ2_XS, 8K | 307-359 (512 and 7,000-token tasks) | 36-49 by task; medians of the five tasks 40.4-41.3 / 39.8-40.9 | 0.1.40 source + 6 local patches | #955 |
-
-Notes:
-
-- #927 ran seven configurations; the table shows the one-card stock and PR sets and the layer split with the PRs (#835 is opt-in in 0.1.40, so those are not the release default), and its README has the helper-mode rows. #917 is 0.1.39 plus then-unmerged #895 and #820, and 0.1.40 turned the shared-expert stream off on HIP (#826). #955's patches 3, 5 and 6 are source changes in 0.1.40.2.
-- #1016 ran its engine at the 0.1.35 commit and the table shows the numbers as submitted.
-- #995 also changed the canonical `2026-09-29-speed-0126` report (matrix.json rewritten, README extended with another host's rows); that part was not ported, only the two new folders.
-- #777 and #811 are the same machine on two quants, kept as two folders.
-- The earlier community folders (`2026-09-30-community-rtx-5090`, `2026-10-03-community-2x-mi50`, `2026-10-04-community-2x-arc-pro-b60`) are listed in `docs/COMMUNITY_BENCHMARKS.md`.
 | [2026-10-06-community-rtxpro-v0140](2026-10-06-community-rtxpro-v0140/) | RTX PRO 6000 | Q4 / Q8 (MTP and ngram runs) | see the README | see the README | 0.1.40 | #1137 |
 | [2026-10-06-community-2x-rx-7900-gre](2026-10-06-community-2x-rx-7900-gre/) | 2x RX 7900 GRE (gfx1100) | layer split, #848 / #854 | see the README | see the README | 0.1.40 | #1140 |
 | [2026-10-06-community-2x-p100](2026-10-06-community-2x-p100/) | 2x Tesla P100 16 GB | Flash-Next IQ3_S, 128K | see the README | see the README | 0.1.40 | #1157 |
@@ -89,7 +81,8 @@ Notes:
 | [2026-10-05-community-rtx5080-9900x3d](2026-10-05-community-rtx5080-9900x3d/) | RTX 5080, Ryzen 9 9900X3D | Coder IQ1_M and others | see the README | see the README | 0.1.40 | #1243 |
 | [2026-10-07-community-rtx-5090-laptop-ud-iq4xs](2026-10-07-community-rtx-5090-laptop-ud-iq4xs/) | RTX 5090 Laptop 24 GB | UD-IQ4_XS (first NVIDIA measurement) | see the README | see the README | 0.1.40.1 | #1245 |
 | [2026-10-06-community-rtx-5090-laptop](2026-10-06-community-rtx-5090-laptop/) | RTX 5090 Laptop 24 GB, Windows 11 | see README | see the README | see the README | 0.1.40.1 | #1263 |
-| [2026-10-06-community-2x-rx-6900xt-0.1.40.1](2026-10-06-community-2x-rx-6900xt-0.1.40.1/) | 2x RX 6900 XT (gfx1030), Ryzen 5 5600X | IQ3_S, 131K | see the README | see the README | 0.1.40.1 | #1270 |
+| [2026-10-06-community-2x-rx-6900xt-0.1.40.1](2026-10-06-community-2x-rx-6900xt-0.1.40.1/) | 2x RX 6900 XT 16 GB (gfx1030), Ryzen 5 5600X, 128 GB | IQ3_S, 131K | one card stock 458 / 473 / 459, with the two gfx103x switches 811 / 973 / 913, with #1150 + #1151 + #1167 969 / 1,152 / 1,126; layer split with them 968 / 1,685 / 2,003 | one card 47.5-51.8; layer split stock 62.1 / 67.0 / 59.0, with the PRs 72.2 / 74.7 / 70.3; helper 64-75 | 0.1.40.1 stock, the two switches, and with #1150, #1151, #1167 | #1270 |
+| [2026-10-09-community-2x-rx-6900xt-0.1.41](2026-10-09-community-2x-rx-6900xt-0.1.41/) | 2x RX 6900 XT 16 GB (PCIe 4.0 x8 each), Ryzen 5 5600X, 128 GB | IQ3_S, 131K | one card stock 473 / 502 / 486, with the two gfx103x switches 850 / 1,102 / 1,027, with the PRs 976 / 1,174 / 1,147; layer split stock 464 / 767 / 869, switches 832 / 1,619 / 1,823, PRs 968 / 1,714 / 2,029; helper with the PRs 986 / 1,173 / 1,147 | one card 46-52; layer split stock 62.6 / 65.0 / 60.8, PRs 64.7 / 68.8 / 68.3, PRs + `--spec 3 --spec-min-p 0.7 --pipeline-windows 2` 77.2 / 82.3 / 75.7; helper PRs 72.5 / 75.2 / 75.1 | 0.1.41 (fb58e0db) | this PR; notes: [Vop3p/dual-6900xt-flash-next-tuning](https://github.com/Vop3p/dual-6900xt-flash-next-tuning) |
 | [2026-10-07-community-arc-b65-v01402](2026-10-07-community-arc-b65-v01402/) | Arc Pro B65 32 GB (Gen4 x16), i5-12600K | Flash-Next IQ2_XS, 8K / 262K profiles | 7K input: 315 (8K, prefill 512), 830 (prefill 4096), 288 (262K) | 43.5 (8K), 42.9 (prefill 4096), 42.4 (262K) at 7K | 0.1.40.2 (SYCL) | #1432 |
 | [2026-10-07-community-rtx5090-pro4000-helper](2026-10-07-community-rtx5090-pro4000-helper/) | RTX 5090 32 GB + RTX PRO 4000 Blackwell 24 GB (helper cache), Ryzen 7 9800X3D, Windows 11 | UD-Q4_K_XL, 262K | 1,514 / 2,048 / 2,201 (5K / 33K / 115K prompt) | 103 / 92 / 94 | 0.1.40.3 | #1433 |
 | [2026-10-07-community-2x-rtx-4000](2026-10-07-community-2x-rtx-4000/) | 2x Quadro RTX 4000 8 GB, 2x Xeon E5-2620 v3, Proxmox LXC | Swift IQ2_XS, 131K | 99.9 to 249.2 on 73K-token prompts (fresh and cached tail) | 18.1 to 22.8 | 0.1.38 | #1443 |
@@ -102,3 +95,13 @@ Notes:
 | [2026-10-08-community-2x-titan-rtx-0.1.40.3](2026-10-08-community-2x-titan-rtx-0.1.40.3/) | 2x TITAN RTX 24 GB (NVLink, unused), Xeon E5-2696 v4, source build | Flash-Next IQ3_S, 262K | 869 / 1,549 / 1,627 (4K / 32K / 128K) | 70.9 / 77.3 / 71.1 | 0.1.40.3 | #1429 |
 | [2026-10-07-community-gfx1150](2026-10-07-community-gfx1150/) | Radeon 890M (gfx1150), Ryzen AI 9 HX PRO 370, 96 GB unified memory | IQ3_XXS | 153 / 216 / 226 (1K / 3.6K / 7K) with the gfx1150 hipBLASLt table, 99 / 124 / 130 without | 15.2-17.6 | 0.1.40.2 | - |
 | [2026-10-09-community-gfx1151-ud-iq4xs-0.1.41](2026-10-09-community-gfx1151-ud-iq4xs-0.1.41/) | EVO-X2, Radeon 8060S (gfx1151), Ryzen AI Max+ 395, 128 GB UMA | Unsloth UD-IQ4_XS | 627 / 687 / 617 default; 808 / 1,165 / 1,109 fast | 42.8 / 44.4 / 42.1 default; 40.1 / 49.6 / 47.5 fast | 0.1.41 (fb58e0d) | - |
+
+
+
+Notes:
+
+- #927 ran seven configurations; the table shows the one-card stock and PR sets and the layer split with the PRs (#835 is opt-in in 0.1.40, so those are not the release default), and its README has the helper-mode rows. #917 is 0.1.39 plus then-unmerged #895 and #820, and 0.1.40 turned the shared-expert stream off on HIP (#826). #955's patches 3, 5 and 6 are source changes in 0.1.40.2.
+- #1016 ran its engine at the 0.1.35 commit and the table shows the numbers as submitted.
+- #995 also changed the canonical `2026-09-29-speed-0126` report (matrix.json rewritten, README extended with another host's rows); that part was not ported, only the two new folders.
+- #777 and #811 are the same machine on two quants, kept as two folders.
+- The earlier community folders (`2026-09-30-community-rtx-5090`, `2026-10-03-community-2x-mi50`, `2026-10-04-community-2x-arc-pro-b60`) are listed in `docs/COMMUNITY_BENCHMARKS.md`.
