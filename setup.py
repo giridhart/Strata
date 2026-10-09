@@ -1013,11 +1013,16 @@ def start_gpus(text):
     are the ones Strata can use, AMD cards as setup lists them ("all": every supported AMD card)."""
     if not text:
         return None
-    if str(text).strip().lower() == "all" and not WIN and not together_ok(gpus()):
+    found = gpus()
+    if str(text).strip().lower() == "all" and not WIN and not together_ok(found):
         amd = amd_gpus()
         if len([g for g in amd if amd_problem(g) is None]) >= 2:
             return [g["index"] for g in amd_parse_gpus("all", amd)]
-    return parse_gpus(text, gpus())
+    if not found and not WIN:                          # #1594: no NVIDIA card, AMD ones: "1,0" names those, as setup lists them
+        amd = amd_gpus()
+        if amd:
+            return [g["index"] for g in amd_parse_gpus(text, amd)]
+    return parse_gpus(text, found)
 
 
 def choose_gpus(a, found) -> list:
@@ -4626,7 +4631,7 @@ def main() -> int:
                     help="EXPERIMENTAL, off by default: the control vector in data/experimental-speed-projection "
                          "(or another GGUF) as a projection on layers 4-44; see docs/DETAILS.md")
     ap.add_argument("--port", type=int, help="the server's port (default: the one the install was set up with, 8080 for a new one)")
-    ap.add_argument("--gpu", help="one GPU, numbered as nvidia-smi numbers them (default: asked when several can be "
+    ap.add_argument("--gpu", help="one GPU, numbered as nvidia-smi numbers them (AMD: as setup lists them) (default: asked when several can be "
                                   "used; with --setup it is saved, when starting it is for that start only)")
     ap.add_argument("--gpus", help="several GPUs sharing one model, as nvidia-smi numbers them (AMD: as setup lists "
                                    "them): \"0,2\", or \"all\" (every card that can); the first is the main one. "
