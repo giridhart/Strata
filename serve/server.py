@@ -198,6 +198,7 @@ def focused_recovery_prompt(tok, ids, generated):
 
 LOOPBACK_NAMES = ("localhost", "127.0.0.1", "::1")
 QUEUE_BEAT_S = 10.0         # a request waiting for the single turn sends a keep-alive this often (#1619)
+KEEPALIVE_S = 10.0          # a held-back tool argument leaves the stream quiet: ping at least this often
 CTX_SLACK = 8               # `strata --serve` rejects prompt + max_new + 8 > context: keep the same margin here
 # The live tok/s is a rate over a window, not a mean since the first token: a mean reads ~1/elapsed at the first
 # token (the Monitor showed five-digit numbers) and then undershoots for the first second of every answer.
@@ -2706,6 +2707,8 @@ class Service:
         self.sampling_defaults = dict(sampling_defaults or {})   # the run config's `sampling` block
         self.shared = {}                              # the web app's Chat settings for every client (POST /settings)
         self.shared_path = None                       # where they are kept between starts (next to the config)
+        self.config_effort = None                     # #1641: the config's "reasoning_effort": the level for requests with none
+        self.keep_awake = None                        # #1727 (opt-in): serve.keepawake.KeepAwake, the config's "prevent_sleep"
         self.fifo = threading.Lock()
         self.slot_save_path = None                    # --slot-save-path: /slots/0?action=save|restore (off when None)
         self.embeddings = threading.local()           # the current request's image embeddings file (GENI)
@@ -3074,12 +3077,12 @@ class Service:
     def with_shared(self, req: dict, api: str) -> dict:
         """The request with the shared thinking level and max tokens filled in where it has none of its own."""
         s = self.shared
-        if not s:
+        effort = s.get("reasoning_effort") or self.config_effort   # the Chat settings first, then the config's
+        if not s and not effort:
             return req
         req = dict(req)
         if "max_tokens" in s and not req.get("max_tokens") and not req.get("max_completion_tokens"):
             req["max_tokens"] = s["max_tokens"]
-        effort = s.get("reasoning_effort")
         if effort:
             if api == "openai":
                 ctk = req.get("chat_template_kwargs") if isinstance(req.get("chat_template_kwargs"), dict) else {}
@@ -3227,6 +3230,35 @@ class Service:
                 "requests_kept": len(hist), "totals": totals, "hardware": tel["now"],
                 "hardware_static":
                 tel["static"], "history": tel["history"], "time": now}
+
+    def prometheus(self) -> str:
+        """GET /metrics/prometheus: the totals and what is running in Prometheus' text format, under llama-server's
+        metric names (llamacpp:*) so its dashboards work unchanged; the drafts and requests as strata:*."""
+        with self.status_lock:
+            s, t = dict(self.status), dict(self.totals)
+            running = len(self.live_reqs) or int(bool(s.get("busy")))
+        prompt_n = t["prompt_tokens"] - t["reused"]               # what was read, as llama.cpp counts it
+        prompt_s, decode_s = t["prompt_ms"] / 1000, t["decode_ms"] / 1000
+        rows = [
+            ("llamacpp:prompt_tokens_total", "counter", "Prompt tokens read", prompt_n),
+            ("llamacpp:prompt_tokens_cached_total", "counter", "Prompt tokens the conversation cache already held",
+             t["reused"]),
+            ("llamacpp:prompt_seconds_total", "counter", "Prompt read time", prompt_s),
+            ("llamacpp:tokens_predicted_total", "counter", "Tokens generated", t["output_tokens"]),
+            ("llamacpp:tokens_predicted_seconds_total", "counter", "Generation time", decode_s),
+            ("llamacpp:prompt_tokens_seconds", "gauge", "Average prompt read throughput in tokens/s",
+             prompt_n / prompt_s if prompt_s else 0),
+            ("llamacpp:predicted_tokens_seconds", "gauge", "Average generation throughput in tokens/s",
+             t["output_tokens"] / decode_s if decode_s else 0),
+            ("llamacpp:requests_processing", "gauge", "Requests running", running),
+            ("llamacpp:requests_deferred", "gauge", "Requests waiting their turn", s.get("queued") or 0),
+            ("strata:requests_total", "counter", "Requests finished", t["requests"]),
+            ("strata:drafts_offered_total", "counter", "Speculative draft tokens offered", t["drafts_offered"]),
+            ("strata:drafts_accepted_total", "counter", "Speculative draft tokens accepted", t["drafts_accepted"]),
+            ("strata:model_loaded", "gauge", "1 while the model is loaded", int(self.loaded())),
+        ]
+        return "".join(f"# HELP {name} {help_}\n# TYPE {name} {kind}\n{name} {value}\n"
+                       for name, kind, help_, value in rows)
 
     def v1_status(self) -> dict:
         """GET /v1/status: what this server is and does, for a client that would rather ask than guess (a front-end
@@ -3532,6 +3564,17 @@ class Service:
         return now
 
     def run(self, ids, thinking, tools, max_new, sampling, cancel, force=None) -> Iterator[tuple[str, object]]:
+        """The request's events (see _run); with "prevent_sleep" in the config, the PC stays awake while it runs or waits."""
+        ka = self.keep_awake
+        if ka is not None:
+            ka.acquire()
+        try:
+            yield from self._run(ids, thinking, tools, max_new, sampling, cancel, force)
+        finally:
+            if ka is not None:
+                ka.release()
+
+    def _run(self, ids, thinking, tools, max_new, sampling, cancel, force=None) -> Iterator[tuple[str, object]]:
         """Yields ("event", Event) as text arrives, then ("done", {"finish": .., "completion_tokens": ..}).
         `force` (forced_call): the opening of the call the reply must make - see prepare()."""
         defaults = {**self.sampling_defaults, **self.shared}   # the config's, then the Chat settings shared with apps
@@ -3672,9 +3715,15 @@ class Service:
                         seg, wrap, leaving = [], False, False   # this pass's tokens; the budget is reached; closed
                         opens = False                   # the thinking is over: write the forced call's opening
                         try:
+                            # A value the frontend holds back (a tool call's array or object argument is sent
+                            # whole, once complete) can keep the stream silent for minutes while tokens are
+                            # generated; a client's idle timeout then ends the request.  Send the same keep-alive
+                            # the engine's heartbeat sends when nothing has gone out for KEEPALIVE_S.
+                            last_out = time.perf_counter()
                             for t in gen:
                                 if t is None:               # heartbeat while the engine is quiet
                                     last_print = self._progress(last_print, st=st)
+                                    last_out = time.perf_counter()
                                     yield "ping", None
                                     continue
                                 n += 1
@@ -3707,6 +3756,11 @@ class Service:
                                     if ev.kind in ("content", "tool_start", "tool_call"):
                                         answered = True
                                     yield "event", ev
+                                if evs:
+                                    last_out = time.perf_counter()
+                                elif time.perf_counter() - last_out >= KEEPALIVE_S:
+                                    last_out = time.perf_counter()
+                                    yield "ping", None
                                 if stops is not None and stops.hit is not None:
                                     finish = "stop"         # gen.close() below STOPs the engine, as for a stop token
                                     break
@@ -4667,6 +4721,15 @@ def make_handler(svc: Service):
                 self.end_headers()
                 self.wfile.write(body)
                 return
+            if path == "/metrics/prometheus":
+                if self._authorized():
+                    body = svc.prometheus().encode()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                return
             if path == "/metrics":
                 from serve import prometheus
                 if prometheus.wants_prometheus(self.headers.get("Accept", ""), urlsplit(self.path).query):
@@ -5145,6 +5208,7 @@ def make_handler(svc: Service):
                 raise ValueError("a forced tool_choice with MCP tools is not supported")
             svc.reasoning_budget(req)                         # a bad value is a 400 before anything is sent
             stop_strings(req)                                 # ... and so is a bad stop / stop_sequences
+            check_request_sampling(req)                       # ... and a sampling field of the wrong type
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, force=force, req=req)
             _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
             cancel = threading.Event()
@@ -5314,6 +5378,10 @@ def make_handler(svc: Service):
                 stop_strings(req)
             except ValueError as e:
                 raise ResponsesError(str(e), "stop") from None
+            try:
+                check_request_sampling(req)                   # the request is also the sampling dict (see below)
+            except ValueError as e:                           # its message starts with the field's name: the param
+                raise ResponsesError(str(e), str(e).partition(":")[0]) from None
             svc.load()
             # #924 (opt-in): a Codex compaction request is rendered with its conversation's tools, so its prompt
             # starts as the cached one did; the parser and the response keep the request's own tools
@@ -5346,6 +5414,7 @@ def make_handler(svc: Service):
             req = svc.with_shared(req, "anthropic")
             messages, tools, kw = anthropic_to_messages(req, svc.anthropic_think_unasked)
             stop_strings(req)                                 # the same 400 as the request itself would get
+            check_request_sampling(req)                       # ... likewise a sampling field of the wrong type
             self._json(200, {"input_tokens": len(svc.encode_prompt(messages, tools, kw))})
 
         def _anthropic(self, req):
@@ -5359,6 +5428,7 @@ def make_handler(svc: Service):
             max_new = int(req.get("max_tokens") or 0)                  # 0/-1: the rest of the context
             svc.reasoning_budget(req)                         # a bad value is a 400 before anything is sent
             stop_strings(req)                                 # ... and so is a bad stop / stop_sequences
+            check_request_sampling(req)                       # ... and a sampling field of the wrong type
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, force=force, req=req)
             _debug_req("anthropic", req, messages, tools, max_new, thinking, len(ids))
             cancel = threading.Event()
@@ -5733,6 +5803,34 @@ def clean_shared_defaults(d) -> dict:
     return out
 
 
+def lift_reasoning_effort_arg(cfg: dict) -> None:
+    """#1641: "--reasoning-effort high" in a config's "args" is meant for the thinking level, which is not an engine
+    option (the engine stopped at the unknown flag).  It is the config's "reasoning_effort" (none, low, medium or high:
+    the level for requests that name none), so the flag is taken out of the engine's arguments and becomes that key
+    unless the config already has one; said at startup."""
+    args = cfg.get("args")
+    if not isinstance(args, list):
+        return
+    out, value, i = [], None, 0
+    while i < len(args):
+        a = args[i]
+        if a == "--reasoning-effort" and i + 1 < len(args):
+            value, i = args[i + 1], i + 2
+        elif isinstance(a, str) and a.startswith("--reasoning-effort="):
+            value, i = a.partition("=")[2], i + 1
+        else:
+            out.append(a)
+            i += 1
+    if value is None:
+        return
+    cfg["args"] = out
+    if cfg.get("reasoning_effort") is None:
+        cfg["reasoning_effort"] = value
+    print("[strata] '--reasoning-effort' in the config's args is not an engine option: taken out of them. The thinking "
+          "level is the config's 'reasoning_effort' key (outside 'args'); it is used as " +
+          f"{cfg['reasoning_effort']!r}", flush=True)
+
+
 def sampling_defaults_from_config(cfg: dict) -> dict:
     """The run config's optional `sampling` block: defaults for the sampling fields a request leaves out, so
     a plain client gets configured sampling instead of greedy.  Supported: temperature, top_p, top_k, min_p,
@@ -5834,6 +5932,36 @@ def start_replicas(cfg: dict, groups: list[list[int]], exe: str, effort_end: lis
     return rp.ReplicaEngine(engines, load_tokens=load)
 
 
+def check_request_sampling(req) -> None:
+    """A request's sampling field of the wrong JSON type ("temperature": "0.7", "top_k": 40.0, "seed": true) is a 400
+    that names the field, as the same value is through POST /settings or the run config.  Unchecked, the value
+    replaced the configured default in run()'s merge and sampling_keys dropped it, so the reply was greedy.  Only
+    types are checked: a number (int or float, never bool) for temperature, top_p, min_p and the three penalties; an
+    integer (never bool or float) for top_k, penalty_last_n and seed.  Ranges behave as before (a temperature <= 0 is
+    greedy, top_k 0 or above 64 is clamped, a seed <= 0 is unset), and an absent or null field is not checked."""
+    for key, integer in (("temperature", False), ("top_p", False), ("min_p", False), ("presence_penalty", False),
+                         ("frequency_penalty", False), ("repetition_penalty", False), ("top_k", True),
+                         ("penalty_last_n", True), ("seed", True)):
+        value = (req or {}).get(key)
+        if value is None:
+            continue
+        if isinstance(value, str) and value.strip():      # some clients send numbers as strings: read and used
+            try:
+                num = float(value)
+                num = int(num) if integer and num == int(num) else (num if not integer else None)
+                if integer and num is None:
+                    raise ValueError
+                if not integer and re.fullmatch(r"\s*[+-]?\d+\s*", value):
+                    num = int(value)
+            except (ValueError, OverflowError):
+                raise ValueError(f"{key}: {'an integer' if integer else 'a number'}") from None
+            if num != num or num in (float("inf"), float("-inf")):
+                raise ValueError(f"{key}: {'an integer' if integer else 'a number'}")
+            req[key] = value = num
+        if isinstance(value, bool) or not isinstance(value, int if integer else (int, float)):
+            raise ValueError(f"{key}: {'an integer' if integer else 'a number'}")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--engine", choices=["mock", "strata"], default="mock")
@@ -5882,6 +6010,7 @@ def main() -> int:
                          "[{\"gpus\": [0, 1]}, {\"gpus\": [2, 3]}])")
     a = ap.parse_args()
     cfg = json.loads(Path(a.config).read_text(encoding="utf-8-sig")) if a.config else {}   # Notepad adds a BOM
+    lift_reasoning_effort_arg(cfg)
     if a.replicas is not None:
         cfg["replicas"] = a.replicas
     if a.gpu is not None:
@@ -5976,6 +6105,18 @@ def main() -> int:
                   sampling_defaults=sampling_defaults,
                   fit_max_tokens=a.fit_max_tokens or cfg.get("fit_max_tokens") is True)
     svc.reasoning_close_retry = cfg.get("reasoning_close_retry") is True    # #1053: opt-in, off by default
+    if cfg.get("prevent_sleep") is not None and not isinstance(cfg["prevent_sleep"], bool):
+        raise SystemExit(f"[strata] config \"prevent_sleep\" must be true or false, not {cfg['prevent_sleep']!r}")
+    from serve.keepawake import KeepAwake
+    svc.keep_awake = KeepAwake.create(cfg.get("prevent_sleep") is True)      # #1727: opt-in, Windows only
+    if cfg.get("reasoning_effort") is not None:         # #1641: the thinking level of requests that name none
+        try:
+            svc.config_effort = clean_shared_defaults({"reasoning_effort": cfg["reasoning_effort"]}).get("reasoning_effort")
+        except ValueError as e:
+            raise SystemExit(f"[strata] config {e}")
+        if svc.config_effort:
+            print(f"[strata] thinking level: {svc.config_effort} (reasoning_effort in the config; a request, or the "
+                  "Chat settings shared with other apps, can set its own)", flush=True)
     svc.codex_thread_titles = cfg.get("codex_thread_titles") is True    # #923: opt-in, off by default
     svc.codex_compaction_cache = cfg.get("codex_compaction_cache") is True   # #924: opt-in, off by default
     try:

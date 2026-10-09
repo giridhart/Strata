@@ -1669,7 +1669,7 @@ class GpuChoice(unittest.TestCase):
     def test_vision_device(self):
         # #408: the image encoder on its own card; the engine's environment stays as it was
         from serve.server import child_env, vision_env
-        cfg = {"gpu": [0, 1], "vision": {"exe": "v", "cuda_device": 2}}
+        cfg = {"gpu": [0, 1], "gpu_order": "as_given", "vision": {"exe": "v", "cuda_device": 2}}
         env = child_env(cfg)
         venv = vision_env(cfg, env)
         self.assertEqual(venv["CUDA_VISIBLE_DEVICES"], "2")
@@ -1924,6 +1924,42 @@ class DraftCounts(unittest.TestCase):
         rows = m["requests"]                                      # newest first
         self.assertEqual([(r["drafts_offered"], r["drafts_accepted"]) for r in rows], [(5, 3), (None, None), (12, 7)])
         self.assertEqual((m["totals"]["drafts_offered"], m["totals"]["drafts_accepted"]), (17, 10))
+
+
+class PrometheusMetrics(unittest.TestCase):
+    """GET /metrics/prometheus: the totals in Prometheus' text format, under llama-server's names."""
+
+    def test_totals(self):
+        tok = ByteTokenizer()
+        engine = DoneLineEngine(tok, "</think>\n\nok", max_context=CTX, done_lines=[
+            "DONE 4 20 400.0 200.0 stop 7 12 5",                # 5 of the prompt's tokens reused
+            "DONE 4 20 400.0 200.0 stop 3 5 0"])
+        svc = Service(engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        httpd = serve(svc, port=0)
+        base = f"http://127.0.0.1:{httpd.server_address[1]}"
+        try:
+            for _ in range(2):
+                body = json.dumps({"model": "m", "max_tokens": 10, "messages": [{"role": "user", "content": "hi"}]})
+                with urllib.request.urlopen(urllib.request.Request(base + "/v1/chat/completions", data=body.encode(),
+                                                                   headers={"Content-Type": "application/json"}),
+                                            timeout=30) as r:
+                    self.assertEqual(r.status, 200)
+            with urllib.request.urlopen(base + "/metrics/prometheus", timeout=10) as r:
+                self.assertTrue(r.headers["Content-Type"].startswith("text/plain"))
+                text = r.read().decode()
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+        m = {line.split()[0]: float(line.split()[1]) for line in text.splitlines() if not line.startswith("#")}
+        t = svc.totals
+        self.assertEqual(m["llamacpp:prompt_tokens_total"], t["prompt_tokens"] - 5)
+        self.assertEqual(m["llamacpp:prompt_tokens_cached_total"], 5)
+        self.assertEqual(m["llamacpp:prompt_seconds_total"], 0.8)
+        self.assertEqual(m["llamacpp:tokens_predicted_total"], t["output_tokens"])
+        self.assertEqual(m["llamacpp:tokens_predicted_seconds_total"], 0.4)
+        self.assertEqual((m["llamacpp:requests_processing"], m["llamacpp:requests_deferred"]), (0, 0))
+        self.assertEqual((m["strata:requests_total"], m["strata:drafts_offered_total"],
+                          m["strata:drafts_accepted_total"]), (2, 17, 10))
 
 
 class PcieShare(unittest.TestCase):
@@ -2271,6 +2307,42 @@ class CancelledRead(unittest.TestCase):
         self.assertEqual(m["totals"]["prompt_tokens"], 8 + 2 * total)
 
 
+class HeldBackArgKeepalive(unittest.TestCase):
+    """#1666: with stream_tools a tool call's array or object argument is held until it is whole, so a big one
+    left the stream silent for minutes while tokens were generated - a client's idle timeout (Forge's is 120 s)
+    then ended a healthy request.  The token loop now sends the engine's own keep-alive ping whenever nothing has
+    gone out for KEEPALIVE_S; a quick answer is untouched."""
+
+    TOOLS = [{"name": "f", "parameters": {"properties": {}}}]
+
+    def test_a_held_back_call_still_pings(self):
+        tok = ByteTokenizer()
+        clock = [0.0]
+
+        class HeldEngine(MockEngine):   # ~1 s to generate each token, none of it leaving the stream
+            def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+                for t in super().generate(ids, max_new, sampling, cancel):
+                    clock[0] += 1.0
+                    yield t
+
+        # a call inside the thinking is held whole until </tool_call> (the frontend's rcall state): every token
+        # after the opener produces no stream event - the same silence a long array argument makes
+        svc = Service(HeldEngine(tok, "<tool_call><function=f>" + "x" * 30, max_context=CTX), tok,
+                      ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        with mock.patch("serve.server.time.perf_counter", lambda: clock[0]):
+            kinds = [k for k, _ in svc.run(tok.encode("hi"), True, self.TOOLS, 60, {}, threading.Event())]
+        self.assertIn("ping", kinds)
+        self.assertIn("done", kinds)
+
+    def test_an_ordinary_answer_does_not_ping(self):
+        tok = ByteTokenizer()
+        svc = Service(MockEngine(tok, "ok", max_context=CTX), tok,
+                      ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        kinds = [k for k, _ in svc.run(tok.encode("hi"), False, None, 10, {}, threading.Event())]
+        self.assertNotIn("ping", kinds)
+        self.assertIn("done", kinds)
+
+
 class LiveRate(unittest.TestCase):
     """The Monitor's Speed readout: live.tok_s is a rate, and a request that never got a DONE keeps no counters.
 
@@ -2468,6 +2540,49 @@ class PromptProgress(unittest.TestCase):
         self.engine.reused = 0                        # an engine too old to print RESUME never sets it
         self.assertEqual(prompt_progress(self.svc)["cache"], 0,
                          "an engine too old to print RESUME counts the reused prefix as work")
+
+
+class ConfigReasoningEffort(unittest.TestCase):
+    """#1641: the config's "reasoning_effort" is the thinking level of requests that name none; "--reasoning-effort" in
+    its "args" (not an engine option) is lifted into that key."""
+
+    def svc(self, effort=None, shared=None):
+        tok = ByteTokenizer()
+        svc = Service(MockEngine(tok, "ok", max_context=CTX), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        svc.config_effort = effort
+        svc.shared = shared or {}
+        return svc
+
+    def test_default_changes_nothing(self):
+        req = {"messages": []}
+        self.assertIs(self.svc().with_shared(req, "openai"), req)
+
+    def test_config_level_fills_in_what_a_request_leaves_out(self):
+        svc = self.svc("low")
+        self.assertEqual(svc.with_shared({"messages": []}, "openai")["reasoning_effort"], "low")
+        self.assertEqual(svc.with_shared({"reasoning_effort": "high"}, "openai")["reasoning_effort"], "high")
+        self.assertEqual(svc.with_shared({}, "anthropic")["output_config"], {"effort": "low"})
+        self.assertEqual(self.svc("none").with_shared({}, "anthropic")["thinking"], {"type": "disabled"})
+
+    def test_shared_settings_win(self):
+        svc = self.svc("low", {"reasoning_effort": "high"})
+        self.assertEqual(svc.with_shared({}, "openai")["reasoning_effort"], "high")
+
+    def test_the_flag_in_args_becomes_the_key(self):
+        from serve.server import lift_reasoning_effort_arg
+        for args in (["--ctx", "4096", "--reasoning-effort", "low"], ["--reasoning-effort=low", "--ctx", "4096"]):
+            cfg = {"args": args}
+            with mock.patch("builtins.print"):
+                lift_reasoning_effort_arg(cfg)
+            self.assertEqual(cfg["args"], ["--ctx", "4096"])
+            self.assertEqual(cfg["reasoning_effort"], "low")
+        cfg = {"args": ["--reasoning-effort", "low"], "reasoning_effort": "none"}
+        with mock.patch("builtins.print"):
+            lift_reasoning_effort_arg(cfg)
+        self.assertEqual((cfg["args"], cfg["reasoning_effort"]), ([], "none"))      # the key wins
+        cfg = {"args": ["--ctx", "4096"]}
+        lift_reasoning_effort_arg(cfg)
+        self.assertEqual(cfg, {"args": ["--ctx", "4096"]})
 
 
 class SharedSettings(unittest.TestCase):
@@ -4948,6 +5063,36 @@ class ClaudeCodeBillingStamp(unittest.TestCase):
         first = svc.encode_prompt(*anthropic_to_messages({"system": self.blocks(c="b145e"), "messages": turn1,
                                                          "tools": tools}))
         self.assertEqual(ids[1][:len(first) - 8], first[:len(first) - 8])   # all but the generation header
+
+
+class ToolOrder(unittest.TestCase):
+    """A tool set that comes back in another order is put back in the order it was first seen (RealScaniX, #1624): the
+    template renders the tool list before the system prompt, so a client whose MCP tools register in a varying order
+    would move the shared prefix back thousands of tokens on every turn and have the conversation read again.  The
+    first request of a set is left exactly as sent."""
+
+    def names(self, tools, wrapper="function"):
+        from serve.frontend import _tool_list
+        return [t.get(wrapper, t)["name"] for t in _tool_list(tools, wrapper)]
+
+    def test_openai_shape_keeps_the_first_order(self):
+        a = [{"type": "function", "function": {"name": n}} for n in ("t1624_read", "t1624_rbash", "t1624_ctx7")]
+        self.assertEqual(self.names(a), ["t1624_read", "t1624_rbash", "t1624_ctx7"])      # the first sight: as sent
+        self.assertEqual(self.names(list(reversed(a))), ["t1624_read", "t1624_rbash", "t1624_ctx7"])
+        self.assertEqual(self.names(a[1:] + a[:1]), ["t1624_read", "t1624_rbash", "t1624_ctx7"])
+
+    def test_anthropic_shape_and_a_different_set(self):
+        a = [{"name": "t1624_read", "input_schema": {}}, {"name": "t1624_edit", "input_schema": {}}]
+        self.assertEqual(self.names(a, None), ["t1624_read", "t1624_edit"])
+        self.assertEqual(self.names(a[::-1], None), ["t1624_read", "t1624_edit"])
+        more = a[::-1] + [{"name": "t1624_new", "input_schema": {}}]       # another set: as sent, then remembered
+        self.assertEqual(self.names(more, None), ["t1624_edit", "t1624_read", "t1624_new"])
+
+    def test_duplicate_names_and_one_tool_are_left_alone(self):
+        d = [{"name": "t1624_x", "input_schema": {}}, {"name": "t1624_x", "input_schema": {"a": 1}}]
+        self.assertEqual(self.names(d, None), ["t1624_x", "t1624_x"])
+        one = [{"name": "t1624_only", "input_schema": {}}]
+        self.assertEqual(self.names(one, None), ["t1624_only"])
 
 
 class UntimedReads(unittest.TestCase):
