@@ -257,7 +257,7 @@ public:
     void enable_stats(int64_t n_layers);
     bool stats_on() const { return stats_on_; }
     void stats_window_start() { gen_.fetch_add(1, std::memory_order_relaxed); }
-    void stats_score(int64_t layer, const int32_t* ids, int64_t n, const int32_t* host_res);
+    void stats_score(int64_t layer, const int32_t* ids, int64_t n, const int32_t* host_res, int pcie_num = 0);
     int64_t predicted() const { return predicted_.load(std::memory_order_relaxed); }
     int64_t skipped() const { return skipped_.load(std::memory_order_relaxed); }
     double busy_ms() const { return (double) busy_us_.load(std::memory_order_relaxed) / 1000.0; }
@@ -285,10 +285,13 @@ private:
     int64_t words_ = 0;
     std::unique_ptr<std::atomic<uint64_t>[]> pmask_;   // [layer][3 sizes][words]
     std::unique_ptr<std::atomic<uint64_t>[]> pstamp_;  // [layer]: gen + 1 of the prediction (0 = none)
+    std::unique_ptr<std::atomic<int32_t>[]> pvote_;    // [layer][kVoteN]: experts by votes, expert + 1 (0 = none)
     std::atomic<uint64_t> gen_{0};
     uint64_t st_layers_ = 0, st_nopred_ = 0, st_actual_ = 0, st_hit_[3] = {0, 0, 0}, st_pred_[3] = {0, 0, 0},
              st_predhit_[3] = {0, 0, 0};
     uint64_t st_windows_ = 0;
+    uint64_t st_vhit_[3] = {0, 0, 0}, st_vpred_[3] = {0, 0, 0}, st_pch_ = 0, st_pcov_[3] = {0, 0, 0};
+    static constexpr int kVoteN = 16;
 };
 
 /// Plan v0.3 P6: what the GPU computes in a verify window's layer, written by the pool (mapped host memory) right
