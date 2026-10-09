@@ -105,3 +105,6 @@ Notes:
 - #995 also changed the canonical `2026-09-29-speed-0126` report (matrix.json rewritten, README extended with another host's rows); that part was not ported, only the two new folders.
 - #777 and #811 are the same machine on two quants, kept as two folders.
 - The earlier community folders (`2026-09-30-community-rtx-5090`, `2026-10-03-community-2x-mi50`, `2026-10-04-community-2x-arc-pro-b60`) are listed in `docs/COMMUNITY_BENCHMARKS.md`.
+
+
+| [2026-10-08-community-2x-rtx3080-20gb-ud-q4-k-xl-512k-pool](2026-10-08-community-2x-rtx3080-20gb-ud-q4-k-xl-512k-pool/) | 2x RTX 3080 20 GB (220 W cap each, PCIe Gen3 x16), Xeon E5-2696 v4 (AVX2), 90 GiB RAM, Proxmox LXC | Unsloth UD-Q4_K_XL, two 262,144-token lanes in a 524,288-token shared KV pool, layer split, batch MTP | 718 / 2,219 / 2,585 / 2,996 / 3,080 (4K / 25K / 51K / 104K / 127K) | 81.2 / 84.0 / 90.6 / 86.3 / 80.7 (same lengths, one stream); 89.5 for two streams (my script) | fork build of 0.1.40.3, source branch `repro/w7` on noon-at-cgn/Strata (not upstream `main` plus the open PRs: it contains the code of my open PRs #1598, #1599, #1601, #1614 (shared KV pool), #1636 (batch MTP on a split), #1637 (`--adapt-async` beside slots), and of #1190, an open PR by another contributor that keeps the RAM copy of the split lend regions) | - |
