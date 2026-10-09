@@ -6521,6 +6521,35 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata generate: the mapped view of the experts %s (%s)\n",
                      dropped ? "is closed" : "stays open", why.c_str());
     }
+    // 0.1.42 (H11): the default CPU share is armed only when the host has the memory for it.  One line says why not;
+    // an explicit STRATA_PREFILL_CPU_SHARE (other than 0) is armed anyway, with a warning when memory is short.
+    auto share_default_ok = [&]() -> bool {
+        strata::prefill::share_rules::ShareMemory sm;
+        strata::core::detail::HostMemory hm;
+        if (strata::core::detail::host_available_memory(hm)) {
+            sm.avail_ram = hm.available;
+            sm.avail_commit = hm.commit == ~uint64_t{0} ? strata::prefill::share_rules::kUnknown : hm.commit;
+        }
+        sm.buffer_bytes = (uint64_t) (1024 + 8 * g.n_expert) * (uint64_t) g.n_embd * 4 + (256ull << 20);
+        if (srcp == &src) {
+            const auto& lay = strata::kernels::cpu::expert_layout();
+            for (int64_t l = 0; l < g.n_layers; ++l)
+                for (int64_t e = 0; e < g.n_expert; ++e)
+                    if (xcache.slot_of(l, e) < 0 && src.resident_blob(l, e) == nullptr && !src.transient(l, e))
+                        sm.inplace_bytes += (uint64_t) lay.blob_bytes(l);
+        }
+        const auto v = strata::prefill::share_rules::default_share_memory_verdict(sm);
+        if (v.arm) return true;
+        const char* ev = std::getenv("STRATA_PREFILL_CPU_SHARE");
+        if (ev == nullptr)
+            std::fprintf(stderr, "strata: the CPU prefill share is not armed by default: %s. STRATA_PREFILL_CPU_SHARE=auto "
+                                 "turns it on anyway\n", v.why.c_str());
+        else if (std::strcmp(ev, "0") != 0)
+            std::fprintf(stderr, "strata: WARNING STRATA_PREFILL_CPU_SHARE=%s is set and kept, but %s: the share can slow "
+                                 "prompts or fail on a machine this short of memory (STRATA_PREFILL_CPU_SHARE=0 turns it off)\n",
+                         ev, v.why.c_str());
+        return false;
+    };
     if (o.serve) {
         if (o.spec < 2 || o.prefill_chunk <= 0 ||
             (graph_hits && (thits.d_res == nullptr || host_res.empty()))) {
@@ -6555,12 +6584,13 @@ int main(int argc, char** argv) {
         }
 #endif
         const bool share_pool = o.batch <= 0 && !o.no_pool;
-        const bool share_has_work = strata::prefill::share_rules::default_share_has_work(
+        bool share_has_work = strata::prefill::share_rules::default_share_has_work(
             (int64_t) xcache.slots(), (int64_t) (g.n_layers * g.n_expert));   // #1595
         if (!share_has_work)
             std::fprintf(stderr, "strata serve: every expert is in the GPU cache (%lld of %lld): the CPU prefill share has "
                                  "nothing to take, so it is not armed by default (STRATA_PREFILL_CPU_SHARE=auto forces it)\n",
                          (long long) xcache.slots(), (long long) (g.n_layers * g.n_expert));
+        if (share_pool && stages.empty() && !multi_gpu && share_has_work && !share_default_ok()) share_has_work = false;   // H11
         strata::prefill::Prefill::arm_cpu_share(share_pool, share_pool && stages.empty() && !multi_gpu && share_has_work);
         void* borrow = nullptr;
         uint64_t borrow_bytes = 0;
@@ -11595,7 +11625,8 @@ int main(int argc, char** argv) {
     // #1595: not by default when the cache holds every expert (nothing to take)
     strata::prefill::Prefill::arm_cpu_share(!multi_gpu && !o.no_pool,
         !multi_gpu && !o.no_pool && o.batch <= 0 &&
-        strata::prefill::share_rules::default_share_has_work((int64_t) xcache.slots(), (int64_t) (g.n_layers * g.n_expert)));   // before the chunk below sizes the loan
+        strata::prefill::share_rules::default_share_has_work((int64_t) xcache.slots(), (int64_t) (g.n_layers * g.n_expert)) &&
+        share_default_ok());   // H11   // before the chunk below sizes the loan
     bool kvg_started = false;   // the elastic K/V took this run's cells
     double prefill_batched_ms = 0;
     std::FILE* final_r = o.dump_final_r.empty() ? nullptr : std::fopen(o.dump_final_r.c_str(), "wb");
