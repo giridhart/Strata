@@ -2542,6 +2542,49 @@ class PromptProgress(unittest.TestCase):
                          "an engine too old to print RESUME counts the reused prefix as work")
 
 
+class ConfigReasoningEffort(unittest.TestCase):
+    """#1641: the config's "reasoning_effort" is the thinking level of requests that name none; "--reasoning-effort" in
+    its "args" (not an engine option) is lifted into that key."""
+
+    def svc(self, effort=None, shared=None):
+        tok = ByteTokenizer()
+        svc = Service(MockEngine(tok, "ok", max_context=CTX), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        svc.config_effort = effort
+        svc.shared = shared or {}
+        return svc
+
+    def test_default_changes_nothing(self):
+        req = {"messages": []}
+        self.assertIs(self.svc().with_shared(req, "openai"), req)
+
+    def test_config_level_fills_in_what_a_request_leaves_out(self):
+        svc = self.svc("low")
+        self.assertEqual(svc.with_shared({"messages": []}, "openai")["reasoning_effort"], "low")
+        self.assertEqual(svc.with_shared({"reasoning_effort": "high"}, "openai")["reasoning_effort"], "high")
+        self.assertEqual(svc.with_shared({}, "anthropic")["output_config"], {"effort": "low"})
+        self.assertEqual(self.svc("none").with_shared({}, "anthropic")["thinking"], {"type": "disabled"})
+
+    def test_shared_settings_win(self):
+        svc = self.svc("low", {"reasoning_effort": "high"})
+        self.assertEqual(svc.with_shared({}, "openai")["reasoning_effort"], "high")
+
+    def test_the_flag_in_args_becomes_the_key(self):
+        from serve.server import lift_reasoning_effort_arg
+        for args in (["--ctx", "4096", "--reasoning-effort", "low"], ["--reasoning-effort=low", "--ctx", "4096"]):
+            cfg = {"args": args}
+            with mock.patch("builtins.print"):
+                lift_reasoning_effort_arg(cfg)
+            self.assertEqual(cfg["args"], ["--ctx", "4096"])
+            self.assertEqual(cfg["reasoning_effort"], "low")
+        cfg = {"args": ["--reasoning-effort", "low"], "reasoning_effort": "none"}
+        with mock.patch("builtins.print"):
+            lift_reasoning_effort_arg(cfg)
+        self.assertEqual((cfg["args"], cfg["reasoning_effort"]), ([], "none"))      # the key wins
+        cfg = {"args": ["--ctx", "4096"]}
+        lift_reasoning_effort_arg(cfg)
+        self.assertEqual(cfg, {"args": ["--ctx", "4096"]})
+
+
 class SharedSettings(unittest.TestCase):
     """The web app's "Use for other apps too": POST /settings makes its Chat settings every client's defaults."""
 

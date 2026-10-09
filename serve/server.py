@@ -2707,6 +2707,7 @@ class Service:
         self.sampling_defaults = dict(sampling_defaults or {})   # the run config's `sampling` block
         self.shared = {}                              # the web app's Chat settings for every client (POST /settings)
         self.shared_path = None                       # where they are kept between starts (next to the config)
+        self.config_effort = None                     # #1641: the config's "reasoning_effort": the level for requests with none
         self.fifo = threading.Lock()
         self.slot_save_path = None                    # --slot-save-path: /slots/0?action=save|restore (off when None)
         self.embeddings = threading.local()           # the current request's image embeddings file (GENI)
@@ -3075,12 +3076,12 @@ class Service:
     def with_shared(self, req: dict, api: str) -> dict:
         """The request with the shared thinking level and max tokens filled in where it has none of its own."""
         s = self.shared
-        if not s:
+        effort = s.get("reasoning_effort") or self.config_effort   # the Chat settings first, then the config's
+        if not s and not effort:
             return req
         req = dict(req)
         if "max_tokens" in s and not req.get("max_tokens") and not req.get("max_completion_tokens"):
             req["max_tokens"] = s["max_tokens"]
-        effort = s.get("reasoning_effort")
         if effort:
             if api == "openai":
                 ctk = req.get("chat_template_kwargs") if isinstance(req.get("chat_template_kwargs"), dict) else {}
@@ -5790,6 +5791,34 @@ def clean_shared_defaults(d) -> dict:
     return out
 
 
+def lift_reasoning_effort_arg(cfg: dict) -> None:
+    """#1641: "--reasoning-effort high" in a config's "args" is meant for the thinking level, which is not an engine
+    option (the engine stopped at the unknown flag).  It is the config's "reasoning_effort" (none, low, medium or high:
+    the level for requests that name none), so the flag is taken out of the engine's arguments and becomes that key
+    unless the config already has one; said at startup."""
+    args = cfg.get("args")
+    if not isinstance(args, list):
+        return
+    out, value, i = [], None, 0
+    while i < len(args):
+        a = args[i]
+        if a == "--reasoning-effort" and i + 1 < len(args):
+            value, i = args[i + 1], i + 2
+        elif isinstance(a, str) and a.startswith("--reasoning-effort="):
+            value, i = a.partition("=")[2], i + 1
+        else:
+            out.append(a)
+            i += 1
+    if value is None:
+        return
+    cfg["args"] = out
+    if cfg.get("reasoning_effort") is None:
+        cfg["reasoning_effort"] = value
+    print("[strata] '--reasoning-effort' in the config's args is not an engine option: taken out of them. The thinking "
+          "level is the config's 'reasoning_effort' key (outside 'args'); it is used as " +
+          f"{cfg['reasoning_effort']!r}", flush=True)
+
+
 def sampling_defaults_from_config(cfg: dict) -> dict:
     """The run config's optional `sampling` block: defaults for the sampling fields a request leaves out, so
     a plain client gets configured sampling instead of greedy.  Supported: temperature, top_p, top_k, min_p,
@@ -5956,6 +5985,7 @@ def main() -> int:
                          "[{\"gpus\": [0, 1]}, {\"gpus\": [2, 3]}])")
     a = ap.parse_args()
     cfg = json.loads(Path(a.config).read_text(encoding="utf-8-sig")) if a.config else {}   # Notepad adds a BOM
+    lift_reasoning_effort_arg(cfg)
     if a.replicas is not None:
         cfg["replicas"] = a.replicas
     if a.gpu is not None:
@@ -6050,6 +6080,14 @@ def main() -> int:
                   sampling_defaults=sampling_defaults,
                   fit_max_tokens=a.fit_max_tokens or cfg.get("fit_max_tokens") is True)
     svc.reasoning_close_retry = cfg.get("reasoning_close_retry") is True    # #1053: opt-in, off by default
+    if cfg.get("reasoning_effort") is not None:         # #1641: the thinking level of requests that name none
+        try:
+            svc.config_effort = clean_shared_defaults({"reasoning_effort": cfg["reasoning_effort"]}).get("reasoning_effort")
+        except ValueError as e:
+            raise SystemExit(f"[strata] config {e}")
+        if svc.config_effort:
+            print(f"[strata] thinking level: {svc.config_effort} (reasoning_effort in the config; a request, or the "
+                  "Chat settings shared with other apps, can set its own)", flush=True)
     svc.codex_thread_titles = cfg.get("codex_thread_titles") is True    # #923: opt-in, off by default
     svc.codex_compaction_cache = cfg.get("codex_compaction_cache") is True   # #924: opt-in, off by default
     try:
