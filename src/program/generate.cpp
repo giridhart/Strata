@@ -8012,6 +8012,25 @@ int main(int argc, char** argv) {
         drive.d.pcie_num = std::max(0, std::min(256, (int) (o.pcie_frac * 256.0 + 0.5)));
         const bool all_experts_resident = !host_res.empty() &&
             std::all_of(host_res.begin(), host_res.end(), [](int32_t r) { return r >= 0; });
+        // STRATA_ROUTE_TAIL_SKIP: ON BY DEFAULT on CUDA builds (owner decision, 0.1.42): a missed expert that every token of
+        // a verify window routes at rank 7 or lower is neither copied nor computed (answers differ slightly from 0.1.41,
+        // KL ~0.003-0.006; docs/DETAILS.md).  =0 restores 0.1.41's bytes.  Nothing to do, so no default and no line, when every
+        // expert is in VRAM; off with --batch slots (a window then mixes requests, and one request's skip would depend on
+        // another's tokens) and, as in the dispatch, with a peer or helper GPU.  A layer split is fine: each stage skips by itself.
+        {
+            const char* tse = std::getenv("STRATA_ROUTE_TAIL_SKIP");
+#if !defined(STRATA_USE_HIP)
+            const bool tail_default_ok = tse == nullptr && !all_experts_resident && o.batch == 0 && o.peer_device < 0;
+#else
+            const bool tail_default_ok = false;   // HIP and SYCL stay as they were
+#endif
+            if (tail_default_ok) strata::core::set_tail_skip_rank(7);
+            if (strata::core::tail_skip_rank() > 0 && !all_experts_resident)
+                std::fprintf(stderr, "strata serve: STRATA_ROUTE_TAIL_SKIP=%d is ON%s: a missed expert that every token of a verify window routes at rank %d or "
+                                     "lower is skipped (+15..25%% decode on 8-16 GB cards, answers differ slightly from 0.1.41); "
+                                     "STRATA_ROUTE_TAIL_SKIP=0 turns it off\n", strata::core::tail_skip_rank(),
+                             tse == nullptr ? " (default)" : "", strata::core::tail_skip_rank());
+        }
         if (o.adapt_every > 0 && o.adapt_swaps > 0 && !all_experts_resident)
             drive.d.usage.assign((size_t) (g.n_layers * g.n_expert), 0.0f);
         // #477 --expert-profile-save: what the adaptive tier learned, kept across restarts (opt-in; off: `heat` stays
