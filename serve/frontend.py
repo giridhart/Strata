@@ -201,12 +201,13 @@ ANTHROPIC_BLOCKS = ("text",) + IMAGE_PARTS + ("thinking", "tool_use", "tool_resu
 
 
 def _check_parts(content, path: str, kinds):
-    """A request's content parts (on chat) or content blocks (on messages), checked while the request is converted:
-    a part whose type this server does not read - a file, audio, a document - raises a ValueError naming the type
-    and where it sits, which the server answers with a 400, as /v1/responses does; these two paths used to drop the
-    part without a word, and the model answered about a file it had never seen.  `kinds` is the types the place
-    reads.  A "refusal" part is read as its text, as /v1/responses does.  Content that is not a list, and a part
-    that is not an object, passes through: the readers skip it as they always did."""
+    """A request's content parts (on chat) or content blocks (on messages), looked at while the request is converted.
+    A part whose type this server does not read (a file, audio, a document, Anthropic's tool_reference,
+    search_result, server_tool_use / web_search_tool_result blocks, ...) is left out of the prompt exactly as it always
+    was, with a debug line: real clients (Claude Code, Codex, opencode, Cline, Continue, Open WebUI) send such parts
+    next to text the model can answer from, so refusing them would break requests that work.  A "refusal" part is read
+    as its text, as /v1/responses does.  Content that is not a list, and a part that is not an object, passes through
+    unchanged."""
     if not isinstance(content, list):
         return content
     out = content
@@ -219,8 +220,8 @@ def _check_parts(content, path: str, kinds):
                 out = list(content)
             out[j] = {"type": "text", "text": part.get("refusal") or ""}
         elif kind not in kinds:
-            read = "text and images are" if set(kinds) & set(IMAGE_PARTS) else "text is"
-            raise ValueError(f"{path}[{j}].type: content parts of type {kind!r} are not supported ({read})")
+            LOGGER.debug("%s[%d].type: content part of type %r is not read by this server; left out of the prompt",
+                         path, j, kind)
     return out
 
 

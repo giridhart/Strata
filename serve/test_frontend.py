@@ -86,55 +86,54 @@ class UnreadContentParts(unittest.TestCase):
         tok = ByteTokenizer()
         self.service = Service(MockEngine(tok, "ok"), tok, self.template)
 
-    def test_chat_file_and_audio_parts_are_refused(self):
+    def test_chat_file_and_audio_parts_are_left_out(self):
         parts = ({"type": "file", "file": {"filename": "a.pdf", "file_data": "data:application/pdf;base64,AA"}},
                  {"type": "input_audio", "input_audio": {"data": "AA", "format": "wav"}})
+        plain = [{"role": "user", "content": "summarize"}, {"role": "user", "content": "this one"}]
         for part in parts:
             with self.subTest(kind=part["type"]):
-                with self.assertRaises(ValueError) as raised:
-                    openai_to_messages({"messages": [
-                        {"role": "user", "content": "summarize the attached file"},
-                        {"role": "assistant", "content": "which file?"},
-                        {"role": "user", "content": [{"type": "text", "text": "this one"}, part]}]})
-                self.assertEqual(str(raised.exception),
-                                 f"messages[2].content[1].type: content parts of type {part['type']!r} are not "
-                                 "supported (text and images are)")
+                got = openai_to_messages({"messages": [
+                    {"role": "user", "content": "summarize"},
+                    {"role": "user", "content": [{"type": "text", "text": "this one"}, part]}]})
+                want = openai_to_messages({"messages": [
+                    {"role": "user", "content": "summarize"},
+                    {"role": "user", "content": [{"type": "text", "text": "this one"}]}]})
+                self.assertEqual(got, want)
 
-    def test_messages_document_block_is_refused(self):
-        with self.assertRaises(ValueError) as raised:
-            anthropic_to_messages({"messages": [
-                {"role": "user", "content": "summarize the attached file"},
-                {"role": "assistant", "content": "which file?"},
+    def test_messages_blocks_real_clients_send_are_left_out(self):
+        # tool_reference (Claude Code's tool search), documents, search results, server tool blocks, signed thinking
+        extra = [{"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": "AA"}},
+                 {"type": "search_result", "source": "s", "title": "t", "content": [{"type": "text", "text": "x"}]},
+                 {"type": "server_tool_use", "id": "s1", "name": "web_search", "input": {}},
+                 {"type": "web_search_tool_result", "tool_use_id": "s1", "content": []},
+                 {"type": "container_upload", "file_id": "f"}]
+        for block in extra:
+            with self.subTest(kind=block["type"]):
+                got = anthropic_to_messages({"messages": [
+                    {"role": "user", "content": "hi"},
+                    {"role": "assistant", "content": [{"type": "text", "text": "ok"}, block]},
+                    {"role": "user", "content": [{"type": "text", "text": "go"}, block]}]})
+                want = anthropic_to_messages({"messages": [
+                    {"role": "user", "content": "hi"},
+                    {"role": "assistant", "content": [{"type": "text", "text": "ok"}]},
+                    {"role": "user", "content": [{"type": "text", "text": "go"}]}]})
+                self.assertEqual(got, want)
+
+    def test_messages_tool_reference_in_a_tool_result_is_left_out(self):
+        def run(extra):
+            return anthropic_to_messages({"messages": [
+                {"role": "user", "content": "find a tool"},
+                {"role": "assistant", "content": [{"type": "tool_use", "id": "t1", "name": "ToolSearch", "input": {}}]},
                 {"role": "user", "content": [
-                    {"type": "text", "text": "this one"},
-                    {"type": "document", "source": {"type": "base64", "media_type": "application/pdf",
-                                                    "data": "AA"}}]}]})
-        self.assertEqual(str(raised.exception),
-                         "messages[2].content[1].type: content parts of type 'document' are not supported "
-                         "(text and images are)")
+                    {"type": "tool_result", "tool_use_id": "t1", "content": [{"type": "text", "text": "found"}] + extra}]}]})
+        self.assertEqual(run([{"type": "tool_reference", "tool_name": "mcp__x"}]), run([]))
 
-    def test_messages_document_in_a_tool_result_is_refused(self):
-        with self.assertRaises(ValueError) as raised:
-            anthropic_to_messages({"messages": [
-                {"role": "user", "content": "read the pdf"},
-                {"role": "assistant", "content": [{"type": "tool_use", "id": "t1", "name": "read", "input": {}}]},
-                {"role": "user", "content": [
-                    {"type": "tool_result", "tool_use_id": "t1", "content": [
-                        {"type": "text", "text": "page 1"},
-                        {"type": "document", "source": {"type": "base64", "media_type": "application/pdf",
-                                                        "data": "AA"}}]}]}]})
-        self.assertEqual(str(raised.exception),
-                         "messages[2].content[0].content[1].type: content parts of type 'document' are not "
-                         "supported (text and images are)")
-
-    def test_a_system_prompt_takes_text_only(self):
-        with self.assertRaises(ValueError) as raised:
-            openai_to_messages({"messages": [
-                {"role": "system", "content": [{"type": "text", "text": "be brief"},
-                                               {"type": "image_url", "image_url": "image.png"}]},
-                {"role": "user", "content": "hi"}]})
-        self.assertEqual(str(raised.exception),
-                         "messages[0].content[1].type: content parts of type 'image_url' are not supported (text is)")
+    def test_a_system_prompt_with_an_image_part_is_read_as_text_as_before(self):
+        got = openai_to_messages({"messages": [
+            {"role": "system", "content": [{"type": "text", "text": "be brief"},
+                                           {"type": "image_url", "image_url": "image.png"}]},
+            {"role": "user", "content": "hi"}]})
+        self.assertEqual(got[0][0]["content"], "be brief")
 
     def test_messages_redacted_thinking_is_dropped(self):
         msgs = {"messages": [
