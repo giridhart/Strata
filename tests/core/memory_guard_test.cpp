@@ -189,7 +189,8 @@ int main() {
         check(!f.sample(), "no meminfo is unknown");
         f.meminfo(120 * GiB, 25 * GiB);
         f.self("0::/a/../g");
-        check(!f.sample(), "a .. component in the cgroup path is refused");
+        check(f.sample() && f.sample()->source == MemorySource::meminfo, "a .. component in the cgroup path: MemAvailable alone");
+        check(!f.sample(100 * GiB), "a .. component with the cap is refused");
         f.self("garbage without colons");
         check(f.sample() && f.sample()->available == 25 * GiB, "unparsable /proc/self/cgroup lines are ignored");
     }
