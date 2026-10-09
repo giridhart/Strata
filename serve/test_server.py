@@ -3347,6 +3347,35 @@ class ThinkingBudget(unittest.TestCase):
         self.assertEqual(b["choices"][0]["message"]["reasoning_content"], ThinkingEngine.THOUGHT)
         self.assertEqual(len(self.engine.prompts), 3)
 
+    def test_the_config_budget_reaches_the_anthropic_and_effort_requests(self):
+        """#984: a config budget applies to a request that sets no budget of its own, whatever its max_tokens and
+        reasoning_effort say, on the Anthropic route too."""
+        from serve.server import REASONING_WRAP_UP
+        self.svc.reasoning_budget_tokens = 20
+        code, raw = self.post("/v1/messages", {"model": "m", "max_tokens": 3000, "stream": True,
+                                               "messages": [{"role": "user", "content": "2+2?"}]})
+        self.assertEqual(code, 200)
+        evs = [json.loads(line[6:]) for line in raw.splitlines() if line.startswith("data: {")]
+        thinking = "".join(e["delta"].get("thinking", "") for e in evs if e["type"] == "content_block_delta")
+        self.assertEqual(thinking, ThinkingEngine.THOUGHT[:20] + REASONING_WRAP_UP.split("</think>")[0])
+        code, b = self.openai(max_tokens=3000, reasoning_effort="high")
+        self.assertEqual(code, 200, b)
+        self.assertTrue(b["choices"][0]["message"]["reasoning_content"].startswith(ThinkingEngine.THOUGHT[:20] + "\n"))
+
+    def test_the_thinking_progress_line_shows_the_budget_not_max_tokens(self):
+        """#984: 'thinking: x of max 6400' read as if the budget was ignored; while a budget applies the line shows it."""
+        st = {"phase": "thinking", "generated": 10, "first_token": time.time() - 1, "started": time.time() - 2,
+              "max_tokens": 6400, "thinking_budget": 2048}
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.svc._progress(0, st=st)
+            self.svc._progress(0, st={**st, "phase": "answering"})
+            self.svc._progress(0, st={**st, "thinking_budget": None})
+        lines = out.getvalue().splitlines()
+        self.assertIn("thinking: 10 of budget 2048 (max 6400) tokens", lines[0])
+        self.assertIn("answering: 10 of max 6400 tokens", lines[1])
+        self.assertIn("thinking: 10 of max 6400 tokens", lines[2])
+
     def test_a_shared_budget_reaches_a_request_that_sets_none(self):
         """The Chat settings shared with other apps may carry a thinking budget too, like max_tokens and the effort."""
         self.svc.set_shared({"reasoning_budget_tokens": 20})
