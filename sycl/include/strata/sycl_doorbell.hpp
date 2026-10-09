@@ -18,7 +18,30 @@
 #include "strata/sycl_queue.hpp"
 
 namespace strata {
+// STRATA_SYCL_A770_FAST=1 (opt-in, experimental, PR #1710): the A770 router and 64-bit paired payload transfers.
+inline bool a770_fast() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_SYCL_A770_FAST"); return v != nullptr && v[0] == '1'; }();
+    return on;
+}
 using sys_atomic_u32 = sycl::atomic_ref<uint32_t, sycl::memory_order::relaxed, sycl::memory_scope::system>;
+
+// Payload pairs use 64-bit transactions; flags remain 32-bit. Keep the same
+// cache-bypass contract while transferring two floats per PCIe transaction.
+template<class T> inline T sys_load_mapped(const T* p) {
+    using read_props = decltype(sycl::ext::oneapi::experimental::properties(
+        sycl::ext::intel::experimental::read_hint<sycl::ext::intel::experimental::cache_control<
+            sycl::ext::intel::experimental::cache_mode::uncached,
+            sycl::ext::oneapi::experimental::cache_level::L1,
+            sycl::ext::oneapi::experimental::cache_level::L3>>));
+    sycl::ext::oneapi::experimental::annotated_ptr<T, read_props> u(const_cast<T*>(p));
+    return u[0];
+}
+inline sycl::float4 load_mapped_float4(const sycl::float4* p) {
+    const uint64_t* words = reinterpret_cast<const uint64_t*>(p);
+    const auto lo = sycl::bit_cast<sycl::float2>(sys_load_mapped(words));
+    const auto hi = sycl::bit_cast<sycl::float2>(sys_load_mapped(words + 1));
+    return sycl::float4(lo.x(), lo.y(), hi.x(), hi.y());
+}
 
 // A system-scope atomic load of host USM is still served from the GPU's cache on an Arc Pro B60 (NEO 26.31,
 // oneAPI 2026.1.1): a device spin never sees the host's store and runs to the spin bound every time (bounded host/GPU
