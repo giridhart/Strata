@@ -718,6 +718,10 @@ print(r.choices[0].message.content)
   `high`) in `strata-<model>.json`, outside `"args"` (#1641): the engine has no such option, and `--reasoning-effort` in
   `"args"` is moved to this key with a note at startup. The web app's shared Chat settings ("Use for other apps too") and a
   request's own level win over it.
+- **Keep Windows awake while it works (opt-in, #1727).** `"prevent_sleep": true` in `strata-<model>.json` keeps the PC
+  from going to sleep while at least one request is running or waiting (Windows' `SetThreadExecutionState` with
+  `ES_SYSTEM_REQUIRED`; the screen may still turn off), and gives the normal sleep rules back when the server is idle
+  and when it exits. Default off. On Linux and macOS it does nothing (one line at startup says so).
 - **A hard thinking budget (opt-in).** `"reasoning_budget_tokens": N` in a request (OpenAI or Anthropic) caps the
   thinking at N tokens: when it gets there the server ends it with a short wrap-up line and `</think>`, and the model
   answers from there (the engine continues from what it already holds, so nothing is read again). The wrap-up is

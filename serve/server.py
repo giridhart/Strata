@@ -2708,6 +2708,7 @@ class Service:
         self.shared = {}                              # the web app's Chat settings for every client (POST /settings)
         self.shared_path = None                       # where they are kept between starts (next to the config)
         self.config_effort = None                     # #1641: the config's "reasoning_effort": the level for requests with none
+        self.keep_awake = None                        # #1727 (opt-in): serve.keepawake.KeepAwake, the config's "prevent_sleep"
         self.fifo = threading.Lock()
         self.slot_save_path = None                    # --slot-save-path: /slots/0?action=save|restore (off when None)
         self.embeddings = threading.local()           # the current request's image embeddings file (GENI)
@@ -3563,6 +3564,17 @@ class Service:
         return now
 
     def run(self, ids, thinking, tools, max_new, sampling, cancel, force=None) -> Iterator[tuple[str, object]]:
+        """The request's events (see _run); with "prevent_sleep" in the config, the PC stays awake while it runs or waits."""
+        ka = self.keep_awake
+        if ka is not None:
+            ka.acquire()
+        try:
+            yield from self._run(ids, thinking, tools, max_new, sampling, cancel, force)
+        finally:
+            if ka is not None:
+                ka.release()
+
+    def _run(self, ids, thinking, tools, max_new, sampling, cancel, force=None) -> Iterator[tuple[str, object]]:
         """Yields ("event", Event) as text arrives, then ("done", {"finish": .., "completion_tokens": ..}).
         `force` (forced_call): the opening of the call the reply must make - see prepare()."""
         defaults = {**self.sampling_defaults, **self.shared}   # the config's, then the Chat settings shared with apps
@@ -6093,6 +6105,10 @@ def main() -> int:
                   sampling_defaults=sampling_defaults,
                   fit_max_tokens=a.fit_max_tokens or cfg.get("fit_max_tokens") is True)
     svc.reasoning_close_retry = cfg.get("reasoning_close_retry") is True    # #1053: opt-in, off by default
+    if cfg.get("prevent_sleep") is not None and not isinstance(cfg["prevent_sleep"], bool):
+        raise SystemExit(f"[strata] config \"prevent_sleep\" must be true or false, not {cfg['prevent_sleep']!r}")
+    from serve.keepawake import KeepAwake
+    svc.keep_awake = KeepAwake.create(cfg.get("prevent_sleep") is True)      # #1727: opt-in, Windows only
     if cfg.get("reasoning_effort") is not None:         # #1641: the thinking level of requests that name none
         try:
             svc.config_effort = clean_shared_defaults({"reasoning_effort": cfg["reasoning_effort"]}).get("reasoning_effort")
