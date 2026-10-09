@@ -4187,6 +4187,18 @@ class SilentEngine(unittest.TestCase):
         self.assertIn("#481", engine.death_note())
         self.assertNotIn("STOP", engine.proc.stdin.getvalue())    # nothing is listening: no STOP, no drain
 
+    def test_death_note_finds_the_watchdog_line_under_a_long_trace(self):
+        # #1705: STRATA_VERIFY_TRACE dumps (~30 KB) after the watchdog's line must not hide it
+        import tempfile
+        engine = self.bare(0.3)
+        with tempfile.TemporaryDirectory() as d:
+            engine.log_path = os.path.join(d, "e.log")
+            with open(engine.log_path, "w", encoding="utf-8") as f:
+                f.write("strata serve: no progress for 60 s during a request (issue #29)\n")
+                f.write("strata verify trace: dump\n" * 1500)
+            engine.proc.poll.return_value = -6
+            self.assertIn("a hang it caught", engine.death_note())
+
     def test_prompt_chunks_set_the_wait(self):
         # a PP line every second, at 100 tok/s: far over a 0.3 s silence, but each chunk is on time for its size
         engine = self.bare(0.3)

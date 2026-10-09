@@ -799,15 +799,17 @@ class StrataEngine:
         """Why the engine most likely ended, from the end of its log: its own watchdog (issue #29), else RAM."""
         if getattr(self, "silent_note", None):          # #481: the server ended it, not the OS or the engine itself
             return self.silent_note
-        tail = ""
+        tail = wide = ""
         try:
             with open(self.log_path, "rb") as f:
                 f.seek(0, 2)
-                f.seek(max(0, f.tell() - 4096))
-                tail = f.read().decode("utf-8", "replace")
+                f.seek(max(0, f.tell() - 262144))
+                wide = f.read().decode("utf-8", "replace")
+            tail = wide[-4096:]
         except (OSError, TypeError):
             pass
-        for line in reversed(tail.splitlines()):
+        # #1705: STRATA_VERIFY_TRACE dumps are ~30 KB and push the watchdog's line out of a 4 KB tail
+        for line in reversed(wide.splitlines()):
             if "issue #29" in line:
                 return ("The engine stopped itself because it had stopped making progress - a hang it caught. Its log "
                         "line: " + line.strip() + " - please report it at github.com/Niko1221/Strata/issues.")
