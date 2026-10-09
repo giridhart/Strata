@@ -11,6 +11,7 @@
 #include <sycl/ext/intel/experimental/cache_control_properties.hpp>
 #include <cstdint>
 #include <cstdlib>
+#include <atomic>
 #include <unordered_map>
 #include <mutex>
 #include <string>
@@ -80,13 +81,20 @@ template<class T> inline void sys_store_mapped(T* p, T v) {
 // verifier's checks catch. ~2 M host-memory reads is a few seconds at PCIe latency.
 // The bound is per device, chosen at run time (spin_max below): 20,000 reads on a card under the xe driver (the B-series
 // on Linux), whose device-plan windows only spin in a failure and where a longer spin is what makes the driver reset the
-// GT; 2,000,000 (a few seconds) elsewhere, Windows included (a JIT/OpenCL B-series build measured faster with the long
-// bound, #1397). On an Arc A-series (i915) the CPU computes the experts the card does not hold and the GPU waits for it at
+// GT; 2,000,000 (a few seconds) elsewhere. A B-series card with no sysfs driver (Windows / OpenCL) gets 20,000 too (#1473,
+// measured +46-67% with --mtp), found from the device's architecture or name. On an Arc A-series (i915) the CPU computes the experts the card does not hold and the GPU waits for it at
 // every layer: 20,000 reads is a few tens of milliseconds, the first request after a start (cold pages, slow CPU
 // layers) is slower than that, the GPU gave up, went on with the experts' outputs missing, and the answer was token 0
 // ("!!!!!") or the engine crashed in the CPU pool on the garbage routing it read next.
 // STRATA_SPIN_MAX=<reads> overrides both; a build's -DSTRATA_SYCL_SPIN_MAX=<reads> (CMake) fixes one bound for every
 // device. The device functions take the bound as an argument: the launchers pass spin_max(queue).
+// Without a sysfs driver name (Windows, OpenCL) a B-series card is recognised from the device itself (intel_gpu_gen):
+// its window waits are the xe kind (expected to expire, so 20,000 reads), EXCEPT in a run that drafts without the MTP
+// layer (--spec N, no --mtp): the suffix drafter's own waits have to complete there, and 20,000 reads left it empty-handed
+// (0 drafts, 21.8 vs 68.8 tok/s, #1473). generate calls spin_drafts_need_long_bound(true) for such a run, before any
+// launch. A Linux xe card keeps 20,000 in every mode (unchanged).
+inline std::atomic<bool>& spin_long_drafts_flag() { static std::atomic<bool> f{false}; return f; }
+inline void spin_drafts_need_long_bound(bool on) { spin_long_drafts_flag() = on; }
 inline uint32_t spin_max(const sycl::queue& q) {
     static std::mutex mu;
     static std::unordered_map<sycl::device, uint32_t> cache;
@@ -99,7 +107,10 @@ inline uint32_t spin_max(const sycl::queue& q) {
 #ifdef STRATA_SYCL_SPIN_MAX
     else v = STRATA_SYCL_SPIN_MAX;
 #else
-    else v = intel_gpu_driver() == "xe" ? 20000u : 2000000u;
+    else if (intel_gpu_driver() == "xe") v = 20000u;
+    else if (intel_gpu_driver().empty() && intel_gpu_gen(d) == IntelGpuGen::Battlemage)
+        v = spin_long_drafts_flag().load() ? 2000000u : 20000u;
+    else v = 2000000u;
 #endif
     cache.emplace(d, v);
     return v;

@@ -116,6 +116,42 @@ inline const std::string& intel_gpu_driver() {
 }
 }  // namespace strata
 
+namespace strata {
+// Which Intel GPU generation a SYCL device is, from the device itself (so it also works on Windows / OpenCL, where
+// intel_gpu_driver() has no sysfs to read): the architecture enum when the runtime knows it, else the marketing name
+// ("Intel(R) Arc(TM) Pro B70", "... A750 ..."). Battlemage = Arc B-series / Pro B-series (B570 B580 B50 B60 B65 B70).
+enum class IntelGpuGen { Unknown, Alchemist, Battlemage };
+inline IntelGpuGen intel_gpu_gen(const sycl::device& d) {
+    if (!d.is_gpu()) return IntelGpuGen::Unknown;
+    try {
+        {
+            namespace exp = sycl::ext::oneapi::experimental;
+            const auto a = d.get_info<exp::info::device::architecture>();
+            if (a == exp::architecture::intel_gpu_bmg_g21 || a == exp::architecture::intel_gpu_bmg_g31)
+                return IntelGpuGen::Battlemage;
+            if (a == exp::architecture::intel_gpu_acm_g10 || a == exp::architecture::intel_gpu_acm_g11 ||
+                a == exp::architecture::intel_gpu_acm_g12)
+                return IntelGpuGen::Alchemist;
+        }
+    } catch (...) {
+    }
+    std::string n;
+    try { n = d.get_info<sycl::info::device::name>(); } catch (...) { return IntelGpuGen::Unknown; }
+    if (n.find("Intel") == std::string::npos) return IntelGpuGen::Unknown;
+    if (n.find("Battlemage") != std::string::npos) return IntelGpuGen::Battlemage;
+    if (n.find("Alchemist") != std::string::npos) return IntelGpuGen::Alchemist;
+    // "Arc(TM) Pro B70", "Arc(TM) B580", "Arc(TM) A750": a letter and 2-3 digits, as a whole word
+    for (size_t i = 0; i + 2 < n.size(); ++i) {
+        if ((i > 0 && n[i - 1] != ' ') || (n[i] != 'A' && n[i] != 'B')) continue;
+        size_t j = i + 1;
+        while (j < n.size() && n[j] >= '0' && n[j] <= '9') ++j;
+        if (j - i - 1 < 2 || j - i - 1 > 3 || (j < n.size() && n[j] != ' ' && n[j] != '(')) continue;
+        return n[i] == 'B' ? IntelGpuGen::Battlemage : IntelGpuGen::Alchemist;
+    }
+    return IntelGpuGen::Unknown;
+}
+}  // namespace strata
+
 #include <cstdint>
 namespace strata {
 // Does every page of a big device allocation keep its own bytes?  On an Arc Pro B70 (xe) a 22 GiB expert-cache arena came
