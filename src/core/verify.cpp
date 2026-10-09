@@ -190,7 +190,11 @@ bool sh_stream_on() {
 // STRATA_HEAD_MIX_MULTI=0 does too): bitwise the same sums.
 bool head_mix_multi_enabled() {
 #if defined(STRATA_USE_HIP)
-    return false;
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_HEAD_MIX_MULTI");   // HIP: opt-in (=1)
+        return v != nullptr && std::atoi(v) != 0;
+    }();
+    return on;
 #else
     static const bool on = [] {
         const char* v = std::getenv("STRATA_HEAD_MIX_MULTI");
@@ -202,7 +206,11 @@ bool head_mix_multi_enabled() {
 
 bool one_token_self_commit() {
 #if defined(STRATA_USE_HIP)
-    return false;
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_ONE_TOKEN_COMMIT");   // HIP: opt-in (=1)
+        return v != nullptr && std::atoi(v) != 0;
+    }();
+    return on;
 #else
     static const bool on = [] {
         const char* v = std::getenv("STRATA_ONE_TOKEN_COMMIT");

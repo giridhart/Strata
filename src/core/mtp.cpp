@@ -857,7 +857,8 @@ bool MtpDrafter::record_rest(int step_row, cudaStream_t cs, std::string& err) {
         }();
         static const bool head_mix_multi_on = [] {
 #if defined(STRATA_USE_HIP)
-            return false;
+            const char* v = std::getenv("STRATA_HEAD_MIX_MULTI");   // HIP: opt-in (=1)
+            return v != nullptr && std::atoi(v) != 0;
 #else
             const char* v = std::getenv("STRATA_HEAD_MIX_MULTI");
             return v == nullptr || std::atoi(v) != 0;
