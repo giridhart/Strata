@@ -372,6 +372,7 @@ struct Options {
     std::string embd_gguf;
     /// Plan v0.3 P2: how the n-gram table is read. Direct (default) = unbuffered SSD reads, table never in RAM.
     std::string ple_io = "direct";
+    bool ple_io_explicit = false;      ///< --ple-io was given: the engine only warns when direct measures slow
     int64_t ple_row_cache = 1 << 20;   ///< bounded row cache (rows of 90 B); 0 disables
     int ple_inflight = 256;   // the prompt path reads a chunk's rows at once: 64 left the SSD half idle (32K: 303 -> 189 ms)
     double ple_delay_us = 0;           ///< fault injection: every row read completes no earlier than this
@@ -1559,6 +1560,31 @@ double pcie_frac_for_gbps(double gbps, double base) {
 
 }  // namespace
 
+// #1425 #1549 #1629: --ple-io direct (the default) does unbuffered random reads of the n-gram table; on some drives
+// (DRAM-less NVMe, Windows unbuffered I/O) they run at 34 MB/s or 4-8 tok/s and a prompt reads layer 1 for minutes.
+// Rows per second of a short cold probe: a few batches of random rows through the same batched reader a prompt chunk
+// uses, stopped after ~0.6 s. Returns <= 0 when nothing could be measured.
+static double ple_direct_rows_per_s(strata::kernels::PleTable& t) {
+    const uint64_t n = t.rows();
+    if (n < 4096) return -1.0;
+    constexpr size_t kTok = 4;   // 64 rows a batch
+    std::vector<uint32_t> rows(kTok * 16);
+    std::vector<float> out(kTok * 2560);
+    uint64_t x = 0x9E3779B97F4A7C15ull ^ n;
+    const auto t0 = std::chrono::steady_clock::now();
+    uint64_t done = 0;
+    double el = 0;
+    for (int b = 0; b < 64; ++b) {
+        for (auto& r : rows) { x ^= x << 13; x ^= x >> 7; x ^= x << 17; r = (uint32_t) (x % n); }
+        std::string e;
+        if (!t.gather_batch(rows.data(), kTok, out.data(), e)) return -1.0;
+        done += rows.size();
+        el = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        if (el > 0.6) break;
+    }
+    return el > 0 ? (double) done / el : -1.0;
+}
+
 int main(int argc, char** argv) {
     // **UNBUFFERED, BECAUSE THE INTERESTING OUTPUT IS THE OUTPUT BEFORE A CRASH.**  `stdout` redirected to a
     // pipe or a file is block-buffered, so a program that dies loses every line it had already printed - which
@@ -1679,7 +1705,7 @@ int main(int argc, char** argv) {
         else if (a == "--dump-routing") o.dump_routing = next("--dump-routing");
         else if (a == "--ple-gguf") o.ple_gguf = next("--ple-gguf");
         else if (a == "--no-ple") o.no_ple = true;
-        else if (a == "--ple-io") o.ple_io = next("--ple-io");
+        else if (a == "--ple-io") { o.ple_io = next("--ple-io"); o.ple_io_explicit = true; }
         else if (a == "--ple-row-cache") o.ple_row_cache = std::atoll(next("--ple-row-cache"));
         else if (a == "--ple-inflight") o.ple_inflight = std::atoi(next("--ple-inflight"));
         else if (a == "--ple-delay-us") o.ple_delay_us = std::atof(next("--ple-delay-us"));
@@ -2862,6 +2888,32 @@ int main(int argc, char** argv) {
         if (!ple_table.open(o.ple_gguf, err, pio)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
+        }
+        // Recommend, never force: when the default direct reads measure slow, switch to the mapped reads (40-100x
+        // faster on the reporters' drives); an explicit --ple-io direct is kept and only warned about.
+        if (pio.mode == strata::kernels::PleIo::Direct && std::getenv("STRATA_PLE_PROBE") == nullptr) {
+            constexpr double kSlowRowsPerS = 15000.0;   // ~60 MB/s of 4 KiB pages; a healthy NVMe is >100k
+            const double rps = ple_direct_rows_per_s(ple_table);
+            if (rps > 0 && rps < kSlowRowsPerS) {
+                if (!o.ple_io_explicit) {
+                    std::fprintf(stderr, "strata generate: --ple-io direct measures slow here (%.0f rows/s, about %.0f MB/s of "
+                                         "random 4 KiB reads): using --ple-io mmap instead (the OS file cache holds the pages; "
+                                         "--ple-io direct forces the old mode, --ple-io ram keeps the table in RAM)\n",
+                                 rps, rps * 4096.0 / 1e6);
+                    ple_table.close();
+                    pio.mode = strata::kernels::PleIo::Mmap;
+                    pio.keepalive_ms = 0;
+                    if (!ple_table.open(o.ple_gguf, err, pio)) {
+                        std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+                        return 1;
+                    }
+                } else {
+                    std::fprintf(stderr, "strata generate: WARNING: --ple-io direct measures slow here (%.0f rows/s, about %.0f "
+                                         "MB/s of random 4 KiB reads): a prompt can spend minutes reading layer 1 and trip the "
+                                         "stall watchdog (#1425, #1629). --ple-io mmap was 40-100x faster on such drives; "
+                                         "--ple-io ram needs the RAM for the table\n", rps, rps * 4096.0 / 1e6);
+                }
+            }
         }
 #if !defined(_WIN32)
         if (pio.mode == strata::kernels::PleIo::Direct) {
