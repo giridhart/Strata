@@ -2,7 +2,12 @@
 // directories standing in for /proc/meminfo, /proc/self/cgroup and /sys/fs/cgroup.  CPU only, no GPU.
 #include "strata/core/conversation_memory.hpp"
 
+#ifdef _WIN32
+#include <process.h>
+#define getpid _getpid
+#else
 #include <unistd.h>
+#endif
 
 #include <cstdint>
 #include <cstdio>
