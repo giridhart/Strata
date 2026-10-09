@@ -958,6 +958,9 @@ void FileExpertSource::close() {
     direct_.clear();
     {
         std::lock_guard<std::mutex> lk(stage_mu_);
+        // the buffers' last copies end before they are freed (#1237)
+        if (!stage_ev_.empty()) (void) cudaDeviceSynchronize();
+        stage_free_events();
         stage_buf_.clear();
         stage_key_.clear();
         stage_epoch_.clear();
@@ -1207,6 +1210,9 @@ bool FileExpertSource::claim_stage(int64_t key, size_t& v, bool& fill, bool ahea
         uint8_t* raw = pinned ? (uint8_t*) p : new (std::nothrow) uint8_t[(size_t) stage_blob_];
         if (raw == nullptr) return false;
         stage_buf_.emplace_back(raw, StageBufFree{pinned});
+        stage_idx_[raw] = stage_buf_.size() - 1;
+        stage_ev_.push_back(nullptr);
+        stage_ev_live_.push_back(0);
         if (pinned && !stage_pin_said_) {
             stage_pin_said_ = true;
             std::fprintf(stderr, "FileExpertSource: the stage buffers are pinned (cudaHostAlloc)\n");
@@ -1228,6 +1234,19 @@ bool FileExpertSource::claim_stage(int64_t key, size_t& v, bool& fill, bool ahea
     } else {
         stage_of_.erase(stage_key_[v]);
         if (stage_pf_[v]) { stage_pf_[v] = 0; io_pf_unused_.fetch_add(1, std::memory_order_relaxed); }   // read ahead, never asked for
+        // #1237: a page-locked buffer is read by the DMA after the copy call returned: it is refilled only once the
+        // last copy queued out of it (note_async_read) has finished.  Rare: the pool is sized so that a buffer asked
+        // for has long been consumed; a wait here means the stream is more than a pool behind.
+        if (v < stage_ev_live_.size() && stage_ev_live_[v]) {
+            stage_ev_live_[v] = 0;
+            if (stage_ev_[v] != nullptr) {
+                if (cudaEventQuery((cudaEvent_t) stage_ev_[v]) == cudaErrorNotReady) {
+                    stage_fence_waits_.fetch_add(1, std::memory_order_relaxed);
+                    (void) cudaEventSynchronize((cudaEvent_t) stage_ev_[v]);
+                }
+                (void) cudaGetLastError();
+            }
+        }
     }
     stage_key_[v] = key;
     stage_epoch_[v] = epoch_;
@@ -1261,6 +1280,38 @@ void FileExpertSource::publish_stage(size_t v, int64_t layer, bool ok, double us
         }
     }
     stage_cv_.notify_all();
+}
+
+void FileExpertSource::note_async_read(const uint8_t* blob, void* stream) {
+    if (blob == nullptr) return;
+    std::lock_guard<std::mutex> lk(stage_mu_);
+    const auto it = stage_idx_.find(blob);
+    if (it == stage_idx_.end()) return;                 // not a stage buffer: the mapping or the resident arena
+    const size_t v = it->second;
+    if (!stage_buf_[v].get_deleter().pinned) return;    // pageable: the driver copied it before the call returned
+    if (stage_ev_[v] == nullptr) {
+        cudaEvent_t ev = nullptr;
+        if (cudaEventCreateWithFlags(&ev, cudaEventDisableTiming) != cudaSuccess) {
+            (void) cudaGetLastError();
+            (void) cudaStreamSynchronize((cudaStream_t) stream);   // no event: wait for the copy itself
+            return;
+        }
+        stage_ev_[v] = ev;
+    }
+    if (cudaEventRecord((cudaEvent_t) stage_ev_[v], (cudaStream_t) stream) != cudaSuccess) {
+        (void) cudaGetLastError();
+        (void) cudaStreamSynchronize((cudaStream_t) stream);
+        return;
+    }
+    stage_ev_live_[v] = 1;
+}
+
+void FileExpertSource::stage_free_events() {
+    for (void*& e : stage_ev_)
+        if (e != nullptr) { (void) cudaEventDestroy((cudaEvent_t) e); e = nullptr; }
+    stage_ev_.clear();
+    stage_ev_live_.clear();
+    stage_idx_.clear();
 }
 
 const uint8_t* FileExpertSource::staged_blob(int64_t layer, int64_t expert) {
@@ -3422,6 +3473,7 @@ void expert_hit_run(void* user, void* stream, HitPhase phase, const int32_t* ids
                     d.fail_expert = e;
                     return;
                 }
+                d.src->note_async_read(b, cs);   // #1237: a page-locked stage buffer is not recycled under the queued copy
                 ++d.cache_admitted;
                 slot = cand;
             } else {
