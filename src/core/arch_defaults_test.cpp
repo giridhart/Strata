@@ -43,11 +43,12 @@ int main() {
                 CHECK(kv.first != bits);
         }
     }
-    // gfx12: the six prompt switches only, no decode switch, no bit-changing one
+    // gfx12: the five prompt switches only, no decode switch, no bit-changing one
     unset("STRATA_GFX12_DEFAULTS");
     for (const char* a : {"gfx1200", "gfx1201", "gfx1201:sramecc-:xnack-"}) {
         const auto t = arch_default_env(a);
-        CHECK(t.size() == 6);
+        CHECK(t.size() == 5);
+        for (const auto& kv : t) CHECK(kv.first != "STRATA_HCD_EXACT");
         for (const auto& kv : t) {
             CHECK(kv.first != "STRATA_Q8_PACKED" && kv.first != "STRATA_SH_STREAM" && kv.first != "STRATA_PF_GEMM" &&
                   kv.first != "STRATA_PF_FUSED");
