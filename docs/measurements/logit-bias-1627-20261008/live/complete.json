@@ -1,9 +1,0 @@
-{
-  "status": "passed",
-  "requests": 26,
-  "token_109266": "你好",
-  "base": "fb58e0db",
-  "model": "ISTA IQ3_XXS",
-  "kv": "int8",
-  "max_context": 32768
-}

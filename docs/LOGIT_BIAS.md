@@ -45,9 +45,8 @@ The `model` value above is the test server's alias; use your server's model name
 Numeric pair values are also supported, for example `[[42, 2.5]]`.
 Token IDs belong to the loaded model's tokenizer; the example ID is not portable
 between arbitrary models. Leading spaces and letter case can also change token IDs.
-The four English requests were measured on llm-60 / ISTA IQ3_XXS;
-[raw requests, responses and token IDs](measurements/logit-bias-1627-20261008/english/rows.json)
-and a [reproduction script](../tools/logit_bias_english_example.py) are included.
+The four English requests were measured on ISTA IQ3_XXS; a
+[reproduction script](../tools/logit_bias_english_example.py) is included.
 
 ## Semantics and limits
 
@@ -75,6 +74,3 @@ restrictive list may reduce draft acceptance. Ordinary MTP was tested. The
 experimental coupled/rejection-sampling combinations and multi-GPU execution
 were not validated in this campaign. There is no startup bias-file option in
 this change: send the field with each request.
-
-See the [validation report](measurements/logit-bias-1627-20261008/README.md)
-for exact scope, examples, and raw receipts.

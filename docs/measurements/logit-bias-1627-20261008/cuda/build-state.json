@@ -1,8 +1,0 @@
-{
-  "host": "llm-60",
-  "base": "fb58e0db",
-  "started": 1791510697.3211799,
-  "phase": "complete",
-  "finished": 1791510859.109081,
-  "binary_sha256": "64774e620823c40b840746cbad2ce96bdcb5f8146ad9547b1dc3464ec81b4db6"
-}

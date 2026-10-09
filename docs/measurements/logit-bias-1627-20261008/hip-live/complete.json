@@ -1,8 +1,0 @@
-{
-  "status": "passed",
-  "requests": 26,
-  "token_109266": "你好",
-  "baseline": "/home/dflanag3/strata-logit-bias-1627-20261008/baseline-build/strata",
-  "candidate": "/home/dflanag3/strata-logit-bias-1627-20261008/build/strata",
-  "config": "/home/dflanag3/CodiServer/config.json"
-}
