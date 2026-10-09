@@ -2065,6 +2065,23 @@ int main(int argc, char** argv) {
         else (void) cudaGetLastError();
     }
 #endif
+#if defined(STRATA_HIP_GFX906)
+    {   // #1728: the gfx906 build's kernels assume 64-lane waves; on a wave32 card they would fault or give wrong
+        // numbers, so say so before the first launch (the ready-made wave32 engine is the one for those cards)
+        int n_dev = 0;
+        if (cudaGetDeviceCount(&n_dev) == cudaSuccess) {
+            for (int d = 0; d < n_dev; ++d) {
+                cudaDeviceProp wp{};
+                if (cudaGetDeviceProperties(&wp, d) == cudaSuccess && wp.warpSize != 64) {
+                    std::fprintf(stderr, "strata generate: this engine was built for gfx906 (wave64, STRATA_HIP_GFX906), but GPU %d "
+                                         "(%s) has %d-lane waves: use the ready-made engine for that card, or hide it "
+                                         "(HIP_VISIBLE_DEVICES)\n", d, wp.name, wp.warpSize);
+                    return 2;
+                }
+            }
+        } else (void) cudaGetLastError();
+    }
+#endif
     strata::core::set_coupled_draft(o.coupled_draft);
     {   // --host-core / STRATA_HOST_CORE, before the pool and the session pin any thread
         std::string hc = o.host_core;
