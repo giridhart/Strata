@@ -74,6 +74,19 @@ template<class T> inline void sys_store_mapped(T* p, T v) {
     sycl::atomic_ref<T, sycl::memory_order::relaxed, sycl::memory_scope::system>(*p).store(v);
 }
 #endif
+// plain = true: an ordinary store. On the i915 driver (Arc A750) a plain store to host USM reaches the host in time
+// and the uncached hint only slows the publish (decode -11% on an A750, 4K prompt, 5 rounds); on xe it must be hinted.
+// STRATA_DOORBELL_PLAIN=0/1 overrides. The launchers read this on the host and pass it to the kernel.
+template<class T> inline void sys_store_mapped(bool plain, T* p, T v) {
+    if (plain) *p = v; else sys_store_mapped(p, v);
+}
+inline bool doorbell_plain_payload() {
+    static const bool v = [] {
+        if (const char* e = std::getenv("STRATA_DOORBELL_PLAIN")) return e[0] == '1';
+        return intel_gpu_driver() == "i915";
+    }();
+    return v;
+}
 
 // Every device spin is bounded. An unbounded spin that never sees its flag is not a hang of one process: the
 // xe driver times the queue out, resets the GT node by node (a window graph has 2,366 of them), and the card
