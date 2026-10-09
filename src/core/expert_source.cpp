@@ -1666,6 +1666,120 @@ bool FileExpertSource::drop_mapping(std::string& why) {
 #endif
 }
 
+bool FileExpertSource::begin_startup_unbuffered(std::string& why) {
+#if defined(_WIN32)
+    if (const char* v = std::getenv("STRATA_STARTUP_UNBUFFERED"); v != nullptr && v[0] != '\0' && std::atoi(v) == 0) {
+        why = "STRATA_STARTUP_UNBUFFERED=0";
+        return false;
+    }
+    if (base_ == nullptr || unmapped_ || startup_ub_ || !role_ptr_.empty() || !maps_.empty() || paths_.size() != 1 ||
+        layer_blob_bytes_.empty()) {
+        why = "experts.bin only";
+        return false;
+    }
+    if (!direct_.empty()) { why = "the file tier reads unbuffered already"; return false; }
+    const auto t0 = std::chrono::steady_clock::now();
+    const uint8_t* m = mapped_blob(0, 0);   // the first blob as the mapping reads it, for the check below
+    if (m == nullptr) { why = "the first blob is not mapped"; return false; }
+    const std::vector<uint8_t> ref(m, m + (size_t) layer_blob_bytes_[0]);
+    // NTFS runs the unbuffered reads of a file one at a time while it is mapped or open buffered (drop_mapping), so
+    // the view, the section and the handle all go.  The first unbuffered open with no buffered handle left purges the
+    // file's cached pages: 1.2-2.5 s after a mapped start had left IQ2_XS's 33 GiB experts.bin on the standby list,
+    // 3 ms after an unbuffered start.  A buffered handle held open instead keeps the cache and serializes the reads
+    UnmapViewOfFile((LPCVOID) base_);
+    unmapped_ = true;
+    if (mapping_ != nullptr) CloseHandle((HANDLE) mapping_);
+    mapping_ = nullptr;
+    if (file_ != nullptr) CloseHandle((HANDLE) file_);
+    file_ = nullptr;
+    std::string fail;
+    if (open_direct(fail)) {
+        // the first blob both ways: a drive that does not read it unbuffered keeps the mapped copy
+        std::vector<uint8_t> probe(ref.size());
+        const Fill f{0, 0, 0, probe.data()};
+        if (read_direct(&f, 1) && std::memcmp(probe.data(), ref.data(), ref.size()) == 0) {
+            startup_ub_ = true;
+            startup_blob_bytes_ = file_blob_bytes_.load();
+            startup_us_ = file_us_.load();
+            char note[96];
+            std::snprintf(note, sizeof note, "the view closed until the RAM copy is built; %.0f ms",
+                          std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+            why = note;
+            return true;
+        }
+        fail = "an unbuffered read of the first blob failed or differed from the mapping";
+        for (void* d : direct_) close_direct(d);
+        direct_.clear();
+        std::lock_guard<std::mutex> lk(stage_mu_);
+        stage_blob_ = 0;
+    }
+    std::string again;
+    why = map_view(again) ? fail : fail + "; " + again;
+    return false;
+#else
+    why = "Windows only";
+    return false;
+#endif
+}
+
+bool FileExpertSource::end_startup_unbuffered(std::string& why) {
+    if (!startup_ub_) return true;
+    startup_ub_ = false;
+    // the view first: closing the unbuffered handles beside a buffered one purges nothing
+    if (!map_view(why)) {
+        why += ": the file tier reads it unbuffered";
+        return false;   // as after drop_mapping: every read goes through read_direct
+    }
+    for (void* d : direct_) close_direct(d);
+    direct_.clear();
+    {   // the mapped tier hands out the mapping: the startup's stage buffers go
+        std::lock_guard<std::mutex> lk(stage_mu_);
+        stage_buf_.clear();
+        stage_key_.clear();
+        stage_epoch_.clear();
+        stage_used_.clear();
+        stage_busy_.clear();
+        stage_pf_.clear();
+        stage_of_.clear();
+        stage_blob_ = 0;
+    }
+    file_blob_bytes_.store(startup_blob_bytes_);
+    file_us_.store(startup_us_);
+    return true;
+}
+
+bool FileExpertSource::map_view(std::string& why) {
+#if defined(_WIN32)
+    // open's mapping of experts.bin, again
+    const std::string& path = paths_.front();
+    const int wide = MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, nullptr, 0);
+    std::vector<wchar_t> wpath((size_t) (wide > 0 ? wide : 1), L'\0');
+    if (wide > 0) MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, wpath.data(), wide);
+    HANDLE f = CreateFileW(wpath.data(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL,
+                           nullptr);
+    LARGE_INTEGER sz{};
+    const bool same = f != INVALID_HANDLE_VALUE && GetFileSizeEx(f, &sz) && (uint64_t) sz.QuadPart == mapped_bytes_;
+    HANDLE m = same ? CreateFileMappingW(f, nullptr, PAGE_READONLY, 0, 0, nullptr) : nullptr;
+    void* view = m != nullptr ? MapViewOfFile(m, FILE_MAP_READ, 0, 0, 0) : nullptr;
+    if (view == nullptr) {
+        why = f != INVALID_HANDLE_VALUE && !same
+                  ? std::string("experts.bin changed size since it was opened")
+                  : "experts.bin could not be mapped again (error " + std::to_string((unsigned long long) GetLastError()) + ")";
+        if (m != nullptr) CloseHandle(m);
+        if (f != INVALID_HANDLE_VALUE) CloseHandle(f);
+        return false;
+    }
+    file_ = f;
+    mapping_ = m;
+    base_ = (const uint8_t*) view;
+    unmapped_ = false;
+    return true;
+#else
+    why = "Windows only";
+    return false;
+#endif
+}
+
 bool FileExpertSource::read_direct(const Fill* fills, size_t n) const {
 #if defined(_WIN32)
     // NTFS runs the unbuffered reads of a file one at a time while the file is mapped or cached anywhere (the engine
@@ -2809,9 +2923,29 @@ bool FileExpertSource::pin_cache_complement(
 #if defined(_WIN32)
     // The mapped pages this process touched (the GPU cache's fill and this copy) leave its working set for the
     // standby list: VirtualUnlock on pages that are not locked does exactly that (it then reports ERROR_NOT_LOCKED).
-    if (maps_.empty()) (void) VirtualUnlock((LPVOID) base_, (SIZE_T) mapped_bytes_);
+    // Not with the view closed (begin_startup_unbuffered): its range may hold other memory by now.
+    if (maps_.empty() && !unmapped_) (void) VirtualUnlock((LPVOID) base_, (SIZE_T) mapped_bytes_);
     for (const Map& m : maps_) (void) VirtualUnlock((LPVOID) m.base, (SIZE_T) m.bytes);
 #endif
+    if (std::getenv("STRATA_VERIFY_COMPLEMENT") != nullptr && host != nullptr && bytes > 0) {
+        // tests: the copy's checksum (FNV-1a of each 1 GiB piece on its own thread, then of those), any reader
+        constexpr uint64_t kPiece = 1ull << 30;
+        const size_t pieces = (size_t) ((bytes + kPiece - 1) / kPiece);
+        std::vector<uint64_t> ph(pieces, 0);
+        std::atomic<size_t> next_piece{0};
+        auto hash_work = [&] {
+            for (size_t i; (i = next_piece.fetch_add(1)) < pieces;)
+                ph[i] = fnv1a64(host + (size_t) (i * kPiece), std::min<uint64_t>(kPiece, bytes - i * kPiece));
+        };
+        std::vector<std::thread> hth;
+        for (int t = 1; t < 8; ++t) hth.emplace_back(hash_work);
+        hash_work();
+        for (auto& t : hth) t.join();
+        uint64_t h = fnv1a64((const uint8_t*) offsets.data(), (uint64_t) (offsets.size() * sizeof(uint64_t)));
+        h = fnv1a64((const uint8_t*) ph.data(), (uint64_t) (ph.size() * sizeof(uint64_t)), h);
+        std::fprintf(stderr, "FileExpertSource: cache complement checksum %016llx (%.2f GiB, its offsets included)\n",
+                     (unsigned long long) h, (double) bytes / 1073741824.0);
+    }
 
     complement_arena_ = arena;
     complement_host_ = host;
@@ -3297,6 +3431,33 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                     !(d.peer != nullptr && d.peer->has(d.layers, e)) && !helper_holds(e)) ++nmiss;
             }
         }
+        // STRATA_ROUTE_TAIL_SKIP=R (opt-in, changes the output): a missed expert that EVERY token of the window routes
+        // only at rank >= R (the smallest weights of the top-10) is neither copied nor computed; its contribution is
+        // zero, without renormalisation (the others keep the weight the router gave them).  Less PCIe and CPU work.
+        static const int tail_rank = [] {
+            const char* v = std::getenv("STRATA_ROUTE_TAIL_SKIP");
+            const int r = v != nullptr ? std::atoi(v) : 0;
+            return r > 0 && r < 10 ? r : 0;
+        }();
+        bool skip_d[kMaxWindowEntries];
+        for (int q = 0; q < nd; ++q) skip_d[q] = false;
+        if (tail_rank > 0 && d.peer == nullptr && d.remote_count == 0) {
+            int minr[kMaxWindowEntries];
+            for (int q = 0; q < nd; ++q) minr[q] = 99;
+            for (int64_t i = 0; i < n; ++i) {
+                int q = 0;
+                while (q < nd && distinct[q] != first_of[i]) ++q;
+                if (q < nd) minr[q] = std::min(minr[q], (int) (i % k));
+            }
+            for (int q = 0; q < nd; ++q) {
+                const int32_t e = ids[distinct[q]];
+                if (e < 0 || e >= d.n_expert || minr[q] < tail_rank) continue;
+                if (d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e] >= 0) continue;   // resident
+                skip_d[q] = true;
+                --nmiss;
+                ++d.tail_experts;
+            }
+        }
         const bool pcie_ok = d.pcie_num > 0 && d.src->pcie_layer(d.layers);
         const int m = pcie_ok ? (nmiss * d.pcie_num) >> 8 : 0;
         int miss_rank = 0, groups = 0, entries = 0, fetches = 0;
@@ -3308,6 +3469,11 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             const int32_t e = ids[i0];
             int kd = -1;
             unsigned long long ptr = 0;
+            if (skip_d[q]) {                       // STRATA_ROUTE_TAIL_SKIP: neither copied nor computed
+                for (int64_t i = i0; i < n; ++i)
+                    if (first_of[i] == i0) kind[i] = -2;
+                continue;
+            }
             if (e >= 0 && e < d.n_expert) {
                 const int32_t slot = d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e];
                 if (slot >= 0) {
@@ -3405,7 +3571,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     const bool gpu_zeroes_hits = (d.plan != nullptr && n <= kMaxWindowEntries && n <= d.plan->cap && dec_batch && !device_plan);
     bool any_cpu = false;
     for (int64_t i = 0; i < n; ++i)
-        if (kind[i] < 0) { any_cpu = true; break; }
+        if (kind[i] == -1) { any_cpu = true; break; }   // -2: skipped (STRATA_ROUTE_TAIL_SKIP), no work
     const auto c1 = std::chrono::steady_clock::now();
     if (any_cpu) {
         // #578 --remote-expert-opt: a token whose experts all run on a GPU (CUDA0 or a helper) needs no CPU activation
@@ -3425,7 +3591,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         static thread_local std::vector<int64_t> miss;
         miss.clear();
         for (int64_t i = 0; i < n_tok * k; ++i)
-            if (kind[i] < 0 && ids[i] >= 0 && ids[i] < d.n_expert &&
+            if (kind[i] == -1 && ids[i] >= 0 && ids[i] < d.n_expert &&
                 std::find(miss.begin(), miss.end(), (int64_t) ids[i]) == miss.end())
                 miss.push_back(ids[i]);
         d.src->prefetch(d.layers, miss.data(), (int64_t) miss.size());
@@ -3442,6 +3608,11 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                 d.fail_layer = d.layers;
                 d.fail_expert = e;
                 return;
+            }
+            if (kind[i] == -2) {            // STRATA_ROUTE_TAIL_SKIP: a skipped tail expert contributes zero
+                std::memset(row, 0, (size_t) H * sizeof(float));
+                ++d.tail_skipped;
+                continue;
             }
             if (kind[i] >= 0) {             // CUDA0, PCIe, or a remote/peer result staged into this row below
                 if (kind[i] == 0) ++d.cache_hits;

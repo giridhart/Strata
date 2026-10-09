@@ -1,3 +1,4 @@
+#include "strata/core/logit_bias.hpp"
 // src/program/generate.cpp - P2.S6: `strata generate`.
 //
 // THE DRIVER, and the first program in this project that answers a question.  Everything below it is a
@@ -2617,7 +2618,10 @@ int main(int argc, char** argv) {
     else if (!strata::kernels::cpu::cpu_avx512_ok())
         std::fprintf(stderr, "strata generate: this CPU has no AVX-512: the expert kernels run on %s "
                              "(multi-token for the i-quant gate/up rows)\n",
-                     !strata::kernels::cpu::cpu_avx2_ok() ? "ggml-cpu vec_dot (no AVX2: the older-CPU build)"
+                     !strata::kernels::cpu::cpu_avx2_ok()
+                         ? (strata::kernels::cpu::cpu_avx1_ok() && std::getenv("STRATA_NO_IQ128") == nullptr
+                            ? "AVX1 128-bit (iq_avx1, the older-CPU build)"
+                            : "ggml-cpu vec_dot (no AVX2: the older-CPU build)")
                      : std::getenv("STRATA_NO_IQ256") == nullptr ? "AVX-2" : "ggml-cpu vec_dot (STRATA_NO_IQ256 set)");
     strata::core::ModelGeometry g;   // canonical defaults; the model file overrides the MoE shape below
     int64_t K = 10;
@@ -4419,6 +4423,19 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: the file tier reads through the file cache (STRATA_UNBUFFERED_LOAD=%s "
                                  "ignored: without --resident-budget-gib the file cache holds the experts)\n", env);
         }
+#if defined(_WIN32)
+        // the GPU cache's fill and the RAM copy read unbuffered even so: through the mapping their pages sat in the
+        // working set beside the copy (end_startup_unbuffered below, once the copy is built).  Windows, experts.bin
+        if (o.resident_cpu_experts && !src.unbuffered()) {
+            std::string why;
+            if (src.begin_startup_unbuffered(why))
+                std::fprintf(stderr, "strata generate: the GPU cache's fill and the RAM copy read unbuffered (%s)\n",
+                             why.c_str());
+            else if (why.find("STRATA_STARTUP_UNBUFFERED") == std::string::npos)
+                std::fprintf(stderr, "strata generate: the GPU cache's fill and the RAM copy read through the mapping "
+                                     "(%s)\n", why.c_str());
+        }
+#endif
         // Linux I/O path (opt in): whole-blob preads instead of page faults, and the predicted experts of the next
         // layers read ahead on I/O threads while the current layer computes (see FileExpertSource::set_io_prefetch)
         if (const char* v = std::getenv("STRATA_IO_PREFETCH"); v != nullptr && std::atoi(v) != 0) {
@@ -4952,6 +4969,39 @@ int main(int argc, char** argv) {
                              "slot 0 verified\n",
                      (long long) prefilled, (long long) (per_layer ? xcache.slots() : want), fill_s,
                      fill_s > 0 ? (double) fill_bytes / 1e6 / fill_s : 0.0);
+        if (std::getenv("STRATA_VERIFY_COMPLEMENT") != nullptr) {
+            // tests: the filled slots' checksum (each slot's blob read back and hashed, then the hashes in slot order)
+            std::vector<std::pair<int32_t, int64_t>> sl;   // (slot, blob bytes)
+            for (int64_t l = 0; l < g.n_layers; ++l)
+                for (int64_t e = 0; e < g.n_expert; ++e)
+                    if (const int32_t s = xcache.slot_of(l, e); s >= 0)
+                        sl.emplace_back(s, (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(l));
+            std::sort(sl.begin(), sl.end());
+            std::vector<uint64_t> sh(sl.size(), 0);
+            std::atomic<size_t> next_slot{0};
+            std::atomic<bool> copy_ok{true};
+            auto hash_work = [&] {
+                std::vector<uint8_t> hb;
+                for (size_t i; (i = next_slot.fetch_add(1)) < sl.size();) {
+                    hb.resize((size_t) sl[i].second);
+                    if (cudaMemcpy(hb.data(), xcache.device_slot(sl[i].first), hb.size(), cudaMemcpyDeviceToHost) !=
+                        cudaSuccess) copy_ok = false;
+                    sh[i] = strata::core::fnv1a64(hb.data(), (uint64_t) hb.size());
+                }
+            };
+            std::vector<std::thread> hth;
+            for (int t = 1; t < 8; ++t) hth.emplace_back(hash_work);
+            hash_work();
+            for (auto& t : hth) t.join();
+            uint64_t h = strata::core::fnv1a64(nullptr, 0);
+            for (size_t i = 0; i < sl.size(); ++i) {   // field by field: a pair's padding is not part of it
+                const int64_t v[2] = {(int64_t) sl[i].first, sl[i].second};
+                h = strata::core::fnv1a64((const uint8_t*) v, sizeof v, h);
+                h = strata::core::fnv1a64((const uint8_t*) &sh[i], sizeof sh[i], h);
+            }
+            std::fprintf(stderr, "strata generate: expert cache checksum %016llx (%zu slots%s)\n", (unsigned long long) h,
+                         sl.size(), copy_ok ? "" : ", A READ-BACK FAILED");
+        }
     }
 
     for (auto& stp : stages) {
@@ -6299,8 +6349,8 @@ int main(int argc, char** argv) {
         }
         for (const auto& [i, s] : filled) host_res[i] = s;
         kvg.refilled += (int64_t) filled.size();
-        if (cudaMemcpy(d_res, host_res.data(), host_res.size() * sizeof(int32_t), cudaMemcpyHostToDevice) != cudaSuccess)
-            return false;
+        // res_put waits for its copy: the next reader can be a verify window (a non-blocking stream) right away
+        if (res_put(d_res) != cudaSuccess) return false;
         for (const strata::core::VmmChunk h : kvg.spare) strata::core::vmm_chunk_free(h);   // new ones, if any
         kvg.spare.clear();
         ++kvg.trims;
@@ -6451,6 +6501,17 @@ int main(int argc, char** argv) {
             else
                 err = whole_err + "; " + err;
         }
+        // the startup reads are done: the view of experts.bin back, the file tier as chosen above
+        bool startup_kept = false;
+        if (src.startup_unbuffered()) {
+            std::string why;
+            const auto end_t0 = std::chrono::steady_clock::now();
+            startup_kept = !src.end_startup_unbuffered(why);
+            if (startup_kept) std::fprintf(stderr, "strata generate: WARNING: %s\n", why.c_str());
+            else
+                std::fprintf(stderr, "strata generate: the startup reads are done: experts.bin mapped again (%.0f ms)\n",
+                             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - end_t0).count());
+        }
         // #669 / #765: a big chunk lends many cache slots to the prompt path, and each lent slot's expert is read back
         // from the SSD whenever the RAM could not keep its copy (31 GB: auto:32768 read prompts ~3x slower than auto).
         // Said, never capped: --prefill is the user's, and with the RAM for them it is the faster one (+21-35%).
@@ -6503,7 +6564,7 @@ int main(int argc, char** argv) {
         // the file cache keeps those, and every refill after a prompt read the drive instead).  Windows and Linux: the
         // unbuffered reads exist there
 #if defined(_WIN32) || defined(__linux__)
-        if (o.mmap_experts && o.resident_budget > 0) {
+        if (o.mmap_experts && o.resident_budget > 0 && !startup_kept) {
             std::string why;
             const bool was = src.unbuffered();
             const bool ub = src.recheck_unbuffered(why);
@@ -6563,6 +6624,23 @@ int main(int argc, char** argv) {
         // neither fires, plain one-token-per-round decoding - slower, never wrong: the verify window still
         // confirms every emitted token against the real model regardless of where the draft came from.
         const bool use_mtp = !o.mtp.empty();
+        // STRATA_PREFILL_HELPER_SOURCE (opt-in): the prompt path may take a blob a helper's VRAM cache already
+        // holds from that cache instead of reading the files again.  The helpers are idle while a prompt is read
+        // (the serve path is serial: no batch slots), so the copy needs no ordering against their kernel streams.
+        // Everything else - the fallback's batched unbuffered reads, its pinned RAM copy, the prompt path's own
+        // decisions - is forwarded unchanged.  Default off: the prompt path's source is srcp, exactly as before.
+        std::vector<strata::core::RemoteExperts*> prefill_helpers;
+        for (int r = 0; r < drive.d.remote_count; ++r) prefill_helpers.push_back(drive.d.remote[r]);
+        std::unique_ptr<strata::core::RemotePrefillSource> prefill_helper_src;
+        strata::core::ExpertSource* prefill_src = srcp;
+        uint64_t helper_blobs_before = 0, helper_bytes_before = 0;
+        if (const char* hv = std::getenv("STRATA_PREFILL_HELPER_SOURCE"); hv != nullptr && std::atoi(hv) != 0 &&
+            srcp != nullptr && !multi_gpu && stages.empty() && o.batch <= 0 && !prefill_helpers.empty()) {
+            prefill_helper_src = std::make_unique<strata::core::RemotePrefillSource>(*srcp, prefill_helpers);
+            prefill_src = prefill_helper_src.get();
+            std::fprintf(stderr, "strata serve: the prompt path reads the experts a helper cache holds from that "
+                                 "cache (STRATA_PREFILL_HELPER_SOURCE)\n");
+        }
         strata::prefill::Prefill sp;
         // the pool is idle while a prompt is read unless batch slots decode between its parts; with
         // STRATA_PREFILL_CPU_SHARE the staged-chunk limit before the chunk below sizes the loans (bytes_needed reads it)
@@ -6891,7 +6969,7 @@ int main(int argc, char** argv) {
             }
             if (multi_gpu) sp.set_stage(0, split_at[0], &stages[0]->sp);
             if (share_pool) sp.set_cpu_pool(&pool);
-            if (!sp.init(wt, g, ss, srcp, &xcache, host_res.data(), o.prefill_chunk, main_cs, err, borrow, borrow_bytes))
+            if (!sp.init(wt, g, ss, prefill_src, &xcache, host_res.data(), o.prefill_chunk, main_cs, err, borrow, borrow_bytes))
                 return err.find("do not fit") != std::string::npos ? 2 : 1;
             return 0;
         };
@@ -8481,7 +8559,7 @@ int main(int argc, char** argv) {
                     slots_all += remote_experts[(size_t) r].resident();
                     mib_all += (int64_t) (remote_experts[(size_t) r].gib() * 1024.0);
                 }
-            std::printf("INFO context=%lld kv=%s kv_resident=%lld expert_slots=%lld expert_cache_mib=%lld "
+            std::printf("INFO logit_bias=1 context=%lld kv=%s kv_resident=%lld expert_slots=%lld expert_cache_mib=%lld "
                         "expert_slots_primary=%lld expert_cache_primary_mib=%lld spec=%d "
                         "mtp_max=%d lookup=%d vram_free_mib=%lld cvec=%s arena_mib=%lld pool_workers=%d pcie_frac=%.2f "
                         "spec_min_p=%.2f conversation_cache_mib=%lld conversation_cache_slots=%d "
@@ -9382,6 +9460,8 @@ int main(int argc, char** argv) {
             unsigned long long req_seed = 0;
             float req_min_p = 0.0f, req_penalty_repeat = 1.0f, req_penalty_freq = 0.0f, req_penalty_present = 0.0f;
             int req_penalty_last_n = 0;
+            std::string req_bias_text;
+            bool req_bias_present = false;
             int req_cvec = 1;   // cvec=0|1: a loaded control vector for this request (on when absent)
             // ckpt=0: a one-shot call whose turn no later request extends.  No checkpoint at its last turn boundary
             // (so no split there) nor every --prompt-cache-every tokens, and its session is neither continued nor
@@ -9409,7 +9489,8 @@ int main(int argc, char** argv) {
                     if (eq == std::string::npos) { endp = const_cast<char*>(start); break; }
                     const std::string key = tok.substr(0, eq);
                     const float fv = std::strtof(tok.c_str() + eq + 1, nullptr);
-                    if (key == "cvec") req_cvec = std::atoi(tok.c_str() + eq + 1);
+                    if (key == "logit_bias") { req_bias_text = tok.substr(eq + 1); req_bias_present = true; }
+                    else if (key == "cvec") req_cvec = std::atoi(tok.c_str() + eq + 1);
                     else if (key == "ckpt") req_ckpt = std::atoi(tok.c_str() + eq + 1) != 0;
                     else if (key == "pin") req_pin = std::max<long long>(0, std::atoll(tok.c_str() + eq + 1));
                     else if (key == "temperature") req_temperature = fv;
@@ -9426,6 +9507,13 @@ int main(int argc, char** argv) {
                     else if (key == "aux_cpus") req_aux_cpus = std::atoi(tok.c_str() + eq + 1) != 0 ? 1 : 0;
                     // unknown keys are skipped: the ids start at the first token without '='
                 }
+            }
+            std::vector<float> req_bias;
+            std::string bias_error;
+            if (req_bias_present && (o.batch > 0 ||
+                !strata::core::parse_logit_bias(req_bias_text, (int) n_vocab, req_bias, bias_error))) {
+                std::printf("ERR logit_bias: %s\n", o.batch > 0 ? "continuous batching is not supported" : bias_error.c_str());
+                continue;
             }
             std::string emb_path;
             if (geni && endp != nullptr) {
@@ -10268,6 +10356,10 @@ int main(int argc, char** argv) {
             req_sp.penalty_freq = req_penalty_freq;
             req_sp.penalty_present = req_penalty_present;
             req_sp.counter = 0;
+            if (!ver.set_logit_bias(req_bias, err) || (pipe && !ver_b.set_logit_bias(req_bias, err))) {
+                std::printf("ERR %s\n", err.c_str());
+                return 1;
+            }
             ver.set_sampling(req_sp);
             if (pipe) ver_b.set_sampling(req_sp);   // (reaches the later stage's odd verifier)
             if (use_mtp) mtp.set_draft_sampling(req_sp);   // STRATA_SPEC_COUPLED=1: sampled drafts (a no-op otherwise)
@@ -11507,6 +11599,9 @@ int main(int argc, char** argv) {
                              100.0 * (double) req_hits / (double) req_look,
                              (long long) req_hits, (long long) req_look, off);
             }
+            if (drive.d.tail_experts > 0)   // STRATA_ROUTE_TAIL_SKIP, cumulative
+                std::fprintf(stderr, "strata serve: route tail skip: %lld missed experts skipped (%lld entries) since the "
+                                     "start\n", (long long) drive.d.tail_experts, (long long) drive.d.tail_skipped);
             // the resident RAM mode, cumulative: experts read from experts.bin since the copy was made (what the plain
             // mmap mode reads through the OS file cache, from the SSD when the RAM could not keep it)
             if (src.complement_ready())
@@ -11612,6 +11707,14 @@ int main(int argc, char** argv) {
                              (double) (remote_experts[(size_t) r].full_row_bytes() - full_before[(size_t) r]) / 1048576.0,
                              remote_experts[(size_t) r].ms_begin() - begin_before[(size_t) r],
                              remote_experts[(size_t) r].ms_wait() - wait_before[(size_t) r]);
+            if (prefill_helper_src) {
+                const uint64_t blobs = prefill_helper_src->helper_blobs(), bytes = prefill_helper_src->helper_bytes();
+                std::fprintf(stderr, "strata serve: prefill helper source: %lld blobs / %.1f MiB taken from a helper's "
+                                     "cache in this request\n",
+                             (long long) (blobs - helper_blobs_before), (double) (bytes - helper_bytes_before) / 1048576.0);
+                helper_blobs_before = blobs;
+                helper_bytes_before = bytes;
+            }
         }
         save_profile("exit");   // #477: QUIT, or the server closed stdin
         return 0;
@@ -12237,13 +12340,18 @@ int main(int argc, char** argv) {
                     if (pk.lookup) { T = pk.t; from_sfx = true; }
                 }
             }
+            // The window's rows sit at p .. p + T - 1, and past the context there is no cell to verify them in: near
+            // its end the window takes only the rows that fit (the admission checked the prompt and max_new, which a
+            // full window can overrun)
+            const int room = (int) std::min<int64_t>(o.spec, o.max_context - p);
+            T = std::min(T, room);
             // --lookup-chain: what followed an earlier occurrence of the context + the MTP's drafts, after them
             int chain_n = 0, cm = 0;
-            if (o.lookup_chain > 0 && use_mtp && !first_window && !from_sfx && T < o.spec) {
+            if (o.lookup_chain > 0 && use_mtp && !first_window && !from_sfx && T < room) {
                 int csrc = -1;
                 const int nt = chain_tail(sfx, drafts.data(), T - 1, ctail);
                 chain_n = strata::spec::propose_from_sources(lookup_src, ctail.data(), nt, T - 1,
-                                                             std::min(o.lookup_chain, o.spec - T), o.lookup_chain_min,
+                                                             std::min(o.lookup_chain, room - T), o.lookup_chain_min,
                                                              cbuf.data(), &cm, &csrc);
                 if (chain_n > 0 && std::getenv("STRATA_LOOKUP_CHAIN_FIXED") == nullptr) {
                     double p_mtp = 1.0;
