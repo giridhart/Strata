@@ -26,7 +26,7 @@ does not show").
 | CUDA | nvcc 13.3 (CUDA toolkit 13.3), source build; runtime 13.2 per `nvidia-smi` |
 | Strata | tag `v0.1.41` (commit `fb58e0d`), built from source with `build.bat` in this folder: `-DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=ON -DSTRATA_BUILD_TESTS=OFF -DCMAKE_CUDA_ARCHITECTURES=120`, MSVC 19.44, Ninja |
 
-Background workloads: two browsers and Docker Desktop were open and idle; no other GPU
+Background workloads: a desktop chat app, two browsers and Docker Desktop were open and idle; no other GPU
 compute. The engine ran as a normal process (not Task Scheduler).
 
 ## Model and configuration
