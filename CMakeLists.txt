@@ -8,7 +8,7 @@
 # below refuses anything older: silently building for a pre-Ampere arch would produce a binary that runs
 # and is wrong about its own performance, which is the worst of both outcomes.
 cmake_minimum_required(VERSION 3.24)
-project(strata VERSION 0.1.41 LANGUAGES CXX)
+project(strata VERSION 0.1.41.1 LANGUAGES CXX)
 # EXPERIMENTAL: the Intel Arc engine, the SYCL port in sycl/ (PR #423; icpx + oneMKL, docs/INTEL_ARC.md). It is its
 # own project that takes the unported sources from src/; with this on, nothing below is configured.
 option(STRATA_ENABLE_SYCL "EXPERIMENTAL: build the Intel Arc (SYCL) engine from sycl/ - docs/INTEL_ARC.md" OFF)
@@ -250,6 +250,21 @@ if(STRATA_BUILD_TESTS)
   add_executable(tuning_header_arch_family_test tests/prefill/tuning_header_arch_family_test.cpp)
   target_include_directories(tuning_header_arch_family_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/prefill")
   add_test(NAME tuning_header_arch_family_test COMMAND tuning_header_arch_family_test)
+
+  # the auto layer split's minimum stage size (#1616): header-only rule, no GPU
+  add_executable(split_rules_test tests/program/split_rules_test.cpp)
+  target_include_directories(split_rules_test PRIVATE include)
+  add_test(NAME split_rules_test COMMAND split_rules_test)
+
+  # the default CPU prefill share is not armed when every expert is resident (#1595): header-only rule, no GPU
+  add_executable(share_rules_test tests/prefill/share_rules_test.cpp)
+  target_include_directories(share_rules_test PRIVATE include)
+  add_test(NAME share_rules_test COMMAND share_rules_test)
+
+  # the Windows HIP auto prefill chunk cap (#1630) and the commit-limit verdict (#1607): header-only, no GPU
+  add_executable(host_limits_test tests/platform/host_limits_test.cpp)
+  target_include_directories(host_limits_test PRIVATE include)
+  add_test(NAME host_limits_test COMMAND host_limits_test)
 endif()
 
 # ---- strata_plan ----------------------------------------------------------
