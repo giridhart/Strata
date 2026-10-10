@@ -8149,7 +8149,6 @@ int main(int argc, char** argv) {
                               : remote_opt ? "not with --remote-expert-opt"
                               : o.adapt_async ? "not with --adapt-async"
                               : o.pipeline_windows > 0 ? "not with --pipeline-windows"
-                              : src.complement_ready() ? "not with the resident RAM mode"
                               : pin_blobs_on() ? "not with page-locked swap sources"
                               : strata::core::dma_batch_mode() != 0 ? "not with STRATA_DMA_BATCH"
                               : adapt_lag() != 1 || adapt_nowait() ? "not with STRATA_ADAPT_LAG / STRATA_ADAPT_NOWAIT"
@@ -11650,11 +11649,17 @@ int main(int argc, char** argv) {
                 else if (aov && !pending.empty() && !aflipped) {
                     // 0.1.43 STRATA_ADAPT_OVERLAP: the tables take the swaps now, exactly where the wait would have ended;
                     // the copies still landing are waited for per layer inside the window (AdaptGate)
-                    for (const auto& [i, slot] : pending) host_res[(size_t) i] = slot;
-                    res_upload();
-                    aflipped = true;
-                    ++aov_flips;
-                    agate.active.store(true, std::memory_order_release);
+                    // (resident RAM mode: the staged evicted experts look committed to the planner at once, the RAM
+                    // copy's places stay as they are until the copies have landed; see soft_commit_exchanges)
+                    if (src.complement_ready() && !src.soft_commit_exchanges()) {
+                        apply_pending(true);   // not possible here: the plain wait
+                    } else {
+                        for (const auto& [i, slot] : pending) host_res[(size_t) i] = slot;
+                        res_upload();
+                        aflipped = true;
+                        ++aov_flips;
+                        agate.active.store(true, std::memory_order_release);
+                    }
                 }
                 else if (pending.empty() || ++pending_age >= adapt_lag()) apply_pending(true);
                 if (!adapt_tick(false)) {   // --adapt-async: the round in flight moves on a step when it can
