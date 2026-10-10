@@ -1320,6 +1320,8 @@ class StrataEngine:
                             return
                         if reused0 is None:
                             reused0 = (self.last or {}).get("reused")
+                        carry_leg(carry, self.last)         # #1869: the solo leg's figures; the slot's admission (a copy of
+                                                            # the held prefix: prompt_read 1) and BDONE replace them
                         prompt = list(ids) + out            # promoted: it continues in a batch slot from here
                 while True:
                     if slot is None:
