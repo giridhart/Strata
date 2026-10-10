@@ -8079,7 +8079,21 @@ int main(int argc, char** argv) {
         {
             const char* tse = std::getenv("STRATA_ROUTE_TAIL_SKIP");
 #if !defined(STRATA_USE_HIP)
-            const bool tail_default_ok = tse == nullptr && !all_experts_resident && o.batch == 0 && o.peer_device < 0;
+            // #1884: with nearly every expert in the GPU cache (V100 32 GB, Coder IQ1_M: 94.8% of the experts, 99.9% decode hits) the few
+            // misses are cheap and the skip costs more draft acceptance (70.1% -> 68.2%) than it saves: -1..2% decode.  No default then.
+            size_t cached_experts = 0;
+            for (int32_t r : host_res) cached_experts += r >= 0 ? 1 : 0;
+            // (STRATA_TAIL_SKIP_MAX_CACHED=<percent>, default 90, moves the line; 101 = never)
+            const char* mcs = std::getenv("STRATA_TAIL_SKIP_MAX_CACHED");
+            const double max_cached = mcs != nullptr && mcs[0] != 0 ? std::atof(mcs) / 100.0 : 0.90;
+            const bool nearly_all_cached = !host_res.empty() && !all_experts_resident &&
+                                           (double) cached_experts >= max_cached * (double) host_res.size();
+            const bool tail_default_ok = tse == nullptr && !all_experts_resident && !nearly_all_cached && o.batch == 0 &&
+                                         o.peer_device < 0;
+            if (tse == nullptr && nearly_all_cached && o.batch == 0 && o.peer_device < 0)
+                std::fprintf(stderr, "strata serve: STRATA_ROUTE_TAIL_SKIP is off by default: %.1f%% of the experts are in the GPU cache, so "
+                                     "few are missed and skipping them costs more draft acceptance than it saves; "
+                                     "STRATA_ROUTE_TAIL_SKIP=7 turns it on\n", 100.0 * (double) cached_experts / (double) host_res.size());
 #else
             const bool tail_default_ok = false;   // HIP and SYCL stay as they were
 #endif

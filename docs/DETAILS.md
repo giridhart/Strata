@@ -1572,7 +1572,10 @@ tokens identical to 0.1.42 without the change, on the RTX 3060, the RTX A4000 al
 
 Where it applies: serve on a CUDA build with one GPU or a layer split (every stage skips by itself). Not applied, and no line printed: when every expert is
 in VRAM (nothing is missed), with `--batch` / `parallel` slots (a window then mixes requests, and one request's skip would depend on another's
-tokens: kept off until measured), with a peer-expert tier or a helper GPU, on HIP and SYCL builds. The request log gets
+tokens: kept off until measured), with a peer-expert tier or a helper GPU, on HIP and SYCL builds, and (0.1.42.1, #1884) when 90% or more
+of all the experts are in the GPU cache: the few misses are cheap there and the skip costs more draft acceptance than it saves (a Tesla V100 32 GB
+with Coder IQ1_M, 94.8% of the experts cached, 99.9% decode hits: draft acceptance 70.1% to 68.2%, decode 1-2% slower than 0.1.41). A start-up line
+says so; `STRATA_ROUTE_TAIL_SKIP=7` turns it on anyway, and `STRATA_TAIL_SKIP_MAX_CACHED=<percent>` moves the line (101 = never). The request log gets
 `route tail skip: N missed experts skipped` (cumulative) while it is active.
 
 **Answers differ slightly from 0.1.41** (`STRATA_ROUTE_TAIL_SKIP=0` brings them back). Teacher-forced KL of the decode path (the default's own greedy text and the default sampled at T=0.8, 28 chat prompts of code,
