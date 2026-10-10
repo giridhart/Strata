@@ -17,6 +17,7 @@
 
 #include "strata/platform/memory.hpp"
 #include "strata/core/arch_defaults.hpp"
+#include "strata/kernels/gfx_arch.hpp"
 #include "strata/core/dma_batch.hpp"
 #include "strata/core/device.hpp"
 #include "strata/core/remote_expert_opt.hpp"
@@ -527,6 +528,8 @@ struct Options {
     int64_t prefill_auto_max = 8192;
     /// #1630: a bare `--prefill auto` stops here on a Windows HIP build (0: no cap). A chunk the user names is not capped.
     int64_t prefill_auto_cap = 0;
+    /// a bare `--prefill auto` (no ":N", no STRATA_PREFILL_AUTO_MAX): the gfx12 Linux rule below may raise its ceiling
+    bool prefill_auto_bare = false;
     bool no_split_rows = false;        ///< plan v0.3 P4 A/B: one whole expert per pool thread
     /// Plan v0.3 P5: the prompt path borrows the top expert-cache slots for its buffers and refills them after
     /// the prompt (default); `--no-prefill-borrow` reserves the buffers' VRAM for the whole session instead.
@@ -1932,6 +1935,7 @@ int main(int argc, char** argv) {
                 constexpr bool win_hip = false;
 #endif
                 const bool bare_auto = v == "auto" && !(o.prefill_auto && env_max != nullptr);
+                o.prefill_auto_bare = bare_auto && o.prefill_auto;
                 o.prefill_auto_cap = strata::platform::host_limits::auto_chunk_cap(win_hip, bare_auto && o.prefill_auto);
                 if (o.prefill_auto_cap > 0) o.prefill_chunk = std::min(o.prefill_chunk, o.prefill_auto_cap);
                 if (strata::platform::host_limits::warn_user_chunk(win_hip, bare_auto, o.prefill_chunk))
@@ -2126,6 +2130,24 @@ int main(int argc, char** argv) {
         cudaDeviceProp ad{};
         if (cudaGetDeviceProperties(&ad, 0) == cudaSuccess) strata::core::apply_arch_defaults(ad.gcnArchName);
         else (void) cudaGetLastError();
+    }
+#endif
+#if defined(STRATA_USE_HIP) && !defined(_WIN32)
+    if (o.prefill_auto_bare && o.prefill_auto_cap == 0) {
+        // gfx1200 / gfx1201 (RDNA4, Linux): a bare `--prefill auto` may reach 16384 instead of 8192 (R9700, IQ3_S / Q2_0, 16K / 32K /
+        // 64K prompts: +0.5 .. +5.8%, residuals identical to 8192).  The fit scan still picks a smaller chunk when the expert cache cannot lend
+        // the buffers.  An explicit --prefill N, auto:N or STRATA_PREFILL_AUTO_MAX is never touched (prefill_auto_bare is false then).
+        // STRATA_GFX12_DEFAULTS=0 or STRATA_GFX12_CHUNK=0 keeps 8192.
+        const char* c0 = std::getenv("STRATA_GFX12_CHUNK");
+        const char* d0 = std::getenv("STRATA_GFX12_DEFAULTS");
+        cudaDeviceProp cp{};
+        if (!(c0 != nullptr && c0[0] == '0') && !(d0 != nullptr && d0[0] == '0') &&
+            cudaGetDeviceProperties(&cp, 0) == cudaSuccess && strata::kernels::gfx_arch_is_gfx12(cp.gcnArchName)) {
+            o.prefill_auto_max = 16384;
+            o.prefill_chunk = 16384;
+            std::fprintf(stderr, "strata generate: gfx12: --prefill auto may take chunks up to 16384 (STRATA_GFX12_CHUNK=0 keeps 8192)\n");
+        }
+        (void) cudaGetLastError();
     }
 #endif
 #if defined(STRATA_HIP_GFX906)
