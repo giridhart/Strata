@@ -1370,7 +1370,11 @@ if(STRATA_NATIVE_EXPERTS)
     if(MSVC)
       target_compile_options(strata_mmq PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/bigobj>)
     endif()
+    # GGML's CUDA error reporting calls cuGetErrorString from the driver API.
     target_link_libraries(strata_mmq PUBLIC ggml-base ${_strata_gpu_runtime_target})
+    if(TARGET CUDA::cuda_driver)   # not in the HIP (gfx906) build, whose CUDA::cudart is a stand-in
+      target_link_libraries(strata_mmq PUBLIC CUDA::cuda_driver)
+    endif()
     if(STRATA_MMQ_KQUANTS)
       target_compile_definitions(strata_mmq PRIVATE STRATA_MMQ_KQUANTS=1)
     endif()

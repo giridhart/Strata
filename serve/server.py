@@ -157,14 +157,23 @@ LOW_EFFORT = EFFORT_TEXT["low"]
 LOOP_CHECK_EVERY = 512           # output tokens between two looks at the reasoning (at a clean parser boundary)
 LOOP_COVERAGE = 0.25             # the share of the last 2,000 words inside 12-word passages seen three times
 LOOP_HISTORY_WORDS = 30000       # how far back the passages are counted (bounds the cost of a look)
+LOOP_TAIL_CHARS = 2048           # chars at the end of the reasoning also checked for a short period (#1753)
+LOOP_TAIL_PERIOD = 64            # a period at most this long in that tail reads as a fully repeated window
 
 
 def reasoning_repeat_coverage(text):
     """Coverage of recent words by 12-word passages seen at least three times.
 
     Only reasoning is supplied. The history (the last LOOP_HISTORY_WORDS words) detects repeated verification passes
-    separated by long code drafts; the recent window excludes old repetitions.
+    separated by long code drafts; the recent window excludes old repetitions.  #1753: a loop can also be one long
+    word (a 24k-digit string cycling an 11-digit pattern): the word split makes it a single word and no word count
+    grows, and #606's token run never grows either (the tokenizer has no multi-digit tokens), so before the word
+    count the last LOOP_TAIL_CHARS chars are checked for a period of at most LOOP_TAIL_PERIOD, and a periodic tail
+    reads as full coverage: it is all of the recent output, repeated.
     """
+    tail = text[-LOOP_TAIL_CHARS:].lower()
+    if len(tail) == LOOP_TAIL_CHARS and any(tail[p:] == tail[:-p] for p in range(1, LOOP_TAIL_PERIOD + 1)):
+        return 1.0
     words = re.findall(r"\w+|[^\w\s]", text.lower())[-LOOP_HISTORY_WORDS:]
     width, window = 12, 2000
     if len(words) < window:
@@ -2171,6 +2180,20 @@ def gpu_list(cfg: dict) -> list[int]:
     return [int(str(x).strip()) for x in items if str(x).strip() != ""]
 
 
+def engine_binary(exe: str, cfg: dict | None = None) -> str:
+    """The file that holds the engine's own option strings, for a feature check that reads it.  The Intel launcher
+    (sycl/serve/strata-sycl.sh) is a shell script that runs its repo's STRATA_SYCL_BIN (default build-sycl-aot/strata)
+    in a container, so the check reads that binary, not the script.  Any other `exe` is the engine itself."""
+    p = Path(exe)
+    if p.name == "strata-sycl.sh":
+        rel = ((cfg or {}).get("env") or {}).get("STRATA_SYCL_BIN") or os.environ.get("STRATA_SYCL_BIN") \
+            or "build-sycl-aot/strata"
+        b = p.resolve().parents[2] / rel
+        if b.is_file():
+            return str(b)
+    return exe
+
+
 def effort_end_args(cfg: dict, exe: str, tok) -> list[str] | None:
     """#458 (opt-in): the engine arguments for "effort_position": "end" - the id of "system" as --tail-role-token, so
     the engine checkpoints in front of the trailing effort turn - or None when the config leaves it at the top (the
@@ -2182,7 +2205,7 @@ def effort_end_args(cfg: dict, exe: str, tok) -> list[str] | None:
     if pos == "start":
         return None
     try:
-        with open(exe, "rb") as f:
+        with open(engine_binary(exe, cfg), "rb") as f:
             known = b"--tail-role-token" in f.read()
     except OSError:
         known = False
@@ -5837,15 +5860,28 @@ def lift_reasoning_effort_arg(cfg: dict) -> None:
           f"{cfg['reasoning_effort']!r}", flush=True)
 
 
+# #1819: llama.cpp clients call the repetition penalty and its window repeat_penalty / repeat_last_n; they are the
+# same settings as repetition_penalty / penalty_last_n (the /props answer already reports them under those names)
+SAMPLING_ALIASES = {"repeat_penalty": "repetition_penalty", "repeat_last_n": "penalty_last_n"}
+
+
 def sampling_defaults_from_config(cfg: dict) -> dict:
     """The run config's optional `sampling` block: defaults for the sampling fields a request leaves out, so
     a plain client gets configured sampling instead of greedy.  Supported: temperature, top_p, top_k, min_p,
-    presence_penalty, repetition_penalty, frequency_penalty, penalty_last_n, seed.  The request's own fields
+    presence_penalty, repetition_penalty (also written repeat_penalty), frequency_penalty, penalty_last_n (also
+    repeat_last_n), seed.  The request's own fields
     always win - an explicit temperature=0 still means greedy, a field set to null falls back to the default.
     A bad value refuses to start the server (a typo'd config should not quietly change sampling); unknown keys
     are named at startup and ignored."""
     out = {}
-    for key, value in (cfg.get("sampling") or {}).items():
+    block = dict(cfg.get("sampling") or {})
+    for alias, canon in SAMPLING_ALIASES.items():      # #1819: llama.cpp's names for the same two fields
+        if block.get(alias) is not None:
+            if block.get(canon) is not None:
+                raise SystemExit(f"[strata] config sampling: both {alias!r} and {canon!r} are set; they are the same "
+                                 f"setting, keep one")
+            block[canon] = block.pop(alias)
+    for key, value in block.items():
         if value is None:
             continue
         number = isinstance(value, (int, float)) and not isinstance(value, bool)
@@ -5945,6 +5981,12 @@ def check_request_sampling(req) -> None:
     types are checked: a number (int or float, never bool) for temperature, top_p, min_p and the three penalties; an
     integer (never bool or float) for top_k, penalty_last_n and seed.  Ranges behave as before (a temperature <= 0 is
     greedy, top_k 0 or above 64 is clamped, a seed <= 0 is unset), and an absent or null field is not checked."""
+    if isinstance(req, dict):      # #1819: llama.cpp's names; the OpenAI-style field wins when both are sent
+        if req.get("repeat_penalty") is not None and req.get("repetition_penalty") is None:
+            req["repetition_penalty"] = req["repeat_penalty"]
+        rl = req.get("repeat_last_n")
+        if req.get("penalty_last_n") is None and isinstance(rl, int) and not isinstance(rl, bool) and rl > 0:
+            req["penalty_last_n"] = rl      # 0 and -1 (off / the whole context) keep the engine's default window
     for key, integer in (("temperature", False), ("top_p", False), ("min_p", False), ("presence_penalty", False),
                          ("frequency_penalty", False), ("repetition_penalty", False), ("top_k", True),
                          ("penalty_last_n", True), ("seed", True)):

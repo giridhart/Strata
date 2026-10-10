@@ -44,6 +44,22 @@ and their limits. Report what you actually measured and label estimates separate
   (medians). Prompt is power-limited (70 W package limit); needle 15/15, agentic 5/5.
 - [2026-10-09: RTX 3060 12 GB, Core i7-12700, 64 GB RAM](../bench/results/2026-10-09-community-rtx-3060-0141/README.md):
   Strata v0.1.41 official Windows release, original Flash-Next Q2_0, IQ2_XS, IQ3_XXS and IQ3_S; prompt sweep from 128 to 128K tokens (260K for three of the four), plus recall, HumanEval 0-39, cache, MTP and concurrency checks.
+- [2026-10-10: AMD Radeon RX 9070 16 GB (gfx1201), Ryzen 7 5800X3D, 64 GB RAM](../bench/results/2026-10-10-community-rx-9070/README.md):
+  Strata 0.1.41 prebuilt Windows HIP engine, Flash-Next IQ3_XXS, 131,072-token context; three runs each at 4,195,
+  33,467 and about 130,000 prompt tokens with a 256-token cap, plus six recall checks. Decode 58.7/57.9/57.9 tok/s,
+  prompt 586/804/833 tok/s at those three lengths, needles 6/6 at 33.5k and 130k; one engine session, no clock capture.
+- [2026-10-10: AMD Radeon RX 9060 XT 16 GB (gfx1200), Ryzen 7 9800X3D, 64 GB RAM](../bench/results/2026-10-10-community-rx-9060-xt/README.md):
+  Strata 0.1.40.3 prebuilt Windows HIP engine, Flash-Next IQ2_XS and IQ3_XXS: a prefill-size sweep (8,192 best), a matched 32K coding comparison (9/9 tasks each, IQ2_XS about 17% faster decode), one 113K recall request. Sanitized data, fixtures and scripts included.
+- [2026-10-10: 2x Tesla P40 24 GB, Xeon E5-2699 v3, 125 GB RAM](../bench/results/2026-10-10-community-2x-p40-iq3_s/README.md):
+  Strata 0.1.41 CUDA 12 source build (sm_61), Flash-Next IQ3_S, 131,072-token context, layer split; decode 35.0 tok/s, prompt 350/558 tok/s at 3.9K/21.9K, needles 6/6, conversation checkpoints.
+- [2026-10-09: RTX 5060 Ti 16 GB + Xeon E5-2680 v4 (Windows 10)](../bench/results/2026-10-09-community-rtx-5060-ti-e5-2680-v4/README.md):
+  Strata 0.1.41, Coder IQ1_M and abliterated Q2_0 at 262K; prompt and decode at 4K / 32K / 128K.
+- [2026-10-09: RTX 5060 Ti 16 GB under WSL2, Ryzen 7 3700X, 128 GB RAM](../bench/results/2026-10-09-community-rtx-5060ti-wsl2-iq3_s-0141/README.md):
+  Strata 0.1.41 source build, IQ3_S with experimental speed projection; single runs only (decode 48.2/47.7 tok/s, prompt 343/598 tok/s at 3.8K/19.2K), no needle test, no TTFT.
+- [2026-10-09: Radeon Pro VII 16 GB (gfx906), Xeon E5-2666 v3, 125.7 GiB RAM](../bench/results/2026-10-09-community-radeon-pro-vii-16gb/README.md):
+  Source builds of 0.1.40.4 and 0.1.41 on the distribution's ROCm 6.2 (host patches in BUILD.json), IQ2_XS at 131K with KV streaming; decode 24.2/24.0/23.7 tok/s, prompt 350/339/284 tok/s at 4K/32K/128K, two sweeps with telemetry. Build logs trimmed (TRIMMED.md).
+- [2026-10-08: RTX 4070 12 GB, Core i5-12600KF, 32 GB DDR4](../bench/results/2026-10-08-community-rtx4070-iq2-xs/README.md):
+  IQ2_XS with adaptive cache E4/S24: 48.23 accepted-decode tok/s (median of 5) on a modified, locally built engine (not an official release; source commit and hashes in provenance.json, steps in REPRODUCE.md).
 
 ## What to record
 

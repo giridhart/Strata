@@ -4086,6 +4086,33 @@ class AmdTelemetry(unittest.TestCase):
                 (hw / "power1_input").write_text("120000000\n")
             (hw / "power1_cap").write_text("300000000\n")
 
+    def test_pcie_link_is_the_narrowest_slowest_hop(self):
+        """#1733: the link is the slowest/narrowest hop between the root port and the card; the bottleneck is only
+        claimed when every hop could be read (pcie_path says how many were)."""
+        from serve import telemetry
+        with tempfile.TemporaryDirectory() as d:
+            hops = []
+            for i, (speed, width) in enumerate((("8.0 GT/s PCIe", "16"), ("8.0 GT/s PCIe", "8"), ("16.0 GT/s PCIe", "16"))):
+                h = Path(d) / f"hop{i}"
+                h.mkdir()
+                (h / "max_link_speed").write_text(speed + "\n")
+                (h / "max_link_width").write_text(width + "\n")
+                hops.append(str(h))
+            (Path(hops[-1]) / "current_link_speed").write_text("16.0 GT/s PCIe\n")
+            (Path(hops[-1]) / "current_link_width").write_text("16\n")
+            a = telemetry.gpu_reader(0, amd=True)
+            a.dev = hops[-1]
+            with mock.patch.object(telemetry._Amd, "_hops", lambda self: hops):
+                self.assertEqual(a.link(), {"pcie_gen": 3, "pcie_gen_max": 3, "pcie_own_gen": 4, "pcie_width": 8,
+                                            "pcie_path": "3/3"})
+            with mock.patch.object(telemetry._Amd, "_hops", lambda self: hops[:2] + [str(Path(d) / "hidden")]):
+                got = a.link()             # an unreadable hop: fall back to the card's own negotiated link
+                self.assertEqual((got["pcie_gen"], got["pcie_width"], got["pcie_path"]), (4, 16, "2/3"))
+            self.assertEqual(telemetry._Amd._gen("32.0 GT/s PCIe"), 5)
+            self.assertIsNone(telemetry._Amd._gen("unknown"))
+            self.assertTrue(telemetry._Amd._bdf("0000:03:00.0"))
+            self.assertFalse(telemetry._Amd._bdf("pci0000:00"))
+
     def test_readings(self):
         from serve import telemetry
         with tempfile.TemporaryDirectory() as d:
@@ -4098,7 +4125,9 @@ class AmdTelemetry(unittest.TestCase):
                 self.assertTrue(g.ok())
                 self.assertEqual(g.name(), "AMD Radeon AI PRO R9700")
                 self.assertEqual(g.read(), {"util": 37, "mem_used": 2 << 30, "mem_total": 32 << 30, "temp": 51.0,
-                                            "power": 85.0, "power_limit": 300.0})
+                                            "power": 85.0, "power_limit": 300.0, "pcie_gen": None,
+                                            "pcie_gen_max": None, "pcie_own_gen": None, "pcie_width": None,
+                                            "pcie_path": "0/0"})    # #1733: no PCIe files in this fake tree
                 r = telemetry.gpu_reader(1, amd=True).read()
                 self.assertEqual((r["util"], r["temp"], r["power"]), (99, 64.0, 120.0))     # power1_input
                 self.assertEqual(telemetry.free_vram_mib(0, amd=True), 30 << 10)

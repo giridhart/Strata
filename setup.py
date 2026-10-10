@@ -1389,15 +1389,28 @@ def find_nvcc(below=None):
 
 def find_vcvars(cuda_v=None):
     """Visual Studio's vcvars64.bat.  #985: CUDA 13.0-13.2 accept Visual Studio 2019 and 2022 only, so a newer one
-    (2026 = version 18) is taken only with CUDA 13.3 or newer (`cuda_v`, the toolkit's (major, minor))."""
+    (2026 = version 18) is taken only with CUDA 13.3 or newer (`cuda_v`, the toolkit's (major, minor)).
+
+    The version range is CUDA's requirement alone, so a caller with no CUDA (`cuda_v is None`) asks vswhere for no
+    range at all: the CPU image encoder is built by MSVC, which is happy with any version (tools/hip/build_windows.bat
+    already calls vswhere that way).  With the range applied to every caller, a machine whose only C++ tools are
+    Visual Studio 2026 gets None back and nothing can be built there (#881).  STRATA_VCVARS=<vcvars64.bat> picks one
+    by hand, for an install vswhere cannot use."""
+    override = os.environ.get("STRATA_VCVARS")
+    if override:
+        v = Path(override)
+        return v if v.exists() else None
     vswhere = Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")) / "Microsoft Visual Studio/Installer/vswhere.exe"
     if not vswhere.exists():
         return None
     # CUDA 13 accepts Visual Studio 2019 and 2022 only: a newer one (2026 = version 18) installed next to them
     # must not be picked ("unsupported Microsoft Visual Studio version"); with only a newer one there is none
-    upper = "19.0" if cuda_v is not None and tuple(cuda_v) >= (13, 3) else "18.0"
-    p = out([str(vswhere), "-latest", "-products", "*", "-version", f"[16.0,{upper})", "-requires",
-             "Microsoft.VisualStudio.Component.VC.Tools.x86.x64", "-property", "installationPath"]).strip()
+    args = [str(vswhere), "-latest", "-products", "*"]
+    if cuda_v is not None:
+        upper = "19.0" if tuple(cuda_v) >= (13, 3) else "18.0"
+        args += ["-version", f"[16.0,{upper})"]
+    args += ["-requires", "Microsoft.VisualStudio.Component.VC.Tools.x86.x64", "-property", "installationPath"]
+    p = out(args).strip()
     v = Path(p) / "VC/Auxiliary/Build/vcvars64.bat" if p else None
     return v if v and v.exists() else None
 
@@ -1708,10 +1721,18 @@ def get_llama_cpp():
     download(LLAMA_CPP_ZIP, z, "llama.cpp source")
     tmp = ROOT / "third_party" / "_unpack"
     shutil.rmtree(tmp, ignore_errors=True)
-    with zipfile.ZipFile(z) as f:
-        # llama.cpp's own web UI (tools/ui) is not used, and its deep paths passed Windows' 260-character limit in a
-        # folder like Downloads\Strata-main\Strata-main (#206)
-        f.extractall(tmp, [m for m in f.namelist() if "/tools/ui/" not in m])
+    try:
+        with zipfile.ZipFile(z) as f:
+            # llama.cpp's own web UI (tools/ui) is not used, and its deep paths passed Windows' 260-character limit in a
+            # folder like Downloads\Strata-main\Strata-main (#206)
+            f.extractall(tmp, [m for m in f.namelist() if "/tools/ui/" not in m])
+    except zipfile.BadZipFile:
+        # #1797: do not let the .done mark make every later run reuse a damaged source archive.
+        try:
+            drop_archive(z)
+        except OSError as e:
+            warn(f"cannot remove damaged {z.name} ({e}): delete it and its .done mark before running setup again")
+        raise
     top = next(tmp.iterdir())
     shutil.rmtree(llama, ignore_errors=True)
     # PR #63: on Windows a rename can fail with PermissionError while an antivirus scanner still holds a file of the
