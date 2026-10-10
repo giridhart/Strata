@@ -194,7 +194,7 @@ need model fixtures (`iq_parity`, `ple_parity`) or the tensor-core kernel below 
 | parity test | result |
 |---|---|
 | bf16_gemv, cvec, dequant_s2, elementwise, gdn, gr, kv_q4, kv_q8, kv_stream, qsa, quantize_act, rope, router_top10, s2_gemv, s2_gemv_q8, s_gemv, s_gemv_q8k, sampler, shared_expert | pass |
-| iq_parity, ple_parity | need fixtures (a `logs/iq_fixture` directory, a Q2_0 shard) |
+| iq_parity, ple_parity | `ctest` generates the `iq_parity` fixtures into the build tree (`iq_parity_fixtures`, needs python3 with numpy; skipped without). `ple_parity` needs the Q2_0 shard 2 GGUF and the dense pack: configure with `-DSTRATA_PLE_GGUF=<shard 2 .gguf>` (and `-DSTRATA_PLE_FIXTURE_DIR=<dir with ple_in.bin and ple_out.bin>`); a missing input is a hard error, as in the CUDA build (#1795) |
 | qsa_prompt_attn_parity | needs the tensor-core kernel (below) |
 | kv_hybrid_parity (0.1.27, hybrid K8V4 KV) | appends, gathers and attention pass; its last step is that same tensor-core kernel |
 

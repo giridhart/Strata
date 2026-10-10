@@ -243,14 +243,64 @@ target_link_libraries(strata PRIVATE strata_engine strata_prefill strata_spec)
 option(STRATA_SYCL_PARITY "Build the kernel parity tests" ON)
 if(STRATA_SYCL_PARITY)
   enable_testing()
-  foreach(p IN ITEMS dequant_s2 s2_gemv iq shared_expert gr gdn s2_gemv_q8 sampler rope quantize_act router_top10
-                     s_gemv elementwise bf16_gemv s_gemv_q8k qsa ple kv_q8 kv_stream kv_q4 cvec)
+  foreach(p IN ITEMS dequant_s2 s2_gemv shared_expert gr gdn s2_gemv_q8 sampler rope quantize_act router_top10
+                     s_gemv elementwise bf16_gemv s_gemv_q8k qsa kv_q8 kv_stream kv_q4 cvec)
     strata_resolve(_src src/kernels/${p}_parity.cpp)
     add_executable(${p}_parity ${_src})
     target_include_directories(${p}_parity PRIVATE ${STRATA_ROOT}/src/kernels)   # the oracle .inc fixtures
     target_link_libraries(${p}_parity PRIVATE strata_kernels)
     add_test(NAME ${p}_parity COMMAND ${p}_parity --selftest)
   endforeach()
+  # #1795: iq_parity and ple_parity are registered as the top-level CMakeLists.txt does, not by the loop above
+  # (iq_parity takes a fixture directory, not --selftest; ple_parity reads real artifacts from the engine root).
+  foreach(p IN ITEMS iq ple)
+    strata_resolve(_src src/kernels/${p}_parity.cpp)
+    add_executable(${p}_parity ${_src})
+    target_include_directories(${p}_parity PRIVATE ${STRATA_ROOT}/src/kernels)
+    target_link_libraries(${p}_parity PRIVATE strata_kernels)
+  endforeach()
+  # iq: tools/iq_fixture.py writes the fixtures into the build tree (needs python3 with numpy; exit 3 = skip)
+  set(_iq_python "")
+  set(_iq_candidates "")
+  if(IQ_FIXTURE_PYTHON)
+    list(APPEND _iq_candidates ${IQ_FIXTURE_PYTHON})
+  else()
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    if(Python3_Interpreter_FOUND)
+      list(APPEND _iq_candidates ${Python3_EXECUTABLE})
+    endif()
+    list(APPEND _iq_candidates "${STRATA_ROOT}/.venv/bin/python" "${STRATA_ROOT}/.venv/Scripts/python.exe" /usr/bin/python3 python3)
+  endif()
+  foreach(_cand IN LISTS _iq_candidates)
+    if(_cand STREQUAL "")
+      continue()
+    endif()
+    execute_process(COMMAND ${_cand} -c "import numpy" OUTPUT_QUIET ERROR_QUIET RESULT_VARIABLE _iq_probe)
+    if(_iq_probe EQUAL 0)
+      set(_iq_python "${_cand}")
+      break()
+    endif()
+  endforeach()
+  if(NOT _iq_python STREQUAL "")
+    add_test(NAME iq_parity_fixtures COMMAND ${_iq_python} ${STRATA_ROOT}/tools/iq_fixture.py
+                                             --out ${CMAKE_CURRENT_BINARY_DIR}/iq_fixture)
+    set_tests_properties(iq_parity_fixtures PROPERTIES FIXTURES_SETUP iq_fixture_data SKIP_RETURN_CODE 3)
+    add_test(NAME iq_parity COMMAND iq_parity ${CMAKE_CURRENT_BINARY_DIR}/iq_fixture)
+    set_tests_properties(iq_parity PROPERTIES FIXTURES_REQUIRED iq_fixture_data SKIP_RETURN_CODE 3)
+  else()
+    message(STATUS "STRATA SYCL tests: no python3 with numpy found - iq_parity and its fixtures are not registered")
+  endif()
+  # ple: real inputs (the Q2_0 shard-2 GGUF, the dense pack, the ggml capture); a missing one is a hard error INSIDE
+  # the test, as in the top-level build.  The working directory is the engine root, so the relative defaults resolve
+  # there.  Point it at your files with -DSTRATA_PLE_GGUF=<shard 2 .gguf> and -DSTRATA_PLE_FIXTURE_DIR=<dir>.
+  set(STRATA_PLE_GGUF "" CACHE FILEPATH "Q2_0 shard 2 GGUF that ple_parity reads (default: ../../Q2_0/... from the engine root)")
+  set(STRATA_PLE_FIXTURE_DIR "${STRATA_ROOT}/bench/micro" CACHE PATH
+      "Directory containing required ple_in.bin and ple_out.bin parity fixtures")
+  set(_ple_args --selftest --in "${STRATA_PLE_FIXTURE_DIR}/ple_in.bin" --out "${STRATA_PLE_FIXTURE_DIR}/ple_out.bin")
+  if(STRATA_PLE_GGUF)
+    list(APPEND _ple_args --gguf "${STRATA_PLE_GGUF}")
+  endif()
+  add_test(NAME ple_parity COMMAND ple_parity ${_ple_args} WORKING_DIRECTORY ${STRATA_ROOT})
   # 0.1.31: the IQ kernels that decode a weight part once for every column/entry, bitwise vs the per-column ones
   # (no --selftest flag: it runs its checks by default), and the rewritten per-hit/grouped expert kernels vs the
   # previous ones, bitwise
