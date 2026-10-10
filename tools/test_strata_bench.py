@@ -140,6 +140,7 @@ class SuiteTests(unittest.TestCase):
             self.assertGreater(t["reused_tokens"], 0)
             self.assertLess(t["read_tokens"], t["prompt_tokens"])
         self.assertGreater(ag["hit_pct"]["median"], 50)
+        self.assertLess(ag["reread_tokens"]["median"], ag["new_tokens"]["median"])      # new file text dominates, not re-reading
         self.assertGreater(turns[-1]["prompt_tokens"], turns[1]["prompt_tokens"])    # the conversation grows
 
     def test_small_context_skips_the_long_prompts(self):
@@ -250,7 +251,11 @@ class ReportTests(unittest.TestCase):
     def test_names(self):
         m = {"gpu": ["NVIDIA GeForce RTX 3060"], "model": "Qwen3.8 Flash-Next", "quant": "IQ3_XXS"}
         self.assertEqual(B.results_dir_name(m, "2026-10-10"), "2026-10-10-community-rtx-3060-qwen3-8-flash-next-iq3-xxs")
+        m["model"] = "qwen-iq3_xxs"                                      # a quant already in the name is not added twice
+        self.assertEqual(B.results_dir_name(m, "2026-10-10"), "2026-10-10-community-rtx-3060-qwen-iq3-xxs")
         self.assertEqual(B.gpu_slug({"gpu": ["A B 4090", "A B 4090"]}), "2x-a-b-4090")
+        m["model"] = "qwen-iq3_xxs"                                      # a quant already in the name is not added twice
+        self.assertEqual(B.results_dir_name(m, "2026-10-10"), "2026-10-10-community-rtx-3060-qwen-iq3-xxs")
         self.assertEqual(B.gpu_slug({"gpu": []}), "cpu")
 
     def test_no_server_is_an_error_not_a_crash(self):

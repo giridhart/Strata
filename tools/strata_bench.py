@@ -226,7 +226,7 @@ class Suite:
         self.clients, self.want_long = want_clients, want_long
         self.quick = quick
         self.nonce = str(int(time.time()))
-        self.words_per_token = None
+        self.tokens_per_word, self.overhead = 1.1, 40
         self.out: dict = {"chat": {}, "prompts": {}, "agent": {}, "clients": {}, "skipped": {}, "failures": []}
 
     def tag(self, *parts) -> str:
@@ -237,14 +237,19 @@ class Suite:
         self.log(f"    FAILED: {d.get('err') or 'no token came back'}")
 
     def calibrate(self):
-        """Words that make a prompt of a wanted size: one tiny request reads 400 words and says how many tokens that was."""
-        r = digest(chat(self.base, self.key, [{"role": "user", "content": f"[{self.tag('cal')}]\n" + long_prompt(400)}], 1))
-        pt = r.get("prompt_tokens")
-        self.words_per_token = 400 / pt if pt and pt > 20 else 0.9
-        self.log(f"  calibrated: about {1 / self.words_per_token:.2f} tokens per word")
+        """Words that make a prompt of a wanted size: two tiny requests (200 and 800 words) give the tokens per word as a
+        slope, so the template's fixed part does not skew it."""
+        pts = []
+        for words in (200, 800):
+            r = digest(chat(self.base, self.key, [{"role": "user", "content": f"[{self.tag('cal', words)}]\n" + long_prompt(words)}], 1))
+            pts.append(r.get("prompt_tokens"))
+        slope = (pts[1] - pts[0]) / 600 if all(pts) and pts[1] > pts[0] else None
+        self.tokens_per_word = slope or 1.1
+        self.overhead = max(0, (pts[0] or 0) - 200 * self.tokens_per_word) if slope else 40
+        self.log(f"  calibrated: about {self.tokens_per_word:.2f} tokens per word")
 
     def prompt_for(self, tokens: int, run: int) -> list:
-        words = max(50, int((tokens - 40) * self.words_per_token))
+        words = max(50, int((tokens - self.overhead) / self.tokens_per_word))
         return [{"role": "user", "content": f"[bench {self.tag(run, tokens, 'p')}]\n" + long_prompt(words)}]
 
     def warm_up(self):
@@ -344,8 +349,14 @@ class Suite:
         follow = [[d for d in s if d["ok"] and d["turn"] > 0] for s in sessions]
         hit = [sum(d["reused_tokens"] or 0 for d in s) / max(1, sum(d["prompt_tokens"] or 0 for d in s)) * 100
                for s in follow if s]
-        reread = [sum(d["read_tokens"] or 0 for d in s) for s in follow if s]
-        self.out["agent"] = {"sessions": sessions, "hit_pct": stat(hit), "reread_tokens": stat(reread),
+        # earlier conversation read again: what the previous turn held (prompt + its reply) minus what this turn reused
+        reread, fresh = [], []
+        for s in sessions:
+            s = [d for d in s if d["ok"]]
+            reread.append(sum(max(0, (p["prompt_tokens"] or 0) + (p["generated_tokens"] or 0) - (d["reused_tokens"] or 0))
+                              for p, d in zip(s, s[1:])))
+            fresh.append(sum(d["read_tokens"] or 0 for d in s[1:]) - reread[-1])
+        self.out["agent"] = {"sessions": sessions, "hit_pct": stat(hit), "reread_tokens": stat(reread), "new_tokens": stat(fresh),
                              "turn_ttft_s": stat(d["ttft_s"] for s in follow for d in s),
                              "last_turn_prompt_tokens": stat(s[-1]["prompt_tokens"] for s in follow if s),
                              "turn_decode_tps": stat(d["decode_tps"] for s in follow for d in s),
@@ -659,8 +670,13 @@ def gpu_slug(machine: dict) -> str:
     return s if len(names) == 1 else f"{len(names)}x-{s}"
 
 
+def model_label(machine: dict) -> str:
+    model, q = machine.get("model") or "model", machine.get("quant")
+    return model if not q or slug(q) in slug(model, 200) else f"{model}-{q}"
+
+
 def results_dir_name(machine: dict, date: str) -> str:
-    return f"{date}-community-{gpu_slug(machine)}-{slug((machine.get('model') or 'model') + ('-' + machine['quant'] if machine.get('quant') else ''), 40)}"
+    return f"{date}-community-{gpu_slug(machine)}-{slug(model_label(machine), 40)}"
 
 
 def unique_dir(parent: Path, name: str) -> Path:
@@ -699,7 +715,7 @@ def render_readme(res: dict) -> str:
     mc, out, p = res["machine"], res["results"], res["params"]
     gpu = " + ".join(mc.get("gpu") or []) or "CPU only"
     vram = f"{mc['gpu_vram_mib'] / 1024:.0f} GiB VRAM" if mc.get("gpu_vram_mib") else "VRAM not read"
-    model = " ".join(x for x in (mc.get("model"), mc.get("quant")) if x) or "model not read"
+    model = (model_label(mc) if mc.get("model") else mc.get("quant")) or "model not read"
     L = [f"# Community benchmark on {gpu}", "",
          f"Measured on {res['date']} with `tools/strata_bench.py` (suite {SCHEMA}, {p['runs']} runs per test, medians with ranges). "
          f"Speeds are the engine's own timings; first-token times are measured by the client over HTTP. Speed only: no "
@@ -741,8 +757,8 @@ def render_readme(res: dict) -> str:
     ag = out["agent"]
     if ag and ag.get("sessions"):
         L += ["", "### Agent session (conversation cache)", "",
-              f"Cache hit over the follow-up turns: {fmt(ag.get('hit_pct'), 1, ' %')}; prompt tokens read again per session: "
-              f"{fmt(ag.get('reread_tokens'), 0)}; first turn (nothing cached) first token: {fmt(ag.get('first_turn_ttft_s'), 2, ' s')}.", "",
+              f"Cache hit over the follow-up turns: {fmt(ag.get('hit_pct'), 1, ' %')}; earlier-turn tokens read again per session: "
+              f"{fmt(ag.get('reread_tokens'), 0)} (earlier turns that the cache did not hold; the {fmt(ag.get('new_tokens'), 0)} new tokens of the files are read once); first turn (nothing cached) first token: {fmt(ag.get('first_turn_ttft_s'), 2, ' s')}.", "",
               "| Turn (run 1) | Prompt tokens | Reused | Read | Prompt tok/s | First token (s) | Decode tok/s |", "| ---: | ---: | ---: | ---: | ---: | ---: | ---: |"]
         for d in ag["sessions"][0]:
             if d["ok"]:
