@@ -3303,8 +3303,24 @@ bool FileExpertSource::stage_exchange(int64_t layer, int64_t in, int64_t out, in
     return true;
 }
 
+bool FileExpertSource::soft_commit_exchanges() {
+    if (staged_.empty()) return true;
+    if (exchange_storage_.active() || !xstage_pinned_ || xstage_ == nullptr || !complement_pinned_ || complement_device_ == nullptr)
+        return false;
+    if (xstage_dev_ == nullptr) {
+        void* d = nullptr;
+        if (cudaHostGetDevicePointer(&d, xstage_, 0) != cudaSuccess || d == nullptr) { (void) cudaGetLastError(); return false; }
+        xstage_dev_ = (const uint8_t*) d;
+    }
+    if (soft_in_.empty()) soft_in_.assign((size_t) blobs_, SIZE_MAX);
+    for (const Exchange& x : staged_) soft_in_[x.out] = x.in;
+    return true;
+}
+
 int64_t FileExpertSource::commit_exchanges() {
     int64_t n = 0;
+    for (const Exchange& x : staged_)
+        if (!soft_in_.empty()) soft_in_[x.out] = SIZE_MAX;
     for (const Exchange& x : staged_) {
         const uint8_t* src = override_[x.out];
         if (exchange_storage_.active()) {
@@ -3432,16 +3448,21 @@ bool FileExpertSource::pinned(int64_t layer, int64_t expert) const {
         layer >= n_layers_ || expert >= n_expert_) return false;
     const size_t index = (size_t) layer * (size_t) n_expert_ + (size_t) expert;
     if (exchange_storage_.active()) return exchange_storage_.resident(index).host != nullptr;
-    if (index >= complement_offsets_.size() || complement_offsets_[index] == kNoComplement) return false;
+    // soft_commit_exchanges: a staged `out` is judged by the place it will take (`in`'s), as after the commit
+    const size_t at_index = !soft_in_.empty() && soft_in_[index] != SIZE_MAX ? soft_in_[index] : index;
+    if (at_index >= complement_offsets_.size() || complement_offsets_[at_index] == kNoComplement) return false;
     // a partial pin (CS-T): only the registered prefix
     return !complement_partial_ ||
-           complement_offsets_[index] + layer_blob_bytes_[(size_t) layer] <= complement_pin_limit_;
+           complement_offsets_[at_index] + layer_blob_bytes_[(size_t) layer] <= complement_pin_limit_;
 }
 
 const uint8_t* FileExpertSource::device_alias(int64_t layer, int64_t expert) const {
     if (!pinned(layer, expert) || complement_device_ == nullptr) return nullptr;
     const size_t index = (size_t) layer * (size_t) n_expert_ + (size_t) expert;
     if (exchange_storage_.active()) return exchange_storage_.resident(index).device;
+    if (!soft_in_.empty() && soft_in_[index] != SIZE_MAX)   // soft_commit_exchanges: out is read from its exchange buffer
+        return override_.empty() || override_[index] == nullptr || xstage_dev_ == nullptr
+                   ? nullptr : xstage_dev_ + (size_t) (override_[index] - xstage_);
     return complement_device_ + (size_t) complement_offsets_[index];
 }
 

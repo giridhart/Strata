@@ -1320,6 +1320,23 @@ int adapt_lag() {
     return v;
 }
 
+/// 0.1.43 STRATA_ADAPT_OVERLAP=1: the adaptive tier's copies land while the next decode window already runs.  The window
+/// sees the swapped-in experts as resident from its first layer, exactly as after #463's wait (so the tokens are the same
+/// ones); what changes is only when the bytes arrive: the copies go in layer order and the verify window holds a layer's
+/// plan back until that layer's copies have landed (AdaptGate in strata/core/verify.hpp).  The ~10 ms a 96-swap round
+/// took at the next window's start (PCIe 3.0 x16, Q2_0) is then hidden behind the window.  On for CUDA (=0 turns it off), opt-in on HIP.
+bool adapt_overlap() {
+    static const bool v = [] {
+        const char* e = std::getenv("STRATA_ADAPT_OVERLAP");
+#if defined(STRATA_USE_HIP)
+        return e && e[0] == '1';      // HIP: not measured yet, opt-in
+#else
+        return !(e && e[0] == '0');   // CUDA: on since 0.1.43 (same tokens, +5.5..8.3% decode on an A4000); =0 turns it off
+#endif
+    }();
+    return v;
+}
+
 /// --adapt-async: one background job at a time (the asynchronous adaptive tier's copies and memcpys).  `post` hands
 /// it over, `idle` says whether it has finished; the owner never posts while a job runs.
 class JobThread {
@@ -2925,6 +2942,7 @@ int main(int argc, char** argv) {
                      (unsigned long long) (total_b >> 20));
         return 1;
     }
+    mem_mark("the CUDA context and the weight arena");
     auto load_t0 = std::chrono::steady_clock::now();
     auto load_s = [&] {
         const auto t = std::chrono::steady_clock::now();
@@ -2940,6 +2958,7 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "strata generate: %llu MiB of weights loaded from %s in %.1f s (%zu canonical tensors "
                          "skipped: served natively)\n",
                  (unsigned long long) (pool_bytes >> 20), o.pack.c_str(), load_s(), skip.size());
+    mem_mark("the pack weights");
 
     strata::core::NativeDense native_dense;
     if (!o.native_dense_gguf.empty()) {
@@ -4162,6 +4181,7 @@ int main(int argc, char** argv) {
                          (unsigned long long) ple_table.rows(), o.ple_gguf.c_str());
         }
     }
+    mem_mark("the session (KV, GDN state, PLE history)");
     for (size_t i = 0; i < stages.size(); ++i) {
         GpuStage& st = *stages[i];
         const strata::core::OnDevice on(st.dev);
@@ -4392,6 +4412,7 @@ int main(int argc, char** argv) {
                      std::chrono::duration<double>(std::chrono::steady_clock::now() - head_t0).count());
     }
     std::vector<float> logits((size_t) n_vocab);
+    mem_mark("the native head");
     float* d_logits = nullptr;
     if (cudaMalloc(&d_logits, (size_t) n_vocab * 4) != cudaSuccess) {
         (void) cudaGetLastError();
@@ -8137,6 +8158,40 @@ int main(int argc, char** argv) {
         std::vector<void*> pin_live;   // the swaps' locked arena pages (pin_blob), unlocked once they have landed
         cudaEvent_t adapt_ev = nullptr;
         cudaEventCreateWithFlags(&adapt_ev, cudaEventDisableTiming);
+        // 0.1.43 STRATA_ADAPT_OVERLAP=1 (adapt_overlap above): the single-GPU, plain-RAM-arena decode loop only
+        strata::core::AdaptGate agate;
+        bool aflipped = false;   // the pending swaps are in the tables and their copies may still be landing
+        bool aov = false;
+        int64_t aov_flips = 0;
+        if (adapt_overlap()) {
+            const char* why = multi_gpu || !stages.empty() ? "not on a layer split"
+                              : peer.valid() ? "not with --peer-device"
+                              : remote_opt ? "not with --remote-expert-opt"
+                              : o.adapt_async ? "not with --adapt-async"
+                              : o.pipeline_windows > 0 ? "not with --pipeline-windows"
+                              : pin_blobs_on() ? "not with page-locked swap sources"
+                              : strata::core::dma_batch_mode() != 0 ? "not with STRATA_DMA_BATCH"
+                              : adapt_lag() != 1 || adapt_nowait() ? "not with STRATA_ADAPT_LAG / STRATA_ADAPT_NOWAIT"
+                              // the resident RAM mode is exact too (soft_commit_exchanges) but not a win everywhere: RTX A4000 +7.0%
+                              // (5/5 pairs), RTX 3060 on a 46 GB box -2.6% (0/5; the CPU experts and the copies share the RAM bandwidth)
+                              : src.complement_ready() && !(std::getenv("STRATA_ADAPT_OVERLAP_RESIDENT") &&
+                                                            std::getenv("STRATA_ADAPT_OVERLAP_RESIDENT")[0] == '1')
+                                    ? "not in the resident RAM mode unless STRATA_ADAPT_OVERLAP_RESIDENT=1"
+                              : drive.d.usage.empty() ? "the adaptive tier is off"
+                              : nullptr;
+            if (why == nullptr) {
+                agate.ticks.resize((size_t) g.n_layers + 1);
+                for (int64_t l = 0; l <= g.n_layers; ++l) agate.ticks[(size_t) l] = {&agate, (int32_t) l};
+                agate.has.assign((size_t) g.n_layers, 0);
+                if (!ver.set_adapt_gate(&agate)) why = "the device-planned layers (STRATA_VERIFY_DEVICE_PLAN) are on";
+            }
+            aov = why == nullptr;
+            if (aov)
+                std::fprintf(stderr, "strata serve: adaptive overlap (STRATA_ADAPT_OVERLAP=0 turns it off): the adaptive tier's copies land while the next window runs "
+                                     "(same tokens, a layer waits for its own copies)\n");
+            else if (std::getenv("STRATA_ADAPT_OVERLAP") != nullptr)   // quiet when it was only the default
+                std::fprintf(stderr, "strata serve: STRATA_ADAPT_OVERLAP=1 is off: %s\n", why);
+        }
         // a layer split's later stages keep a copy of the residency table on their devices, and swap on their own
         auto res_upload = [&]() {
             if (d_res != nullptr)
@@ -8165,6 +8220,8 @@ int main(int argc, char** argv) {
             }
             pending.clear();
             pending_age = 0;
+            agate.active.store(false, std::memory_order_release);   // 0.1.43: the copies have landed (STRATA_ADAPT_OVERLAP)
+            aflipped = false;
             res_upload();
         };
         // --pipeline-windows: set while the tier adapts beside windows in flight (see its use in adapt)
@@ -8197,6 +8254,12 @@ int main(int argc, char** argv) {
             }
             std::sort(swaps.begin(), swaps.end(), [](const Swap& a, const Swap& b) { return a.gain > b.gain; });
             if ((int) swaps.size() > o.adapt_swaps) swaps.resize((size_t) o.adapt_swaps);
+            if (aov) {   // 0.1.43: the copies go in layer order and each layer's landing is told to the verify window
+                std::stable_sort(swaps.begin(), swaps.end(), [](const Swap& a, const Swap& b) { return a.layer < b.layer; });
+                agate.landed.store(-1, std::memory_order_release);
+                agate.has.assign((size_t) g.n_layers, 0);
+                for (const Swap& s : swaps) agate.has[(size_t) s.layer] = 1;
+            }
             // the copies back read the cache of the card that owns each layer (see resident_stage_swaps)
             auto home_of = [&](int64_t layer) -> SwapHome {
                 const int stn = multi_gpu ? stage_of(layer) : 0;
@@ -8237,6 +8300,13 @@ int main(int argc, char** argv) {
             std::vector<size_t> cp_bytes;
             for (size_t si = 0; si < swaps.size(); ++si) {
                 const Swap& s = swaps[si];
+                if (aov && (si == 0 || swaps[si - 1].layer != s.layer)) {
+                    // test hook (STRATA_ADAPT_OVERLAP_SLOW_US=N): a slow link, to make the windows wait for the copies
+                    static const int slow_us = [] { const char* e = std::getenv("STRATA_ADAPT_OVERLAP_SLOW_US"); return e ? std::atoi(e) : 0; }();
+                    static int slow_arg = slow_us;
+                    if (slow_us > 0)
+                        cudaLaunchHostFunc(adapt_stream, [](void* p) { std::this_thread::sleep_for(std::chrono::microseconds(*(int*) p)); }, &slow_arg);
+                }
                 const size_t in = (size_t) s.layer * g.n_expert + s.in, out = (size_t) s.layer * g.n_expert + s.out;
                 const int32_t slot = fenced_slots.empty() ? host_res[out] : fenced_slots[si];
                 const uint8_t* b = srcp->blob_stable(s.layer, s.in);
@@ -8266,6 +8336,16 @@ int main(int argc, char** argv) {
                 host_res[out] = strata::core::kNotResident;   // evicted now: the CPU computes it meanwhile
                 srcp->prefetch(s.layer, s.out);   // a file-backed arena released its pages: read them back ahead
                 pending.emplace_back((int32_t) in, slot);      // resident once the copy has landed
+                if (aov && (si + 1 == swaps.size() || swaps[si + 1].layer != s.layer) &&
+                    cudaLaunchHostFunc(adapt_stream, [](void* p) {
+                        auto* t = (strata::core::AdaptGate::Tick*) p;
+                        int32_t cur = t->gate->landed.load(std::memory_order_relaxed);
+                        while (cur < t->layer && !t->gate->landed.compare_exchange_weak(cur, t->layer, std::memory_order_release)) {}
+                    }, &agate.ticks[(size_t) s.layer]) != cudaSuccess) {
+                    (void) cudaGetLastError();
+                    cudaStreamSynchronize(adapt_stream);   // no callback: wait here, the gate opens at once
+                    agate.landed.store((int32_t) g.n_layers, std::memory_order_release);
+                }
             }
             if (!cp_dst.empty() && strata::core::copy_blobs(cp_dst.data(), cp_src.data(), cp_bytes.data(), cp_dst.size(),
                                                             adapt_stream, dma_mode) != cudaSuccess) {
@@ -11591,6 +11671,21 @@ int main(int argc, char** argv) {
                 // expert ran on the GPU or the CPU (they round differently) depended on the copy's timing
                 // (STRATA_ADAPT_NOWAIT=1: 0.1.37's non-blocking query, the A/B)
                 if (adapt_nowait()) apply_pending(false);
+                else if (aov && !pending.empty() && !aflipped) {
+                    // 0.1.43 STRATA_ADAPT_OVERLAP: the tables take the swaps now, exactly where the wait would have ended;
+                    // the copies still landing are waited for per layer inside the window (AdaptGate)
+                    // (resident RAM mode: the staged evicted experts look committed to the planner at once, the RAM
+                    // copy's places stay as they are until the copies have landed; see soft_commit_exchanges)
+                    if (src.complement_ready() && !src.soft_commit_exchanges()) {
+                        apply_pending(true);   // not possible here: the plain wait
+                    } else {
+                        for (const auto& [i, slot] : pending) host_res[(size_t) i] = slot;
+                        res_upload();
+                        aflipped = true;
+                        ++aov_flips;
+                        agate.active.store(true, std::memory_order_release);
+                    }
+                }
                 else if (pending.empty() || ++pending_age >= adapt_lag()) apply_pending(true);
                 if (!adapt_tick(false)) {   // --adapt-async: the round in flight moves on a step when it can
                     std::printf("ERR an adaptive refill failed\n");
@@ -11622,6 +11717,7 @@ int main(int argc, char** argv) {
                     std::printf("ERR %s\n", drive.d.failed && drive.d.fail ? drive.d.fail : err.c_str());
                     return 1;
                 }
+                if (aflipped) apply_pending(true);   // 0.1.43: every layer's copies were waited for in the window; the bookkeeping now
                 // Diagnostics (as in generate): STRATA_DUMP_FIRST_LOGITS=<path> writes the logits of each request's first
                 // window to <path>.<n>, so the prompt paths (a peer card's share, a split) can be compared by KL
                 if (first_window) {
@@ -11740,6 +11836,9 @@ int main(int argc, char** argv) {
                              (d1.actq - ds0.actq) / w, (d1.jobs - ds0.jobs) / w, (d1.run - ds0.run) / w,
                              (d1.host - ds0.host) / w, dt_commit / w, dt_draft / w, (d1.misses - ds0.misses) / (w * L),
                              (d1.entries - ds0.entries) / (w * L), (d1.hits - ds0.hits) / (w * L), (d1.pcie - ds0.pcie) / (w * L));
+                if (aov)
+                    std::fprintf(stderr, "strata decode adapt overlap: %lld windows took swaps still landing, a layer waited %.2f ms in all so far\n",
+                                 (long long) aov_flips, ver.ms_gate);
                 for (int st = 0; st < n_stages; ++st) {   // every stage's GPU profile, not only the first card's
                     const std::string pr = stage_ver(st).profile_report();
                     if (pr.empty()) continue;

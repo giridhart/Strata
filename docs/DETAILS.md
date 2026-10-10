@@ -1669,6 +1669,14 @@ the pairs in which the switched arm won). They are here so you can try them on y
   -0.1% (5/6). Boxes that hold all experts in RAM never use the stage buffers.
 - **`STRATA_ADAPT_LAG=2`: the adaptive tier's copies are waited for one window later** (#764). Decode, 6 pairs: Tesla P100
   (PCIe 3.0 x16) +3.5% (6/6 pairs faster), RTX 5070 +0.2% (4/6), RTX 3060 -1.3% (0/6), so it stays opt-in.
+- **`STRATA_ADAPT_OVERLAP` (CUDA: on, `=0` turns it off; HIP: `=1` turns it on): the adaptive tier's copies land while the next
+  window runs, with the same tokens.** The window takes the swaps at the same moment as with #463's wait (so the same experts run
+  on the GPU and the CPU in every window), but the copies go in layer order and the verify window holds a layer's plan back
+  until that layer's copies have landed, instead of the whole window waiting for the round (about 10 ms every fourth window on
+  an A4000, PCIe 3.0 x16). One GPU, the whole arena in RAM, no `--adapt-async`, `--pipeline-windows`, `STRATA_ADAPT_LAG`,
+  `STRATA_ADAPT_NOWAIT` or `STRATA_DMA_BATCH`; otherwise the log says why it is off. RTX A4000, 6 interleaved pairs each,
+  decode median tok/s: Q2_0 16 GB 62.5 -> 66.2 (+5.9%), Q2_0 as a 12 GB card 51.3 -> 54.2 (+5.7%), IQ3_XXS 16 GB 48.6 -> 52.6 (+8.3%),
+  IQ3_XXS as 12 GB 39.3 -> 41.5 (+5.5%), 6/6 pairs faster every time.
 
 ## Thread placement: `--aux-cpus` (Linux, off by default)
 

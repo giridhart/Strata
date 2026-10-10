@@ -39,6 +39,18 @@
 
 namespace strata::core {
 
+/// 0.1.43 (STRATA_ADAPT_OVERLAP): the adaptive tier's copies still landing while a decode window runs.  The window's
+/// residency tables are the baseline's (the swapped-in experts are resident from the window's first layer), but their
+/// bytes arrive layer by layer: `run` holds a layer's plan (the first thing that lets the GPU read the layer's expert
+/// slots) back until `landed >= layer` for a layer with a swap (`has[layer]`).  Set `active` only around one window.
+struct AdaptGate {
+    struct Tick { AdaptGate* gate; int32_t layer; };
+    std::atomic<int32_t> landed{-1};      ///< the highest layer whose swap copies have landed (n_layers: all of them)
+    std::atomic<bool> active{false};
+    std::vector<uint8_t> has;             ///< per layer: a swap copies into this layer's slots
+    std::vector<Tick> ticks;              ///< host-function contexts, one per layer and the final one (stable storage)
+};
+
 class NativeHead;
 class RemoteExpertOpt;
 
@@ -216,6 +228,14 @@ public:
     /// expert evicted on the host (the pool then computes it on the CPU) before the device table follows.  Also turns
     /// the device-planned layers (E-6) off.  Before `init`.
     void set_always_publish(bool on) { always_publish_ = on; }
+    /// 0.1.43: the adaptive tier's overlap gate (see AdaptGate).  Refused (false) with the device-planned layers (E-6),
+    /// which never ask the host.  The pointer must outlive the verifier's windows.
+    bool set_adapt_gate(AdaptGate* g) {
+        if (g != nullptr && device_plan_) return false;
+        adapt_gate_ = g;
+        return true;
+    }
+    double ms_gate = 0;   ///< host time spent holding a layer's plan for the adaptive copies (decode timing prints it)
     cudaStream_t stream() const { return cs_; }
     int device() const { return device_; }
     /// Capture every window size and the commit graph now (a capture syncs the stream: never with a window in flight).
@@ -321,6 +341,8 @@ private:
     // pipelined windows (pl_launch ...)
     cudaStream_t ext_stream_ = nullptr;   ///< set_stream: the stage's shared stream (not destroyed here)
     bool always_publish_ = false;
+    bool adapt_gate_wait(int32_t layer, std::string& err);
+    AdaptGate* adapt_gate_ = nullptr;     ///< 0.1.43: STRATA_ADAPT_OVERLAP's gate (null: off)
     void pl_stage(int T, const int32_t* tokens, int64_t pos0, const int32_t ple_prev[2]);
     cudaEvent_t ev_done_ = nullptr, ev_commit_ = nullptr;
     unsigned long long* prof_pin_ = nullptr;   ///< pinned host copy of the stamps (pipelined windows)
