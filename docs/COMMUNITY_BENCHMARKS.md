@@ -55,7 +55,7 @@ The simplest report is one command after setup. Windows: double-click `BENCH.bat
 It starts the model with the settings you already have (the newest `strata-*.json`; `--config FILE` picks another one),
 or uses a Strata server that is already running on that port (`--url http://127.0.0.1:8080` for another address). It then
 sends a fixed suite through the HTTP API, three runs each, and reports medians with ranges. The default takes about
-6 to 10 minutes once the model has loaded:
+3 to 10 minutes once the model has loaded:
 
 | Test | What it sends | What it reports |
 | --- | --- | --- |

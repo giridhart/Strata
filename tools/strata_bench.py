@@ -18,7 +18,7 @@ real HTTP API, three runs each, medians reported:
 
 Speeds are the engine's own timings (the `timings` of the answer: prompt_per_second, predicted_per_second); time to first
 token and latency are measured by this client.  Thinking is off for the suite (--think turns it on), so the answers are
-short and the runs comparable.  The default run takes about 6-10 minutes after the model has loaded.
+short and the runs comparable.  The default run takes about 3-10 minutes after the model has loaded (the slower the card, the longer).
 
 The result goes to bench/results/<date>-community-<gpu>-<model>/ : README.md in the format of
 docs/COMMUNITY_BENCHMARKS.md, results.json (every request) and an engine log excerpt.  Home folders, user and host names,
@@ -731,7 +731,7 @@ def render_readme(res: dict) -> str:
          "## Model and configuration", "",
          f"- Model and quantization: {model}",
          f"- Context: {mc.get('context') or 'not read'} tokens; parallel slots: {mc.get('parallel_slots') or 1}",
-         f"- Settings: the install's own configuration, unchanged (`{mc.get('config', {}).get('backend', 'default backend')}` backend); thinking "
+         f"- Settings: the install's own configuration, unchanged{' (' + mc['config']['backend'] + ' backend)' if mc.get('config', {}).get('backend') else ''}; thinking "
          f"{'on' if p['think'] else 'off'} for the suite; temperature 0", ""]
     if mc.get("launch"):
         L += ["```text", mc["launch"], "```", ""]
@@ -898,7 +898,7 @@ def main(argv=None) -> int:
         slots = pre.get("parallel_slots") or 1
         if a.clients and a.clients > slots:
             say(f"Note: the server runs {slots} request(s) at a time (--batch), so {a.clients} clients will partly wait their turn.")
-        say("Running the suite (about 6-10 minutes) ...")
+        say("Running the suite (about 3-10 minutes) ...")
         out = suite.run()
         machine = collect_machine(base, key, cfg)             # again: VRAM and the cache after the work
         if not machine.get("gpu"):
