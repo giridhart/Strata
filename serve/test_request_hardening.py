@@ -130,6 +130,32 @@ class Hardening(unittest.TestCase):
                                                        "max_tokens": 8, "temperature": "0.7", "top_k": "40"})
         self.assertEqual(code, 200, out)
 
+    def test_llama_cpp_names_for_the_repetition_penalty(self):
+        """#1819: repeat_penalty / repeat_last_n are repetition_penalty / penalty_last_n; the OpenAI-style name wins."""
+        from serve.server import SAMPLING_ALIASES, check_request_sampling, sampling_defaults_from_config
+        req = {"repeat_penalty": 1.1, "repeat_last_n": 128}
+        check_request_sampling(req)
+        self.assertEqual((req["repetition_penalty"], req["penalty_last_n"]), (1.1, 128))
+        req = {"repeat_penalty": 1.3, "repetition_penalty": 1.05, "repeat_last_n": 9, "penalty_last_n": 32}
+        check_request_sampling(req)
+        self.assertEqual((req["repetition_penalty"], req["penalty_last_n"]), (1.05, 32))
+        req = {"repeat_last_n": 0}                      # off / -1: the engine's default window, nothing is set
+        check_request_sampling(req)
+        self.assertNotIn("penalty_last_n", req)
+        with self.assertRaises(ValueError):
+            check_request_sampling({"repeat_penalty": "abc"})
+        self.assertEqual(sampling_defaults_from_config({"sampling": {"repeat_penalty": 1.1, "repeat_last_n": 256}}),
+                         {"repetition_penalty": 1.1, "penalty_last_n": 256})
+        self.assertEqual(sampling_defaults_from_config({"sampling": {"temperature": 0.6}}), {"temperature": 0.6})
+        with self.assertRaises(SystemExit):
+            sampling_defaults_from_config({"sampling": {"repeat_penalty": 1.1, "repetition_penalty": 1.2}})
+        with self.assertRaises(SystemExit):
+            sampling_defaults_from_config({"sampling": {"repeat_penalty": -1}})
+        self.assertEqual(set(SAMPLING_ALIASES.values()), {"repetition_penalty", "penalty_last_n"})
+        code, out = self.post("/v1/chat/completions", {"messages": [{"role": "user", "content": "hi"}],
+                                                       "max_tokens": 8, "repeat_penalty": 1.1, "repeat_last_n": 64})
+        self.assertEqual(code, 200, out)
+
     def test_in_type_values_and_nulls_still_answer(self):
         chat = {"messages": [{"role": "user", "content": "hi"}], "max_tokens": 8, "temperature": 0, "top_k": 0,
                 "seed": 7}

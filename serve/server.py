@@ -5860,15 +5860,28 @@ def lift_reasoning_effort_arg(cfg: dict) -> None:
           f"{cfg['reasoning_effort']!r}", flush=True)
 
 
+# #1819: llama.cpp clients call the repetition penalty and its window repeat_penalty / repeat_last_n; they are the
+# same settings as repetition_penalty / penalty_last_n (the /props answer already reports them under those names)
+SAMPLING_ALIASES = {"repeat_penalty": "repetition_penalty", "repeat_last_n": "penalty_last_n"}
+
+
 def sampling_defaults_from_config(cfg: dict) -> dict:
     """The run config's optional `sampling` block: defaults for the sampling fields a request leaves out, so
     a plain client gets configured sampling instead of greedy.  Supported: temperature, top_p, top_k, min_p,
-    presence_penalty, repetition_penalty, frequency_penalty, penalty_last_n, seed.  The request's own fields
+    presence_penalty, repetition_penalty (also written repeat_penalty), frequency_penalty, penalty_last_n (also
+    repeat_last_n), seed.  The request's own fields
     always win - an explicit temperature=0 still means greedy, a field set to null falls back to the default.
     A bad value refuses to start the server (a typo'd config should not quietly change sampling); unknown keys
     are named at startup and ignored."""
     out = {}
-    for key, value in (cfg.get("sampling") or {}).items():
+    block = dict(cfg.get("sampling") or {})
+    for alias, canon in SAMPLING_ALIASES.items():      # #1819: llama.cpp's names for the same two fields
+        if block.get(alias) is not None:
+            if block.get(canon) is not None:
+                raise SystemExit(f"[strata] config sampling: both {alias!r} and {canon!r} are set; they are the same "
+                                 f"setting, keep one")
+            block[canon] = block.pop(alias)
+    for key, value in block.items():
         if value is None:
             continue
         number = isinstance(value, (int, float)) and not isinstance(value, bool)
@@ -5968,6 +5981,12 @@ def check_request_sampling(req) -> None:
     types are checked: a number (int or float, never bool) for temperature, top_p, min_p and the three penalties; an
     integer (never bool or float) for top_k, penalty_last_n and seed.  Ranges behave as before (a temperature <= 0 is
     greedy, top_k 0 or above 64 is clamped, a seed <= 0 is unset), and an absent or null field is not checked."""
+    if isinstance(req, dict):      # #1819: llama.cpp's names; the OpenAI-style field wins when both are sent
+        if req.get("repeat_penalty") is not None and req.get("repetition_penalty") is None:
+            req["repetition_penalty"] = req["repeat_penalty"]
+        rl = req.get("repeat_last_n")
+        if req.get("penalty_last_n") is None and isinstance(rl, int) and not isinstance(rl, bool) and rl > 0:
+            req["penalty_last_n"] = rl      # 0 and -1 (off / the whole context) keep the engine's default window
     for key, integer in (("temperature", False), ("top_p", False), ("min_p", False), ("presence_penalty", False),
                          ("frequency_penalty", False), ("repetition_penalty", False), ("top_k", True),
                          ("penalty_last_n", True), ("seed", True)):
