@@ -6707,6 +6707,12 @@ int main(int argc, char** argv) {
         const bool dropped = src.drop_mapping(why);
         std::fprintf(stderr, "strata generate: the mapped view of the experts %s (%s)\n",
                      dropped ? "is closed" : "stays open", why.c_str());
+        // --ple-io mmap / ram maps the PLE shard for the whole run; when that shard also holds experts, NTFS still runs
+        // the unbuffered reads of that one file one at a time (the default --ple-io direct keeps no mapping)
+        if (dropped && src.gguf_mode() && !o.ple_gguf.empty() && o.ple_io != "direct")
+            std::fprintf(stderr, "strata generate: note: --ple-io %s keeps %s mapped; if that shard holds experts, their "
+                                 "reads stay serialized (--ple-io direct, the default, keeps no mapping)\n",
+                         o.ple_io.c_str(), o.ple_gguf.c_str());
     }
     // 0.1.42 (H11): the default CPU share is armed only when the host has the memory for it.  One line says why not;
     // an explicit STRATA_PREFILL_CPU_SHARE (other than 0) is armed anyway, with a warning when memory is short.
