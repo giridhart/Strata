@@ -191,15 +191,26 @@ class VsRange(unittest.TestCase):
         seen = []
         with mock.patch.object(setup.Path, "exists", lambda self: True),                 mock.patch.object(setup, "out", lambda cmd, *a, **k: seen.append(cmd) or "C:/VS"):
             setup.find_vcvars(cuda_v)
-        return seen[0][seen[0].index("-version") + 1]
+        return seen[0][seen[0].index("-version") + 1] if "-version" in seen[0] else None
 
     def test_the_range_follows_the_toolkit(self):
-        self.assertEqual(self.asked(None), "[16.0,18.0)")
+        self.assertIsNone(self.asked(None))      # #881: without CUDA vswhere gets no version range
         self.assertEqual(self.asked((13, 0)), "[16.0,18.0)")
         self.assertEqual(self.asked((13, 2)), "[16.0,18.0)")
         self.assertEqual(self.asked((13, 3)), "[16.0,19.0)")
         self.assertEqual(self.asked((14, 0)), "[16.0,19.0)")
 
+
+    def test_vcvars_by_hand(self):
+        """#881: STRATA_VCVARS names a vcvars64.bat directly, for an install vswhere cannot use."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            bat = Path(d) / "vcvars64.bat"
+            bat.write_text("rem")
+            with mock.patch.dict(os.environ, {"STRATA_VCVARS": str(bat)}):
+                self.assertEqual(setup.find_vcvars(), bat)
+            with mock.patch.dict(os.environ, {"STRATA_VCVARS": str(Path(d) / "missing.bat")}):
+                self.assertIsNone(setup.find_vcvars())
 
 class ExperimentalSm60(unittest.TestCase):
     """#295: Pascal (6.x) and Volta (7.0) only with STRATA_EXPERIMENTAL_SM60=1, built with -DSTRATA_EXPERIMENTAL_SM60=ON

@@ -33,7 +33,7 @@ ENGINE_WITHOUT = b"\x7fELF ... --serve ..."
 class EffortEndArgs(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        self.repo = Path(self.tmp.name) / "Strata"
+        self.repo = Path(self.tmp.name) / "engine-repo"
         (self.repo / "sycl" / "serve").mkdir(parents=True)
         self.launcher = self.repo / "sycl" / "serve" / "strata-sycl.sh"
         self.launcher.write_text("#!/usr/bin/env bash\nexec ${STRATA_SYCL_BIN:-build-sycl-aot/strata}\n")
