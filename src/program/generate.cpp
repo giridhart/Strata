@@ -569,6 +569,8 @@ struct Options {
     /// Plan v0.3 P6: the share (0..1) of each layer's distinct missed experts the GPU reads over PCIe from the
     /// pinned arena while the CPU computes the rest (verify windows).
     double pcie_frac = -1.0;   ///< < 0: the model's default (0.2 direct for the Q2_0 pack, 0.55 DMA for native packs)
+    bool pcie_frac_auto = false;     ///< CUDA single-GPU serve, no --pcie-frac: the share is refined in the first decode windows (PcieAuto)
+    double pcie_probe_gbps = 0.0;    ///< the start-up probe's reading (for PcieAuto)
     std::string pcie_mode = "auto";   ///< auto | dma | kernel | direct
     /// Plan v0.3 P6: every `adapt_every` rounds, swap up to `adapt_swaps` of the most-routed missing experts into
     /// the VRAM tier in place of the least-routed resident ones (decayed counts).  0 = static residency.
@@ -1610,6 +1612,49 @@ double pcie_frac_for_gbps(double gbps, double base) {
     return gbps <= 0.0 ? base : base * std::min(1.0, gbps / 20.0);
 }
 
+// 0.1.42, CUDA single-GPU serve, no --pcie-frac: the share refined from what the CPU pool measures in the first decode
+// windows.  The balance share of the missed experts is link / (link + CPU rate).  The link is the start-up probe; the CPU
+// rate is the expert bytes over the pool's wall time per missed expert (ExpertDispatch::ms_run / multi_misses), which the
+// engine already times.  The best shares measured with the route tail skip on (RTX 3060 0.15-0.20, Tesla P100 0.20, RTX
+// A4000 flat from 0.15 to 0.40; the 0.1.41 rule gave 0.55, 0.29, 0.30) lie within one 0.05 step of link / (link + 1.85 x pool rate).
+// Three updates at most (after 48, then 96 and 96 more windows), each rounded to 0.05, so a noisy window cannot move
+// the share by less than a step and it stops moving after the third.  STRATA_PCIE_FRAC_DEFAULT=old keeps the 0.1.41 rule.
+struct PcieAuto {
+    static constexpr double kPoolFactor = 1.85;
+    bool on = false;
+    double link_gbps = 0.0, blob_bytes = 0.0;
+    double mark_ms = 0.0;
+    int64_t mark_jobs = 0;
+    double acc_ms = 0.0;
+    int64_t acc_jobs = 0;
+    int acc_win = 0, updates = 0;
+    void mark(double ms_run, int64_t jobs) { mark_ms = ms_run; mark_jobs = jobs; }
+    /// After a decode window: the new share, or -1 while there is nothing to change.  `tc_us`/`rate` get the reading.
+    double window(double ms_run, int64_t jobs, double cur, double* tc_us, double* rate) {
+        if (!on) return -1.0;
+        acc_ms += ms_run - mark_ms;
+        acc_jobs += jobs - mark_jobs;
+        mark(ms_run, jobs);
+        ++acc_win;
+        if (acc_win < (updates == 0 ? 48 : 96)) return -1.0;
+        if (acc_jobs < 300) {          // too few missed experts to read the pool's speed (everything hits): look again
+            if (acc_win >= 2000) on = false;
+            return -1.0;
+        }
+        const double tc = acc_ms * 1000.0 / (double) acc_jobs;
+        acc_ms = 0.0;
+        acc_jobs = 0;
+        acc_win = 0;
+        if (++updates >= 3) on = false;
+        if (!(tc > 1.0) || !(blob_bytes > 0.0) || !(link_gbps > 0.0)) return -1.0;
+        const double r = blob_bytes / (tc * 1e-6) / 1e9;
+        const double f = std::min(0.60, std::max(0.10, std::round(link_gbps / (link_gbps + kPoolFactor * r) * 20.0) / 20.0));
+        *tc_us = tc;
+        *rate = r;
+        return std::fabs(f - cur) < 0.025 ? -1.0 : f;
+    }
+};
+
 }  // namespace
 
 // #1425 #1549 #1629: --ple-io direct (the default) does unbuffered random reads of the n-gram table; on some drives
@@ -2634,6 +2679,11 @@ int main(int argc, char** argv) {
             o.pcie_frac = pcie_frac_for_gbps(bw, base);
             std::fprintf(stderr, "strata generate: PCIe probe: %.1f GB/s host->device (best of %s) -> pcie_frac %.2f "
                                  "(default %.2f)\n", bw, bursts.c_str(), o.pcie_frac, base);
+#if !defined(STRATA_USE_HIP)
+            const char* pfd = std::getenv("STRATA_PCIE_FRAC_DEFAULT");
+            o.pcie_frac_auto = o.layer_split.empty() && !(pfd != nullptr && std::strcmp(pfd, "old") == 0);
+            o.pcie_probe_gbps = bw;
+#endif
         } else {
             o.pcie_frac = base;
             std::fprintf(stderr, "strata generate: PCIe probe failed -> pcie_frac default %.2f\n", base);
@@ -8036,6 +8086,15 @@ int main(int argc, char** argv) {
         }
         if (o.adapt_every > 0 && o.adapt_swaps > 0 && !all_experts_resident)
             drive.d.usage.assign((size_t) (g.n_layers * g.n_expert), 0.0f);
+        PcieAuto pcie_auto;
+        if (o.pcie_frac_auto && native_pack && !all_experts_resident && o.batch == 0 && o.peer_device < 0 && n_stages == 1) {
+            const auto& pl = strata::kernels::cpu::expert_layout();
+            double sum = 0.0;
+            for (int64_t l = 0; l < g.n_layers; ++l) sum += (double) pl.blob_bytes(l);
+            pcie_auto.on = true;
+            pcie_auto.link_gbps = o.pcie_probe_gbps;
+            pcie_auto.blob_bytes = g.n_layers > 0 ? sum / (double) g.n_layers : 0.0;
+        }
         // #477 --expert-profile-save: what the adaptive tier learned, kept across restarts (opt-in; off: `heat` stays
         // empty and nothing below runs).  It needs the adaptive tier's counts and the residency table.
         std::vector<double> heat;
@@ -10810,6 +10869,7 @@ int main(int argc, char** argv) {
             const uint64_t file_bytes0 = src.file_read_bytes();
             const int64_t decode_look0 = drive.d.cache_hits + drive.d.cache_admitted + drive.d.cache_refused;
             const int64_t offload0 = drive.d.offload_entries;   // #588
+            pcie_auto.mark(drive.d.ms_run, drive.d.multi_misses);   // the prompt's windows are not the decode's
             if (cancelled) finish = "cancel";
             // ======== --pipeline-windows 2: the decode windows with the two cards overlapped ========
             // Stage 0 (the first card) runs window K+1 while stage 1 verifies window K, on the guess that K is accepted
@@ -11606,6 +11666,21 @@ int main(int argc, char** argv) {
                     auto msd = [](Clock::time_point a0, Clock::time_point b0) { return std::chrono::duration<double, std::milli>(b0 - a0).count(); };
                     dt_run += msd(tw0, tw1); dt_commit += msd(tw1, tw2); dt_draft += msd(tw2, tw3);
                     ++dec_windows; dec_T += T;
+                }
+                if (pcie_auto.on) {   // the default share, refined from the CPU pool's speed (PcieAuto); a request's own share is left alone
+                    double tc_us = 0.0, rate = 0.0;
+                    const double nf = req_pcie_frac == o.pcie_frac
+                                          ? pcie_auto.window(drive.d.ms_run, drive.d.multi_misses, o.pcie_frac, &tc_us, &rate)
+                                          : (pcie_auto.mark(drive.d.ms_run, drive.d.multi_misses), -1.0);
+                    if (nf >= 0.0) {
+                        std::fprintf(stderr, "strata serve: PCIe share: the CPU pool takes %.0f us per missed expert (%.1f GB/s of expert bytes), "
+                                             "the link %.1f GB/s -> pcie_frac %.2f (was %.2f; --pcie-frac N fixes it, "
+                                             "STRATA_PCIE_FRAC_DEFAULT=old keeps the start-up rule)\n",
+                                     tc_us, rate, pcie_auto.link_gbps, nf, o.pcie_frac);
+                        o.pcie_frac = nf;
+                        req_pcie_frac = nf;
+                        drive.d.pcie_num = std::max(0, std::min(256, (int) (nf * 256.0 + 0.5)));
+                    }
                 }
                 if (adapt_thr.joinable()) adapt_thr.join();
                 if (!adapt_ok) {
