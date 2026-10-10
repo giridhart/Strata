@@ -2521,8 +2521,18 @@ constexpr IlRows kIlRows_70[] = {
     {13, {{0, 2, 2, 2, 2}, {0, 2, 2, 2, 2}, {0, 1, 2, 2, 2}}},   // Q5_K
     {14, {{0, 1, 1, 1, 1}, {0, 2, 2, 2, 2}, {0, 2, 2, 4, 2}}},   // Q6_K
 };
+// Pascal (sm_60), read off mmvq_il_parity --bench --emit-table on a Tesla P100-PCIE-16GB (three runs, identical
+// tables), the same 3% rule.  Pascal has no dp4a (strata_dp4a: four vmad), so the kernels are compute-bound and more rows a
+// warp (weights and activations reused across rows) win 15-35% on the large shapes.  Bitwise equal to native_mmvq.
+constexpr IlRows kIlRows_60[] = {
+    {23, {{0, 4, 4, 4, 4}, {2, 4, 2, 4, 4}, {1, 1, 1, 1, 1}}},   // IQ4_XS
+    {12, {{0, 4, 4, 4, 4}, {0, 2, 2, 2, 2}, {0, 0, 0, 4, 4}}},   // Q4_K
+    {13, {{0, 2, 2, 2, 2}, {0, 4, 2, 2, 4}, {0, 2, 2, 2, 2}}},   // Q5_K
+    {14, {{0, 2, 2, 2, 4}, {0, 0, 0, 4, 4}, {0, 0, 0, 4, 4}}},   // Q6_K
+};
 struct IlArch { int cc; const IlRows* t; size_t n; };
 constexpr IlArch kIlArch[] = {
+    {60, kIlRows_60, sizeof(kIlRows_60) / sizeof(IlRows)},   // Pascal GP100: measured on a Tesla P100
     {70, kIlRows_70, sizeof(kIlRows_70) / sizeof(IlRows)},   // Volta: PR 1401, measured on a V100-SXM2
 };
 // STRATA_MMVQ_IL_ROWS="type:ncols:r0,r1,r2,r3,r4;..." overrides single rows of the table for every card (type = ggml
@@ -2595,6 +2605,9 @@ namespace {
 // native_mmvq's kernels unchanged
 // Volta (PR 1401): opt-in with STRATA_SM70_TABLE=1 until the author confirms on a V100 with the final code
 bool sm70_opt_in() { const char* v = std::getenv("STRATA_SM70_TABLE"); return v != nullptr && std::atoi(v) != 0; }
+// Pascal (sm_60, GP100): the same interleaved kernels (bitwise equal to native_mmvq's, mmvq_il_parity), its own table
+// kIlRows_60.  STRATA_SM60_TABLE=0 keeps native_mmvq's kernels on a P100; any other value (or unset) uses the table.
+bool sm60_table_on() { const char* v = std::getenv("STRATA_SM60_TABLE"); return v == nullptr || std::atoi(v) != 0; }
 bool il_arch_ok() {
     static int ok[16] = {};   // 0 unknown, 1 yes, -1 no, by device ordinal
     int dev = 0;
@@ -2604,7 +2617,7 @@ bool il_arch_ok() {
         int minor = 0;
         cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev);
         ok[dev] = (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) == cudaSuccess &&
-                   (major >= 8 || (major == 7 && minor == 0 && sm70_opt_in()))) ? 1 : -1;
+                   (major >= 8 || (major == 7 && minor == 0 && sm70_opt_in()) || (major == 6 && minor == 0 && sm60_table_on()))) ? 1 : -1;
     }
     return ok[dev] > 0;
 }

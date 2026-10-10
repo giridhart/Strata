@@ -225,6 +225,11 @@ int check_tables() {
         ++bad;
         std::printf("FAIL table: the sm_70 table is not the V100's\n");
     }
+    // Pascal has its own table too (the P100's): Q6_K, 3 columns, 12288 rows -> 4 rows a warp; sm_75 still has none (the shared one)
+    if (native_mmvq_il_rows_for(60, 14, 3, 12288) != 4 || native_mmvq_il_rows_for(60, 23, 2, 512) != 0) {
+        ++bad;
+        std::printf("FAIL table: the sm_60 table is not the P100's\n");
+    }
     if (native_mmvq_il_rows_for(89, 99, 2, 2560) != 0 || native_mmvq_il_rows_for(89, 12, 5, 2560) != 0) {
         ++bad;
         std::printf("FAIL table: an unknown type or ncols must be 0\n");
