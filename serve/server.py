@@ -2453,7 +2453,7 @@ def ordered_gpus(cfg: dict, scores=None, vrams=None) -> list[int]:
     """#1352: the cards of a layer split in the order the engine stages them.  With "layer_split": "auto" (the
     default) the faster card goes LAST - the last stage runs the head, the draft layer and the verify, and a prompt
     chunk waits on it (the reporter's 4070 Ti SUPER + 5060 Ti: a 6K prompt took 50 s one way round and 15 s the
-    other); "faster" is multiprocessors x max clock.  Equal cards keep the config's order (the sort is stable), and
+    other); "faster" is multiprocessors x max clock.  Equal cards - scores within 5% - keep the config's order, and
     so does anything we cannot measure.  "gpu_order": "as_given" keeps the config's order whatever the cards.  A
     manual "layer_split" ("24") also keeps it: the user placed the layers.  #1576: the reorder is skipped when it
     would land the last stage on a card with less total VRAM than the one the config put there - that stage's head,
@@ -2469,6 +2469,8 @@ def ordered_gpus(cfg: dict, scores=None, vrams=None) -> list[int]:
     sc = scores if scores is not None else (hip_speed_scores(gl) if hip else gpu_speed_scores(gl))
     if not sc or any(i not in sc for i in gl):
         return gl
+    if max(sc[i] for i in gl) < 1.05 * min(sc[i] for i in gl):
+        return gl     # #1760: cards within 5% of each other are the same card (two 5070 Ti read 1.2% apart on the clock): keep the order
     out = sorted(gl, key=lambda i: sc[i])
     if out != gl:
         vram = vrams if vrams is not None else (None if scores is not None else gpu_vram_mib(gl, hip))

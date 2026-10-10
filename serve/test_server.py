@@ -1631,6 +1631,8 @@ class GpuChoice(unittest.TestCase):
         self.assertEqual(ordered_gpus(base, fast_first), [2, 0])
         self.assertEqual(ordered_gpus({"gpu": [2, 0], "args": []}, fast_first), [2, 0])
         self.assertEqual(ordered_gpus(base, {0: 5.0, 2: 5.0}), [0, 2])                       # identical cards
+        self.assertEqual(ordered_gpus(base, {0: 173740000.0, 2: 171640000.0}), [0, 2])      # #1760: two 5070 Ti, 1.2% apart
+        self.assertEqual(ordered_gpus(base, {0: 106.0, 2: 100.0}), [2, 0])                    # 6% apart: a real difference
         self.assertEqual(ordered_gpus({**base, "gpu_order": "as_given"}, fast_first), [0, 2])
         self.assertEqual(ordered_gpus({**base, "layer_split": "24"}, fast_first), [0, 2])
         self.assertEqual(ordered_gpus({**base, "args": ["--layer-split", "24"]}, fast_first), [0, 2])
