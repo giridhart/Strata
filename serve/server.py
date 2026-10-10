@@ -6321,6 +6321,11 @@ def main() -> int:
             except KeyboardInterrupt:                   # a second Ctrl+C: don't wait for the engine to free its memory
                 if getattr(engine, "proc", None):
                     engine.proc.kill()
+        try:
+            from serve import cache_drop
+            cache_drop.drop_after_exit(engine)           # opt-in (STRATA_DROP_CACHE_ON_EXIT=1), default unchanged
+        except Exception as e:  # noqa: BLE001 - never block the exit
+            print(f"[strata] could not release the model files' cache: {e}", flush=True)
         print("[strata] stopped", flush=True)
     return 0
 

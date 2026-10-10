@@ -115,6 +115,25 @@ uint64_t meminfo_bytes(const std::string& meminfo_text, const std::string& key) 
     return 0;
 }
 
+uint64_t numa_pin_free(uint64_t global_free, const std::vector<uint64_t>& node_free) {
+    if (node_free.size() < 2) return global_free;
+    const uint64_t smallest = *std::min_element(node_free.begin(), node_free.end());
+    return std::min<uint64_t>(global_free, smallest * (uint64_t) node_free.size());
+}
+
+std::string page_cache_hint(const std::string& meminfo_text) {
+    const uint64_t cache = meminfo_bytes(meminfo_text, "Cached") + meminfo_bytes(meminfo_text, "Buffers");
+    if (cache < (1ull << 30)) return "";
+    char msg[420];
+    std::snprintf(msg, sizeof msg,
+                  "; %.1f GiB of the RAM is file cache (earlier runs' model files, which Linux gives back on demand - "
+                  "'free' showing little is normal). If the start still fails, free it with: "
+                  "sync; echo 1 | sudo tee /proc/sys/vm/drop_caches   (or start strata serve with "
+                  "STRATA_DROP_CACHE_ON_EXIT=1 so it releases its model files when it stops)",
+                  (double) cache / 1073741824.0);
+    return msg;
+}
+
 bool make_cache_complement_plan(
     int64_t n_layers, int64_t n_expert, const std::vector<uint64_t>& layer_blob_bytes,
     const std::vector<std::pair<int32_t, int32_t>>& primary_gpu_pairs,
@@ -423,6 +442,21 @@ bool free_memory_bytes(uint64_t& bytes) {
     std::stringstream text;
     text << info.rdbuf();
     bytes = detail::meminfo_bytes(text.str(), "MemFree");
+    if (bytes == 0) return false;
+    // 0.1.42: a multi-socket host's nodes each have their own free pages; judge by the emptiest one too
+    std::vector<uint64_t> nodes;
+    for (int n = 0; n < 64; ++n) {
+        std::ifstream node("/sys/devices/system/node/node" + std::to_string(n) + "/meminfo");
+        if (!node) break;
+        std::string line;
+        while (std::getline(node, line)) {
+            std::istringstream f(line);
+            std::string a, id, key;
+            uint64_t kb = 0;
+            if (f >> a >> id >> key >> kb && key == "MemFree:") { nodes.push_back(kb * 1024); break; }
+        }
+    }
+    bytes = detail::numa_pin_free(bytes, nodes);
     return bytes > 0;
 #else
     bytes = 0;
@@ -2693,6 +2727,13 @@ bool FileExpertSource::pin_cache_complement(
                           (double) bytes / 1073741824.0, commit < physical ? "commit" : "RAM",
                           (double) available / 1073741824.0, (double) headroom_bytes / 1073741824.0);
             err = message;
+#if defined(__linux__)
+            if (std::ifstream mi("/proc/meminfo"); mi) {
+                std::stringstream mt;
+                mt << mi.rdbuf();
+                err += detail::page_cache_hint(mt.str());
+            }
+#endif
             return false;
         }
     }
