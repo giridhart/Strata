@@ -1324,9 +1324,16 @@ int adapt_lag() {
 /// sees the swapped-in experts as resident from its first layer, exactly as after #463's wait (so the tokens are the same
 /// ones); what changes is only when the bytes arrive: the copies go in layer order and the verify window holds a layer's
 /// plan back until that layer's copies have landed (AdaptGate in strata/core/verify.hpp).  The ~10 ms a 96-swap round
-/// took at the next window's start (PCIe 3.0 x16, Q2_0) is then hidden behind the window.  Off by default.
+/// took at the next window's start (PCIe 3.0 x16, Q2_0) is then hidden behind the window.  On for CUDA (=0 turns it off), opt-in on HIP.
 bool adapt_overlap() {
-    static const bool v = [] { const char* e = std::getenv("STRATA_ADAPT_OVERLAP"); return e && e[0] == '1'; }();
+    static const bool v = [] {
+        const char* e = std::getenv("STRATA_ADAPT_OVERLAP");
+#if defined(STRATA_USE_HIP)
+        return e && e[0] == '1';      // HIP: not measured yet, opt-in
+#else
+        return !(e && e[0] == '0');   // CUDA: on since 0.1.43 (same tokens, +5.5..8.3% decode on an A4000); =0 turns it off
+#endif
+    }();
     return v;
 }
 
@@ -8156,9 +8163,9 @@ int main(int argc, char** argv) {
             }
             aov = why == nullptr;
             if (aov)
-                std::fprintf(stderr, "strata serve: STRATA_ADAPT_OVERLAP=1: the adaptive tier's copies land while the next window runs "
+                std::fprintf(stderr, "strata serve: adaptive overlap (STRATA_ADAPT_OVERLAP=0 turns it off): the adaptive tier's copies land while the next window runs "
                                      "(same tokens, a layer waits for its own copies)\n");
-            else
+            else if (std::getenv("STRATA_ADAPT_OVERLAP") != nullptr)   // quiet when it was only the default
                 std::fprintf(stderr, "strata serve: STRATA_ADAPT_OVERLAP=1 is off: %s\n", why);
         }
         // a layer split's later stages keep a copy of the residency table on their devices, and swap on their own
