@@ -2925,6 +2925,7 @@ int main(int argc, char** argv) {
                      (unsigned long long) (total_b >> 20));
         return 1;
     }
+    mem_mark("the CUDA context and the weight arena");
     auto load_t0 = std::chrono::steady_clock::now();
     auto load_s = [&] {
         const auto t = std::chrono::steady_clock::now();
@@ -2940,6 +2941,7 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "strata generate: %llu MiB of weights loaded from %s in %.1f s (%zu canonical tensors "
                          "skipped: served natively)\n",
                  (unsigned long long) (pool_bytes >> 20), o.pack.c_str(), load_s(), skip.size());
+    mem_mark("the pack weights");
 
     strata::core::NativeDense native_dense;
     if (!o.native_dense_gguf.empty()) {
@@ -4162,6 +4164,7 @@ int main(int argc, char** argv) {
                          (unsigned long long) ple_table.rows(), o.ple_gguf.c_str());
         }
     }
+    mem_mark("the session (KV, GDN state, PLE history)");
     for (size_t i = 0; i < stages.size(); ++i) {
         GpuStage& st = *stages[i];
         const strata::core::OnDevice on(st.dev);
@@ -4392,6 +4395,7 @@ int main(int argc, char** argv) {
                      std::chrono::duration<double>(std::chrono::steady_clock::now() - head_t0).count());
     }
     std::vector<float> logits((size_t) n_vocab);
+    mem_mark("the native head");
     float* d_logits = nullptr;
     if (cudaMalloc(&d_logits, (size_t) n_vocab * 4) != cudaSuccess) {
         (void) cudaGetLastError();
