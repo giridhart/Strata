@@ -394,9 +394,7 @@ void test_pin_pacing() {
     require(page_cache_hint(info).find("drop_caches") != std::string::npos &&
             page_cache_hint(info).find("STRATA_DROP_CACHE_ON_EXIT") != std::string::npos &&
             page_cache_hint(info).find("52.0 GiB") != std::string::npos, "the cache hint is incomplete");
-    require(page_cache_hint("MemFree: 100 kB
-Cached: 1000 kB
-").empty(), "a small cache was reported");
+    require(page_cache_hint("MemFree: 100 kB\nCached: 1000 kB\n").empty(), "a small cache was reported");
 }
 
 void test_resident_memory_budget() {
