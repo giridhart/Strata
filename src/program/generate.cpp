@@ -2693,11 +2693,9 @@ int main(int argc, char** argv) {
             o.pcie_frac = pcie_frac_for_gbps(bw, base);
             std::fprintf(stderr, "strata generate: PCIe probe: %.1f GB/s host->device (best of %s) -> pcie_frac %.2f "
                                  "(default %.2f)\n", bw, bursts.c_str(), o.pcie_frac, base);
-#if !defined(STRATA_USE_HIP)
             const char* pfd = std::getenv("STRATA_PCIE_FRAC_DEFAULT");
-            o.pcie_frac_auto = o.layer_split.empty() && !(pfd != nullptr && std::strcmp(pfd, "old") == 0);
+            o.pcie_frac_auto = o.layer_split.empty() && decode_defaults_arch_ok() && !(pfd != nullptr && std::strcmp(pfd, "old") == 0);
             o.pcie_probe_gbps = bw;
-#endif
         } else {
             o.pcie_frac = base;
             std::fprintf(stderr, "strata generate: PCIe probe failed -> pcie_frac default %.2f\n", base);
