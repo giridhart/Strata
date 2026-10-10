@@ -58,6 +58,7 @@ LONG_MAX_TOKENS = 24
 AGENT_MAX_TOKENS = 64
 AGENT_TURNS = 5
 AGENT_WORDS = 1500
+AGENT_MIN_CONTEXT = 10240      # the last turn of the session holds about 10K tokens
 BURST_MAX_TOKENS = 128
 
 
@@ -337,6 +338,10 @@ class Suite:
         return turns
 
     def run_agent(self):
+        if self.ctx and self.ctx < AGENT_MIN_CONTEXT:
+            self.out["skipped"]["agent"] = f"context {self.ctx} is below ~10K"
+            self.log(f"agent: skipped: context {self.ctx} is below ~10K")
+            return
         self.log(f"agent: a session of {AGENT_TURNS + 1} turns with four tools, x {self.runs} runs")
         sessions = []
         for run in range(self.runs):
@@ -575,6 +580,7 @@ def collect_machine(base: str, key: str, cfg: dict | None) -> dict:
     n_ctx = None
     for d in models.get("data") or []:
         n_ctx = (d.get("meta") or {}).get("n_ctx") or n_ctx
+    n_ctx = n_ctx or (props.get("default_generation_settings") or {}).get("n_ctx")
     return {
         "gpu": gpu_names, "gpu_vram_mib": vram_mib, "gpu_driver": (local["gpus"][0].get("driver") if local["gpus"] else local.get("rocm_driver")),
         "cuda": local.get("cuda"), "cpu": static.get("cpu_name") or cpu_name(), "cpu_cores": static.get("cores"),

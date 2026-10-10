@@ -147,7 +147,14 @@ class SuiteTests(unittest.TestCase):
         self.srv.ctx = 8192
         out = self.suite(ctx=8192, runs=1, want_long=True).run()
         self.assertIn("4K", out["prompts"])
-        self.assertEqual(set(out["skipped"]), {"16K", "32K"})
+        self.assertEqual(set(out["skipped"]), {"16K", "32K", "agent"})
+        self.assertIn("below ~10K", out["skipped"]["agent"])
+        self.assertEqual(out["agent"], {})                                  # no request was sent for the agent session
+
+    def test_agent_runs_when_the_context_fits_it(self):
+        out = self.suite(ctx=16384, runs=1).run()
+        self.assertNotIn("agent", out["skipped"])
+        self.assertTrue(out["agent"]["sessions"])
 
     def test_failures_are_reported_not_hidden(self):
         self.srv.fail_after = 3                  # warm-up and calibration succeed, then every request fails
