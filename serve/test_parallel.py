@@ -570,6 +570,26 @@ class ParallelService(unittest.TestCase):
         self.assertEqual(u["input_tokens"] + u["cache_read_input_tokens"], prompt, u)
         self.assertEqual(u["cache_read_input_tokens"], 3, u)    # the first read's reuse, not the continuation's
 
+    def test_a_slot_request_ended_by_its_stop_token_reports_the_slot_leg(self):
+        """#1869: the consumer leaves at the stop token, before the BDONE: the request kept the admission's one token and
+        its few ms.  Its figures are the slot leg's now (finish=stop was the broken case, finish=length read the BDONE)."""
+        import serve.server as server
+        self.start(2, slot_cache=True, reuse=True, more=("--readfield",))
+        res = {}
+        with mock.patch.object(server, "EOS_IDS", {257}):          # the fake engine's stop token
+            a = threading.Thread(target=lambda: res.setdefault("a", self.chat("List three primes please", 200)))
+            b = threading.Thread(target=lambda: res.setdefault("b", self.chat("Name two rivers in Germany", 200)))
+            a.start(); b.start(); a.join(30); b.join(30)
+        self.assertEqual(len(self.svc.history), 2)
+        for h in self.svc.history:
+            self.assertEqual(h["engine_generated"], h["output_tokens"], h)
+            self.assertGreaterEqual(h["decode_ms"], 1.0, h)
+        for r in res.values():
+            t = r["timings"]
+            self.assertEqual(t["prompt_n"] + t["cache_n"], r["usage"]["prompt_tokens"], t)
+            self.assertEqual(t["predicted_n"], 10, t)
+        self.assertFalse(any(self.engine.slot_busy))                 # the slots are free (no BDONE left for a wait)
+
     def test_a_request_moved_between_solo_and_slot_keeps_its_totals(self):
         """#1869/#1870: a request that read its prompt and decoded on the solo path, was STOPped when another arrived and
         went on in a slot (its admission copies the held prefix: prompt_read 1, one token) reports the prompt it read and
