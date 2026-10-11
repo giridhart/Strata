@@ -711,7 +711,15 @@ bool Verifier::record_window(int T, sycl::queue* cs, std::string& err) try {
                 if (!native_of(wq, v.name("attn_q.weight"), err) || !native_of(wk, v.name("attn_k.weight"), err) ||
                     !native_of(wv, v.name("attn_v.weight"), err) || !native_of(wo, v.name("attn_output.weight"), err))
                     return false;
+                // #783 PR-f (stuchapin909): the per-head RMSNorm and the rope in one launch, bit-identical to the pair
+                // (rope_parity check 6); STRATA_NO_NORM_ROPE=1 keeps the two; off on HIP until its parity check passes
+                const bool fuse_nr = native_qsa_enabled() && native_rope_enabled() && native_norm_rope_usable((int)HD, (int)s.n_rot);
                 auto norm_rope = [&](float* data, const WeightRef* norm, int rows, int cols, const int32_t* pos) {
+                    if (fuse_nr && native_norm_rope_usable(cols, (int)s.n_rot)) {
+                        native_qsa_rms_norm_rope(data, cols, (const float*)norm->data, data, rows, cols, (int)s.n_rot, EPS,
+                                                 rope_scaling(), pos, cs);
+                        return;
+                    }
                     if (native_qsa_enabled())
                         native_qsa_rms_norm_weighted(data, (const float*)norm->data, data, cols, rows, EPS, cs);
                     else
@@ -776,16 +784,22 @@ bool Verifier::record_window(int T, sycl::queue* cs, std::string& err) try {
                 native_mmvq(wq->native_type, wq->native_data, xq_, qfull_ + tb * NH * 2 * HD, (int)N,
                             (int)(NH * 2 * HD), n, cs);
                 if (qb) {
-                    float* dst_p = qcur_ + tb * NH * HD;
-                    const float* src_p = qfull_ + tb * NH * 2 * HD;
-                    const size_t total_rows = (size_t)(n * NH);
-                    const size_t hd_elems = (size_t)HD;
-                    cs->parallel_for(sycl::range<2>(total_rows, hd_elems), [=](sycl::id<2> id) {
-                        size_t r = id[0];
-                        size_t c = id[1];
-                        dst_p[r * hd_elems + c] = src_p[r * (hd_elems * 2) + c];
-                    });
-                    norm_rope(qcur_ + tb * NH * HD, wqn, (int)(n * NH), (int)HD, pos_ + tb * NH);
+                    if (fuse_nr) {   // the q/gate split reads q straight out of the q|gate rows (stride 2 * HD)
+                        native_qsa_rms_norm_rope(qfull_ + tb * NH * 2 * HD, (int)(2 * HD), (const float*)wqn->data,
+                                                 qcur_ + tb * NH * HD, (int)(n * NH), (int)HD, (int)s.n_rot, EPS,
+                                                 rope_scaling(), pos_ + tb * NH, cs);
+                    } else {
+                        float* dst_p = qcur_ + tb * NH * HD;
+                        const float* src_p = qfull_ + tb * NH * 2 * HD;
+                        const size_t total_rows = (size_t)(n * NH);
+                        const size_t hd_elems = (size_t)HD;
+                        cs->parallel_for(sycl::range<2>(total_rows, hd_elems), [=](sycl::id<2> id) {
+                            size_t r = id[0];
+                            size_t c = id[1];
+                            dst_p[r * hd_elems + c] = src_p[r * (hd_elems * 2) + c];
+                        });
+                        norm_rope(qcur_ + tb * NH * HD, wqn, (int)(n * NH), (int)HD, pos_ + tb * NH);
+                    }
                     if (st.kv_rot)
                         fwht256_inplace_cuda(qcur_ + tb * NH * HD, (int64_t)n * NH, cs);  // <Hq, Hk> = <q, k>
                     bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*)wiq->data, qidx_ + tb * IQ * ID,
@@ -794,15 +808,20 @@ bool Verifier::record_window(int T, sycl::queue* cs, std::string& err) try {
                 } else {
                     for (int t = tb; t < te; ++t) {
                         float* qc = qcur_ + t * NH * HD;
-                        const float* src_p = qfull_ + t * NH * 2 * HD;
-                        const size_t total_rows = (size_t)NH;
-                        const size_t hd_elems = (size_t)HD;
-                        cs->parallel_for(sycl::range<2>(total_rows, hd_elems), [=](sycl::id<2> id) {
-                            size_t r = id[0];
-                            size_t c = id[1];
-                            qc[r * hd_elems + c] = src_p[r * (hd_elems * 2) + c];
-                        });
-                        norm_rope(qc, wqn, (int)NH, (int)HD, pos_ + t * NH);
+                        if (fuse_nr) {
+                            native_qsa_rms_norm_rope(qfull_ + t * NH * 2 * HD, (int)(2 * HD), (const float*)wqn->data, qc,
+                                                     (int)NH, (int)HD, (int)s.n_rot, EPS, rope_scaling(), pos_ + t * NH, cs);
+                        } else {
+                            const float* src_p = qfull_ + t * NH * 2 * HD;
+                            const size_t total_rows = (size_t)NH;
+                            const size_t hd_elems = (size_t)HD;
+                            cs->parallel_for(sycl::range<2>(total_rows, hd_elems), [=](sycl::id<2> id) {
+                                size_t r = id[0];
+                                size_t c = id[1];
+                                qc[r * hd_elems + c] = src_p[r * (hd_elems * 2) + c];
+                            });
+                            norm_rope(qc, wqn, (int)NH, (int)HD, pos_ + t * NH);
+                        }
                         if (st.kv_rot) fwht256_inplace_cuda(qc, NH, cs);  // <Hq, Hk> = <q, k>
                     }
                     for (int t = tb; t < te; ++t) {

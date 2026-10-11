@@ -16,7 +16,10 @@
 #include <sycl/sycl.hpp>
 
 #include "strata/core/sycl_arch.hpp"
+#include "strata/kernels/native_qsa.hpp"
+#include "strata/kernels/native_rope.hpp"
 
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -137,5 +140,116 @@ static void BM_Xe2_Speculative_Verify_Step(benchmark::State& state) {
 
 // Register Sweep across Speculative Draft Candidates B = 1, 2, 3, 4, 5, 8
 BENCHMARK(BM_Xe2_Speculative_Verify_Step)->Arg(1)->Arg(2)->Arg(3)->Arg(4)->Arg(5)->Arg(8)->UseManualTime();
+
+// ============================================================================
+// Benchmark: BM_Xe2_Fused_RMSNorm_RoPE vs BM_Xe2_Unfused_RMSNorm_RoPE
+// ============================================================================
+
+static void BM_Xe2_Unfused_RMSNorm_RoPE(benchmark::State& state) {
+    const int B = state.range(0);
+    const int NH = 16;
+    const int HD = 128;
+    const int N_ROT = 64;
+    const int rows = B * NH;
+
+    sycl::queue q{sycl::default_selector_v, {sycl::property::queue::in_order(), sycl::property::queue::enable_profiling()}};
+
+    auto* d_in       = sycl::malloc_device<float>(rows * 2 * HD, q);
+    auto* d_gamma    = sycl::malloc_device<float>(HD, q);
+    auto* d_norm_out = sycl::malloc_device<float>(rows * HD, q);
+    auto* d_out      = sycl::malloc_device<float>(rows * HD, q);
+    auto* d_pos      = sycl::malloc_device<int32_t>(rows, q);
+
+    q.fill(d_in, 0.5f, rows * 2 * HD);
+    q.fill(d_gamma, 1.0f, HD);
+    std::vector<int32_t> h_pos(rows);
+    for (int i = 0; i < rows; ++i) h_pos[i] = i;
+    q.memcpy(d_pos, h_pos.data(), rows * sizeof(int32_t)).wait();
+
+    strata::kernels::RopeScaling scaling{};
+
+    // Warmup
+    for (int w = 0; w < 3; ++w) {
+        q.parallel_for(sycl::range<2>(rows, HD), [=](sycl::id<2> id) {
+            d_norm_out[id[0] * HD + id[1]] = d_in[id[0] * 2 * HD + id[1]];
+        });
+        strata::kernels::native_qsa_rms_norm_weighted(d_norm_out, d_gamma, d_norm_out, HD, rows, 1e-6f, &q);
+        strata::kernels::native_rope_apply(d_norm_out, d_out, rows, HD, N_ROT, scaling, d_pos, &q);
+        q.wait();
+    }
+
+    for (auto _ : state) {
+        auto t0 = std::chrono::steady_clock::now();
+        q.parallel_for(sycl::range<2>(rows, HD), [=](sycl::id<2> id) {
+            d_norm_out[id[0] * HD + id[1]] = d_in[id[0] * 2 * HD + id[1]];
+        });
+        strata::kernels::native_qsa_rms_norm_weighted(d_norm_out, d_gamma, d_norm_out, HD, rows, 1e-6f, &q);
+        strata::kernels::native_rope_apply(d_norm_out, d_out, rows, HD, N_ROT, scaling, d_pos, &q);
+        q.wait();
+        auto t1 = std::chrono::steady_clock::now();
+        state.SetIterationTime(std::chrono::duration<double>(t1 - t0).count());
+    }
+
+    state.counters["Batch_B"] = benchmark::Counter((double)B);
+    state.counters["Rows"]    = benchmark::Counter((double)rows);
+    state.counters["tokens_per_sec"] = benchmark::Counter((double)B, benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
+
+    sycl::free(d_in, q);
+    sycl::free(d_gamma, q);
+    sycl::free(d_norm_out, q);
+    sycl::free(d_out, q);
+    sycl::free(d_pos, q);
+}
+
+static void BM_Xe2_Fused_RMSNorm_RoPE(benchmark::State& state) {
+    const int B = state.range(0);
+    const int NH = 16;
+    const int HD = 128;
+    const int N_ROT = 64;
+    const int rows = B * NH;
+
+    sycl::queue q{sycl::default_selector_v, {sycl::property::queue::in_order(), sycl::property::queue::enable_profiling()}};
+
+    auto* d_in       = sycl::malloc_device<float>(rows * 2 * HD, q);
+    auto* d_gamma    = sycl::malloc_device<float>(HD, q);
+    auto* d_out      = sycl::malloc_device<float>(rows * HD, q);
+    auto* d_pos      = sycl::malloc_device<int32_t>(rows, q);
+
+    q.fill(d_in, 0.5f, rows * 2 * HD);
+    q.fill(d_gamma, 1.0f, HD);
+    std::vector<int32_t> h_pos(rows);
+    for (int i = 0; i < rows; ++i) h_pos[i] = i;
+    q.memcpy(d_pos, h_pos.data(), rows * sizeof(int32_t)).wait();
+
+    strata::kernels::RopeScaling scaling{};
+
+    // Warmup
+    for (int w = 0; w < 3; ++w) {
+        strata::kernels::native_qsa_rms_norm_rope(d_in, 2 * HD, d_gamma, d_out, rows, HD, N_ROT, 1e-6f,
+                                                  scaling, d_pos, &q);
+        q.wait();
+    }
+
+    for (auto _ : state) {
+        auto t0 = std::chrono::steady_clock::now();
+        strata::kernels::native_qsa_rms_norm_rope(d_in, 2 * HD, d_gamma, d_out, rows, HD, N_ROT, 1e-6f,
+                                                  scaling, d_pos, &q);
+        q.wait();
+        auto t1 = std::chrono::steady_clock::now();
+        state.SetIterationTime(std::chrono::duration<double>(t1 - t0).count());
+    }
+
+    state.counters["Batch_B"] = benchmark::Counter((double)B);
+    state.counters["Rows"]    = benchmark::Counter((double)rows);
+    state.counters["tokens_per_sec"] = benchmark::Counter((double)B, benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
+
+    sycl::free(d_in, q);
+    sycl::free(d_gamma, q);
+    sycl::free(d_out, q);
+    sycl::free(d_pos, q);
+}
+
+BENCHMARK(BM_Xe2_Unfused_RMSNorm_RoPE)->Arg(1)->Arg(2)->Arg(4)->Arg(8)->UseManualTime();
+BENCHMARK(BM_Xe2_Fused_RMSNorm_RoPE)->Arg(1)->Arg(2)->Arg(4)->Arg(8)->UseManualTime();
 
 BENCHMARK_MAIN();

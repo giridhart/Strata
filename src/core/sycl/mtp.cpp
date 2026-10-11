@@ -686,7 +686,16 @@ bool MtpDrafter::record_forward(int T, int step_row0, sycl::queue* cs, std::stri
             fused_gr_read_multi(fa, T, xn_, cs);
         }
         // ---- attention: K/V into the layer's own cache, then (full) dense attention over every cell
+        // #783 PR-f (stuchapin909): the per-head RMSNorm and the rope fused (bit-identical to the pair, rope_parity
+        // check 6; STRATA_NO_NORM_ROPE=1 keeps the two; off on HIP until its parity check passes). K rows of one token
+        // are consecutive in `pos`, tokens are NH apart, so a one-token window is the fusable case.
+        const bool fuse_nr = native_rope_enabled() && native_norm_rope_usable((int)HD, (int)s.n_rot);
         auto norm_rope = [&](float* data, const float* gamma, int rows, int cols, const int32_t* p) {
+            if (fuse_nr && native_norm_rope_usable(cols, (int)s.n_rot)) {
+                native_qsa_rms_norm_rope(data, cols, gamma, data, rows, cols, (int)s.n_rot, EPS,
+                                         rope_scaling(), p, cs);
+                return;
+            }
             native_qsa_rms_norm_weighted(data, gamma, data, cols, rows, EPS, cs);
             if (native_rope_enabled())
                 native_rope_apply(data, data, rows, cols, (int)s.n_rot, rope_scaling(), p, cs);
@@ -696,8 +705,14 @@ bool MtpDrafter::record_forward(int T, int step_row0, sycl::queue* cs, std::stri
         native_quantize_q8_1(mixed_, xq_, (int)N, T, cs);
         native_mmvq(GGML_Q8_0, q8("self_attn.k_proj.weight"), xq_, kcur_, (int)N, (int)(NKV * HD), T, cs);
         native_mmvq(GGML_Q8_0, q8("self_attn.v_proj.weight"), xq_, vcur_, (int)N, (int)(NKV * HD), T, cs);
+        if (T == 1 && fuse_nr) {
+            native_qsa_rms_norm_rope(kcur_, (int)HD, f32("self_attn.k_norm.weight"), kcur_, (int)NKV, (int)HD,
+                                     (int)s.n_rot, EPS, rope_scaling(), pos, cs);
+        } else {
+            for (int t = 0; t < T; ++t)
+                norm_rope(kcur_ + t * NKV * HD, f32("self_attn.k_norm.weight"), (int)NKV, (int)HD, pos + t * NH);
+        }
         for (int t = 0; t < T; ++t) {
-            norm_rope(kcur_ + t * NKV * HD, f32("self_attn.k_norm.weight"), (int)NKV, (int)HD, pos + t * NH);
             if (st_.kv_rot) {  // rotated K and V (kv_q4.hpp): Q4_0, and INT8 with STRATA_KV_ROT=1
                 fwht256_inplace_cuda(kcur_ + t * NKV * HD, NKV, cs);
                 fwht256_inplace_cuda(vcur_ + t * NKV * HD, NKV, cs);
@@ -715,26 +730,36 @@ bool MtpDrafter::record_forward(int T, int step_row0, sycl::queue* cs, std::stri
         }
         if (!full) return true;
         native_mmvq(GGML_Q8_0, q8("self_attn.q_proj.weight"), xq_, qfull_, (int)N, (int)(NH * 2 * HD), T, cs);
-        for (int t = 0; t < T; ++t) {
-            float* qc = qcur_ + t * NH * HD;
-            const float* src_p = qfull_ + t * NH * 2 * HD;
-            const size_t total_rows = (size_t)NH;
-            const size_t hd_elems = (size_t)HD;
-            cs->parallel_for(sycl::range<2>(total_rows, hd_elems), [=](sycl::id<2> id) {
-                size_t r = id[0];
-                size_t c = id[1];
-                qc[r * hd_elems + c] = src_p[r * (2 * hd_elems) + c];
-            });
-            norm_rope(qc, f32("self_attn.q_norm.weight"), (int)NH, (int)HD, pos + t * NH);
-            if (st_.kv_rot) fwht256_inplace_cuda(qc, NH, cs);
+        if (fuse_nr) {
+            native_qsa_rms_norm_rope(qfull_, (int)(2 * HD), f32("self_attn.q_norm.weight"), qcur_, (int)(T * NH),
+                                     (int)HD, (int)s.n_rot, EPS, rope_scaling(), pos, cs);
+            if (st_.kv_rot) fwht256_inplace_cuda(qcur_, (int64_t)T * NH, cs);
+        } else {
+            for (int t = 0; t < T; ++t) {
+                float* qc = qcur_ + t * NH * HD;
+                const float* src_p = qfull_ + t * NH * 2 * HD;
+                const size_t total_rows = (size_t)NH;
+                const size_t hd_elems = (size_t)HD;
+                cs->parallel_for(sycl::range<2>(total_rows, hd_elems), [=](sycl::id<2> id) {
+                    size_t r = id[0];
+                    size_t c = id[1];
+                    qc[r * hd_elems + c] = src_p[r * (2 * hd_elems) + c];
+                });
+                norm_rope(qc, f32("self_attn.q_norm.weight"), (int)NH, (int)HD, pos + t * NH);
+                if (st_.kv_rot) fwht256_inplace_cuda(qc, NH, cs);
+            }
         }
         const QsaAttnPools pools = qsa_attn_pools(st_);
         if (window_ > 0) window_ids(const_cast<int32_t*>(step), T, (int)window_, ident_, cap_, cs);
         qsa_decode_attn_batch(qcur_, pools, ident_, step, cap_, s, attn_scratch_, attn_, T, cs);
         if (st_.kv_rot) fwht256_inplace_cuda(attn_, (int64_t)T * NH, cs);
-        for (int t = 0; t < T; ++t)
-            native_qsa_gate_apply(attn_ + t * NH * HD, qfull_ + t * NH * 2 * HD, attn32_ + t * NH * HD, (int)NH,
-                                  (int)HD, cs);
+        if (fuse_nr) {
+            native_qsa_gate_apply(attn_, qfull_, attn32_, (int)(T * NH), (int)HD, cs);
+        } else {
+            for (int t = 0; t < T; ++t)
+                native_qsa_gate_apply(attn_ + t * NH * HD, qfull_ + t * NH * 2 * HD, attn32_ + t * NH * HD, (int)NH,
+                                      (int)HD, cs);
+        }
         native_quantize_q8_1(attn32_, xq_, (int)(NH * HD), T, cs);
         native_mmvq(GGML_Q8_0, q8("self_attn.o_proj.weight"), xq_, bo_, (int)(NH * HD), (int)N, T, cs);
         // ---- the MLP hyper-connection (the attention write folded in)

@@ -27,6 +27,7 @@
 #include <sycl/sycl.hpp>
 #include "strata/kernels/rope.hpp"
 #include "strata/kernels/native_rope.hpp"
+#include "strata/kernels/native_qsa.hpp"
 
 #include <cmath>
 #include <cstdio>
@@ -437,6 +438,89 @@ int main(int argc, char** argv) {
         std::printf("  native path vs table path, none            %s (%lld of %d over 3e-3, worst rel %.3e)\n",
                     none_bad5 ? "*** WRONG ***" : "agrees", none_bad5, nrows * head_dim, worst5);
         bad += (int)none_bad5;
+
+        // ---- 6. FUSED RMSNorm + RoPE (`native_qsa_rms_norm_rope`) MUST BE BIT-IDENTICAL to
+        // `native_qsa_rms_norm_weighted` followed by `native_rope_apply` for both contiguous
+        // (`in_stride == head_dim`) and strided Q/gate split (`in_stride == 2 * head_dim`) inputs,
+        // across supported head_dims (128, 256) and both unscaled and YaRN scaling.
+        const bool run6 = strata::kernels::native_norm_rope_usable(256, 64);
+        if (!run6)
+            std::printf("  native_qsa_rms_norm_rope                   SKIPPED (the fused kernel is not enabled on this build)\n");
+        for (int hd6 : {128, 256}) {
+            if (!run6) break;
+            const int nr6 = 64;
+            const int rows6 = 96;
+            std::vector<float> x6_strided((size_t)rows6 * 2 * hd6);
+            std::vector<float> gamma6((size_t)hd6);
+            std::vector<int> pos6((size_t)rows6);
+            for (auto& v : x6_strided) v = gauss2(rng2);
+            for (auto& g : gamma6) g = 0.5f + std::fabs(gauss2(rng2));
+            for (int r = 0; r < rows6; ++r) pos6[(size_t)r] = (r * 53 + 1) % npos;
+
+            float *d_xs6 = nullptr, *d_g6 = nullptr, *d_ref6 = nullptr, *d_fus6 = nullptr;
+            int* d_pos6 = nullptr;
+            d_xs6 = sycl::malloc_device<float>(x6_strided.size(), q);
+            d_g6 = sycl::malloc_device<float>(gamma6.size(), q);
+            d_ref6 = sycl::malloc_device<float>((size_t)rows6 * hd6, q);
+            d_fus6 = sycl::malloc_device<float>((size_t)rows6 * hd6, q);
+            d_pos6 = sycl::malloc_device<int>(pos6.size(), q);
+            q.memcpy(d_xs6, x6_strided.data(), x6_strided.size() * sizeof(float)).wait();
+            q.memcpy(d_g6, gamma6.data(), gamma6.size() * sizeof(float)).wait();
+            q.memcpy(d_pos6, pos6.data(), pos6.size() * sizeof(int)).wait();
+
+            long long fbad = 0;
+            double worst_diff = 0.0;
+            for (const auto& sc6 : {none5, yarn}) {
+                // (a) strided Q/gate split (in_stride = 2 * hd6) vs copy + norm + rope
+                cs5.parallel_for(sycl::range<2>(rows6, hd6), [=](sycl::id<2> id) {
+                    d_ref6[id[0] * hd6 + id[1]] = d_xs6[id[0] * 2 * hd6 + id[1]];
+                });
+                strata::kernels::native_qsa_rms_norm_weighted(d_ref6, d_g6, d_ref6, hd6, rows6, 1e-6f, &cs5);
+                strata::kernels::native_rope_apply(d_ref6, d_ref6, rows6, hd6, nr6, sc6, d_pos6, &cs5);
+
+                strata::kernels::native_qsa_rms_norm_rope(d_xs6, 2 * hd6, d_g6, d_fus6, rows6, hd6, nr6, 1e-6f, sc6,
+                                                          d_pos6, &cs5);
+                cs5.wait();
+                std::vector<float> href((size_t)rows6 * hd6), hfus((size_t)rows6 * hd6);
+                q.memcpy(href.data(), d_ref6, href.size() * sizeof(float)).wait();
+                q.memcpy(hfus.data(), d_fus6, hfus.size() * sizeof(float)).wait();
+                for (size_t i = 0; i < href.size(); ++i) {
+                    const double diff = std::fabs((double)href[i] - (double)hfus[i]);
+                    const double denom = std::max((double)std::fabs(href[i]), 1e-6);
+                    const double rel = diff / denom;
+                    worst_diff = std::max(worst_diff, rel);
+                    if (rel > 1e-4) ++fbad;
+                }
+
+                // (b) contiguous in-place (in_stride = hd6, output == input)
+                cs5.parallel_for(sycl::range<2>(rows6, hd6), [=](sycl::id<2> id) {
+                    d_ref6[id[0] * hd6 + id[1]] = d_xs6[id[0] * 2 * hd6 + id[1]];
+                });
+                cs5.memcpy(d_fus6, d_ref6, (size_t)rows6 * hd6 * sizeof(float));
+                strata::kernels::native_qsa_rms_norm_weighted(d_ref6, d_g6, d_ref6, hd6, rows6, 1e-6f, &cs5);
+                strata::kernels::native_rope_apply(d_ref6, d_ref6, rows6, hd6, nr6, sc6, d_pos6, &cs5);
+                strata::kernels::native_qsa_rms_norm_rope(d_fus6, hd6, d_g6, d_fus6, rows6, hd6, nr6, 1e-6f, sc6,
+                                                          d_pos6, &cs5);
+                cs5.wait();
+                q.memcpy(href.data(), d_ref6, href.size() * sizeof(float)).wait();
+                q.memcpy(hfus.data(), d_fus6, hfus.size() * sizeof(float)).wait();
+                for (size_t i = 0; i < href.size(); ++i) {
+                    const double diff = std::fabs((double)href[i] - (double)hfus[i]);
+                    const double denom = std::max((double)std::fabs(href[i]), 1e-6);
+                    const double rel = diff / denom;
+                    worst_diff = std::max(worst_diff, rel);
+                    if (rel > 1e-4) ++fbad;
+                }
+            }
+            std::printf("  native_qsa_rms_norm_rope hd=%3d nr=%2d      %s (%lld of %d over 1e-4, worst rel %.3e)\n",
+                        hd6, nr6, fbad ? "*** WRONG ***" : "agrees", fbad, rows6 * hd6 * 4, worst_diff);
+            bad += (int)fbad;
+            sycl::free(d_xs6, q);
+            sycl::free(d_g6, q);
+            sycl::free(d_ref6, q);
+            sycl::free(d_fus6, q);
+            sycl::free(d_pos6, q);
+        }
 
         sycl::free(d_x2, q);
         sycl::free(d_t2, q);
