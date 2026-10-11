@@ -1193,6 +1193,23 @@ void copy_or_zero_from_mapped(float* dst, const float* src, long long n, const u
     check("copy_or_zero_from_mapped");
 }
 
+namespace {
+__global__ void wait_copy_i32_kernel(const volatile uint32_t* flag, uint32_t value, int32_t* __restrict__ dst,
+                                     const volatile int32_t* src, int n) {
+    if (threadIdx.x == 0) {
+        while (*flag < value) strata_spin_pause();
+        __threadfence_system();
+    }
+    __syncthreads();
+    for (int i = threadIdx.x; i < n; i += blockDim.x) dst[i] = src[i];
+}
+}  // namespace
+void wait_copy_i32_from_mapped(const uint32_t* flag, uint32_t value, int32_t* dst, const int32_t* src, int64_t n,
+                               void* stream) {
+    wait_copy_i32_kernel<<<1, 128, 0, (cudaStream_t) stream>>>(flag, value, dst, src, (int) n);
+    check("wait_copy_i32_from_mapped");
+}
+
 void wait_flag_ge(const uint32_t* flag, uint32_t value, void* stream) {
     wait_flag_ge_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(flag, value);
     check("wait_flag_ge");
@@ -1239,6 +1256,10 @@ __global__ void gpu_stamp_kernel(unsigned long long* buf, int i) {
     buf[i] = t;
 }
 }  // namespace
+namespace {
+__global__ void noop_kernel() {}
+}  // namespace
+void gpu_noop(void* stream) { noop_kernel<<<1, 32, 0, (cudaStream_t) stream>>>(); }
 void gpu_stamp(unsigned long long* buf, int i, void* stream) {
     if (pdl_scope()) launch_pdl(gpu_stamp_kernel<true>, dim3(1), dim3(1), 0, (cudaStream_t) stream, buf, i);
     else gpu_stamp_kernel<false><<<1, 1, 0, (cudaStream_t) stream>>>(buf, i);

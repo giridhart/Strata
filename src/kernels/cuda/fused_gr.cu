@@ -4,6 +4,7 @@
 #include "strata/kernels/fused_gr.hpp"
 #include "strata/kernels/bf16_bits.hpp"
 #include "strata/kernels/verify_kernels.hpp"
+#include "strata/kernels/gfx_arch.hpp"
 #include "s26_tsum.cuh"
 
 #include <cuda_fp16.h>
@@ -618,6 +619,66 @@ __global__ void __launch_bounds__(THREADS) gr_norm_split_kernel(GrMulti m) {
     for (int d = t; d < N; d += THREADS) xn[c * N + d] *= rs;
 }
 
+// 143-amdk: gr_norm_split_kernel with the loads of a thread's (at most three) float4 issued together and the scaled
+// product written once from registers.  The same elements go through the same operations in the same order (the
+// thread's own sum of squares ascends in k; the warp sum, part[] sum and rsqrt are the kernel's), so rs and xn are
+// bitwise the same; what goes is the loop's one-iteration-at-a-time loads and the second pass that read xn back from
+// global memory (a write, a barrier, a read: two memory latencies).
+__global__ void __launch_bounds__(THREADS) gr_norm_split_fast_kernel(GrMulti m) {
+    __shared__ float part[WARPS];
+    __shared__ float s_rs;
+    const FusedGrArgs& a = m.a[blockIdx.x];
+    const int c = blockIdx.y;
+    float* xn = m.xn + (size_t) blockIdx.x * D;
+    const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
+    const float gw = a.apply ? 2.0f * sigmoidf_(a.inj_prev[c] / (float) HC) : 0.0f;
+    // the thread's float4 of stream c: i = 4 t + 1024 k in [c N, (c + 1) N), ascending k; N / 1024 = 2.5 -> at most 3
+    constexpr int KS = 3;
+    int k0 = (c * N - 4 * t + THREADS * 4 - 1) / (THREADS * 4);
+    if (k0 < 0) k0 = 0;
+    float4 r[KS], g[KS];
+    bool ok[KS];
+#pragma unroll
+    for (int j = 0; j < KS; ++j) {
+        const int i = t * 4 + (k0 + j) * THREADS * 4;
+        ok[j] = i < (c + 1) * N;
+        if (ok[j]) {
+            r[j] = *reinterpret_cast<const float4*>(a.R + i);
+            g[j] = *reinterpret_cast<const float4*>(a.w_norm + i);
+            if (a.apply) {
+                const float4 b = *reinterpret_cast<const float4*>(a.bo_prev + (i - c * N));
+                r[j].x = fmaf(b.x, gw, r[j].x); r[j].y = fmaf(b.y, gw, r[j].y);
+                r[j].z = fmaf(b.z, gw, r[j].z); r[j].w = fmaf(b.w, gw, r[j].w);
+            }
+        }
+    }
+    float ss = 0.0f;
+#pragma unroll
+    for (int j = 0; j < KS; ++j) {
+        if (ok[j]) {
+            const float sq = r[j].x * r[j].x + r[j].y * r[j].y + r[j].z * r[j].z + r[j].w * r[j].w;
+            ss += sq;
+            r[j] = make_float4(r[j].x * g[j].x, r[j].y * g[j].y, r[j].z * g[j].z, r[j].w * g[j].w);
+        }
+    }
+    const float v = warp_sum(ss);
+    if (lane == 0) part[warp] = v;
+    __syncthreads();
+    if (t == 0) {
+        float s = 0.0f;
+        for (int w = 0; w < WARPS; ++w) s += part[w];
+        s_rs = rsqrtf(s / (float) N + a.eps);
+        a.rs[c] = s_rs;
+    }
+    __syncthreads();
+    const float rs = s_rs;
+#pragma unroll
+    for (int j = 0; j < KS; ++j)
+        if (ok[j])
+            *reinterpret_cast<float4*>(xn + t * 4 + (k0 + j) * THREADS * 4) =
+                make_float4(r[j].x * rs, r[j].y * rs, r[j].z * rs, r[j].w * rs);
+}
+
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800 && !defined(__HIPCC__)
 #define STRATA_GR_CP_ASYNC 1
 #endif
@@ -864,18 +925,41 @@ bool gr_down_max4() {
     return on;
 }
 
+// the split norm with registers (gr_norm_split_fast_kernel): gfx12 only until another arch is measured;
+// STRATA_GR_NORM_FAST=0 / 1 forces it off / on
+bool norm_fast_on() {
+#if defined(__HIPCC__)
+    static const int env = [] { const char* e = std::getenv("STRATA_GR_NORM_FAST"); return e != nullptr ? (std::atoi(e) != 0 ? 1 : 0) : -1; }();
+    if (env >= 0) return env != 0;
+    static int per_dev[64];   // 0 unknown, 1 no, 2 yes
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) return false;
+    if (!per_dev[dev]) {
+        cudaDeviceProp p;
+        per_dev[dev] = cudaGetDeviceProperties(&p, dev) == cudaSuccess && strata::kernels::gfx_arch_is_gfx12(p.gcnArchName) ? 2 : 1;
+    }
+    return per_dev[dev] == 2;
+#else
+    return false;
+#endif
+}
+
 void launch_multi(const GrMulti& m, int variant, cudaStream_t st, unsigned long long* stamp_buf, int stamp_i0) {
     const int n_tok = m.T;
 #if STRATA_GR_FAST_BUILD
     // gfx906: the latency-hidden norm/up (STRATA_GR_FAST=0: off) - the same sums in the same order as the kernels
     // they replace (gr_parity checks the multi-token read against single-token calls bitwise)
     const bool fast = gr_fast();
-    if (variant >= kHcSplit) gr_norm_split_kernel<<<dim3((unsigned) n_tok, HC), THREADS, 0, st>>>(m);
-    else if (fast) gr_norm_fast_kernel<<<n_tok, THREADS, 0, st>>>(m);
+    if (variant >= kHcSplit) {
+        if (norm_fast_on()) gr_norm_split_fast_kernel<<<dim3((unsigned) n_tok, HC), THREADS, 0, st>>>(m);
+        else gr_norm_split_kernel<<<dim3((unsigned) n_tok, HC), THREADS, 0, st>>>(m);
+    } else if (fast) gr_norm_fast_kernel<<<n_tok, THREADS, 0, st>>>(m);
     else gr_norm_multi_kernel<<<n_tok, THREADS, 0, st>>>(m);
 #else
-    if (variant >= kHcSplit) gr_norm_split_kernel<<<dim3((unsigned) n_tok, HC), THREADS, 0, st>>>(m);
-    else gr_norm_multi_kernel<<<n_tok, THREADS, 0, st>>>(m);
+    if (variant >= kHcSplit) {
+        if (norm_fast_on()) gr_norm_split_fast_kernel<<<dim3((unsigned) n_tok, HC), THREADS, 0, st>>>(m);
+        else gr_norm_split_kernel<<<dim3((unsigned) n_tok, HC), THREADS, 0, st>>>(m);
+    } else gr_norm_multi_kernel<<<n_tok, THREADS, 0, st>>>(m);
 #endif
     if (stamp_buf) gpu_stamp(stamp_buf, stamp_i0, (void*) st);
     const bool staged = variant >= kHcStaged;
