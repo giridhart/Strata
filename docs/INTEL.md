@@ -820,7 +820,7 @@ gate identical in the 32K and the 128K configuration); every one has an off swit
   sit past 4 GiB in the borrowed region (an A770 oneMKL bug that did not show on this card: off on Battlemage, `STRATA_SYCL_GEMM_STAGE=1`
   brings it back), and the lent slots were refilled by a single-threaded GGUF read (0.9 s for 930 slots, now a DMA from the pinned mirror:
   the experts in the last 10% of the cache slots are mirrored too, `STRATA_LEND_MIRROR=0` off). 4K prompt incl. the refill 7.2 -> 3.3 s,
-  1K 3.1 -> 1.6 s, 16K 25.5 -> 13.5 s, 49K 78 -> 44 s; a 684-token request through the server 2.64 -> ~1.7 s.
+  1K 3.1 -> 1.6 s, 16K 25.5 -> 13.5 s, 49K 78 -> 44 s; a 684-token request through the server 2.64 -> 1.59 s, a 3,083-token one 6.1 -> 2.95 s (the same answer).
 - **Decode: `data/expert-profile-sycl.bin`.** The shipped profile ranks the experts for a document summary; a chat, code or non-English prompt finds
   only 60% of its routed experts in the cache (85% for a summary). `tools/make_profile_mix.py` builds a ranking from several routing traces with
   every trace counting the same, `tools/collect_profile_traces.py` records them (`bench/profile_corpus.json`: 45 prompts) through the engine's
