@@ -354,7 +354,9 @@ LoadStats load_experts(const std::string& path, uint8_t* dst, uint64_t blob_byte
 }
 
 LoadStats load_experts_ranges(const std::string& path, uint8_t* dst, const std::vector<uint64_t>& layer_off,
-                              const std::vector<uint64_t>& layer_bytes, int threads, uint64_t chunk) {
+                              const std::vector<uint64_t>& layer_bytes, int threads, uint64_t chunk,
+                              const std::atomic<int>* ready) {
+    (void)ready;
     LoadStats st;
     const uint64_t layers = (uint64_t)layer_off.size();
     st.layers = layers;

@@ -41,6 +41,16 @@ bool read_expert_profile(const std::string& path, int64_t n_layers, int64_t n_ex
         return false;
     }
     const uint32_t version = hdr[0], nl = hdr[1], ne = hdr[2], want = hdr[3], n_ranked = hdr[4];
+    if (version != 1) {
+        std::fclose(f);
+        char buf[256];
+        std::snprintf(buf, sizeof buf,
+                      "read_expert_profile: %s is a version %u profile but this engine reads version 1 - it was "
+                      "written by a different release's tools/make_profile.py or --expert-profile-save",
+                      path.c_str(), version);
+        err = buf;
+        return false;
+    }
     if ((int64_t)nl != n_layers || (int64_t)ne != n_expert) {
         std::fclose(f);
         char buf[256];
@@ -169,6 +179,8 @@ bool ExpertCache::ensure_blocking_staging(std::size_t bytes, std::string& err) {
     return true;
 }
 #endif
+
+void ExpertCache::set_vmm(bool /*enabled*/) {}
 
 bool ExpertCache::open(int64_t n_slots, int64_t n_layers, int64_t n_expert, int64_t blob_bytes, std::string& err) try {
     close();

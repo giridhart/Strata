@@ -1,4 +1,3 @@
-#ifdef SYCL_LANGUAGE_VERSION
 #pragma once
 
 #include <cstdint>
@@ -67,26 +66,9 @@ std::optional<uint64_t> available_host_bytes();
 
 std::optional<uint64_t> conversation_mem_available(std::istream& meminfo);
 
-inline bool conversation_memory_admit(std::optional<uint64_t> available,
-                                      uint64_t allocation, uint64_t floor) {
-    return available && *available >= floor && allocation <= *available - floor;
+inline std::optional<uint64_t> conversation_available_memory() {
+    return available_host_bytes();
 }
-
-} // namespace strata::core
-
-#else
-#pragma once
-
-#include <cstdint>
-#include <istream>
-#include <optional>
-
-namespace strata::core {
-
-// Host physical memory, not swap/commit or a container/job memory reservation.
-// Unknown telemetry is deliberately distinct from a measured zero.
-std::optional<uint64_t> conversation_available_memory();
-std::optional<uint64_t> conversation_mem_available(std::istream& meminfo);
 
 inline bool conversation_memory_admit(std::optional<uint64_t> available,
                                       uint64_t allocation, uint64_t floor) {
@@ -94,5 +76,3 @@ inline bool conversation_memory_admit(std::optional<uint64_t> available,
 }
 
 } // namespace strata::core
-
-#endif
