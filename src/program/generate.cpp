@@ -2721,19 +2721,35 @@ int main(int argc, char** argv) {
     // PR #44: a x8 link carries half of what the native default assumes - the GPU's SMs read that share over the
     // link (the copy kernel, since 0.1.14), so on a slower link it must shrink or the window waits for it.  The
     // real H2D bandwidth is probed once; from 20 GB/s up (x16 PCIe 4/5) the measured default stays.  The canonical
-    // pack's 0.2 was never measured against the link, so it is left alone.  `--calibrate` measures it outright.
+    // pack keeps 0.2 as its start value (0.1.43: PcieAuto refines it on CUDA).  `--calibrate` measures it outright.
     if (o.pcie_frac < 0.0) {
         const double base = native_pack ? 0.55 : 0.2;
         std::string bursts;
-        const double bw = native_pack ? probe_pcie_h2d_gbps(&bursts) : -1.0;
-        if (!native_pack) {
+        const char* pfd = std::getenv("STRATA_PCIE_FRAC_DEFAULT");
+        const bool pf_old = pfd != nullptr && std::strcmp(pfd, "old") == 0;
+#if !defined(STRATA_USE_HIP)
+        const bool pf_old_canon = pf_old;
+#else
+        const bool pf_old_canon = true;   // the canonical pack's PcieAuto is CUDA only
+#endif
+        // the canonical pack keeps its 0.2 as the START value, but is probed too (CUDA, unless
+        // STRATA_PCIE_FRAC_DEFAULT=old) so that PcieAuto can refine the share from the CPU pool's speed
+        const double bw = (native_pack || !pf_old_canon) ? probe_pcie_h2d_gbps(&bursts) : -1.0;
+        if (!native_pack && !(bw > 0.0)) {
             o.pcie_frac = base;
+        } else if (!native_pack) {
+            o.pcie_frac = base;
+            std::fprintf(stderr, "strata generate: PCIe probe: %.1f GB/s host->device (best of %s); the canonical pack "
+                                 "starts at pcie_frac %.2f and refines it from the CPU pool's speed\n", bw, bursts.c_str(), base);
+#if !defined(STRATA_USE_HIP)
+            o.pcie_frac_auto = o.layer_split.empty();
+            o.pcie_probe_gbps = bw;
+#endif
         } else if (bw > 0.0) {
             o.pcie_frac = pcie_frac_for_gbps(bw, base);
             std::fprintf(stderr, "strata generate: PCIe probe: %.1f GB/s host->device (best of %s) -> pcie_frac %.2f "
                                  "(default %.2f)\n", bw, bursts.c_str(), o.pcie_frac, base);
-            const char* pfd = std::getenv("STRATA_PCIE_FRAC_DEFAULT");
-            o.pcie_frac_auto = o.layer_split.empty() && decode_defaults_arch_ok() && !(pfd != nullptr && std::strcmp(pfd, "old") == 0);
+            o.pcie_frac_auto = o.layer_split.empty() && decode_defaults_arch_ok() && !pf_old;
             o.pcie_probe_gbps = bw;
         } else {
             o.pcie_frac = base;
@@ -8159,7 +8175,7 @@ int main(int argc, char** argv) {
         if (o.adapt_every > 0 && o.adapt_swaps > 0 && !all_experts_resident)
             drive.d.usage.assign((size_t) (g.n_layers * g.n_expert), 0.0f);
         PcieAuto pcie_auto;
-        if (o.pcie_frac_auto && native_pack && !all_experts_resident && o.batch == 0 && o.peer_device < 0 && n_stages == 1) {
+        if (o.pcie_frac_auto && !all_experts_resident && o.batch == 0 && o.peer_device < 0 && n_stages == 1) {
             const auto& pl = strata::kernels::cpu::expert_layout();
             double sum = 0.0;
             for (int64_t l = 0; l < g.n_layers; ++l) sum += (double) pl.blob_bytes(l);
