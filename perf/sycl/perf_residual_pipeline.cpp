@@ -15,7 +15,9 @@
 #include <sycl/sycl.hpp>
 
 #include "strata/core/sycl_arch.hpp"
+#include "strata/kernels/gr.hpp"
 
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -481,9 +483,280 @@ static void BM_Xe2_Residual_Layer_Chaining(benchmark::State& state) {
     sycl::free(d_weight, q);
 }
 
+// ============================================================================
+// Benchmark 4: Multi-Token Hyper-Connection GR Read (Sequential vs Batched)
+// ============================================================================
+
+static void BM_Xe2_GR_Read_Sequential(benchmark::State& state) {
+    const int B = state.range(0);
+    const int64_t hc_dim = (int64_t)HC * N_EMBD;
+    const int64_t hc_lr = 320;
+    const float eps = 1e-6f;
+    const strata::kernels::GrShapes sh{N_EMBD, HC, hc_lr};
+
+    sycl::queue q{sycl::default_selector_v,
+                 {sycl::property::queue::in_order(), sycl::property::queue::enable_profiling()}};
+
+    strata::kernels::gr_set_native_mmvf(true);
+
+    const size_t r_total = (size_t)B * hc_dim;
+    const size_t down_total = (size_t)hc_lr * hc_dim;
+    const size_t up_total = (size_t)hc_dim * hc_lr;
+    const size_t inj_total = (size_t)HC * hc_dim;
+
+    auto* d_R       = sycl::malloc_device<float>(r_total, q);
+    auto* d_wnorm   = sycl::malloc_device<float>(hc_dim, q);
+    auto* d_wdown   = sycl::malloc_device<uint16_t>(down_total, q);
+    auto* d_wup     = sycl::malloc_device<uint16_t>(up_total, q);
+    auto* d_winj    = sycl::malloc_device<uint16_t>(inj_total, q);
+    auto* d_mixed   = sycl::malloc_device<float>((size_t)B * N_EMBD, q);
+    auto* d_inject  = sycl::malloc_device<float>((size_t)B * HC, q);
+
+    void* ws_raw = sycl::malloc_device<uint8_t>(strata::kernels::gr_workspace_bytes(sh) + 64, q);
+    strata::kernels::GrWorkspace ws;
+    strata::kernels::gr_workspace_init(sh, ws_raw, ws);
+
+    q.fill(d_R, 1.0f, r_total);
+    q.fill(d_wnorm, 1.0f, hc_dim);
+    q.fill(d_wdown, (uint16_t)0x3c00, down_total);
+    q.fill(d_wup, (uint16_t)0x3c00, up_total);
+    q.fill(d_winj, (uint16_t)0x3c00, inj_total);
+    q.fill(d_mixed, 0.0f, (size_t)B * N_EMBD);
+    q.fill(d_inject, 0.0f, (size_t)B * HC).wait();
+
+    // Warmup
+    for (int w = 0; w < 3; ++w) {
+        for (int t = 0; t < B; ++t) {
+            strata::kernels::gr_read(d_R + (size_t)t * hc_dim, d_wnorm, d_wdown, d_wup, d_winj,
+                                     eps, sh, ws, d_mixed + (size_t)t * N_EMBD,
+                                     d_inject + (size_t)t * HC, &q);
+        }
+        q.wait();
+    }
+
+    for (auto _ : state) {
+        auto t0 = std::chrono::steady_clock::now();
+        for (int t = 0; t < B; ++t) {
+            strata::kernels::gr_read(d_R + (size_t)t * hc_dim, d_wnorm, d_wdown, d_wup, d_winj,
+                                     eps, sh, ws, d_mixed + (size_t)t * N_EMBD,
+                                     d_inject + (size_t)t * HC, &q);
+        }
+        q.wait();
+        auto t1 = std::chrono::steady_clock::now();
+        state.SetIterationTime(std::chrono::duration<double>(t1 - t0).count());
+    }
+
+    state.counters["Batch_B"] = benchmark::Counter((double)B);
+    state.counters["tokens_per_sec"] = benchmark::Counter((double)B, benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
+    const double bytes_transferred = (double)B * (hc_dim * sizeof(float) + N_EMBD * sizeof(float) + HC * sizeof(float))
+                                   + (hc_dim * sizeof(float) + down_total * sizeof(uint16_t) + up_total * sizeof(uint16_t) + inj_total * sizeof(uint16_t));
+    state.counters["Bandwidth_GBps"] = benchmark::Counter(bytes_transferred, benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
+
+    sycl::free(d_R, q);
+    sycl::free(d_wnorm, q);
+    sycl::free(d_wdown, q);
+    sycl::free(d_wup, q);
+    sycl::free(d_winj, q);
+    sycl::free(d_mixed, q);
+    sycl::free(d_inject, q);
+    sycl::free(ws_raw, q);
+}
+
+static void BM_Xe2_GR_Read_Batched(benchmark::State& state) {
+    const int B = state.range(0);
+    const int64_t hc_dim = (int64_t)HC * N_EMBD;
+    const int64_t hc_lr = 320;
+    const float eps = 1e-6f;
+    const strata::kernels::GrShapes sh{N_EMBD, HC, hc_lr};
+
+    sycl::queue q{sycl::default_selector_v,
+                 {sycl::property::queue::in_order(), sycl::property::queue::enable_profiling()}};
+
+    strata::kernels::gr_set_native_mmvf(true);
+
+    const size_t r_total = (size_t)B * hc_dim;
+    const size_t down_total = (size_t)hc_lr * hc_dim;
+    const size_t up_total = (size_t)hc_dim * hc_lr;
+    const size_t inj_total = (size_t)HC * hc_dim;
+
+    auto* d_R       = sycl::malloc_device<float>(r_total, q);
+    auto* d_wnorm   = sycl::malloc_device<float>(hc_dim, q);
+    auto* d_wdown   = sycl::malloc_device<uint16_t>(down_total, q);
+    auto* d_wup     = sycl::malloc_device<uint16_t>(up_total, q);
+    auto* d_winj    = sycl::malloc_device<uint16_t>(inj_total, q);
+    auto* d_mixed   = sycl::malloc_device<float>((size_t)B * N_EMBD, q);
+    auto* d_inject  = sycl::malloc_device<float>((size_t)B * HC, q);
+    auto* d_xn      = sycl::malloc_device<float>(r_total, q);
+    auto* d_lo      = sycl::malloc_device<float>((size_t)B * hc_lr, q);
+    auto* d_gated   = sycl::malloc_device<float>(r_total, q);
+
+    void* ws_raw = sycl::malloc_device<uint8_t>(strata::kernels::gr_workspace_bytes(sh) + 64, q);
+    strata::kernels::GrWorkspace ws;
+    strata::kernels::gr_workspace_init(sh, ws_raw, ws);
+
+    q.fill(d_R, 1.0f, r_total);
+    q.fill(d_wnorm, 1.0f, hc_dim);
+    q.fill(d_wdown, (uint16_t)0x3c00, down_total);
+    q.fill(d_wup, (uint16_t)0x3c00, up_total);
+    q.fill(d_winj, (uint16_t)0x3c00, inj_total);
+    q.fill(d_mixed, 0.0f, (size_t)B * N_EMBD);
+    q.fill(d_inject, 0.0f, (size_t)B * HC);
+    q.fill(d_xn, 0.0f, r_total);
+    q.fill(d_lo, 0.0f, (size_t)B * hc_lr);
+    q.fill(d_gated, 0.0f, r_total).wait();
+
+    // Warmup
+    for (int w = 0; w < 3; ++w) {
+        strata::kernels::gr_read_multi(d_R, d_wnorm, d_wdown, d_wup, d_winj, eps, sh, ws,
+                                       d_xn, d_lo, d_gated, d_mixed, d_inject, B, &q);
+        q.wait();
+    }
+
+    for (auto _ : state) {
+        auto t0 = std::chrono::steady_clock::now();
+        strata::kernels::gr_read_multi(d_R, d_wnorm, d_wdown, d_wup, d_winj, eps, sh, ws,
+                                       d_xn, d_lo, d_gated, d_mixed, d_inject, B, &q);
+        q.wait();
+        auto t1 = std::chrono::steady_clock::now();
+        state.SetIterationTime(std::chrono::duration<double>(t1 - t0).count());
+    }
+
+    state.counters["Batch_B"] = benchmark::Counter((double)B);
+    state.counters["tokens_per_sec"] = benchmark::Counter((double)B, benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
+    const double bytes_transferred = (double)B * (hc_dim * sizeof(float) + N_EMBD * sizeof(float) + HC * sizeof(float))
+                                   + (hc_dim * sizeof(float) + down_total * sizeof(uint16_t) + up_total * sizeof(uint16_t) + inj_total * sizeof(uint16_t));
+    state.counters["Bandwidth_GBps"] = benchmark::Counter(bytes_transferred, benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
+
+    sycl::free(d_R, q);
+    sycl::free(d_wnorm, q);
+    sycl::free(d_wdown, q);
+    sycl::free(d_wup, q);
+    sycl::free(d_winj, q);
+    sycl::free(d_mixed, q);
+    sycl::free(d_inject, q);
+    sycl::free(d_xn, q);
+    sycl::free(d_lo, q);
+    sycl::free(d_gated, q);
+    sycl::free(ws_raw, q);
+}
+
+// ============================================================================
+// Benchmark 5: Multi-Token Hyper-Connection GR Write (Sequential vs Batched)
+// ============================================================================
+
+static void BM_Xe2_GR_Write_Sequential(benchmark::State& state) {
+    const int B = state.range(0);
+    const int64_t hc_dim = (int64_t)HC * N_EMBD;
+    const int64_t hc_lr = 320;
+    const strata::kernels::GrShapes sh{N_EMBD, HC, hc_lr};
+
+    sycl::queue q{sycl::default_selector_v,
+                 {sycl::property::queue::in_order(), sycl::property::queue::enable_profiling()}};
+
+    strata::kernels::gr_set_native_mmvf(true);
+
+    const size_t r_total = (size_t)B * hc_dim;
+    const size_t blk_total = (size_t)B * N_EMBD;
+    const size_t inj_total = (size_t)B * HC;
+
+    auto* d_R         = sycl::malloc_device<float>(r_total, q);
+    auto* d_block_out = sycl::malloc_device<float>(blk_total, q);
+    auto* d_inject    = sycl::malloc_device<float>(inj_total, q);
+    auto* d_R_out     = sycl::malloc_device<float>(r_total, q);
+
+    q.fill(d_R, 1.0f, r_total);
+    q.fill(d_block_out, 0.5f, blk_total);
+    q.fill(d_inject, 0.1f, inj_total);
+    q.fill(d_R_out, 0.0f, r_total).wait();
+
+    // Warmup
+    for (int w = 0; w < 3; ++w) {
+        for (int t = 0; t < B; ++t) {
+            strata::kernels::gr_write(d_R + (size_t)t * hc_dim, d_block_out + (size_t)t * N_EMBD,
+                                      d_inject + (size_t)t * HC, sh, d_R_out + (size_t)t * hc_dim, &q);
+        }
+        q.wait();
+    }
+
+    for (auto _ : state) {
+        auto t0 = std::chrono::steady_clock::now();
+        for (int t = 0; t < B; ++t) {
+            strata::kernels::gr_write(d_R + (size_t)t * hc_dim, d_block_out + (size_t)t * N_EMBD,
+                                      d_inject + (size_t)t * HC, sh, d_R_out + (size_t)t * hc_dim, &q);
+        }
+        q.wait();
+        auto t1 = std::chrono::steady_clock::now();
+        state.SetIterationTime(std::chrono::duration<double>(t1 - t0).count());
+    }
+
+    state.counters["Batch_B"] = benchmark::Counter((double)B);
+    state.counters["tokens_per_sec"] = benchmark::Counter((double)B, benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
+    const double bytes_transferred = (double)B * (2 * hc_dim * sizeof(float) + N_EMBD * sizeof(float) + HC * sizeof(float));
+    state.counters["Bandwidth_GBps"] = benchmark::Counter(bytes_transferred, benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
+
+    sycl::free(d_R, q);
+    sycl::free(d_block_out, q);
+    sycl::free(d_inject, q);
+    sycl::free(d_R_out, q);
+}
+
+static void BM_Xe2_GR_Write_Batched(benchmark::State& state) {
+    const int B = state.range(0);
+    const int64_t hc_dim = (int64_t)HC * N_EMBD;
+    const int64_t hc_lr = 320;
+    const strata::kernels::GrShapes sh{N_EMBD, HC, hc_lr};
+
+    sycl::queue q{sycl::default_selector_v,
+                 {sycl::property::queue::in_order(), sycl::property::queue::enable_profiling()}};
+
+    strata::kernels::gr_set_native_mmvf(true);
+
+    const size_t r_total = (size_t)B * hc_dim;
+    const size_t blk_total = (size_t)B * N_EMBD;
+    const size_t inj_total = (size_t)B * HC;
+
+    auto* d_R         = sycl::malloc_device<float>(r_total, q);
+    auto* d_block_out = sycl::malloc_device<float>(blk_total, q);
+    auto* d_inject    = sycl::malloc_device<float>(inj_total, q);
+    auto* d_R_out     = sycl::malloc_device<float>(r_total, q);
+
+    q.fill(d_R, 1.0f, r_total);
+    q.fill(d_block_out, 0.5f, blk_total);
+    q.fill(d_inject, 0.1f, inj_total);
+    q.fill(d_R_out, 0.0f, r_total).wait();
+
+    // Warmup
+    for (int w = 0; w < 3; ++w) {
+        strata::kernels::gr_write_multi(d_R, d_block_out, d_inject, sh, d_R_out, B, &q);
+        q.wait();
+    }
+
+    for (auto _ : state) {
+        auto t0 = std::chrono::steady_clock::now();
+        strata::kernels::gr_write_multi(d_R, d_block_out, d_inject, sh, d_R_out, B, &q);
+        q.wait();
+        auto t1 = std::chrono::steady_clock::now();
+        state.SetIterationTime(std::chrono::duration<double>(t1 - t0).count());
+    }
+
+    state.counters["Batch_B"] = benchmark::Counter((double)B);
+    state.counters["tokens_per_sec"] = benchmark::Counter((double)B, benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
+    const double bytes_transferred = (double)B * (2 * hc_dim * sizeof(float) + N_EMBD * sizeof(float) + HC * sizeof(float));
+    state.counters["Bandwidth_GBps"] = benchmark::Counter(bytes_transferred, benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
+
+    sycl::free(d_R, q);
+    sycl::free(d_block_out, q);
+    sycl::free(d_inject, q);
+    sycl::free(d_R_out, q);
+}
+
 // Register Benchmarks
 BENCHMARK(BM_Xe2_Residual_Unfused)->UseManualTime();
 BENCHMARK(BM_Xe2_Residual_Fused)->UseManualTime();
 BENCHMARK(BM_Xe2_Residual_Layer_Chaining)->RangeMultiplier(2)->Range(1, 8)->UseManualTime();
+BENCHMARK(BM_Xe2_GR_Read_Sequential)->Arg(1)->Arg(2)->Arg(4)->Arg(8)->UseManualTime();
+BENCHMARK(BM_Xe2_GR_Read_Batched)->Arg(1)->Arg(2)->Arg(4)->Arg(8)->UseManualTime();
+BENCHMARK(BM_Xe2_GR_Write_Sequential)->Arg(1)->Arg(2)->Arg(4)->Arg(8)->UseManualTime();
+BENCHMARK(BM_Xe2_GR_Write_Batched)->Arg(1)->Arg(2)->Arg(4)->Arg(8)->UseManualTime();
 
 BENCHMARK_MAIN();
