@@ -1,0 +1,71 @@
+name: Build Strata (Intel Arc B580 / Xe2)
+
+on:
+  push:
+    branches:
+      - main
+      - sycl-b580
+  pull_request:
+    branches:
+      - main
+      - sycl-b580
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build & Verify SYCL for Intel Arc B580 (Xe2)
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            cmake \
+            ninja-build \
+            pkg-config \
+            ca-certificates \
+            curl \
+            gpg \
+            wget
+
+      - name: Add Intel oneAPI repository
+        run: |
+          wget -qO- https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB | gpg --dearmor | sudo tee /usr/share/keyrings/oneapi-archive-keyring.gpg > /dev/null
+          echo "deb [signed-by=/usr/share/keyrings/oneapi-archive-keyring.gpg] https://apt.repos.intel.com/oneapi all main" | sudo tee /etc/apt/sources.list.d/oneAPI.list
+          sudo apt-get update
+
+      - name: Install Intel oneAPI DPC++/C++ compiler
+        run: |
+          sudo apt-get install -y --no-install-recommends intel-oneapi-compiler-dpcpp-cpp
+
+      - name: Verify compiler environment
+        run: |
+          source /opt/intel/oneapi/setvars.sh --force
+          icpx --version
+
+      - name: Build Strata (Intel Xe2 / Arc B580)
+        run: |
+          ./tools/build_sycl.sh strata
+
+      - name: Build Parity & Unit Tests
+        run: |
+          ./tools/build_sycl.sh all
+
+      - name: Run Host/Emulation Test Suite
+        run: |
+          ./tools/test_sycl.sh
+
+      - name: Upload Strata binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: strata-b580-linux-x86_64
+          path: build_sycl/strata
+          if-no-files-found: error
