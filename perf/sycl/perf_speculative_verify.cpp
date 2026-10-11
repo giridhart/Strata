@@ -17,12 +17,14 @@
 
 #include "strata/core/sycl_arch.hpp"
 #include "strata/kernels/kv_q8.hpp"
+#include "strata/kernels/native_moe.hpp"
 #include "strata/kernels/native_qsa.hpp"
 #include "strata/kernels/native_qsa_indexer.hpp"
 #include "strata/kernels/native_rope.hpp"
 #include "strata/kernels/native_router.hpp"
 #include "strata/kernels/qsa.hpp"
 #include "strata/kernels/route_prior.hpp"
+#include "strata/kernels/s2_expert_grouped.hpp"
 
 #include <chrono>
 #include <cmath>
@@ -375,6 +377,112 @@ static void BM_Xe2_Route_Resident(benchmark::State& state) {
     sycl::free(d_res, q);
 }
 
+// ============================================================================
+// Benchmark: BM_Xe2_MoE_Combine_Separate vs BM_Xe2_MoE_Combine_FusedHits
+// ============================================================================
+
+static void BM_Xe2_MoE_Combine_Separate(benchmark::State& state) {
+    const int B = state.range(0);
+    constexpr int N = 2048;
+    constexpr int K = 10;
+    const int cap = 16;
+
+    sycl::queue q{sycl::default_selector_v, {sycl::property::queue::in_order(), sycl::property::queue::enable_profiling()}};
+
+    auto* parts = sycl::malloc_device<float>(B * K * N, q);
+    auto* hits = sycl::malloc_device<float>(cap * N, q);
+    auto* dst = sycl::malloc_device<int32_t>(cap, q);
+    auto* counts = sycl::malloc_device<int32_t>(2, q);
+    auto* weights = sycl::malloc_device<float>(B * K, q);
+    auto* shared = sycl::malloc_device<float>(B * N, q);
+    auto* output = sycl::malloc_device<float>(B * N, q);
+
+    q.fill(parts, 0.1f, B * K * N);
+    q.fill(hits, 0.2f, cap * N);
+    q.fill(dst, 0, cap);
+    int32_t h_counts[2] = {0, cap / 2};
+    q.memcpy(counts, h_counts, 2 * sizeof(int32_t));
+    q.fill(weights, 0.1f, B * K);
+    q.fill(shared, 0.05f, B * N);
+    q.fill(output, 0.0f, B * N).wait();
+
+    for (int w = 0; w < 3; ++w) {
+        strata::kernels::moe_hit_add(parts, hits, dst, counts + 1, cap, N, &q);
+        strata::kernels::native_moe_combine_multi(parts, weights, shared, output, N, K, B, &q);
+        q.wait();
+    }
+
+    for (auto _ : state) {
+        auto t0 = std::chrono::steady_clock::now();
+        strata::kernels::moe_hit_add(parts, hits, dst, counts + 1, cap, N, &q);
+        strata::kernels::native_moe_combine_multi(parts, weights, shared, output, N, K, B, &q);
+        q.wait();
+        auto t1 = std::chrono::steady_clock::now();
+        state.SetIterationTime(std::chrono::duration<double>(t1 - t0).count());
+    }
+
+    state.counters["Batch_B"] = benchmark::Counter((double)B);
+    state.counters["tokens_per_sec"] = benchmark::Counter((double)B, benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
+
+    sycl::free(parts, q);
+    sycl::free(hits, q);
+    sycl::free(dst, q);
+    sycl::free(counts, q);
+    sycl::free(weights, q);
+    sycl::free(shared, q);
+    sycl::free(output, q);
+}
+
+static void BM_Xe2_MoE_Combine_FusedHits(benchmark::State& state) {
+    const int B = state.range(0);
+    constexpr int N = 2048;
+    constexpr int K = 10;
+    const int cap = 16;
+
+    sycl::queue q{sycl::default_selector_v, {sycl::property::queue::in_order(), sycl::property::queue::enable_profiling()}};
+
+    auto* parts = sycl::malloc_device<float>(B * K * N, q);
+    auto* hits = sycl::malloc_device<float>(cap * N, q);
+    auto* dst = sycl::malloc_device<int32_t>(cap, q);
+    auto* counts = sycl::malloc_device<int32_t>(2, q);
+    auto* weights = sycl::malloc_device<float>(B * K, q);
+    auto* shared = sycl::malloc_device<float>(B * N, q);
+    auto* output = sycl::malloc_device<float>(B * N, q);
+
+    q.fill(parts, 0.1f, B * K * N);
+    q.fill(hits, 0.2f, cap * N);
+    q.fill(dst, 0, cap);
+    int32_t h_counts[2] = {0, cap / 2};
+    q.memcpy(counts, h_counts, 2 * sizeof(int32_t));
+    q.fill(weights, 0.1f, B * K);
+    q.fill(shared, 0.05f, B * N);
+    q.fill(output, 0.0f, B * N).wait();
+
+    for (int w = 0; w < 3; ++w) {
+        strata::kernels::native_moe_combine_multi_hits_added(parts, hits, dst, counts + 1, weights, shared, output, N, K, B, &q);
+        q.wait();
+    }
+
+    for (auto _ : state) {
+        auto t0 = std::chrono::steady_clock::now();
+        strata::kernels::native_moe_combine_multi_hits_added(parts, hits, dst, counts + 1, weights, shared, output, N, K, B, &q);
+        q.wait();
+        auto t1 = std::chrono::steady_clock::now();
+        state.SetIterationTime(std::chrono::duration<double>(t1 - t0).count());
+    }
+
+    state.counters["Batch_B"] = benchmark::Counter((double)B);
+    state.counters["tokens_per_sec"] = benchmark::Counter((double)B, benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
+
+    sycl::free(parts, q);
+    sycl::free(hits, q);
+    sycl::free(dst, q);
+    sycl::free(counts, q);
+    sycl::free(weights, q);
+    sycl::free(shared, q);
+    sycl::free(output, q);
+}
+
 static void BM_Xe2_KV_Append_Sequential(benchmark::State& state) {
     const int B = state.range(0);
     strata::kernels::QsaShapes s = strata::kernels::qsa_real_shapes();
@@ -665,6 +773,8 @@ BENCHMARK(BM_Xe2_Router_Sequential)->Arg(1)->Arg(2)->Arg(4)->Arg(8)->UseManualTi
 BENCHMARK(BM_Xe2_Router_MultiToken)->Arg(1)->Arg(2)->Arg(4)->Arg(8)->UseManualTime();
 BENCHMARK(BM_Xe2_Route_Resident)->Arg(1)->Arg(2)->Arg(4)->Arg(8)->UseManualTime();
 BENCHMARK(BM_Xe2_Route_Prior)->Arg(1)->Arg(2)->Arg(4)->Arg(8)->UseManualTime();
+BENCHMARK(BM_Xe2_MoE_Combine_Separate)->Arg(1)->Arg(2)->Arg(4)->Arg(8)->UseManualTime();
+BENCHMARK(BM_Xe2_MoE_Combine_FusedHits)->Arg(1)->Arg(2)->Arg(4)->Arg(8)->UseManualTime();
 BENCHMARK(BM_Xe2_KV_Append_Sequential)->Arg(1)->Arg(2)->Arg(4)->Arg(8)->UseManualTime();
 BENCHMARK(BM_Xe2_KV_Append_Batched)->Arg(1)->Arg(2)->Arg(4)->Arg(8)->UseManualTime();
 BENCHMARK(BM_Xe2_Indexer_Append_Sequential)->Arg(1)->Arg(2)->Arg(4)->Arg(8)->UseManualTime();
