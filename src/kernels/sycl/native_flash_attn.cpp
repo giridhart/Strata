@@ -38,17 +38,18 @@ static sycl::queue& default_queue() {
 
 template <int Width>
 inline float warp_sum(sycl::sub_group sg, float x) {
+    if constexpr (Width == 32) {
+        return sycl::reduce_over_group(sg, x, sycl::plus<float>());
+    } else {
 #pragma unroll
-    for (int offset = Width / 2; offset; offset >>= 1)
-        x += sycl::permute_group_by_xor(sg, x, offset);
-    return x;
+        for (int offset = Width / 2; offset; offset >>= 1)
+            x += sycl::permute_group_by_xor(sg, x, offset);
+        return x;
+    }
 }
 
 inline float warp_max(sycl::sub_group sg, float x) {
-#pragma unroll
-    for (int offset = 16; offset; offset >>= 1)
-        x = sycl::fmax(x, sycl::permute_group_by_xor(sg, x, offset));
-    return x;
+    return sycl::reduce_over_group(sg, x, sycl::maximum<float>());
 }
 
 // D=256, ncols=1, F16/F16; 128 threads (4 warps of 32), nthreads_KQ=nthreads_V=8,

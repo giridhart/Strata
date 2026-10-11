@@ -20,6 +20,7 @@
 #include "strata/core/sycl_arch.hpp"
 #include "strata/kernels/quantize_act.hpp"
 #include "strata/kernels/s2_gemv_q8.hpp"
+#include "strata/kernels/dequant_s2.hpp"
 
 #include <cmath>
 #include <cstdint>
@@ -334,6 +335,51 @@ void BM_Xe2_Dequant_Q8_0(benchmark::State& state) {
     sycl::free(d_out, q);
 }
 
+/// Standalone S2 Dequantization Benchmark
+/// Measures streaming throughput and bandwidth of dequant_s2
+void BM_Xe2_Dequant_S2(benchmark::State& state) {
+    const size_t num_elements = state.range(0);
+    const size_t num_blocks = num_elements / 64;
+    const size_t codes_bytes = num_blocks * 16;
+    const size_t scales_elems = num_blocks;
+
+    sycl::queue q{sycl::default_selector_v, sycl::property::queue::in_order()};
+
+    std::vector<uint8_t> h_codes(codes_bytes, 0x55);
+    std::vector<float> h_scales(scales_elems, 0.05f);
+    uint8_t* d_codes = sycl::malloc_device<uint8_t>(codes_bytes, q);
+    float* d_scales = sycl::malloc_device<float>(scales_elems, q);
+    float* d_out = sycl::malloc_device<float>(num_elements, q);
+
+    q.memcpy(d_codes, h_codes.data(), codes_bytes).wait();
+    q.memcpy(d_scales, h_scales.data(), scales_elems * sizeof(float)).wait();
+
+    // Warmup
+    for (int i = 0; i < 5; ++i) {
+        strata::kernels::dequant_s2(d_codes, d_scales, d_out, num_blocks);
+    }
+    q.wait();
+
+    for (auto _ : state) {
+        auto start = std::chrono::high_resolution_clock::now();
+        strata::kernels::dequant_s2(d_codes, d_scales, d_out, num_blocks);
+        q.wait();
+        auto end = std::chrono::high_resolution_clock::now();
+        auto elapsed = std::chrono::duration_cast<std::chrono::duration<double>>(end - start);
+        state.SetIterationTime(elapsed.count());
+    }
+
+    const double bytes = static_cast<double>(codes_bytes + scales_elems * sizeof(float) + num_elements * sizeof(float));
+    state.counters["Bandwidth_GBps"] =
+        benchmark::Counter(bytes, benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
+    state.counters["elements_per_sec"] =
+        benchmark::Counter(static_cast<double>(num_elements), benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
+
+    sycl::free(d_codes, q);
+    sycl::free(d_scales, q);
+    sycl::free(d_out, q);
+}
+
 /// S2 GEMV with Q8_0 Activations (s2_gemv_q8)
 static void BM_Xe2_S2_GEMV_Q8(benchmark::State& state) {
     const int64_t K = state.range(0);
@@ -404,6 +450,9 @@ BENCHMARK(BM_Xe2_Dequant_SLMBuffered)->UseManualTime()->Args({32, 2560, 10240});
 
 // Standalone Q8_0 Dequantization
 BENCHMARK(BM_Xe2_Dequant_Q8_0)->UseManualTime()->Arg(10240)->Arg(20480)->Arg(81920)->Arg(262144)->Arg(1048576);
+
+// Standalone S2 Dequantization
+BENCHMARK(BM_Xe2_Dequant_S2)->UseManualTime()->Arg(10240)->Arg(20480)->Arg(81920)->Arg(262144)->Arg(1048576);
 
 // S2 GEMV with Q8_0 Activations
 BENCHMARK(BM_Xe2_S2_GEMV_Q8)->UseManualTime()->Args({2560, 6144})->Args({2560, 10240});

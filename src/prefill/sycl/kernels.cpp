@@ -16,16 +16,10 @@ constexpr int N = 2560, HC = 4, D = N * HC, LR = 320;
 constexpr int S = 128, HK = 16, HV = 48, C = 10240;
 
 inline float warp_sum(float v) {
-#pragma unroll
-    for (int o = 16; o > 0; o >>= 1)
-        v += sycl::permute_group_by_xor(sycl::ext::oneapi::this_work_item::get_sub_group(), v, o);
-    return v;
+    return sycl::reduce_over_group(sycl::ext::oneapi::this_work_item::get_sub_group(), v, sycl::plus<float>());
 }
 inline float warp_max(float v) {
-#pragma unroll
-    for (int o = 16; o > 0; o >>= 1)
-        v = sycl::fmax(v, sycl::permute_group_by_xor(sycl::ext::oneapi::this_work_item::get_sub_group(), v, o));
-    return v;
+    return sycl::reduce_over_group(sycl::ext::oneapi::this_work_item::get_sub_group(), v, sycl::maximum<float>());
 }
 inline uint16_t bf(float f) {
     uint32_t u = sycl::bit_cast<unsigned int>(f);
@@ -920,8 +914,7 @@ void kv_append_kernel(const float* __restrict__ K, const float* __restrict__ V, 
         return;
     }
     float a = sycl::fabs(x);
-    for (int o = 16; o > 0; o >>= 1)
-        a = sycl::fmax(a, sycl::permute_group_by_xor(sycl::ext::oneapi::this_work_item::get_sub_group(), a, o));
+    a = sycl::reduce_over_group(sycl::ext::oneapi::this_work_item::get_sub_group(), a, sycl::maximum<float>());
 
     if ((item_ct1.get_local_id(2) & 31) == 0) wm[item_ct1.get_local_id(2) >> 5] = a;
     /*
