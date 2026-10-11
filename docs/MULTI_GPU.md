@@ -247,7 +247,8 @@ The Coder on an RTX 5080 + RTX 3090 (Ryzen 9 9950X3D), 32K context; details in
 
 **0.1.43 default.** On AMD RDNA4 (gfx1200 / gfx1201) with `--serve`, the draft layer and a layer split of **three or more
 stages**, `--pipeline-windows 2` is on unless you say otherwise (the log says "is on by default for a layer split of N
-stages"). It never changes the text (below), so there is no quality trade. `--pipeline-windows 0` or
+stages"). It is no quality trade: the tokens are the serial loop's up to CPU rounding (below; on 4x R9700 with default
+flags 10 of 10 prompts matched the serial loop over 160 tokens). `--pipeline-windows 0` or
 `STRATA_PIPELINE_AUTO=0` turns it off; `--pipeline-windows 2` asks for it on any split. A split of two stages stays
 opt-in: there the draft layer's chain shares the last card with that card's window and, on 2x R9700, code decode lost
 3% (prose, 4K prompts and 32K prompts: no gain). The same options that switch it off when you ask for it (`--batch`,
