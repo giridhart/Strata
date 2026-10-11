@@ -46,9 +46,7 @@ void gdn_conv_l2_multi_kernel(const float* __restrict__ hist, const float* __res
     if (qk_group < qk_heads) {
         float sq = y * y;
         auto sg = item.get_sub_group();
-        for (int o = 16; o > 0; o >>= 1) {
-            sq += sycl::permute_group_by_xor(sg, sq, o);
-        }
+        sq = sycl::reduce_over_group(sg, sq, sycl::plus<float>());
         if ((local_id & 31) == 0) part[local_id >> 5] = sq;
         item.barrier(sycl::access::fence_space::local_space);
         const float ss = part[0] + part[1] + part[2] + part[3];
@@ -112,9 +110,7 @@ void gdn_ab_multi_kernel(const float* __restrict__ x, const uint16_t* __restrict
     for (int t = 0; t < kVerifyMaxT; ++t) {
         if (t >= T) break;
         float a = acc[t];
-        for (int o = 16; o > 0; o >>= 1) {
-            a += sycl::permute_group_by_xor(sg, a, o);
-        }
+        a = sycl::reduce_over_group(sg, a, sycl::plus<float>());
         if (lane != 0) continue;
         if (is_beta) {
             beta[(size_t)t * h_v + r] = 1.0f / (1.0f + sycl::native::exp(-a));
@@ -180,9 +176,7 @@ void gdn_step_norm_multi_kernel(float* __restrict__ state, const float* __restri
         }
         if (t < t_out_begin) continue;  // a replayed token: its state update is needed, its output is not
         auto sg = item.get_sub_group();
-        for (int o2 = 16; o2 > 0; o2 >>= 1) {
-            sq_part += sycl::permute_group_by_xor(sg, sq_part, o2);
-        }
+        sq_part = sycl::reduce_over_group(sg, sq_part, sycl::plus<float>());
         if ((tid & 31) == 0) wsum[tid >> 5] = sq_part;
         item.barrier(sycl::access::fence_space::local_space);
         if (rg == 0) {
@@ -294,9 +288,7 @@ void row_top_prob_kernel(const float* __restrict__ logits, int n_vocab, const in
     for (int i = tid; i < n_vocab; i += 1024)
         s += sycl::native::exp(l[i] - m);
     auto sg = item.get_sub_group();
-    for (int o = 16; o > 0; o >>= 1) {
-        s += sycl::permute_group_by_xor(sg, s, o);
-    }
+    s = sycl::reduce_over_group(sg, s, sycl::plus<float>());
     if ((tid & 31) == 0) part[tid >> 5] = s;
     item.barrier(sycl::access::fence_space::local_space);
     if (tid == 0) {

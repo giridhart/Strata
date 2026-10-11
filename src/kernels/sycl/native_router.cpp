@@ -34,17 +34,11 @@ namespace {
 std::atomic<bool> enabled{false};
 
 inline float warp_sum(float value, const sycl::sub_group& sg) {
-#pragma unroll
-    for (int mask = 16; mask; mask >>= 1)
-        value += sycl::permute_group_by_xor(sg, value, mask);
-    return value;
+    return sycl::reduce_over_group(sg, value, sycl::plus<float>());
 }
 
 inline float warp_max(float value, const sycl::sub_group& sg) {
-#pragma unroll
-    for (int mask = 16; mask; mask >>= 1)
-        value = sycl::fmax(value, sycl::permute_group_by_xor(sg, value, mask));
-    return value;
+    return sycl::reduce_over_group(sg, value, sycl::maximum<float>());
 }
 
 inline void route_token(const float* logits, int32_t* ids, float* weights, size_t tok, int lane,
