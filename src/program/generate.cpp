@@ -2738,7 +2738,11 @@ int main(int argc, char** argv) {
         std::string bursts;
         const char* pfd = std::getenv("STRATA_PCIE_FRAC_DEFAULT");
         const bool pf_old = pfd != nullptr && std::strcmp(pfd, "old") == 0;
-#if !defined(STRATA_USE_HIP)
+#if !defined(STRATA_USE_HIP) && defined(_WIN32)
+        // Windows: opt-in (STRATA_PCIE_AUTO_CANON=1); an RTX 5070 decoded a short Q2_0 answer 3% slower with it, code 2.5% faster
+        const char* pac = std::getenv("STRATA_PCIE_AUTO_CANON");
+        const bool pf_old_canon = pf_old || !(pac != nullptr && pac[0] == '1');
+#elif !defined(STRATA_USE_HIP)
         const bool pf_old_canon = pf_old;
 #else
         const bool pf_old_canon = true;   // the canonical pack's PcieAuto is CUDA only
