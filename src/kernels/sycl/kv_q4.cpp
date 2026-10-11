@@ -98,16 +98,18 @@ inline void q4_store(uint8_t* pool, long long row, int b, int lane, uint16_t d, 
     if (lane < 16) blk->qs[lane] = byte;
 }
 
-// One block = one 32-value group of one KV head of K (blockIdx.z = 0) or V (1); 32 threads. KV streaming: the VRAM
-// page only if the block is resident (table >= 0), the host copy always (identity layout) when there is one.
+// One block = one 32-value group of one KV head of K (plane 0) or V (plane 1) for token step_idx; 32 threads.
 void kv_append_q4_kernel(uint8_t* __restrict__ k_q4, uint8_t* __restrict__ v_q4, const int32_t* __restrict__ table,
-                         const int32_t* __restrict__ step, const float* __restrict__ kcur,
-                         const float* __restrict__ vcur, int kv_heads, int head_dim, int page_size, KvHostPools host,
+                         const int32_t* __restrict__ step, int step_stride, int planes,
+                         const float* __restrict__ kcur, const float* __restrict__ vcur,
+                         int kv_heads, int head_dim, int page_size, KvHostPools host,
                          const sycl::nd_item<3>& item) {
-    const long long pos = (long long)*(step + kStepPos);
+    const int step_idx = (int)(item.get_group(0) / (unsigned)planes);
+    const bool is_v = (item.get_group(0) % (unsigned)planes) == 1u;
+    const long long pos = (long long)*(step + (long long)step_idx * step_stride + kStepPos);
     const int h = item.get_group(2), b = item.get_group(1), t = item.get_local_id(2);
-    const bool is_v = item.get_group(0) == 1;
-    const float x = (is_v ? vcur : kcur)[h * head_dim + b * QK4_0 + t];
+    const long long step_off = (long long)step_idx * kv_heads * head_dim;
+    const float x = (is_v ? vcur : kcur)[step_off + h * head_dim + b * QK4_0 + t];
     uint8_t byte;
     const uint16_t d = q4_group(x, t, byte, item.get_sub_group());
     const long long page = (long long)table[pos / page_size];
@@ -198,21 +200,30 @@ void fwht256_cuda(const float* src, float* dst, int64_t n_rows, void* stream) {
     if (!stream) default_queue.wait();
 }
 
-void kv_append_q4_step(uint8_t* k_q4, uint8_t* v_q4, const int32_t* page_table, const int32_t* step, const float* kcur,
-                       const float* vcur, const QsaShapes& s, void* stream, const KvHostPools* host) {
+void kv_append_q4_steps(uint8_t* k_q4, uint8_t* v_q4, const int32_t* page_table, const int32_t* step,
+                        int step_stride, int n_steps, const float* kcur, const float* vcur, const QsaShapes& s,
+                        void* stream, const KvHostPools* host) {
+    if (n_steps <= 0) return;
     need_256(s, "kv_append_q4");
-    const sycl::range<3> grid(2, (unsigned)(s.head_dim / QK4_0), (unsigned)s.n_head_kv);
+    const int planes = (v_q4 == nullptr || (v_q4 == k_q4 && vcur == kcur)) ? 1 : 2;
+    const sycl::range<3> grid((unsigned)(n_steps * planes), (unsigned)(s.head_dim / QK4_0), (unsigned)s.n_head_kv);
     sycl::queue* q = stream ? static_cast<sycl::queue*>(stream) : &default_queue;
     q->submit([&](sycl::handler& cgh) {
         KvHostPools host_pools = host ? *host : KvHostPools{};
 
         cgh.parallel_for(sycl::nd_range<3>(grid * sycl::range<3>(1, 1, 32), sycl::range<3>(1, 1, 32)),
                          [=](sycl::nd_item<3> item) [[sycl::reqd_sub_group_size(32)]] {
-                             kv_append_q4_kernel(k_q4, v_q4, page_table, step, kcur, vcur, (int)s.n_head_kv,
-                                                 (int)s.head_dim, (int)s.page_size, host_pools, item);
+                             kv_append_q4_kernel(k_q4, v_q4, page_table, step, step_stride, planes, kcur, vcur,
+                                                 (int)s.n_head_kv, (int)s.head_dim, (int)s.page_size, host_pools,
+                                                 item);
                          });
     });
     if (!stream) default_queue.wait();
+}
+
+void kv_append_q4_step(uint8_t* k_q4, uint8_t* v_q4, const int32_t* page_table, const int32_t* step, const float* kcur,
+                       const float* vcur, const QsaShapes& s, void* stream, const KvHostPools* host) {
+    kv_append_q4_steps(k_q4, v_q4, page_table, step, 0, 1, kcur, vcur, s, stream, host);
 }
 
 void kv_append_q4(uint8_t* k_q4, uint8_t* v_q4, const int32_t* page_table, int64_t pos0, int64_t T, const float* K,
