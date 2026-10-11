@@ -712,22 +712,31 @@ bool MtpDrafter::record_forward(int T, int step_row0, sycl::queue* cs, std::stri
             for (int t = 0; t < T; ++t)
                 norm_rope(kcur_ + t * NKV * HD, f32("self_attn.k_norm.weight"), (int)NKV, (int)HD, pos + t * NH);
         }
-        for (int t = 0; t < T; ++t) {
-            if (st_.kv_rot) {  // rotated K and V (kv_q4.hpp): Q4_0, and INT8 with STRATA_KV_ROT=1
+        static const bool no_batch_kv = std::getenv("STRATA_NO_BATCH_KV_STEP") != nullptr;
+        if (st_.kv_rot) {  // rotated K and V (kv_q4.hpp): Q4_0, and INT8 with STRATA_KV_ROT=1
+            for (int t = 0; t < T; ++t) {
                 fwht256_inplace_cuda(kcur_ + t * NKV * HD, NKV, cs);
                 fwht256_inplace_cuda(vcur_ + t * NKV * HD, NKV, cs);
             }
-            // stored in the state's own format (#293 appended rotated INT8 K/V as Q4_0, into pools INT8 never has)
-            if (st_.kv_q4)
-                kv_append_q4_step(st_.k_q4, st_.v_q4, st_.page_table, step + t * 4, kcur_ + t * NKV * HD,
-                                  vcur_ + t * NKV * HD, s, cs, &st_.host);
-            else if (st_.kv_int8)
-                kv_append_q8_step(st_.k_q, st_.v_q, st_.k_scale, st_.v_scale, st_.page_table, step + t * 4,
-                                  kcur_ + t * NKV * HD, vcur_ + t * NKV * HD, s, cs, &st_.host);
-            else
-                kv_append_step(st_.k_pool, st_.v_pool, st_.page_table, step + t * 4, kcur_ + t * NKV * HD,
-                               vcur_ + t * NKV * HD, s, cs, &st_.host);
         }
+        // stored in the state's own format (#293 appended rotated INT8 K/V as Q4_0, into pools INT8 never has)
+        if (!no_batch_kv && st_.kv_q4)
+            kv_append_q4_steps(st_.k_q4, st_.v_q4, st_.page_table, step, 4, T, kcur_, vcur_, s, cs, &st_.host);
+        else if (!no_batch_kv && st_.kv_int8)
+            kv_append_q8_steps(st_.k_q, st_.v_q, st_.k_scale, st_.v_scale, st_.page_table, step, 4, kcur_, vcur_,
+                               (int)(NKV * HD), T, s, cs, &st_.host);
+        else
+            for (int t = 0; t < T; ++t) {
+                if (st_.kv_q4)
+                    kv_append_q4_step(st_.k_q4, st_.v_q4, st_.page_table, step + t * 4, kcur_ + t * NKV * HD,
+                                      vcur_ + t * NKV * HD, s, cs, &st_.host);
+                else if (st_.kv_int8)
+                    kv_append_q8_step(st_.k_q, st_.v_q, st_.k_scale, st_.v_scale, st_.page_table, step + t * 4,
+                                      kcur_ + t * NKV * HD, vcur_ + t * NKV * HD, s, cs, &st_.host);
+                else
+                    kv_append_step(st_.k_pool, st_.v_pool, st_.page_table, step + t * 4, kcur_ + t * NKV * HD,
+                                   vcur_ + t * NKV * HD, s, cs, &st_.host);
+            }
         if (!full) return true;
         native_mmvq(GGML_Q8_0, q8("self_attn.q_proj.weight"), xq_, qfull_, (int)N, (int)(NH * 2 * HD), T, cs);
         if (fuse_nr) {
