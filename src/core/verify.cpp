@@ -1083,7 +1083,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         bool il_ready = false;   // xil_ holds xq_'s interleaved copy (reset whenever xq_ is rewritten)
         auto mm = [&](const WeightRef* w, float* out, int n_in, int n_out) {
             if (g_mmvq_il() && strata::kernels::native_mmvq_il_supported(w->native_type, n, n_out)) {
-                if (!il_ready) {
+                if (!il_ready && n >= 2) {   // one column reads the plain q8_1 blocks
                     strata::kernels::native_q8_1_interleave(xq_, xil_, n_in, n, cs);
                     il_ready = true;
                 }
@@ -1768,7 +1768,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             try {
                 native_quantize_q8_1(head_mixed_, xq_, (int) N, T, cs);
                 if (g_mmvq_il() && strata::kernels::native_mmvq_il_supported(head_->type(), (int) T, (int) n_vocab_)) {
-                    strata::kernels::native_q8_1_interleave(xq_, xil_, (int) N, (int) T, cs);
+                    if (T >= 2) strata::kernels::native_q8_1_interleave(xq_, xil_, (int) N, (int) T, cs);
                     strata::kernels::native_mmvq_il(head_->type(), head_->weights(), xq_, xil_, head_logits_, (int) N,
                                                     (int) n_vocab_, (int) T, cs);
                 } else
