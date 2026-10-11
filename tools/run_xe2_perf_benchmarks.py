@@ -57,8 +57,8 @@ BENCHMARK_TARGETS = [
     {
         "name": "perf_moe_accumulate",
         "tier": 1,
-        "title": "MoE Expert Weighted Accumulation",
-        "description": "10-expert reduction comparing Atomic vs Direct Combine vs SIMD16 Subgroup Reduce",
+        "title": "MoE Expert Weighted Accumulation & Grouped GEMV",
+        "description": "10-expert reduction (Atomic/Combine/Subgroup) and 16-lane subgroup MoE GEMV (Sub16 vs Legacy32)",
     },
     {
         "name": "perf_dequant_dpas",
