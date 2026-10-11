@@ -41,12 +41,14 @@ constexpr int SG_SZ = strata::sycl_arch::SUB_GROUP_SIZE;
 
 template <int BlockSize>
 void weighted_rms_norm(sycl::nd_item<1> item, const float* __restrict__ input, const float* __restrict__ gamma,
-                       float* __restrict__ output, int n_cols, float epsilon, float* sums) {
+                       float* __restrict__ output, int n_cols, int n_rows, float epsilon, float* sums) {
     auto sg = item.get_sub_group();
     const int tid = item.get_local_id(0);
-    const std::size_t row_offset = std::size_t(item.get_group(0)) * n_cols;
+    const std::size_t global_row = item.get_group(0);
+    const std::size_t row_in_token = global_row % (size_t)n_rows;
+    const std::size_t row_offset = global_row * n_cols;
     input += row_offset;
-    gamma += row_offset;
+    gamma += row_in_token * n_cols;
     output += row_offset;
     float partial = 0.0f;
     for (int col = tid; col < n_cols; col += BlockSize) {
@@ -84,27 +86,33 @@ void check_pointer(const void* p) {
 
 void native_gr_rms_norm_weighted(const float* input, const float* gamma, float* output, int n_cols, int n_rows,
                                  float epsilon, void* stream) {
-    if (n_cols <= 0 || n_rows <= 0 || !std::isfinite(epsilon) || epsilon < 0.0f)
+    native_gr_rms_norm_weighted_multi(input, gamma, output, n_cols, n_rows, 1, epsilon, stream);
+}
+
+void native_gr_rms_norm_weighted_multi(const float* input, const float* gamma, float* output,
+                                       int n_cols, int n_rows, int n_tok, float epsilon, void* stream) {
+    if (n_cols <= 0 || n_rows <= 0 || n_tok <= 0 || !std::isfinite(epsilon) || epsilon < 0.0f)
         throw std::invalid_argument("native GR RMSNorm requires positive dimensions and finite nonnegative epsilon");
     check_pointer(input);
     check_pointer(gamma);
     check_pointer(output);
     sycl::queue* q = stream ? static_cast<sycl::queue*>(stream) : &default_queue;
+    const size_t total_rows = (size_t)n_rows * n_tok;
     if (n_cols < 1024) {
         q->submit([&](sycl::handler& cgh) {
             sycl::local_accessor<float, 1> sums(sycl::range<1>(256 / SG_SZ), cgh);
-            cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t)n_rows * 256), sycl::range<1>(256)),
+            cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(total_rows * 256), sycl::range<1>(256)),
                              [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(SG_SZ)]] {
-                                 weighted_rms_norm<256>(item, input, gamma, output, n_cols, epsilon,
+                                 weighted_rms_norm<256>(item, input, gamma, output, n_cols, n_rows, epsilon,
                                                         sums.get_multi_ptr<sycl::access::decorated::no>().get());
                              });
         });
     } else {
         q->submit([&](sycl::handler& cgh) {
             sycl::local_accessor<float, 1> sums(sycl::range<1>(1024 / SG_SZ), cgh);
-            cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t)n_rows * 1024), sycl::range<1>(1024)),
+            cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(total_rows * 1024), sycl::range<1>(1024)),
                              [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(SG_SZ)]] {
-                                 weighted_rms_norm<1024>(item, input, gamma, output, n_cols, epsilon,
+                                 weighted_rms_norm<1024>(item, input, gamma, output, n_cols, n_rows, epsilon,
                                                          sums.get_multi_ptr<sycl::access::decorated::no>().get());
                              });
         });

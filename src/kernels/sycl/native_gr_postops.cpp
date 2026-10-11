@@ -50,10 +50,14 @@ void down_silu(sycl::nd_item<1> item, float* lo, int count, float scale) {
 }
 
 template <bool Fused>
-void pre_gated(sycl::nd_item<1> item, const float* __restrict__ xn, float* __restrict__ gate, float* __restrict__ mixed,
-               int n_embd, int hc, float scale) {
-    const std::size_t d = item.get_global_id(0);
+void pre_gated_multi(sycl::nd_item<2> item, const float* __restrict__ xn, float* __restrict__ gate,
+                     float* __restrict__ mixed, int n_embd, int hc, float scale) {
+    const std::size_t d = item.get_global_id(1);
     if (d >= std::size_t(n_embd)) return;
+    const std::size_t t = item.get_group(0);
+    xn += t * std::size_t(n_embd) * hc;
+    gate += t * std::size_t(n_embd) * hc;
+    mixed += t * std::size_t(n_embd);
     float sum = 0.0f;
     for (int c = 0; c < hc; ++c) {
         const std::size_t i = std::size_t(c) * n_embd + d;
@@ -71,10 +75,16 @@ void pre_gated(sycl::nd_item<1> item, const float* __restrict__ xn, float* __res
         mixed[d] = scale_zero_bias(sum, scale);
 }
 
-void post(sycl::nd_item<1> item, const float* residual, const float* __restrict__ block_out,
-          const float* __restrict__ inject, float* output, int n_embd, int hc, float scale) {
-    const std::size_t i = item.get_global_id(0);
+void post_multi_k(sycl::nd_item<2> item, const float* residual, const float* __restrict__ block_out,
+                  const float* __restrict__ inject, float* output, int n_embd, int hc, float scale,
+                  long long r_stride, long long b_stride, long long i_stride) {
+    const std::size_t i = item.get_global_id(1);
     if (i >= std::size_t(n_embd) * hc) return;
+    const long long t = item.get_group(0);
+    residual += t * r_stride;
+    output += t * r_stride;
+    block_out += t * b_stride;
+    inject += t * i_stride;
     const int c = int(i / n_embd), d = int(i % n_embd);
     const float weight = scale_zero_bias(sigmoid(scale_zero_bias(inject[c], scale)), 2.0f);
     // Exact residual/output alias is supported; no other thread reads residual[i].
@@ -106,27 +116,41 @@ void native_gr_down_silu(float* lo, int hc_lr, int hc, void* stream) {
     if (!stream) default_queue.wait();
 }
 
-void native_gr_pre_gated(const float* xn, float* gate, float* mixed, int n_embd, int hc, bool fused_layer,
-                         void* stream) {
+void native_gr_pre_gated_multi(const float* xn, float* gate, float* mixed, int n_embd, int hc, int n_tok,
+                               bool fused_layer, void* stream) {
+    if (n_tok <= 0)
+        throw std::invalid_argument("native GR postops require positive n_tok");
     check_shape(n_embd, hc);
     check_pointer(xn);
     check_pointer(gate);
     check_pointer(mixed);
     sycl::queue* q = stream ? static_cast<sycl::queue*>(stream) : &default_queue;
     const float float_hc = 1.0f / float(hc);
-    const size_t total_threads = (size_t)blocks(n_embd) * THREADS;
+    const size_t total_cols = (size_t)blocks(n_embd) * THREADS;
     if (fused_layer) {
-        q->parallel_for(sycl::nd_range<1>(sycl::range<1>(total_threads), sycl::range<1>(THREADS)),
-                        [=](sycl::nd_item<1> item) { pre_gated<true>(item, xn, gate, mixed, n_embd, hc, float_hc); });
+        q->parallel_for(sycl::nd_range<2>(sycl::range<2>((size_t)n_tok, total_cols), sycl::range<2>(1, THREADS)),
+                        [=](sycl::nd_item<2> item) {
+                            pre_gated_multi<true>(item, xn, gate, mixed, n_embd, hc, float_hc);
+                        });
     } else {
-        q->parallel_for(sycl::nd_range<1>(sycl::range<1>(total_threads), sycl::range<1>(THREADS)),
-                        [=](sycl::nd_item<1> item) { pre_gated<false>(item, xn, gate, mixed, n_embd, hc, float_hc); });
+        q->parallel_for(sycl::nd_range<2>(sycl::range<2>((size_t)n_tok, total_cols), sycl::range<2>(1, THREADS)),
+                        [=](sycl::nd_item<2> item) {
+                            pre_gated_multi<false>(item, xn, gate, mixed, n_embd, hc, float_hc);
+                        });
     }
     if (!stream) default_queue.wait();
 }
 
-void native_gr_post(const float* residual, const float* block_out, const float* inject, float* output, int n_embd,
-                    int hc, void* stream) {
+void native_gr_pre_gated(const float* xn, float* gate, float* mixed, int n_embd, int hc, bool fused_layer,
+                         void* stream) {
+    native_gr_pre_gated_multi(xn, gate, mixed, n_embd, hc, 1, fused_layer, stream);
+}
+
+void native_gr_post_multi(const float* residual, const float* block_out, const float* inject, float* output,
+                          int n_embd, int hc, int n_tok, long long r_stride, long long b_stride, long long i_stride,
+                          void* stream) {
+    if (n_tok <= 0)
+        throw std::invalid_argument("native GR postops require positive n_tok");
     check_shape(n_embd, hc);
     check_pointer(residual);
     check_pointer(block_out);
@@ -134,11 +158,26 @@ void native_gr_post(const float* residual, const float* block_out, const float* 
     check_pointer(output);
     sycl::queue* q = stream ? static_cast<sycl::queue*>(stream) : &default_queue;
     const float float_hc = 1.0f / float(hc);
-    const size_t total_threads = (size_t)blocks(std::size_t(n_embd) * hc) * THREADS;
+    const size_t total_elements = (size_t)blocks(std::size_t(n_embd) * hc) * THREADS;
     q->parallel_for(
-        sycl::nd_range<1>(sycl::range<1>(total_threads), sycl::range<1>(THREADS)),
-        [=](sycl::nd_item<1> item) { post(item, residual, block_out, inject, output, n_embd, hc, float_hc); });
+        sycl::nd_range<2>(sycl::range<2>((size_t)n_tok, total_elements), sycl::range<2>(1, THREADS)),
+        [=](sycl::nd_item<2> item) {
+            post_multi_k(item, residual, block_out, inject, output, n_embd, hc, float_hc,
+                         r_stride, b_stride, i_stride);
+        });
     if (!stream) default_queue.wait();
+}
+
+void native_gr_post_multi(const float* residual, const float* block_out, const float* inject, float* output,
+                          int n_embd, int hc, int n_tok, void* stream) {
+    const long long hc_dim = (long long)n_embd * hc;
+    native_gr_post_multi(residual, block_out, inject, output, n_embd, hc, n_tok, hc_dim, (long long)n_embd,
+                         (long long)hc, stream);
+}
+
+void native_gr_post(const float* residual, const float* block_out, const float* inject, float* output, int n_embd,
+                    int hc, void* stream) {
+    native_gr_post_multi(residual, block_out, inject, output, n_embd, hc, 1, stream);
 }
 
 }  // namespace strata::kernels
