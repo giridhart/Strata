@@ -55,8 +55,19 @@ bool load_ze(ZeFns& f) {
 
 bool copy_engine_active() { return g_active.load(); }
 
-namespace { std::atomic<const sycl::queue*> g_copy_q{nullptr}; }
-bool is_copy_engine_queue(const sycl::queue* q) { return q != nullptr && q == g_copy_q.load(); }
+namespace {
+// one copy-engine queue per device (a layer split calls this once per card): device -> queue; a device that has none maps to nullptr
+struct DevQ { sycl::device dev; sycl::queue* q; };
+std::vector<DevQ>& dev_queues() { static std::vector<DevQ> v; return v; }
+std::mutex& dev_mu() { static std::mutex m; return m; }
+}  // namespace
+bool is_copy_engine_queue(const sycl::queue* q) {
+    if (q == nullptr) return false;
+    std::lock_guard<std::mutex> lk(dev_mu());
+    for (const DevQ& d : dev_queues()) if (d.q == q) return true;
+    return false;
+}
+
 
 sycl::queue* make_copy_engine_queue(const char* what) {
     static const bool off = [] { const char* v = std::getenv("STRATA_COPY_ENGINE"); return v && v[0] == '0'; }();
@@ -65,14 +76,13 @@ sycl::queue* make_copy_engine_queue(const char* what) {
     (void) what;
     return nullptr;
 #else
-    static std::mutex mu;
-    static sycl::queue* made = nullptr;
-    static bool tried = false;
-    std::lock_guard<std::mutex> lk(mu);
-    if (tried) return made;
-    tried = true;
+    std::lock_guard<std::mutex> lk(dev_mu());
+    sycl::device dev = dpct::get_current_device();
+    for (const DevQ& d : dev_queues()) if (d.dev == dev) return d.q;   // asked before for this card (nullptr: it has none)
+    dev_queues().push_back({dev, nullptr});
+    const size_t slot = dev_queues().size() - 1;
     try {
-        sycl::device dev = dpct::get_current_device();
+
         if (dev.get_backend() != sycl::backend::ext_oneapi_level_zero) return nullptr;
         // The legacy Level Zero adapter already puts memcpy on the copy engine (and its kernel launches are slower); only
         // the v2 adapter needs this.  SYCL_UR_USE_LEVEL_ZERO_V2=0 selects the legacy one.
@@ -107,8 +117,7 @@ sycl::queue* make_copy_engine_queue(const char* what) {
             cl, dev, sycl::ext::oneapi::level_zero::ownership::keep,
             sycl::property_list{sycl::property::queue::in_order{}});
         auto* q = new sycl::queue(sycl::make_queue<sycl::backend::ext_oneapi_level_zero>(in, ctx));
-        made = q;
-        g_copy_q.store(q);
+        dev_queues()[slot].q = q;
         g_active.store(true);
         static std::atomic<bool> said{false};
         if (!said.exchange(true))
