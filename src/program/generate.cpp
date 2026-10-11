@@ -648,7 +648,8 @@ struct Options {
     /// the verify windows run with the stages overlapped (stage 0 reads window K+1 while stage 1 reads window K);
     /// 2 = the decode windows too: stage 0 runs window K+1 speculatively while stage 1 verifies window K (rolled back
     /// when K is not accepted as guessed).  0 = off (the stages take turns).
-    int pipeline_windows = 0;
+    /// -1 (not asked for) = 2 on gfx12 (HIP) layer splits of 3 or more stages, else 0; --pipeline-windows N asks for it.
+    int pipeline_windows = -1;
     /// The suffix drafter (prompt lookup): when the text being written repeats an earlier stretch of the context (code
     /// edits, quoted input, tool-call JSON) by at least this many tokens, the window may be filled with what followed
     /// it there instead of the MTP's drafts, where the MTP's own first guess agrees and the draft policy expects it to
@@ -785,7 +786,8 @@ void usage() {
                  "                       window (STRATA_BATCH_MTP=1 does the same); works on one GPU and on a layer split (the\n"
                  "                       slot drafters sit on the last stage's GPU; not with --batch-groups); needs VRAM per slot\n"
                  "  --batch-groups G     --batch with a layer split: the slots in G groups pipelined through the GPUs\n"
-                 "  --pipeline-windows N --serve with a layer split on two GPUs (opt-in): one conversation's verify windows\n"
+                 "  --pipeline-windows N --serve with a layer split on two GPUs (on by default for 3+ stages on AMD gfx12;\n"
+                 "                       STRATA_PIPELINE_AUTO=0 or N=0 turns it off): one conversation's verify windows\n"
                  "                       with the GPUs overlapped - 1 = the prompt's short reads, 2 = decode as well\n"
                  "                       (stage 0 runs the next window while stage 1 verifies this one); docs/MULTI_GPU.md\n"
                  "  --trim-stage-weights an explicit --layer-split: each GPU loads only its own layers' dense weights\n"
@@ -1056,6 +1058,7 @@ struct GpuStage {
     int dev = 0;
     int64_t lb = 0, le = 0;
     double pcie_frac = 0.0;
+    double link_gbps = 0.0;   ///< this card's probed host->device bandwidth (PcieAuto's per-stage share)
     strata::core::WeightTable wt;
     strata::core::NativeDense dense;
     strata::core::NativeHead head;
@@ -1553,6 +1556,12 @@ bool load_control_vectors(const Options& o, const strata::core::ModelGeometry& g
     std::fprintf(stderr, "strata generate: control vector mode = %s, dir = %s, layers %d..%d (%d steered)\n",
                  o.cvec_mode == 0 ? "project" : "add", single >= 0 ? "single" : "per-layer", first, last, steered);
     return true;
+}
+
+/// 0.1.43 (HIP, opt-in STRATA_PCIE_AUTO_SPLIT=1): PcieAuto also refines a layer split's shares, each stage by its own probed link.
+static bool pcie_auto_split_ok() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_PCIE_AUTO_SPLIT"); return v != nullptr && std::atoi(v) != 0; }();   // opt-in until measured (HIP)
+    return on;
 }
 
 // 0.1.43: the HIP defaults of the decode speed push (route tail skip, measured PCIe share) were measured on gfx1201 (Radeon AI PRO
@@ -2749,7 +2758,7 @@ int main(int argc, char** argv) {
             o.pcie_frac = pcie_frac_for_gbps(bw, base);
             std::fprintf(stderr, "strata generate: PCIe probe: %.1f GB/s host->device (best of %s) -> pcie_frac %.2f "
                                  "(default %.2f)\n", bw, bursts.c_str(), o.pcie_frac, base);
-            o.pcie_frac_auto = o.layer_split.empty() && decode_defaults_arch_ok() && !pf_old;
+            o.pcie_frac_auto = (o.layer_split.empty() || pcie_auto_split_ok()) && decode_defaults_arch_ok() && !pf_old;
             o.pcie_probe_gbps = bw;
         } else {
             o.pcie_frac = base;
@@ -3331,6 +3340,27 @@ int main(int argc, char** argv) {
     // --pipeline-windows (opt-in): one conversation's windows with the two stages of a layer split overlapped.  Decided
     // here, before any stage sizes its expert cache (the second verifier per stage and the snapshots are allocated
     // after the caches, so their room is kept out of them).  What it does not support turns it off, said once.
+    // 0.1.43: not asked for (-1) = on (2) for gfx12 layer splits of three or more stages, where it was measured (4x R9700);
+    // with two stages it loses (the drafter's chain shares the last card with its window).  STRATA_PIPELINE_AUTO=0 keeps
+    // it off, --pipeline-windows N asks for it as before.  Anything it does not support leaves it off, said nothing.
+    const bool pw_auto = o.pipeline_windows < 0;
+    if (pw_auto) {
+        static const char* ae = std::getenv("STRATA_PIPELINE_AUTO");
+        static const char* am = std::getenv("STRATA_PIPELINE_AUTO_MIN_STAGES");
+        const size_t min_st = am != nullptr ? (size_t) std::max(2, std::atoi(am)) : 3;
+        bool on = o.serve && multi_gpu && !split_same && split_devs.size() + 1 >= min_st && !(ae != nullptr && std::atoi(ae) == 0);
+#if defined(STRATA_USE_HIP)
+        on = on && decode_defaults_arch_ok();
+#else
+        on = false;
+#endif
+        const bool helpers_a = o.expert_cache_remote[0] > 0 || o.expert_cache_remote[1] > 0 || o.expert_cache_remote[2] > 0;
+        on = on && !o.mtp.empty() && o.spec >= 2 && o.batch == 0 && o.peer_device < 0 && !helpers_a && !o.adapt_async;
+        o.pipeline_windows = on ? 2 : 0;
+        if (on)
+            std::fprintf(stderr, "strata generate: --pipeline-windows 2 is on by default for a layer split of %zu stages "
+                                 "(--pipeline-windows 0 or STRATA_PIPELINE_AUTO=0 turns it off)\n", split_devs.size() + 1);
+    }
     if (o.pipeline_windows > 0) {
         const bool helpers = o.expert_cache_remote[0] > 0 || o.expert_cache_remote[1] > 0 || o.expert_cache_remote[2] > 0;
         const char* off = !o.serve ? "it needs --serve"
@@ -3437,6 +3467,7 @@ int main(int argc, char** argv) {
             std::string bursts;
             const double bw = probe_pcie_h2d_gbps(&bursts);
             if (bw > 0.0) st.pcie_frac = pcie_frac_for_gbps(bw, 0.55);
+            st.link_gbps = bw;
             std::fprintf(stderr, "strata generate: layer split: CUDA%d PCIe probe %.1f GB/s (best of %s) -> pcie_frac "
                                  "%.2f\n", st.dev, bw, bursts.c_str(), st.pcie_frac);
         }
@@ -8175,7 +8206,7 @@ int main(int argc, char** argv) {
         if (o.adapt_every > 0 && o.adapt_swaps > 0 && !all_experts_resident)
             drive.d.usage.assign((size_t) (g.n_layers * g.n_expert), 0.0f);
         PcieAuto pcie_auto;
-        if (o.pcie_frac_auto && !all_experts_resident && o.batch == 0 && o.peer_device < 0 && n_stages == 1) {
+        if (o.pcie_frac_auto && !all_experts_resident && o.batch == 0 && o.peer_device < 0 && (n_stages == 1 || pcie_auto_split_ok())) {
             const auto& pl = strata::kernels::cpu::expert_layout();
             double sum = 0.0;
             for (int64_t l = 0; l < g.n_layers; ++l) sum += (double) pl.blob_bytes(l);
@@ -11843,6 +11874,17 @@ int main(int argc, char** argv) {
                         o.pcie_frac = nf;
                         req_pcie_frac = nf;
                         drive.d.pcie_num = std::max(0, std::min(256, (int) (nf * 256.0 + 0.5)));
+                        // a layer split: every later stage takes the share its own probed link gives against the same pool rate
+                        split_drive.pcie_num[0] = drive.d.pcie_num;
+                        for (int st = 1; st < n_stages; ++st) {
+                            GpuStage& gs = *stages[(size_t) st - 1];
+                            if (!(gs.link_gbps > 0.0)) continue;
+                            gs.pcie_frac = std::min(0.60, std::max(0.10, std::round(gs.link_gbps / (gs.link_gbps +
+                                               PcieAuto::kPoolFactor * rate) * 20.0) / 20.0));
+                            split_drive.pcie_num[st] = pcie_num_of(gs.pcie_frac);
+                            std::fprintf(stderr, "strata serve: PCIe share: stage %d (link %.1f GB/s) -> pcie_frac %.2f\n", st + 1,
+                                         gs.link_gbps, gs.pcie_frac);
+                        }
                     }
                 }
                 if (adapt_thr.joinable()) adapt_thr.join();
