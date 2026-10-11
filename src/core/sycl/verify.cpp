@@ -531,6 +531,9 @@ bool Verifier::record_window(int T, sycl::queue* cs, std::string& err) try {
         return v == nullptr || std::atoi(v) != 0;
     }();
     static const bool g_no_batch_kv = std::getenv("STRATA_NO_BATCH_KV_STEP") != nullptr;
+    static const bool lean_env = [] { const char* v = std::getenv("STRATA_VERIFY_LEAN"); return !(v && v[0] == '0'); }();
+    static const bool no_host_env = [] { const char* v = std::getenv("STRATA_VERIFY_NO_HOST"); return v && *v && std::strcmp(v, "0") != 0; }();
+    const bool lean = lean_env && no_host_env && device_plan_;
     auto stamp = [&](int64_t l, int i, int grp) {
         if (prof_on_ && grp == 0) gpu_stamp(prof_, (int)(l * kProfPer + i), cs);
     };
@@ -958,8 +961,10 @@ bool Verifier::record_window(int T, sycl::queue* cs, std::string& err) try {
                           hits_.cache_base, slot_off_d_, (long long)hits_.blob,
                           plan_ + (size_t)grp * (size_t)(plan_i32_ + 16), (long long)max_t_ * K, skip_ + grp,
                           (uint32_t)((l - lb_) * G + grp + 1), cs);
-        doorbell_publish(xm, ids_ + tb * K, w_ + tb * K, (int64_t)n * N, (int64_t)n * K, m_x_ + tb * N, m_ids_ + tb * K,
-                         m_w_ + tb * K, m_seq_, cs);
+        if (!lean) {
+            doorbell_publish(xm, ids_ + tb * K, w_ + tb * K, (int64_t)n * N, (int64_t)n * K, m_x_ + tb * N, m_ids_ + tb * K,
+                             m_w_ + tb * K, m_seq_, cs);
+        }
         stamp(l, 17, grp);
         {
             const WeightRef *wgi = need(v, "ffn_gate_inp_shexp.weight", err),
@@ -1019,9 +1024,9 @@ bool Verifier::record_window(int T, sycl::queue* cs, std::string& err) try {
         const int64_t cap = (int64_t)n * K, capx = (int64_t)max_t_ * K;
         int32_t* pl = plan_ + (size_t)grp * (size_t)(plan_i32_ + 16);
         if (device_plan_) {  // E-6: skipped when the device planned this group (all its experts resident)
-            wait_flag_ge_or(m_flagA_, ring, skip_ + grp, cs);
-            copy_i32_from_mapped_unless(pl, m_plan_ + (size_t)grp * (size_t)plan_i32_, plan_i32_, skip_ + grp, ring,
-                                        cs);
+            if (!lean) wait_flag_ge_or(m_flagA_, ring, skip_ + grp, cs);
+            if (!lean) copy_i32_from_mapped_unless(pl, m_plan_ + (size_t)grp * (size_t)plan_i32_, plan_i32_, skip_ + grp, ring,
+                                                   cs);
         } else {
             wait_flag_ge(m_flagA_, ring, cs);  // the pool published this group's GPU plan
             copy_i32_from_mapped(pl, m_plan_ + (size_t)grp * (size_t)plan_i32_, plan_i32_, cs);
@@ -1052,21 +1057,22 @@ bool Verifier::record_window(int T, sycl::queue* cs, std::string& err) try {
         };
         grouped(p_ptr, p_start, p_counts);
         stamp(l, 20, grp);
-        if (device_plan_)
-            wait_flag_ge_or(m_flagB_, ring, skip_ + grp, cs);
-        else
+        if (device_plan_) {
+            if (!lean) wait_flag_ge_or(m_flagB_, ring, skip_ + grp, cs);
+        } else {
             wait_flag_ge(m_flagB_, ring, cs);  // the PCIe share is in staging (DMA) or mapped
-        if (sink_.pcie_mode == 2) {            // stage it with a copy kernel, then point at staging
+        }
+        if (!lean && sink_.pcie_mode == 2) {   // stage it with a copy kernel, then point at staging
             const int64_t per = G == 2 ? kStagingBlobs / 2 : kStagingBlobs;
             uint8_t* stage = staging_ + (size_t)(grp * per) * lay.max_blob;
             fetch_blobs(p_ptr2, p_counts + 2, stage, (int64_t)lay.blob_bytes(l), (int)per, cs);
             rebase_ptrs((unsigned long long*)p_ptr2, p_counts + 2, stage, (int64_t)lay.blob_bytes(l), cs);
         }
         stamp(l, 21, grp);
-        grouped(p_ptr2, p_start2, p_counts + 2);
+        if (!lean) grouped(p_ptr2, p_start2, p_counts + 2);
         stamp(l, 22, grp);
         if (device_plan_) {  // no CPU share when the device planned the group: its rows are zeros
-            wait_flag_ge_or(m_flag_, ring, skip_ + grp, cs);
+            if (!lean) wait_flag_ge_or(m_flag_, ring, skip_ + grp, cs);
             copy_or_zero_from_mapped(parts_ + (size_t)tb * K * N, m_ymiss_ + (size_t)tb * K * N, (long long)n * K * N,
                                      skip_ + grp, ring, cs);
         } else {
