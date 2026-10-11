@@ -102,8 +102,8 @@ class SyclBackend(unittest.TestCase):
 class CMakeOption(unittest.TestCase):
     def test_sycl_is_off_by_default_and_exclusive(self):
         src = (ROOT / "CMakeLists.txt").read_text(encoding="utf-8-sig")
-        self.assertIn('option(STRATA_ENABLE_SYCL "EXPERIMENTAL', src)
-        self.assertRegex(src, r'option\(STRATA_ENABLE_SYCL "[^"]*" OFF\)')
+        self.assertIn('option(STRATA_ENABLE_SYCL_SUBDIR "EXPERIMENTAL', src)
+        self.assertRegex(src, r'option\(STRATA_ENABLE_SYCL_SUBDIR "[^"]*" OFF\)')
         self.assertIn("add_subdirectory(sycl)", src)
 
 

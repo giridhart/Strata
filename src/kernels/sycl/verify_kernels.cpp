@@ -572,7 +572,8 @@ void dense_steps(const int32_t* cells, int n, int32_t* steps, void* stream) {
 }
 
 void gdn_conv_l2_multi(const float* history, const float* qkv, const float* conv_w, float* h, int channels,
-                       int qk_heads, float eps, int n_tok, void* stream, int t_begin) {
+                       int qk_heads, float eps, int n_tok, void* stream, int t_begin, bool commit) {
+    (void)commit;
     if (!history || !qkv || !conv_w || !h || channels % S != 0 || n_tok < 1 || n_tok > kVerifyMaxT) {
         std::fprintf(stderr, "gdn_conv_l2_multi: invalid arguments\n");
         std::exit(1);
@@ -612,7 +613,8 @@ void gdn_ab_multi(const float* x, const uint16_t* w_alpha, const uint16_t* w_bet
 
 void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const float* gate, const float* beta,
                          const float* z, const float* gamma, float eps, float* y, int h_k, int h_v, int n_tok,
-                         const int32_t* n_keep, void* stream, int t_out_begin) {
+                         const int32_t* n_keep, void* stream, int t_out_begin, void* xq_out) {
+    (void)xq_out;
     if (!state || !h || !gate || !beta || !z || !gamma || !y || h_k <= 0 || h_v % h_k || n_tok < 1 ||
         n_tok > kVerifyMaxT) {
         std::fprintf(stderr, "gdn_step_norm_multi: invalid arguments\n");
@@ -635,7 +637,8 @@ void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const 
 
 void resident_plan(const int32_t* ids, int n_entries, int k, const int32_t* res_layer, int n_expert,
                    const uint8_t* cache_base, const unsigned long long* slot_off, long long blob, int32_t* plan,
-                   long long capx, uint32_t* skip, uint32_t ring, void* stream) {
+                   long long capx, uint32_t* skip, uint32_t ring, void* stream, uint32_t* plan_err) {
+    (void)plan_err;
     sycl::queue* q = stream ? static_cast<sycl::queue*>(stream) : &default_queue();
     q->submit([&](sycl::handler& cgh) {
         sycl::local_accessor<int32_t, 1> s_ids(sycl::range<1>(64), cgh);
