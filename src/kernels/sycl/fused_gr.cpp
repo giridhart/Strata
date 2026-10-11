@@ -1683,4 +1683,6 @@ void fused_gr_check() {
                                  : "");
 }
 
+void fused_gr_set_fast(int) {}
+
 }  // namespace strata::kernels
