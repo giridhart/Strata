@@ -686,11 +686,7 @@ struct Fmt<8> {
 
 inline float warp_sum(float v) {
     auto sg = sycl::ext::oneapi::this_work_item::get_sub_group();
-#pragma unroll
-    for (int o = 16; o > 0; o >>= 1) {
-        v += sycl::permute_group_by_xor(sg, v, o);
-    }
-    return v;
+    return sycl::reduce_over_group(sg, v, sycl::plus<float>());
 }
 
 inline float sub16_sum(float v) {
@@ -1126,8 +1122,8 @@ inline void row_dot_40_sub8(const uint8_t* row, const block_q8_1* x, const int (
     using S = Split<TY>;
 #pragma unroll
     for (int c = 0; c < NC; ++c) s[c] = 0.0f;
-    {
-        const int k = t, kbx = k / F::ipb, iqs = F::step * (k % F::ipb);
+    for (int k = t; k < 40; k += 32) {
+        const int kbx = k / F::ipb, iqs = F::step * (k % F::ipb);
         const typename S::W w = S::load(row, kbx, iqs);
 #pragma unroll
         for (int c = 0; c < NC; ++c)
@@ -1197,7 +1193,7 @@ inline void row_dot_20_sub16(const uint8_t* row, const block_q8_1* x, const int 
         const typename S::W w = S::load(row, kbx, iqs);
 #pragma unroll
         for (int c = 0; c < NC; ++c)
-            if (EXACT_N || c < n) s[c] += S::apply(w, x + off[c] + kbx * (F::qk / 32), iqs);
+            if (EXACT_N || c < n) s16[c] += S::apply(w, x + off[c] + kbx * (F::qk / 32), iqs);
     }
 #pragma unroll
     for (int c = 0; c < NC; ++c) {

@@ -17,9 +17,7 @@ namespace {
 static sycl::queue default_queue;
 
 inline float wmax(float v, const sycl::sub_group& sg) {
-#pragma unroll
-    for (int m = 16; m; m >>= 1) v = sycl::fmax(v, sycl::permute_group_by_xor(sg, v, m));
-    return v;
+    return sycl::reduce_over_group(sg, v, sycl::maximum<float>());
 }
 
 // One subgroup (32 lanes) per token; 512 experts = 16 values per lane

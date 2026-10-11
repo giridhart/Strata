@@ -143,20 +143,12 @@ static_assert(sizeof(IQ4NLBlock) == 18 && alignof(IQ4NLBlock) == 2 && offsetof(I
 
 inline float warp_sum(float x) {
     auto sg = sycl::ext::oneapi::this_work_item::get_sub_group();
-#pragma unroll
-    for (int offset = WARP / 2; offset > 0; offset >>= 1) {
-        x += sycl::permute_group_by_xor(sg, x, offset);
-    }
-    return x;
+    return sycl::reduce_over_group(sg, x, sycl::plus<float>());
 }
 
 inline float warp_max(float x) {
     auto sg = sycl::ext::oneapi::this_work_item::get_sub_group();
-#pragma unroll
-    for (int offset = WARP / 2; offset > 0; offset >>= 1) {
-        x = sycl::fmax(x, sycl::permute_group_by_xor(sg, x, offset));
-    }
-    return x;
+    return sycl::reduce_over_group(sg, x, sycl::maximum<float>());
 }
 
 void native_quantize_q8_1_kernel(const float* __restrict__ x, Q81Block* __restrict__ y, int n_in) {

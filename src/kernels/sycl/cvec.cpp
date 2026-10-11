@@ -81,25 +81,12 @@ void cvec_kernel(float* __restrict__ R, const float* __restrict__ dir, const flo
         }
     }
     if (steer && mode == 0) {
-#pragma unroll
-        for (int o = 16; o > 0; o >>= 1)
-            dot += sycl::permute_group_by_xor(sycl::ext::oneapi::this_work_item::get_sub_group(), dot, o);
+        dot = sycl::reduce_over_group(sycl::ext::oneapi::this_work_item::get_sub_group(), dot, sycl::plus<float>());
         if ((item.get_local_id(0) & 31) == 0) part[item.get_local_id(0) >> 5] = dot;
-        /*
-        DPCT1118:3: SYCL group functions and algorithms must be encountered in
-        converged control flow. You may need to adjust the code.
-        */
-        /*
-        DPCT1065:214: Consider replacing sycl::nd_item::barrier() with
-        sycl::nd_item::barrier(sycl::access::fence_space::local_space) for
-        better performance if there is no access to global memory.
-        */
-        item.barrier();
+        item.barrier(sycl::access::fence_space::local_space);
         if (item.get_local_id(0) < 32) {
             float p = item.get_local_id(0) < THREADS / 32 ? part[item.get_local_id(0)] : 0.0f;
-#pragma unroll
-            for (int o = 16; o > 0; o >>= 1)
-                p += sycl::permute_group_by_xor(sycl::ext::oneapi::this_work_item::get_sub_group(), p, o);
+            p = sycl::reduce_over_group(sycl::ext::oneapi::this_work_item::get_sub_group(), p, sycl::plus<float>());
             if (item.get_local_id(0) == 0) part[0] = p;
         }
         /*
