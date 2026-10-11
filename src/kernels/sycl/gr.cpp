@@ -66,19 +66,11 @@ inline float silu_f(float x) { return x / (1.0f + sycl::native::exp(-x)); }
 inline float sigmoid_f(float x) { return 1.0f / (1.0f + sycl::native::exp(-x)); }
 
 inline double warp_sum(sycl::sub_group sg, double v) {
-#pragma unroll
-    for (int off = 16; off > 0; off >>= 1) {
-        v += sycl::shift_group_left(sg, v, off);
-    }
-    return sycl::select_from_group(sg, v, 0);
+    return sycl::reduce_over_group(sg, v, sycl::plus<double>());
 }
 
 inline float warp_sumf(sycl::sub_group sg, float v) {
-#pragma unroll
-    for (int off = 16; off > 0; off >>= 1) {
-        v += sycl::shift_group_left(sg, v, off);
-    }
-    return sycl::select_from_group(sg, v, 0);
+    return sycl::reduce_over_group(sg, v, sycl::plus<float>());
 }
 
 /// The FP32 block-wide sum, for the reason the review's G5 states: this is a GeForce part and FP64 runs at a

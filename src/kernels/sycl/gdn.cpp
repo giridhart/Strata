@@ -85,8 +85,7 @@ void gdn_l2_kernel(sycl::nd_item<1> item, float* __restrict__ x, int cols, float
     for (int i = item.get_local_id(0); i < cols; i += item.get_local_range(0))
         acc += (double)p[i] * (double)p[i];
 
-    for (int off = 16; off > 0; off >>= 1)
-        acc += sycl::shift_group_left(item.get_sub_group(), acc, off);
+    acc = sycl::reduce_over_group(item.get_sub_group(), acc, sycl::plus<double>());
 
     if (item.get_local_id(0) == 0) ssum = acc;
     item.barrier(sycl::access::fence_space::local_space);
@@ -106,8 +105,7 @@ void gdn_out_norm_kernel(sycl::nd_item<1> item, const float* __restrict__ o, con
     for (int i = item.get_local_id(0); i < S; i += item.get_local_range(0))
         acc += (double)po[i] * (double)po[i];
 
-    for (int off = 16; off > 0; off >>= 1)
-        acc += sycl::shift_group_left(item.get_sub_group(), acc, off);
+    acc = sycl::reduce_over_group(item.get_sub_group(), acc, sycl::plus<double>());
 
     if (item.get_local_id(0) == 0) ssum = acc;
     item.barrier(sycl::access::fence_space::local_space);

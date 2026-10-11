@@ -37,17 +37,13 @@ void router_top10_kernel(sycl::nd_item<1> item, const float* __restrict__ logits
     float mx = -INFINITY;
     for (int e = tid; e < n_expert; e += nt)
         mx = sycl::fmax(mx, l[e]);
-    for (int off = 16; off > 0; off >>= 1) {
-        mx = sycl::fmax(mx, sycl::shift_group_left(item.get_sub_group(), mx, off));
-    }
+    mx = sycl::reduce_over_group(item.get_sub_group(), mx, sycl::maximum<float>());
     if ((tid & 31) == 0) s_red[tid >> 5] = mx;
     item.barrier(sycl::access::fence_space::local_space);
     if (tid < 32) {
         const int nw = (nt + 31) >> 5;
         float v = (tid < nw) ? s_red[tid] : -INFINITY;
-        for (int off = 16; off > 0; off >>= 1) {
-            v = sycl::fmax(v, sycl::shift_group_left(item.get_sub_group(), v, off));
-        }
+        v = sycl::reduce_over_group(item.get_sub_group(), v, sycl::maximum<float>());
         if (tid == 0) s_red[0] = v;
     }
     item.barrier(sycl::access::fence_space::local_space);

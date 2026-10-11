@@ -112,8 +112,7 @@ void rms_norm_weighted_kernel(float* __restrict__ x, const float* __restrict__ w
     float acc = 0.0f;
     for (int64_t c = lane; c < cols; c += 32)
         acc += r[c] * r[c];
-    for (int off = 16; off > 0; off >>= 1)
-        acc += sycl::shift_group_left(item.get_sub_group(), acc, off);
+    acc = sycl::reduce_over_group(item.get_sub_group(), acc, sycl::plus<float>());
     // The MEAN, not the sum: `ref/qsa.py::rms_norm` divides by `np.mean(np.square(x))`.  Broadcasting the
     // reciprocal from lane 0 keeps all 32 lanes on the same value - computing `rsqrt` per lane would be the
     // same number but a needless 32-way divergence in the last bit.

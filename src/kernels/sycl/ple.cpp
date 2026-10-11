@@ -77,15 +77,13 @@ double block_sum(double v, double* scratch) {
     auto item = sycl::ext::oneapi::this_work_item::get_nd_item<1>();
     item.barrier();
     const int lane = item.get_local_id(0) & 31, warp = item.get_local_id(0) >> 5;
-    for (int off = 16; off > 0; off >>= 1)
-        v += sycl::shift_group_left(item.get_sub_group(), v, off);
+    v = sycl::reduce_over_group(item.get_sub_group(), v, sycl::plus<double>());
     if (lane == 0) scratch[warp] = v;
     item.barrier();
     const int nw = ((int)item.get_local_range(0) + 31) >> 5;
     v = (int(item.get_local_id(0)) < nw) ? scratch[item.get_local_id(0)] : 0.0;
     if (warp == 0)
-        for (int off = 16; off > 0; off >>= 1)
-            v += sycl::shift_group_left(item.get_sub_group(), v, off);
+        v = sycl::reduce_over_group(item.get_sub_group(), v, sycl::plus<double>());
     if (item.get_local_id(0) == 0) scratch[0] = v;
     item.barrier();
     return scratch[0];
@@ -445,8 +443,8 @@ void ple_block(const float* emb, const float* hidden, const float* hist_rows, co
 
 void ple_block_projected(const float* projected_key, const float* projected_value, const float* hidden,
                          const float* hist_rows, const PleWeights& w, PleOut& out, void* scratch, void* stream) {
-    if (!projected_key || !projected_value || !hidden || !hist_rows || !out.result || !scratch) return;
-    const int n_embd = NG_N_EMBD, hc = NG_HC, hc_dim = NG_HC_DIM;
+    const int n_embd = NG_N_EMBD, hc_dim = NG_HC_DIM;
+    [[maybe_unused]] const int hc = NG_HC;
     float* d_scratch = (float*)scratch;
     float* d_key = d_scratch;
     float* d_query = d_key + hc_dim;
