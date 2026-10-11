@@ -124,11 +124,7 @@ inline float row_dot_s2_q8(const uint8_t* __restrict__ codes, const uint8_t* __r
 }
 
 inline float warp_sum(float v) {
-#pragma unroll
-
-    for (int off = 16; off > 0; off >>= 1)
-        v += shift_sub_group_left(sycl::ext::oneapi::this_work_item::get_sub_group(), v, off);
-    return v;
+    return sycl::reduce_over_group(sycl::ext::oneapi::this_work_item::get_sub_group(), v, sycl::plus<float>());
 }
 
 /// GATE AND UP, ONE WARP PER ROW.
