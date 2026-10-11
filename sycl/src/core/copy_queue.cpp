@@ -1,5 +1,6 @@
 // src/core/copy_queue.cpp - see include/strata/copy_queue.hpp.
 #include "strata/copy_queue.hpp"
+#include "strata/sycl_queue.hpp"
 
 #include <dpct/dpct.hpp>
 #include <sycl/ext/oneapi/backend/level_zero.hpp>
@@ -84,6 +85,13 @@ sycl::queue* make_copy_engine_queue(const char* what) {
     try {
 
         if (dev.get_backend() != sycl::backend::ext_oneapi_level_zero) return nullptr;
+        // Battlemage only unless STRATA_COPY_ENGINE=1: on an Arc A750 (i915, JIT) the prompt path hung with it once the stager's
+        // completion flag became a copy-engine memcpy (4K and 600-token prompts, 10+ minutes, GPU not hung), and the measured gain
+        // there was 1.4% (a prompt there is compute bound).
+        {
+            const char* force = std::getenv("STRATA_COPY_ENGINE");
+            if (!(force && force[0] == '1') && strata::intel_gpu_gen(dev) != strata::IntelGpuGen::Battlemage) return nullptr;
+        }
         // The legacy Level Zero adapter already puts memcpy on the copy engine (and its kernel launches are slower); only
         // the v2 adapter needs this.  SYCL_UR_USE_LEVEL_ZERO_V2=0 selects the legacy one.
         const char* v2 = std::getenv("SYCL_UR_USE_LEVEL_ZERO_V2");

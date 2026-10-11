@@ -11,7 +11,8 @@
 // sycl::make_queue<ext_oneapi_level_zero>, so everything built on SYCL queues (memcpy, events, ext_oneapi_submit_barrier
 // across queues) keeps working, only the engine changes.  It returns nullptr (the caller keeps an ordinary in-order queue)
 // when the backend is not Level Zero, the device has no copy-only group, the loader or the call fails, or
-// STRATA_COPY_ENGINE=0.  Same bytes, same kernels: the tokens do not change.
+// STRATA_COPY_ENGINE=0 (default: on for a Battlemage card, which is where it was measured; =1 forces it on any Level Zero
+// device, =0 off).  Same bytes, same kernels: the tokens do not change.
 #pragma once
 #include <sycl/sycl.hpp>
 
