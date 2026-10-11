@@ -19,6 +19,7 @@
 
 #include "strata/core/sycl_arch.hpp"
 #include "strata/kernels/quantize_act.hpp"
+#include "strata/kernels/s2_gemv_q8.hpp"
 
 #include <cmath>
 #include <cstdint>
@@ -333,6 +334,54 @@ void BM_Xe2_Dequant_Q8_0(benchmark::State& state) {
     sycl::free(d_out, q);
 }
 
+/// S2 GEMV with Q8_0 Activations (s2_gemv_q8)
+static void BM_Xe2_S2_GEMV_Q8(benchmark::State& state) {
+    const int64_t K = state.range(0);
+    const int64_t N = state.range(1);
+    const int tpr = 32;
+
+    sycl::queue q{sycl::default_selector_v, {sycl::property::queue::in_order()}};
+
+    const size_t act_bytes = (size_t)(K / 32) * 34;
+    const size_t codes_bytes = (size_t)N * (K / 4);
+    const size_t scales_elems = (size_t)N * (K / 64);
+
+    uint8_t* d_act = sycl::malloc_device<uint8_t>(act_bytes, q);
+    uint8_t* d_codes = sycl::malloc_device<uint8_t>(codes_bytes, q);
+    float* d_scales = sycl::malloc_device<float>(scales_elems, q);
+    float* d_y = sycl::malloc_device<float>(N, q);
+
+    q.memset(d_act, 1, act_bytes).wait();
+    q.memset(d_codes, 0x55, codes_bytes).wait();
+    q.fill(d_scales, 0.01f, scales_elems).wait();
+
+    // Warmup
+    for (int i = 0; i < 5; ++i) {
+        strata::kernels::s2_gemv_q8(d_act, d_codes, d_scales, d_y, K, N, tpr, &q);
+    }
+    q.wait();
+
+    for (auto _ : state) {
+        auto start = std::chrono::high_resolution_clock::now();
+        strata::kernels::s2_gemv_q8(d_act, d_codes, d_scales, d_y, K, N, tpr, &q);
+        q.wait();
+        auto end = std::chrono::high_resolution_clock::now();
+        auto elapsed = std::chrono::duration_cast<std::chrono::duration<double>>(end - start);
+        state.SetIterationTime(elapsed.count());
+    }
+
+    const double bytes = (double)(codes_bytes + scales_elems * sizeof(float) + act_bytes + N * sizeof(float));
+    state.counters["Bandwidth_GBps"] =
+        benchmark::Counter(bytes, benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
+    state.counters["TFLOPS"] =
+        benchmark::Counter(2.0 * K * N, benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
+
+    sycl::free(d_act, q);
+    sycl::free(d_codes, q);
+    sycl::free(d_scales, q);
+    sycl::free(d_y, q);
+}
+
 // ============================================================================
 // Registration: Critical Decode Gate & Expert Projections
 // ============================================================================
@@ -355,6 +404,9 @@ BENCHMARK(BM_Xe2_Dequant_SLMBuffered)->UseManualTime()->Args({32, 2560, 10240});
 
 // Standalone Q8_0 Dequantization
 BENCHMARK(BM_Xe2_Dequant_Q8_0)->UseManualTime()->Arg(10240)->Arg(20480)->Arg(81920)->Arg(262144)->Arg(1048576);
+
+// S2 GEMV with Q8_0 Activations
+BENCHMARK(BM_Xe2_S2_GEMV_Q8)->UseManualTime()->Args({2560, 6144})->Args({2560, 10240});
 
 // ============================================================================
 // Main Entry Point

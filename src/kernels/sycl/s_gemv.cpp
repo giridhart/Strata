@@ -530,7 +530,7 @@ static void s_gemv_split_impl(const uint16_t* x, const uint8_t* codes, const flo
 
                 cgh.parallel_for(
                     sycl::nd_range<1>(sycl::range<1>(grid * threads_per_row), sycl::range<1>(threads_per_row)),
-                    [=](sycl::nd_item<1> item) {
+                    [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
                         s_gemv_split_kernel<2>(x, codes, scales, offset, y, n_in, n_out, form.code_bias, cb,
                                                form.group_elems, group_shift, form.has_offset ? 1 : 0, threads_per_row,
                                                partial_acc.get_multi_ptr<sycl::access::decorated::no>().get(),
@@ -545,7 +545,7 @@ static void s_gemv_split_impl(const uint16_t* x, const uint8_t* codes, const flo
 
                 cgh.parallel_for(
                     sycl::nd_range<1>(sycl::range<1>(grid * threads_per_row), sycl::range<1>(threads_per_row)),
-                    [=](sycl::nd_item<1> item) {
+                    [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
                         s_gemv_split_kernel<4>(x, codes, scales, offset, y, n_in, n_out, form.code_bias, cb,
                                                form.group_elems, group_shift, form.has_offset ? 1 : 0, threads_per_row,
                                                partial_acc.get_multi_ptr<sycl::access::decorated::no>().get(),
@@ -560,7 +560,7 @@ static void s_gemv_split_impl(const uint16_t* x, const uint8_t* codes, const flo
 
                 cgh.parallel_for(
                     sycl::nd_range<1>(sycl::range<1>(grid * threads_per_row), sycl::range<1>(threads_per_row)),
-                    [=](sycl::nd_item<1> item) {
+                    [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
                         s_gemv_split_kernel<8>(x, codes, scales, offset, y, n_in, n_out, form.code_bias, cb,
                                                form.group_elems, group_shift, form.has_offset ? 1 : 0, threads_per_row,
                                                partial_acc.get_multi_ptr<sycl::access::decorated::no>().get(),

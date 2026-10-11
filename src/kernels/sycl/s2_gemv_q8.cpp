@@ -31,7 +31,7 @@ void s2_gemv_q8_kernel(sycl::nd_item<1> item, const uint8_t* __restrict__ act, c
     const uint8_t* c = codes + o * n_quads;  // one code byte per quad
     const float* s = scales + o * (n_in / QK_S2);
 
-    float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+    float a0 = 0.0f, a1 = 0.0f;
     for (long long q = tid; q < n_quads; q += threads_per_row) {
         const uint8_t byte = c[q];
         const float d = s[q >> 4];  // (q*4) >> 6, the S2 group index as a shift
@@ -45,16 +45,17 @@ void s2_gemv_q8_kernel(sycl::nd_item<1> item, const uint8_t* __restrict__ act, c
         const int8_t* xq = reinterpret_cast<const int8_t*>(blk + 2);
         const int off = (int)((q * 4) % QK8_0);
 
-        const float w0 = (float)((int)(byte & 3) - 1) * d;
-        const float w1 = (float)((int)((byte >> 2) & 3) - 1) * d;
-        const float w2 = (float)((int)((byte >> 4) & 3) - 1) * d;
-        const float w3 = (float)((int)((byte >> 6) & 3) - 1) * d;
-        a0 += w0 * ((float)xq[off + 0] * dx);
-        a1 += w1 * ((float)xq[off + 1] * dx);
-        a2 += w2 * ((float)xq[off + 2] * dx);
-        a3 += w3 * ((float)xq[off + 3] * dx);
+        const int c0 = (int)(byte & 3) - 1;
+        const int c1 = (int)((byte >> 2) & 3) - 1;
+        const int c2 = (int)((byte >> 4) & 3) - 1;
+        const int c3 = (int)((byte >> 6) & 3) - 1;
+        const int idot0 = c0 * (int)xq[off + 0] + c1 * (int)xq[off + 1];
+        const int idot1 = c2 * (int)xq[off + 2] + c3 * (int)xq[off + 3];
+        const float scale = d * dx;
+        a0 += (float)idot0 * scale;
+        a1 += (float)idot1 * scale;
     }
-    float acc_sum = (a0 + a1) + (a2 + a3);
+    float acc_sum = a0 + a1;
     const auto sg = item.get_sub_group();
     if (threads_per_row <= SG_SIZE) {
         acc_sum = sycl::reduce_over_group(sg, acc_sum, sycl::plus<float>());

@@ -46,7 +46,7 @@ void s2_gemv_quads_kernel(const uint16_t* __restrict__ x, const uint8_t* __restr
     const uint8_t* c = codes + o * n_quads;  // exactly one code byte per quad
     const float* s = scales + o * (n_in / QK_S2);
 
-    float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+    float a0 = 0.0f, a1 = 0.0f;
     for (long long q = tid; q < n_quads; q += threads_per_row) {
         const uint8_t byte = c[q];  // ONE load for four codes
         const float d = s[q >> 4];  // (q*4) >> 6, the group index as a shift
@@ -55,18 +55,14 @@ void s2_gemv_quads_kernel(const uint16_t* __restrict__ x, const uint8_t* __restr
         const sycl::uint2 xw = *reinterpret_cast<const sycl::uint2*>(x + q * 4);
         const sycl::half2 h01 = *reinterpret_cast<const sycl::half2*>(&xw.x());
         const sycl::half2 h23 = *reinterpret_cast<const sycl::half2*>(&xw.y());
-        // the four codes, each carrying the -1 bias in the INTEGER domain; the scale is applied once per
-        // element here rather than once per group, which is the same expression the generic kernel uses
-        const float w0 = (float)((int)(byte & 3) - 1) * d;
-        const float w1 = (float)((int)((byte >> 2) & 3) - 1) * d;
-        const float w2 = (float)((int)((byte >> 4) & 3) - 1) * d;
-        const float w3 = (float)((int)((byte >> 6) & 3) - 1) * d;
-        a0 += w0 * h01[0];
-        a1 += w1 * h01[1];
-        a2 += w2 * h23[0];
-        a3 += w3 * h23[1];
+        const float q0 = (float)((int)(byte & 3) - 1) * (float)h01[0] +
+                         (float)((int)((byte >> 2) & 3) - 1) * (float)h01[1];
+        const float q1 = (float)((int)((byte >> 4) & 3) - 1) * (float)h23[0] +
+                         (float)((int)((byte >> 6) & 3) - 1) * (float)h23[1];
+        a0 += q0 * d;
+        a1 += q1 * d;
     }
-    float acc_sum = (a0 + a1) + (a2 + a3);
+    float acc_sum = a0 + a1;
     const auto sg = item_ct1.get_sub_group();
     if (threads_per_row <= SG_SIZE) {
         acc_sum = sycl::reduce_over_group(sg, acc_sum, sycl::plus<float>());
@@ -99,7 +95,7 @@ void s2_gemv_quads(const uint16_t* x, const uint8_t* codes, const float* scales,
     const sycl::nd_range<1> range(sycl::range<1>((size_t)n_out * threads_per_row), sycl::range<1>(threads_per_row));
     q.submit([&](sycl::handler& cgh) {
         sycl::local_accessor<float, 1> partial_acc(sycl::range<1>(threads_per_row), cgh);
-        cgh.parallel_for(range, [=](sycl::nd_item<1> item_ct1) {
+        cgh.parallel_for(range, [=](sycl::nd_item<1> item_ct1) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
             s2_gemv_quads_kernel(x, codes, scales, y, n_in, n_out, threads_per_row, item_ct1,
                                  partial_acc.get_multi_ptr<sycl::access::decorated::no>().get());
         });
