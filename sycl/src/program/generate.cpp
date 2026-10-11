@@ -12037,7 +12037,13 @@ int main(int argc, char **argv) try {
         strata::core::Verifier ver;
         strata::core::VerifyHits vh;
         vh.d_res = thits.d_res;
-        if (mirror_table_d) strata::kernels::resident_plan_set_mirror(thits.d_res, mirror_table_d);
+        int32_t* usage_dev = nullptr;   // STRATA_USAGE_DUMP=PATH: the device plan counts every routed expert (measurement)
+        const char* usage_dump = std::getenv("STRATA_USAGE_DUMP");
+        if (mirror_table_d && usage_dump && *usage_dump) {
+            usage_dev = sycl::malloc_device<int32_t>((size_t) (g.n_layers * g.n_expert), dpct::get_in_order_queue());
+            dpct::get_in_order_queue().memset(usage_dev, 0, (size_t) (g.n_layers * g.n_expert) * 4).wait();
+        }
+        if (mirror_table_d) strata::kernels::resident_plan_set_mirror(thits.d_res, mirror_table_d, usage_dev);
         vh.h_res = host_res.empty() ? nullptr : host_res.data();
         vh.cache_base = thits.cache_base;
         vh.blob = thits.blob;
@@ -12484,6 +12490,24 @@ int main(int argc, char **argv) try {
             std::printf("%-24s plan %.3f  activation quantize %.3f  jobs %.3f  run %.3f ms/round\n", "dispatch",
                         drive.d.ms_plan / rounds, drive.d.ms_actq / rounds, drive.d.ms_jobs / rounds,
                         drive.d.ms_run / rounds);
+        if (usage_dev != nullptr) {   // STRATA_USAGE_DUMP: the window's routing as make_profile.py reads it (layer, k=1, id, weight)
+            std::vector<int32_t> uh((size_t) (g.n_layers * g.n_expert));
+            dpct::get_in_order_queue().memcpy(uh.data(), usage_dev, uh.size() * 4).wait();
+            if (FILE* uf = std::fopen(usage_dump, "wb")) {
+                int64_t total = 0;
+                for (int64_t l = 0; l < g.n_layers; ++l)
+                    for (int64_t e = 0; e < g.n_expert; ++e)
+                        for (int32_t c = 0; c < uh[(size_t) (l * g.n_expert + e)]; ++c, ++total) {
+                            const int32_t hdr[3] = {(int32_t) l, 1, (int32_t) e};
+                            const float wgt[2] = {0.0f, 0.0f};
+                            std::fwrite(hdr, 4, 3, uf);
+                            std::fwrite(wgt, 4, 1, uf);   // (layer, k) + k ids + k weights: 8 + 8 bytes
+                        }
+                std::fclose(uf);
+                std::printf("%-24s %s (%lld routed entries counted on the device)\n", "usage dumped", usage_dump,
+                            (long long) total);
+            }
+        }
         if (rounds > 0 && !drive.d.usage.empty())
             std::printf("%-24s %lld experts swapped into the VRAM tier (every %d rounds, %.3f ms/round)\n", "adaptive tier",
                         (long long) swaps_total, o.adapt_every, ms_adapt / rounds);
