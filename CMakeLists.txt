@@ -8,7 +8,7 @@
 # below refuses anything older: silently building for a pre-Ampere arch would produce a binary that runs
 # and is wrong about its own performance, which is the worst of both outcomes.
 cmake_minimum_required(VERSION 3.24)
-project(strata VERSION 0.1.42 LANGUAGES CXX)
+project(strata VERSION 0.1.43 LANGUAGES CXX)
 # EXPERIMENTAL: the Intel Arc engine, the legacy SYCL port in sycl/ (PR #423; icpx + oneMKL, docs/INTEL_ARC.md).
 option(STRATA_ENABLE_SYCL_SUBDIR "EXPERIMENTAL: build the Intel Arc engine from sycl/ - docs/INTEL_ARC.md" OFF)
 if(STRATA_ENABLE_SYCL_SUBDIR)
@@ -1033,6 +1033,9 @@ endif()
     add_executable(fused_gr_bench src/kernels/fused_gr_bench.cpp)
     target_include_directories(fused_gr_bench PRIVATE ${_strata_gpu_include_directories})
     target_link_libraries(fused_gr_bench PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+    add_executable(router_chain_bench src/kernels/router_chain_bench.cpp)
+    target_include_directories(router_chain_bench PRIVATE ${_strata_gpu_include_directories})
+    target_link_libraries(router_chain_bench PRIVATE strata_kernels ${_strata_gpu_runtime_target})
   endif()
   if(STRATA_ENABLE_SYCL)
     add_executable(gr_parity src/kernels/sycl/gr_parity.cpp)
@@ -1120,6 +1123,14 @@ endif()
     target_include_directories(route_window_parity PRIVATE ${_strata_gpu_include_directories})
     target_link_libraries(route_window_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
     add_test(NAME route_window_parity COMMAND route_window_parity)
+
+    # STRATA_ROUTE_RESIDENT's swap: the warp-per-token kernel against a scalar reference of the same semantics,
+    # bitwise on the ids, the weights and the four counters (GPU, synthetic, no model)
+    add_executable(route_resident_parity src/kernels/route_resident_parity.cu)
+    target_include_directories(route_resident_parity PRIVATE ${_strata_gpu_include_directories})
+    target_link_libraries(route_resident_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+    add_test(NAME route_resident_parity COMMAND route_resident_parity)
+    set_tests_properties(route_resident_parity PROPERTIES TIMEOUT 120)
   endif()
   if(STRATA_ENABLE_SYCL)
     add_executable(router_top10_parity src/kernels/sycl/router_top10_parity.cpp)
