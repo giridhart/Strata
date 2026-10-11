@@ -28,6 +28,8 @@ inline sycl::queue& get_default_queue() {
 #include "strata/kernels/gr.hpp"
 #include "strata/kernels/kv_q4.hpp"
 #include "strata/kernels/kv_q8.hpp"
+#include "strata/kernels/kv_stream.hpp"
+#include "strata/kernels/route_prior.hpp"
 #include "strata/kernels/native_mmvq.hpp"
 #include "strata/kernels/native_qsa.hpp"
 #include "strata/kernels/native_qsa_indexer.hpp"
@@ -528,6 +530,7 @@ bool Verifier::record_window(int T, sycl::queue* cs, std::string& err) try {
         const char* v = std::getenv("STRATA_DEC_BATCH");
         return v == nullptr || std::atoi(v) != 0;
     }();
+    static const bool g_no_batch_kv = std::getenv("STRATA_NO_BATCH_KV_STEP") != nullptr;
     auto stamp = [&](int64_t l, int i, int grp) {
         if (prof_on_ && grp == 0) gpu_stamp(prof_, (int)(l * kProfPer + i), cs);
     };
@@ -759,27 +762,58 @@ bool Verifier::record_window(int T, sycl::queue* cs, std::string& err) try {
                 }
                 stamp(l, 8, grp);
                 if (grp == 0) copy_from_mapped(tail_snap_ + (size_t)qi * TS, st.idx_tail, TS, cs);
-                for (int t = tb; t < te; ++t) {
-                    const int32_t* step_t = step_ + t * kStepCount;
+                if (dec_batch && !g_no_batch_kv) {
+                    const int32_t* step_b = step_ + tb * kStepCount;
+                    const float* kc_b = kcur_ + tb * NKV * HD;
+                    const float* vc_b = vcur_ + tb * NKV * HD;
                     if (st.kv_hybrid) {  // K8V4: the unused half's lanes folded onto the used pool (layer.cpp)
-                        kv_append_q8_step(st.k_q, st.k_q, st.k_scale, st.k_scale, st.page_table, step_t,
-                                          kcur_ + t * NKV * HD, kcur_ + t * NKV * HD, s, cs, nullptr);
-                        kv_append_q4_step(st.v_q4, st.v_q4, st.page_table, step_t, vcur_ + t * NKV * HD,
-                                          vcur_ + t * NKV * HD, s, cs, nullptr);
+                        const KvHostPools hk = kv_hybrid_k_half(st.host), hv = kv_hybrid_v_half(st.host);
+                        const bool mirror = st.host.present();
+                        kv_append_q8_steps(st.k_q, st.k_q, st.k_scale, st.k_scale, st.page_table, step_b, kStepCount,
+                                           kc_b, kc_b, (int)(NKV * HD), n, s, cs, mirror ? &hk : nullptr);
+                        kv_append_q4_steps(st.v_q4, st.v_q4, st.page_table, step_b, kStepCount, n, vc_b, vc_b, s, cs,
+                                           mirror ? &hv : nullptr);
                     } else if (st.kv_q4)
-                        kv_append_q4_step(st.k_q4, st.v_q4, st.page_table, step_t, kcur_ + t * NKV * HD,
-                                          vcur_ + t * NKV * HD, s, cs, &st.host);
+                        kv_append_q4_steps(st.k_q4, st.v_q4, st.page_table, step_b, kStepCount, n, kc_b, vc_b, s, cs,
+                                           &st.host);
                     else if (st.kv_int8)
-                        kv_append_q8_step(st.k_q, st.v_q, st.k_scale, st.v_scale, st.page_table, step_t,
-                                          kcur_ + t * NKV * HD, vcur_ + t * NKV * HD, s, cs, &st.host);
+                        kv_append_q8_steps(st.k_q, st.v_q, st.k_scale, st.v_scale, st.page_table, step_b, kStepCount,
+                                           kc_b, vc_b, (int)(NKV * HD), n, s, cs, &st.host);
                     else
-                        kv_append_step(st.k_pool, st.v_pool, st.page_table, step_t, kcur_ + t * NKV * HD,
-                                       vcur_ + t * NKV * HD, s, cs, &st.host);
+                        for (int t = tb; t < te; ++t)
+                            kv_append_step(st.k_pool, st.v_pool, st.page_table, step_ + t * kStepCount,
+                                           kcur_ + t * NKV * HD, vcur_ + t * NKV * HD, s, cs, &st.host);
+                } else {
+                    for (int t = tb; t < te; ++t) {
+                        const int32_t* step_t = step_ + t * kStepCount;
+                        if (st.kv_hybrid) {  // K8V4: the unused half's lanes folded onto the used pool (layer.cpp)
+                            const KvHostPools hk = kv_hybrid_k_half(st.host), hv = kv_hybrid_v_half(st.host);
+                            const bool mirror = st.host.present();
+                            kv_append_q8_step(st.k_q, st.k_q, st.k_scale, st.k_scale, st.page_table, step_t,
+                                              kcur_ + t * NKV * HD, kcur_ + t * NKV * HD, s, cs, mirror ? &hk : nullptr);
+                            kv_append_q4_step(st.v_q4, st.v_q4, st.page_table, step_t, vcur_ + t * NKV * HD,
+                                              vcur_ + t * NKV * HD, s, cs, mirror ? &hv : nullptr);
+                        } else if (st.kv_q4)
+                            kv_append_q4_step(st.k_q4, st.v_q4, st.page_table, step_t, kcur_ + t * NKV * HD,
+                                              vcur_ + t * NKV * HD, s, cs, &st.host);
+                        else if (st.kv_int8)
+                            kv_append_q8_step(st.k_q, st.v_q, st.k_scale, st.v_scale, st.page_table, step_t,
+                                              kcur_ + t * NKV * HD, vcur_ + t * NKV * HD, s, cs, &st.host);
+                        else
+                            kv_append_step(st.k_pool, st.v_pool, st.page_table, step_t, kcur_ + t * NKV * HD,
+                                           vcur_ + t * NKV * HD, s, cs, &st.host);
+                    }
                 }
                 const QsaIndexerBuffers ib{st.idx_tail, st.idx_dead, st.idx_pooled, st.idx_block_pos};
-                for (int t = tb; t < te; ++t)
-                    native_qsa_indexer_append(idx_raw + t * ID, step_ + t * kStepCount + kStepPos, 0,
-                                              (const float*)wikn->data, EPS, ib, s, st.max_cells, rope_scaling(), cs);
+                if (dec_batch && !g_no_batch_kv) {
+                    native_qsa_indexer_append_steps(idx_raw + tb * ID, step_ + tb * kStepCount + kStepPos, kStepCount,
+                                                    n, 0, (const float*)wikn->data, EPS, ib, s, st.max_cells,
+                                                    rope_scaling(), cs);
+                } else {
+                    for (int t = tb; t < te; ++t)
+                        native_qsa_indexer_append(idx_raw + t * ID, step_ + t * kStepCount + kStepPos, 0,
+                                                  (const float*)wikn->data, EPS, ib, s, st.max_cells, rope_scaling(), cs);
+                }
                 stamp(l, 9, grp);
                 native_mmvq(wq->native_type, wq->native_data, xq_, qfull_ + tb * NH * 2 * HD, (int)N,
                             (int)(NH * 2 * HD), n, cs);
@@ -896,6 +930,13 @@ bool Verifier::record_window(int T, sycl::queue* cs, std::string& err) try {
                 mb.weights = w_ + t * K;
                 if (!moe_route(wt, g, l, K, mb, mixed_ + t * N, cs, err, nullptr)) return false;
             }
+        static const float route_prior = [] {
+            const char* v = std::getenv("STRATA_ROUTE_PRIOR");
+            return v ? (float)std::atof(v) : 0.0f;
+        }();
+        if (route_prior > 0.0f && NE == 512 && K == 10 && hits_.d_res != nullptr)
+            route_prior_top10(logits_ + tb * NE, hits_.d_res + l * g.n_expert, route_prior, ids_ + tb * K, w_ + tb * K,
+                              n, cs);
         static const auto route_resident_cfg = [] {
             struct { float margin = 0.0f; int lo = 6, hi = 9; } c;
             if (const char* v = std::getenv("STRATA_ROUTE_RESIDENT")) c.margin = (float)std::atof(v);

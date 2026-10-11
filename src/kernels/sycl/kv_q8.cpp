@@ -22,14 +22,24 @@ void validate(const QsaShapes& s, const char* what) {
 }
 
 // One block = one 64-value group of one KV head of K (blockIdx.z = 0) or V (1); 64 threads, one value each.
+// MULTI (S26 STRATA_LFUSE): blockIdx.z = 2 * token + (K / V); token j reads step + j * step_stride and its rows at
+// kcur / vcur + j * cur_stride - every token's code is the single launch's
+template <bool MULTI = false>
 void kv_append_q8_kernel(int8_t* __restrict__ k_q, int8_t* __restrict__ v_q, uint16_t* __restrict__ k_scale,
                          uint16_t* __restrict__ v_scale, const int32_t* __restrict__ table,
                          const int32_t* __restrict__ step, const float* __restrict__ kcur,
                          const float* __restrict__ vcur, int kv_heads, int head_dim, int page_size, KvHostPools host,
+                         int step_stride, int cur_stride,
                          float* warp_max, const sycl::nd_item<3>& item) {
+    if constexpr (MULTI) {
+        const int j = item.get_group(0) >> 1;
+        step += (size_t)j * step_stride;
+        kcur += (size_t)j * cur_stride;
+        vcur += (size_t)j * cur_stride;
+    }
     const long long pos = (long long)*(step + kStepPos);
     const int h = item.get_group(2), g = item.get_group(1), t = item.get_local_id(2);
-    const bool is_v = item.get_group(0) == 1;
+    const bool is_v = MULTI ? ((item.get_group(0) & 1) == 1) : (item.get_group(0) == 1);
     const int groups = head_dim / KV_Q8_GROUP;
     const float x = (is_v ? vcur : kcur)[h * head_dim + g * KV_Q8_GROUP + t];
     // max |x| over the 64 values: two warps, then combine through shared memory in a fixed order
@@ -113,9 +123,34 @@ void kv_append_q8_step(int8_t* k_q, int8_t* v_q, uint16_t* k_scale, uint16_t* v_
 
         cgh.parallel_for(sycl::nd_range<3>(grid * sycl::range<3>(1, 1, KV_Q8_GROUP), sycl::range<3>(1, 1, KV_Q8_GROUP)),
                          [=](sycl::nd_item<3> item) [[sycl::reqd_sub_group_size(32)]] {
-                             kv_append_q8_kernel(k_q, v_q, k_scale, v_scale, page_table, step, kcur, vcur,
-                                                 (int)s.n_head_kv, (int)s.head_dim, (int)s.page_size, host_pools,
-                                                 warp_max_acc.get_multi_ptr<sycl::access::decorated::no>().get(), item);
+                             kv_append_q8_kernel<false>(k_q, v_q, k_scale, v_scale, page_table, step, kcur, vcur,
+                                                        (int)s.n_head_kv, (int)s.head_dim, (int)s.page_size, host_pools,
+                                                        0, 0,
+                                                        warp_max_acc.get_multi_ptr<sycl::access::decorated::no>().get(),
+                                                        item);
+                         });
+    });
+    if (!stream) default_queue.wait();
+}
+
+void kv_append_q8_steps(int8_t* k_q, int8_t* v_q, uint16_t* k_scale, uint16_t* v_scale, const int32_t* page_table,
+                        const int32_t* step, int step_stride, const float* kcur, const float* vcur, int cur_stride,
+                        int n_tok, const QsaShapes& s, void* stream, const KvHostPools* host) {
+    validate(s, "kv_append_q8 (steps)");
+    if (n_tok < 1) return;
+    const sycl::range<3> grid((unsigned)(2 * n_tok), (unsigned)(s.head_dim / KV_Q8_GROUP), (unsigned)s.n_head_kv);
+    sycl::queue* q = stream ? static_cast<sycl::queue*>(stream) : &default_queue;
+    q->submit([&](sycl::handler& cgh) {
+        sycl::local_accessor<float, 1> warp_max_acc(sycl::range<1>(2), cgh);
+        KvHostPools host_pools = host ? *host : KvHostPools{};
+
+        cgh.parallel_for(sycl::nd_range<3>(grid * sycl::range<3>(1, 1, KV_Q8_GROUP), sycl::range<3>(1, 1, KV_Q8_GROUP)),
+                         [=](sycl::nd_item<3> item) [[sycl::reqd_sub_group_size(32)]] {
+                             kv_append_q8_kernel<true>(k_q, v_q, k_scale, v_scale, page_table, step, kcur, vcur,
+                                                       (int)s.n_head_kv, (int)s.head_dim, (int)s.page_size, host_pools,
+                                                       step_stride, cur_stride,
+                                                       warp_max_acc.get_multi_ptr<sycl::access::decorated::no>().get(),
+                                                       item);
                          });
     });
     if (!stream) default_queue.wait();

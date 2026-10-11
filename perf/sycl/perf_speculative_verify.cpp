@@ -16,9 +16,11 @@
 #include <sycl/sycl.hpp>
 
 #include "strata/core/sycl_arch.hpp"
+#include "strata/kernels/kv_q8.hpp"
 #include "strata/kernels/native_qsa.hpp"
 #include "strata/kernels/native_rope.hpp"
 #include "strata/kernels/native_router.hpp"
+#include "strata/kernels/qsa.hpp"
 
 #include <chrono>
 #include <cmath>
@@ -371,8 +373,140 @@ static void BM_Xe2_Route_Resident(benchmark::State& state) {
     sycl::free(d_res, q);
 }
 
+static void BM_Xe2_KV_Append_Sequential(benchmark::State& state) {
+    const int B = state.range(0);
+    strata::kernels::QsaShapes s = strata::kernels::qsa_real_shapes();
+    s.page_size = 64;
+    const int H = (int) s.n_head_kv, D = (int) s.head_dim, P = (int) s.page_size, G = D / strata::kernels::KV_Q8_GROUP;
+    const int pages = 8, cells = pages * P;
+
+    sycl::queue q{sycl::default_selector_v, {sycl::property::queue::in_order(), sycl::property::queue::enable_profiling()}};
+
+    const size_t q8n = (size_t) cells * H * D, q8s = (size_t) cells * H * G;
+    auto* kq = sycl::malloc_device<int8_t>(q8n, q);
+    auto* vq = sycl::malloc_device<int8_t>(q8n, q);
+    auto* ks = sycl::malloc_device<uint16_t>(q8s, q);
+    auto* vs = sycl::malloc_device<uint16_t>(q8s, q);
+    auto* table = sycl::malloc_device<int32_t>(pages, q);
+    auto* d_k = sycl::malloc_device<float>((size_t) B * H * D, q);
+    auto* d_v = sycl::malloc_device<float>((size_t) B * H * D, q);
+    auto* d_step = sycl::malloc_device<int32_t>((size_t) B * strata::kernels::kStepCount, q);
+
+    q.fill(kq, (int8_t) 0, q8n);
+    q.fill(vq, (int8_t) 0, q8n);
+    q.fill(ks, (uint16_t) 0, q8s);
+    q.fill(vs, (uint16_t) 0, q8s);
+    std::vector<int32_t> h_table(pages);
+    for (int i = 0; i < pages; ++i) h_table[i] = i;
+    q.memcpy(table, h_table.data(), pages * sizeof(int32_t));
+    q.fill(d_k, 0.5f, (size_t) B * H * D);
+    q.fill(d_v, 0.5f, (size_t) B * H * D);
+    std::vector<int32_t> h_step((size_t) B * strata::kernels::kStepCount, 0);
+    for (int t = 0; t < B; ++t) {
+        h_step[(size_t) t * strata::kernels::kStepCount + strata::kernels::kStepPos] = t;
+    }
+    q.memcpy(d_step, h_step.data(), h_step.size() * sizeof(int32_t)).wait();
+
+    // Warmup
+    for (int w = 0; w < 3; ++w) {
+        for (int t = 0; t < B; ++t) {
+            strata::kernels::kv_append_q8_step(kq, vq, ks, vs, table,
+                                               d_step + (size_t) t * strata::kernels::kStepCount,
+                                               d_k + (size_t) t * H * D,
+                                               d_v + (size_t) t * H * D, s, &q);
+        }
+        q.wait();
+    }
+
+    for (auto _ : state) {
+        auto t0 = std::chrono::steady_clock::now();
+        for (int t = 0; t < B; ++t) {
+            strata::kernels::kv_append_q8_step(kq, vq, ks, vs, table,
+                                               d_step + (size_t) t * strata::kernels::kStepCount,
+                                               d_k + (size_t) t * H * D,
+                                               d_v + (size_t) t * H * D, s, &q);
+        }
+        q.wait();
+        auto t1 = std::chrono::steady_clock::now();
+        state.SetIterationTime(std::chrono::duration<double>(t1 - t0).count());
+    }
+
+    state.counters["Batch_B"] = benchmark::Counter((double) B);
+    state.counters["tokens_per_sec"] = benchmark::Counter((double) B, benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
+
+    sycl::free(kq, q); sycl::free(vq, q);
+    sycl::free(ks, q); sycl::free(vs, q);
+    sycl::free(table, q);
+    sycl::free(d_k, q); sycl::free(d_v, q);
+    sycl::free(d_step, q);
+}
+
+static void BM_Xe2_KV_Append_Batched(benchmark::State& state) {
+    const int B = state.range(0);
+    strata::kernels::QsaShapes s = strata::kernels::qsa_real_shapes();
+    s.page_size = 64;
+    const int H = (int) s.n_head_kv, D = (int) s.head_dim, P = (int) s.page_size, G = D / strata::kernels::KV_Q8_GROUP;
+    const int pages = 8, cells = pages * P;
+
+    sycl::queue q{sycl::default_selector_v, {sycl::property::queue::in_order(), sycl::property::queue::enable_profiling()}};
+
+    const size_t q8n = (size_t) cells * H * D, q8s = (size_t) cells * H * G;
+    auto* kq = sycl::malloc_device<int8_t>(q8n, q);
+    auto* vq = sycl::malloc_device<int8_t>(q8n, q);
+    auto* ks = sycl::malloc_device<uint16_t>(q8s, q);
+    auto* vs = sycl::malloc_device<uint16_t>(q8s, q);
+    auto* table = sycl::malloc_device<int32_t>(pages, q);
+    auto* d_k = sycl::malloc_device<float>((size_t) B * H * D, q);
+    auto* d_v = sycl::malloc_device<float>((size_t) B * H * D, q);
+    auto* d_step = sycl::malloc_device<int32_t>((size_t) B * strata::kernels::kStepCount, q);
+
+    q.fill(kq, (int8_t) 0, q8n);
+    q.fill(vq, (int8_t) 0, q8n);
+    q.fill(ks, (uint16_t) 0, q8s);
+    q.fill(vs, (uint16_t) 0, q8s);
+    std::vector<int32_t> h_table(pages);
+    for (int i = 0; i < pages; ++i) h_table[i] = i;
+    q.memcpy(table, h_table.data(), pages * sizeof(int32_t));
+    q.fill(d_k, 0.5f, (size_t) B * H * D);
+    q.fill(d_v, 0.5f, (size_t) B * H * D);
+    std::vector<int32_t> h_step((size_t) B * strata::kernels::kStepCount, 0);
+    for (int t = 0; t < B; ++t) {
+        h_step[(size_t) t * strata::kernels::kStepCount + strata::kernels::kStepPos] = t;
+    }
+    q.memcpy(d_step, h_step.data(), h_step.size() * sizeof(int32_t)).wait();
+
+    // Warmup
+    for (int w = 0; w < 3; ++w) {
+        strata::kernels::kv_append_q8_steps(kq, vq, ks, vs, table, d_step,
+                                            strata::kernels::kStepCount, d_k, d_v, H * D,
+                                            B, s, &q, nullptr);
+        q.wait();
+    }
+
+    for (auto _ : state) {
+        auto t0 = std::chrono::steady_clock::now();
+        strata::kernels::kv_append_q8_steps(kq, vq, ks, vs, table, d_step,
+                                            strata::kernels::kStepCount, d_k, d_v, H * D,
+                                            B, s, &q, nullptr);
+        q.wait();
+        auto t1 = std::chrono::steady_clock::now();
+        state.SetIterationTime(std::chrono::duration<double>(t1 - t0).count());
+    }
+
+    state.counters["Batch_B"] = benchmark::Counter((double) B);
+    state.counters["tokens_per_sec"] = benchmark::Counter((double) B, benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
+
+    sycl::free(kq, q); sycl::free(vq, q);
+    sycl::free(ks, q); sycl::free(vs, q);
+    sycl::free(table, q);
+    sycl::free(d_k, q); sycl::free(d_v, q);
+    sycl::free(d_step, q);
+}
+
 BENCHMARK(BM_Xe2_Router_Sequential)->Arg(1)->Arg(2)->Arg(4)->Arg(8)->UseManualTime();
 BENCHMARK(BM_Xe2_Router_MultiToken)->Arg(1)->Arg(2)->Arg(4)->Arg(8)->UseManualTime();
 BENCHMARK(BM_Xe2_Route_Resident)->Arg(1)->Arg(2)->Arg(4)->Arg(8)->UseManualTime();
+BENCHMARK(BM_Xe2_KV_Append_Sequential)->Arg(1)->Arg(2)->Arg(4)->Arg(8)->UseManualTime();
+BENCHMARK(BM_Xe2_KV_Append_Batched)->Arg(1)->Arg(2)->Arg(4)->Arg(8)->UseManualTime();
 
 BENCHMARK_MAIN();

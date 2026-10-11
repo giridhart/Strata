@@ -388,6 +388,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP OR STRATA_ENABLE_SYCL)
                           src/kernels/sycl/native_gdn.cpp
                           src/kernels/sycl/native_gr_postops.cpp
                           src/kernels/sycl/native_router.cpp
+                          src/kernels/sycl/route_prior.cpp
                           src/kernels/sycl/native_gdn_preprocess.cpp
                           src/kernels/sycl/native_qsa.cpp
                           src/kernels/sycl/native_rope.cpp
@@ -1133,12 +1134,17 @@ endif()
     add_executable(native_multi_parity src/kernels/native_multi_parity.cpp)
     target_include_directories(native_multi_parity PRIVATE ${_strata_gpu_include_directories})
     target_link_libraries(native_multi_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
-    add_test(NAME native_multi_parity COMMAND native_multi_parity)
-    # #783 PR-d: the batched K/V append (INT8, Q4_0, the hybrid fold) against the per-cell appends, memcmp
+  endif()
+  # #783 PR-d: the batched K/V append (INT8, Q4_0, the hybrid fold) against the per-cell appends, memcmp
+  if(STRATA_ENABLE_SYCL)
+    add_executable(kv_steps_parity src/kernels/sycl/kv_steps_parity.cpp)
+  else()
     add_executable(kv_steps_parity src/kernels/kv_steps_parity.cpp)
-    target_include_directories(kv_steps_parity PRIVATE ${_strata_gpu_include_directories})
-    target_link_libraries(kv_steps_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
-    add_test(NAME kv_steps_parity COMMAND kv_steps_parity)
+  endif()
+  target_include_directories(kv_steps_parity PRIVATE ${_strata_gpu_include_directories})
+  target_link_libraries(kv_steps_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+  add_test(NAME kv_steps_parity COMMAND kv_steps_parity)
+  if(NOT STRATA_ENABLE_SYCL)
     # #783 PR-e: the device-built expert plan (parallel grouping + prefix scan) against a host replay of its contract
     add_executable(resident_plan_parity src/kernels/resident_plan_parity.cpp)
     target_include_directories(resident_plan_parity PRIVATE ${_strata_gpu_include_directories})
