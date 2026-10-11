@@ -37,7 +37,7 @@ inline sycl::queue& default_queue() {
 
 /// One SUBGROUP per output row, lanes striding the reduction axis. On Xe2 (B580/Lunar Lake),
 /// this executes natively in SIMD16 with single-cycle hardware group reduction.
-template <int SUB_SIZE = SG_SIZE>
+template <int SUB_SIZE = SG_SIZE, bool STREAMING = false>
 void bf16_gemv_subgroup_kernel(sycl::nd_item<1> item, const uint16_t* __restrict__ x, const uint16_t* __restrict__ w,
                                float* __restrict__ y, long long n_in, long long n_out) {
     const auto sg = item.get_sub_group();
@@ -47,8 +47,20 @@ void bf16_gemv_subgroup_kernel(sycl::nd_item<1> item, const uint16_t* __restrict
     const int lane = sg.get_local_linear_id();
     const uint16_t* row = w + o * n_in;
     float acc = 0.0f;
-    for (long long i = lane; i < n_in; i += SUB_SIZE)
-        acc += f32_from_bf16(x[i]) * f32_from_bf16(row[i]);
+    if constexpr (STREAMING) {
+        auto stream_props = sycl::ext::oneapi::experimental::properties{
+            sycl::ext::intel::experimental::read_hint<
+                sycl::ext::intel::experimental::cache_control<
+                    sycl::ext::intel::experimental::cache_mode::streaming,
+                    sycl::ext::oneapi::experimental::cache_level::L3>>};
+        sycl::ext::oneapi::experimental::annotated_ptr<
+            const uint16_t, decltype(stream_props)> row_stream(row, stream_props);
+        for (long long i = lane; i < n_in; i += SUB_SIZE)
+            acc += f32_from_bf16(x[i]) * f32_from_bf16(uint16_t(row_stream[i]));
+    } else {
+        for (long long i = lane; i < n_in; i += SUB_SIZE)
+            acc += f32_from_bf16(x[i]) * f32_from_bf16(row[i]);
+    }
     acc = sycl::reduce_over_group(sg, acc, sycl::plus<float>());
     if (lane == 0) y[o] = acc;
 }
@@ -56,7 +68,7 @@ void bf16_gemv_subgroup_kernel(sycl::nd_item<1> item, const uint16_t* __restrict
 /// TPR lanes cooperate on ONE row's reduction: `threads_per_row` threads each take a strided slice and the
 /// block reduces through shared memory. On Xe2, we first reduce within each SIMD16 subgroup via
 /// single-cycle hardware reduction, then reduce the subgroup sums in local memory.
-template <int SUB_SIZE = SG_SIZE>
+template <int SUB_SIZE = SG_SIZE, bool STREAMING = false>
 void bf16_gemv_split_kernel(sycl::nd_item<1> item, const uint16_t* __restrict__ x, const uint16_t* __restrict__ w,
                             float* __restrict__ y, long long n_in, long long n_out, int tpr,
                             sycl::local_accessor<float, 1> scratch) {
@@ -70,8 +82,20 @@ void bf16_gemv_split_kernel(sycl::nd_item<1> item, const uint16_t* __restrict__ 
 
     const uint16_t* row = w + o * n_in;
     float acc = 0.0f;
-    for (long long i = t; i < n_in; i += tpr)
-        acc += f32_from_bf16(x[i]) * f32_from_bf16(row[i]);
+    if constexpr (STREAMING) {
+        auto stream_props = sycl::ext::oneapi::experimental::properties{
+            sycl::ext::intel::experimental::read_hint<
+                sycl::ext::intel::experimental::cache_control<
+                    sycl::ext::intel::experimental::cache_mode::streaming,
+                    sycl::ext::oneapi::experimental::cache_level::L3>>};
+        sycl::ext::oneapi::experimental::annotated_ptr<
+            const uint16_t, decltype(stream_props)> row_stream(row, stream_props);
+        for (long long i = t; i < n_in; i += tpr)
+            acc += f32_from_bf16(x[i]) * f32_from_bf16(uint16_t(row_stream[i]));
+    } else {
+        for (long long i = t; i < n_in; i += tpr)
+            acc += f32_from_bf16(x[i]) * f32_from_bf16(row[i]);
+    }
 
     // Subgroup reduction first (single-cycle hardware reduction on Xe2)
     acc = sycl::reduce_over_group(sg, acc, sycl::plus<float>());
@@ -93,13 +117,21 @@ void bf16_gemv_split_kernel(sycl::nd_item<1> item, const uint16_t* __restrict__ 
 void bf16_gemv(const uint16_t* x, const uint16_t* w, float* y, int64_t n_in, int64_t n_out, void* stream) {
     sycl::queue* q = stream ? static_cast<sycl::queue*>(stream) : &default_queue();
     if (n_in <= 0 || n_out <= 0) return;
+    const auto prof = strata::sycl_arch::get_xe2_tuning_profile(q->get_device());
     if (n_out >= 64) {
         const int sgs = THREADS / SG_SIZE;
         const unsigned grid = (unsigned)((n_out + sgs - 1) / sgs);
-        q->parallel_for(sycl::nd_range<1>(sycl::range<1>((grid) * (THREADS)), sycl::range<1>(THREADS)),
-                        [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
-                            bf16_gemv_subgroup_kernel<SG_SIZE>(item, x, w, y, n_in, n_out);
-                        });
+        if (prof.enable_streaming_hints) {
+            q->parallel_for(sycl::nd_range<1>(sycl::range<1>((grid) * (THREADS)), sycl::range<1>(THREADS)),
+                            [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
+                                bf16_gemv_subgroup_kernel<SG_SIZE, true>(item, x, w, y, n_in, n_out);
+                            });
+        } else {
+            q->parallel_for(sycl::nd_range<1>(sycl::range<1>((grid) * (THREADS)), sycl::range<1>(THREADS)),
+                            [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
+                                bf16_gemv_subgroup_kernel<SG_SIZE, false>(item, x, w, y, n_in, n_out);
+                            });
+        }
         return;
     }
     // For narrow shapes (n_out < 64, e.g. ssm_alpha [2560, 48]), dispatch the SLM split reduction
@@ -111,13 +143,21 @@ void bf16_gemv_split(const uint16_t* x, const uint16_t* w, float* y, int64_t n_i
                      void* stream) {
     sycl::queue* q = stream ? static_cast<sycl::queue*>(stream) : &default_queue();
     if (n_in <= 0 || n_out <= 0) return;
+    const auto prof = strata::sycl_arch::get_xe2_tuning_profile(q->get_device());
     if (threads_per_row == 32 || threads_per_row == SG_SIZE) {
         const int sgs = THREADS / SG_SIZE;
         const unsigned grid = (unsigned)((n_out + sgs - 1) / sgs);
-        q->parallel_for(sycl::nd_range<1>(sycl::range<1>((grid) * (THREADS)), sycl::range<1>(THREADS)),
-                        [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
-                            bf16_gemv_subgroup_kernel<SG_SIZE>(item, x, w, y, n_in, n_out);
-                        });
+        if (prof.enable_streaming_hints) {
+            q->parallel_for(sycl::nd_range<1>(sycl::range<1>((grid) * (THREADS)), sycl::range<1>(THREADS)),
+                            [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
+                                bf16_gemv_subgroup_kernel<SG_SIZE, true>(item, x, w, y, n_in, n_out);
+                            });
+        } else {
+            q->parallel_for(sycl::nd_range<1>(sycl::range<1>((grid) * (THREADS)), sycl::range<1>(THREADS)),
+                            [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
+                                bf16_gemv_subgroup_kernel<SG_SIZE, false>(item, x, w, y, n_in, n_out);
+                            });
+        }
         return;
     }
     if (threads_per_row <= 0 || (threads_per_row & (threads_per_row - 1)) != 0) {
@@ -130,10 +170,17 @@ void bf16_gemv_split(const uint16_t* x, const uint16_t* w, float* y, int64_t n_i
     const unsigned grid = (unsigned)n_out;
     q->submit([&](sycl::handler& cgh) {
         sycl::local_accessor<float, 1> scratch_acc(sycl::range<1>(threads_per_row), cgh);
-        cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>((grid) * (threads_per_row)), sycl::range<1>(threads_per_row)),
-                         [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
-                             bf16_gemv_split_kernel<SG_SIZE>(item, x, w, y, n_in, n_out, threads_per_row, scratch_acc);
-                         });
+        if (prof.enable_streaming_hints) {
+            cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>((grid) * (threads_per_row)), sycl::range<1>(threads_per_row)),
+                             [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
+                                 bf16_gemv_split_kernel<SG_SIZE, true>(item, x, w, y, n_in, n_out, threads_per_row, scratch_acc);
+                             });
+        } else {
+            cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>((grid) * (threads_per_row)), sycl::range<1>(threads_per_row)),
+                             [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
+                                 bf16_gemv_split_kernel<SG_SIZE, false>(item, x, w, y, n_in, n_out, threads_per_row, scratch_acc);
+                             });
+        }
     });
 }
 

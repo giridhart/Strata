@@ -399,6 +399,190 @@ static void BM_Xe2_MoE_GroupedExpert(benchmark::State& state) {
 }
 
 // ============================================================================
+// Dual-Column Gate + Up GEMV with In-Register SwiGLU
+// ============================================================================
+
+constexpr int INTER_DIM = 6144;
+
+void moe_gemv_single_kernel(sycl::nd_item<1> item, const float* __restrict__ x, const float* __restrict__ w,
+                            float* __restrict__ out, int B, int K, int N) {
+    const int global_col = item.get_group(0);
+    const int b = global_col / N;
+    const int c = global_col % N;
+    const int lane = item.get_local_id(0);
+    auto sg = item.get_sub_group();
+
+    if (b >= B) return;
+
+    const float* x_tok = x + b * K;
+    float dot = 0.0f;
+    for (int k = lane; k < K; k += 16) {
+        dot += x_tok[k] * w[k * N + c];
+    }
+    dot = sycl::reduce_over_group(sg, dot, sycl::plus<float>());
+    if (lane == 0) out[b * N + c] = dot;
+}
+
+void moe_swiglu_elementwise_kernel(sycl::nd_item<1> item, const float* __restrict__ g, const float* __restrict__ u,
+                                   float* __restrict__ y, int total_elements) {
+    const int idx = item.get_global_id(0);
+    if (idx >= total_elements) return;
+    const float g_val = g[idx];
+    const float u_val = u[idx];
+    const float silu_g = g_val / (1.0f + sycl::native::exp(-g_val));
+    y[idx] = silu_g * u_val;
+}
+
+void moe_dual_column_swiglu_kernel(sycl::nd_item<1> item, const float* __restrict__ x,
+                                   const float* __restrict__ wg, const float* __restrict__ wu,
+                                   float* __restrict__ y, int B, int K, int N) {
+    const int global_col = item.get_group(0);
+    const int b = global_col / N;
+    const int c = global_col % N;
+    const int lane = item.get_local_id(0);
+    auto sg = item.get_sub_group();
+
+    if (b >= B) return;
+
+    const float* x_tok = x + b * K;
+    float dot_g = 0.0f;
+    float dot_u = 0.0f;
+    for (int k = lane; k < K; k += 16) {
+        const float x_val = x_tok[k];
+        dot_g += x_val * wg[k * N + c];
+        dot_u += x_val * wu[k * N + c];
+    }
+    dot_g = sycl::reduce_over_group(sg, dot_g, sycl::plus<float>());
+    dot_u = sycl::reduce_over_group(sg, dot_u, sycl::plus<float>());
+
+    if (lane == 0) {
+        const float silu_g = dot_g / (1.0f + sycl::native::exp(-dot_g));
+        y[b * N + c] = silu_g * dot_u;
+    }
+}
+
+static void BM_Xe2_MoE_Separate_Gate_Up_SwiGLU(benchmark::State& state) {
+    const int B = state.range(0);
+    sycl::queue q{sycl::default_selector_v, {sycl::property::queue::enable_profiling()}};
+
+    const size_t x_elements = (size_t)B * N_EMBD;
+    const size_t w_elements = (size_t)N_EMBD * INTER_DIM;
+    const size_t act_elements = (size_t)B * INTER_DIM;
+
+    auto* d_x  = sycl::malloc_device<float>(x_elements, q);
+    auto* d_wg = sycl::malloc_device<float>(w_elements, q);
+    auto* d_wu = sycl::malloc_device<float>(w_elements, q);
+    auto* d_g  = sycl::malloc_device<float>(act_elements, q);
+    auto* d_u  = sycl::malloc_device<float>(act_elements, q);
+    auto* d_y  = sycl::malloc_device<float>(act_elements, q);
+
+    q.fill(d_x, 0.05f, x_elements);
+    q.fill(d_wg, 0.01f, w_elements);
+    q.fill(d_wu, 0.01f, w_elements);
+    q.wait();
+
+    // Warmup
+    for (int w = 0; w < 3; ++w) {
+        q.parallel_for(sycl::nd_range<1>(B * INTER_DIM * 16, 16),
+                       [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
+                           moe_gemv_single_kernel(item, d_x, d_wg, d_g, B, N_EMBD, INTER_DIM);
+                       });
+        q.parallel_for(sycl::nd_range<1>(B * INTER_DIM * 16, 16),
+                       [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
+                           moe_gemv_single_kernel(item, d_x, d_wu, d_u, B, N_EMBD, INTER_DIM);
+                       });
+        q.parallel_for(sycl::nd_range<1>(((B * INTER_DIM + 127) / 128) * 128, 128),
+                       [=](sycl::nd_item<1> item) {
+                           moe_swiglu_elementwise_kernel(item, d_g, d_u, d_y, B * INTER_DIM);
+                       }).wait();
+    }
+
+    for (auto _ : state) {
+        auto ev1 = q.parallel_for(sycl::nd_range<1>(B * INTER_DIM * 16, 16),
+                                  [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
+                                      moe_gemv_single_kernel(item, d_x, d_wg, d_g, B, N_EMBD, INTER_DIM);
+                                  });
+        auto ev2 = q.parallel_for(sycl::nd_range<1>(B * INTER_DIM * 16, 16),
+                                  [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
+                                      moe_gemv_single_kernel(item, d_x, d_wu, d_u, B, N_EMBD, INTER_DIM);
+                                  });
+        auto ev3 = q.submit([&](sycl::handler& cgh) {
+            cgh.depends_on({ev1, ev2});
+            cgh.parallel_for(sycl::nd_range<1>(((B * INTER_DIM + 127) / 128) * 128, 128),
+                             [=](sycl::nd_item<1> item) {
+                                 moe_swiglu_elementwise_kernel(item, d_g, d_u, d_y, B * INTER_DIM);
+                             });
+        });
+        ev3.wait();
+        const auto t0 = ev1.get_profiling_info<sycl::info::event_profiling::command_start>();
+        const auto t1 = ev3.get_profiling_info<sycl::info::event_profiling::command_end>();
+        state.SetIterationTime((t1 - t0) * 1e-9);
+    }
+
+    const double flops = 4.0 * (double)B * N_EMBD * INTER_DIM + 3.0 * (double)B * INTER_DIM;
+    const double bytes = (w_elements * 2 + x_elements + act_elements * 5) * sizeof(float);
+    state.counters["GFLOPS"] = benchmark::Counter(flops * 1e-9, benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
+    state.counters["Bandwidth_GBps"] = benchmark::Counter(bytes, benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
+    state.counters["Batch_B"] = benchmark::Counter((double)B);
+
+    sycl::free(d_x, q);
+    sycl::free(d_wg, q);
+    sycl::free(d_wu, q);
+    sycl::free(d_g, q);
+    sycl::free(d_u, q);
+    sycl::free(d_y, q);
+}
+
+static void BM_Xe2_MoE_DualColumn_SwiGLU(benchmark::State& state) {
+    const int B = state.range(0);
+    sycl::queue q{sycl::default_selector_v, {sycl::property::queue::enable_profiling()}};
+
+    const size_t x_elements = (size_t)B * N_EMBD;
+    const size_t w_elements = (size_t)N_EMBD * INTER_DIM;
+    const size_t act_elements = (size_t)B * INTER_DIM;
+
+    auto* d_x  = sycl::malloc_device<float>(x_elements, q);
+    auto* d_wg = sycl::malloc_device<float>(w_elements, q);
+    auto* d_wu = sycl::malloc_device<float>(w_elements, q);
+    auto* d_y  = sycl::malloc_device<float>(act_elements, q);
+
+    q.fill(d_x, 0.05f, x_elements);
+    q.fill(d_wg, 0.01f, w_elements);
+    q.fill(d_wu, 0.01f, w_elements);
+    q.wait();
+
+    // Warmup
+    for (int w = 0; w < 3; ++w) {
+        q.parallel_for(sycl::nd_range<1>(B * INTER_DIM * 16, 16),
+                       [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
+                           moe_dual_column_swiglu_kernel(item, d_x, d_wg, d_wu, d_y, B, N_EMBD, INTER_DIM);
+                       }).wait();
+    }
+
+    for (auto _ : state) {
+        auto ev = q.parallel_for(sycl::nd_range<1>(B * INTER_DIM * 16, 16),
+                                 [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
+                                     moe_dual_column_swiglu_kernel(item, d_x, d_wg, d_wu, d_y, B, N_EMBD, INTER_DIM);
+                                 });
+        ev.wait();
+        const auto t0 = ev.get_profiling_info<sycl::info::event_profiling::command_start>();
+        const auto t1 = ev.get_profiling_info<sycl::info::event_profiling::command_end>();
+        state.SetIterationTime((t1 - t0) * 1e-9);
+    }
+
+    const double flops = 4.0 * (double)B * N_EMBD * INTER_DIM + 3.0 * (double)B * INTER_DIM;
+    const double bytes = (w_elements * 2 + x_elements + act_elements) * sizeof(float);
+    state.counters["GFLOPS"] = benchmark::Counter(flops * 1e-9, benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
+    state.counters["Bandwidth_GBps"] = benchmark::Counter(bytes, benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
+    state.counters["Batch_B"] = benchmark::Counter((double)B);
+
+    sycl::free(d_x, q);
+    sycl::free(d_wg, q);
+    sycl::free(d_wu, q);
+    sycl::free(d_y, q);
+}
+
+// ============================================================================
 // Registration: MoE Expert Reduction Across Batch Sizes
 // ============================================================================
 
@@ -422,6 +606,10 @@ BENCHMARK(BM_Xe2_MoE_SubgroupReduce)->UseManualTime()->Args({32});
 
 BENCHMARK(BM_Xe2_MoE_GroupedExpert<true>)->Name("BM_Xe2_MoE_GroupedExpert_Sub16")->UseManualTime()->Args({1})->Args({4})->Args({8});
 BENCHMARK(BM_Xe2_MoE_GroupedExpert<false>)->Name("BM_Xe2_MoE_GroupedExpert_Legacy32")->UseManualTime()->Args({1})->Args({4})->Args({8});
+
+BENCHMARK(BM_Xe2_MoE_Separate_Gate_Up_SwiGLU)->UseManualTime()->Args({1})->Args({4})->Args({8})->Args({16})->Args({32});
+BENCHMARK(BM_Xe2_MoE_DualColumn_SwiGLU)->UseManualTime()->Args({1})->Args({4})->Args({8})->Args({16})->Args({32});
+
 
 // ============================================================================
 // Main Entry Point

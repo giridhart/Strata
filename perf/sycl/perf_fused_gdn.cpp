@@ -320,8 +320,108 @@ static void BM_Xe2_GDN_Fused_SLM(benchmark::State& state) {
     sycl::free(d_y, q);
 }
 
+// ============================================================================
+// Benchmark: BM_Xe2_GDN_Fused_SLM_Padded (Bank Conflict Mitigation)
+// ============================================================================
+
+template <int PAD>
+static void BM_Xe2_GDN_Fused_SLM_Padded(benchmark::State& state) {
+    const int h_v = state.range(0);
+    const int h_k = state.range(1);
+
+    sycl::queue q{sycl::default_selector_v, {sycl::property::queue::enable_profiling()}};
+
+    const size_t state_elements = (size_t)S * S * h_v;
+    const size_t qk_elements = (size_t)S * h_k;
+    const size_t out_elements = (size_t)S * h_v;
+
+    auto* d_state = sycl::malloc_device<float>(state_elements, q);
+    auto* d_q     = sycl::malloc_device<float>(qk_elements, q);
+    auto* d_k     = sycl::malloc_device<float>(qk_elements, q);
+    auto* d_v     = sycl::malloc_device<float>(out_elements, q);
+    auto* d_gate  = sycl::malloc_device<float>(h_v, q);
+    auto* d_beta  = sycl::malloc_device<float>(h_v, q);
+    auto* d_z     = sycl::malloc_device<float>(out_elements, q);
+    auto* d_gamma = sycl::malloc_device<float>(S, q);
+    auto* d_y     = sycl::malloc_device<float>(out_elements, q);
+
+    q.fill(d_state, 0.01f, state_elements);
+    q.fill(d_q, 0.05f, qk_elements);
+    q.fill(d_k, 0.05f, qk_elements);
+    q.fill(d_v, 0.1f, out_elements);
+    q.fill(d_gate, -0.5f, h_v);
+    q.fill(d_beta, 0.8f, h_v);
+    q.fill(d_z, 0.2f, out_elements);
+    q.fill(d_gamma, 1.0f, S);
+    q.wait();
+
+    // Warmup
+    for (int w = 0; w < 5; ++w) {
+        q.submit([&](sycl::handler& cgh) {
+            sycl::local_accessor<float, 1> sk(sycl::range<1>(S), cgh);
+            sycl::local_accessor<float, 1> sq(sycl::range<1>(S), cgh);
+            sycl::local_accessor<float, 2> red(sycl::range<2>(4, S + PAD), cgh);
+            sycl::local_accessor<float, 1> wsum(sycl::range<1>(32), cgh);
+
+            cgh.parallel_for(sycl::nd_range<2>(sycl::range<2>(h_v, 512), sycl::range<2>(4, 128)),
+                             [=](sycl::nd_item<2> item) [[sycl::reqd_sub_group_size(16)]] {
+                                 gdn_fused_step_norm_kernel(
+                                     d_state, d_q, d_k, d_v, d_gate, d_beta, d_z, d_gamma, 1e-5f, d_y, h_k, h_v, item,
+                                     sk.get_multi_ptr<sycl::access::decorated::no>().get(),
+                                     sq.get_multi_ptr<sycl::access::decorated::no>().get(), red,
+                                     wsum.get_multi_ptr<sycl::access::decorated::no>().get());
+                             });
+        }).wait();
+    }
+
+    for (auto _ : state) {
+        auto ev = q.submit([&](sycl::handler& cgh) {
+            sycl::local_accessor<float, 1> sk(sycl::range<1>(S), cgh);
+            sycl::local_accessor<float, 1> sq(sycl::range<1>(S), cgh);
+            sycl::local_accessor<float, 2> red(sycl::range<2>(4, S + PAD), cgh);
+            sycl::local_accessor<float, 1> wsum(sycl::range<1>(32), cgh);
+
+            cgh.parallel_for(sycl::nd_range<2>(sycl::range<2>(h_v, 512), sycl::range<2>(4, 128)),
+                             [=](sycl::nd_item<2> item) [[sycl::reqd_sub_group_size(16)]] {
+                                 gdn_fused_step_norm_kernel(
+                                     d_state, d_q, d_k, d_v, d_gate, d_beta, d_z, d_gamma, 1e-5f, d_y, h_k, h_v, item,
+                                     sk.get_multi_ptr<sycl::access::decorated::no>().get(),
+                                     sq.get_multi_ptr<sycl::access::decorated::no>().get(), red,
+                                     wsum.get_multi_ptr<sycl::access::decorated::no>().get());
+                             });
+        });
+        ev.wait();
+        const auto t0 = ev.template get_profiling_info<sycl::info::event_profiling::command_start>();
+        const auto t1 = ev.template get_profiling_info<sycl::info::event_profiling::command_end>();
+        state.SetIterationTime((t1 - t0) * 1e-9);
+    }
+
+    const double bytes_transferred = (double)(state_elements * 2 + qk_elements * 2 + out_elements * 3) * sizeof(float);
+    state.counters["Bandwidth_GBps"] = benchmark::Counter(bytes_transferred, benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
+    state.counters["Heads_HV"]       = benchmark::Counter(h_v);
+    state.counters["Heads_HK"]       = benchmark::Counter(h_k);
+    state.counters["Pad_Elements"]   = benchmark::Counter(PAD);
+    state.counters["State_MB"]       = benchmark::Counter(state_elements * sizeof(float) / 1e6);
+
+    sycl::free(d_state, q);
+    sycl::free(d_q, q);
+    sycl::free(d_k, q);
+    sycl::free(d_v, q);
+    sycl::free(d_gate, q);
+    sycl::free(d_beta, q);
+    sycl::free(d_z, q);
+    sycl::free(d_gamma, q);
+    sycl::free(d_y, q);
+}
+
 // Register Benchmarks
 BENCHMARK(BM_Xe2_GDN_Unfused)->Args({DEFAULT_HV, DEFAULT_HK})->Args({DEFAULT_HV, 4})->UseManualTime();
 BENCHMARK(BM_Xe2_GDN_Fused_SLM)->Args({DEFAULT_HV, DEFAULT_HK})->Args({DEFAULT_HV, 4})->UseManualTime();
 
+// Register Padded SLM sweeps (4, 8, 16 floats bank offset) across head configurations
+BENCHMARK(BM_Xe2_GDN_Fused_SLM_Padded<4>)->Args({DEFAULT_HV, DEFAULT_HK})->Args({DEFAULT_HV, 4})->UseManualTime();
+BENCHMARK(BM_Xe2_GDN_Fused_SLM_Padded<8>)->Args({DEFAULT_HV, DEFAULT_HK})->Args({DEFAULT_HV, 4})->UseManualTime();
+BENCHMARK(BM_Xe2_GDN_Fused_SLM_Padded<16>)->Args({DEFAULT_HV, DEFAULT_HK})->Args({DEFAULT_HV, 4})->UseManualTime();
+
 BENCHMARK_MAIN();
+

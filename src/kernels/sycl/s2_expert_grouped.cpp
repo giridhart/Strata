@@ -14,6 +14,7 @@
 // The two agree to float rounding and not to the bit, which is the same contract `s_gemv_parity` carries for
 // the same reason.  `bench/micro/moe_hit_parity.cu` is the check.
 #include <sycl/sycl.hpp>
+#include "strata/core/sycl_arch.hpp"
 #include "strata/kernels/s2_expert_grouped.hpp"
 #include "strata/kernels/dp4a.hpp"
 
@@ -351,6 +352,50 @@ void gu_pair_kernel(const uint8_t* __restrict__ blob_base, const int32_t* __rest
     gate_up[(size_t)n_hits * FF + (size_t)h * FF + (size_t)r] = su;
 }
 
+/// Fused Dual-Column Gate + Up with in-register SwiGLU activation
+void gu_pair_swiglu_kernel(const uint8_t* __restrict__ blob_base, const int32_t* __restrict__ slot_index, long long blob_bytes,
+                           const uint8_t* __restrict__ x_q8_0, const float* __restrict__ x_scales, float* __restrict__ gate_up,
+                           int n_hits, const int32_t* __restrict__ d_count, const int32_t* __restrict__ dst_index,
+                           int tok_div) {
+    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    const int warps_per_block = (int)(item_ct1.get_local_range(2) >> 5);
+    const long long pair = (long long)item_ct1.get_group(2) * warps_per_block + (item_ct1.get_local_id(2) >> 5);
+    const long long total = (long long)n_hits * FF;
+    if (pair >= total) return;
+    const int h = (int)(pair / FF);
+    if (d_count != nullptr && h >= *d_count) return;
+    const int r = (int)(pair % FF);
+    const int lane = item_ct1.get_local_id(2) & 31;
+
+    const uint8_t* blob = blob_base + (size_t)slot_index[h] * (size_t)blob_bytes;
+    if (tok_div > 0) {
+        const int tok = dst_index[h] / tok_div;
+        x_q8_0 += (size_t)tok * (size_t)(H / 32) * 34;
+        if (x_scales != nullptr) x_scales += (size_t)tok * (size_t)(H / 32);
+    }
+    const uint8_t* codes = blob + (size_t)(2 * r) * ROW_GU;  // gate row; the up row follows it
+    const uint8_t* scales = blob + O_GU_SCALES + (size_t)(2 * r) * SC_GU * 2;
+    float acc_g = 0.0f, acc_u = 0.0f;
+    for (int c = lane; c < H / 32; c += 32) {
+        const uint8_t* xb = x_q8_0 + (size_t)c * 34;
+        const float dx = x_scales ? x_scales[c] : f16_ld(xb);
+        int X[8], m[8];
+        const int hx = load_x_chunk(xb, X);
+        expand_codes(*(const sycl::uint2*)(codes + (size_t)c * 8), m);
+        const float dw_g = f16_ld(scales + (size_t)(c >> 1) * 2);
+        acc_g += dw_g * dx * (float)(chunk_s(m, X) - hx);
+        expand_codes(*(const sycl::uint2*)(codes + ROW_GU + (size_t)c * 8), m);
+        const float dw_u = f16_ld(scales + SC_GU * 2 + (size_t)(c >> 1) * 2);
+        acc_u += dw_u * dx * (float)(chunk_s(m, X) - hx);
+    }
+    const float sg = warp_sum(acc_g);
+    const float su = warp_sum(acc_u);
+    if (lane != 0) return;
+    const float silu_g = sg / (1.0f + sycl::native::exp(-sg));
+    gate_up[(size_t)h * FF + (size_t)r] = silu_g * su;
+    gate_up[(size_t)n_hits * FF + (size_t)h * FF + (size_t)r] = su;
+}
+
 /// `down_kernel`, new: ONE WARP PER PAIR OF ROWS `r, r + 1` of one hit, the intermediate's chunk loaded once for both.
 
 void down_pair_kernel(const uint8_t* __restrict__ blob_base, const int32_t* __restrict__ slot_index,
@@ -645,14 +690,25 @@ void moe_hit_grouped_s2(const uint8_t* blob_base, const int32_t* slot_index, con
     uint8_t* h_q8_0 = (uint8_t*)scratch + gu_bytes;
     float* h_scales = (float*)((uint8_t*)scratch + gu_bytes + q8_bytes);
 
-    // 1. gate + up, one launch for every row of every hit.
-    {
+    // 1 & 2. gate + up and silu(gate) * up (dual-column fused or separate)
+    const auto prof = strata::sycl_arch::get_xe2_tuning_profile(cs->get_device());
+    const bool dual_col = prof.enable_dual_column;
+    if (fast && dual_col) {
+        const int warps = THREADS / 32;
+        const long long pairs = n_hits * (long long)FF;
+        cs->parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, (unsigned)((pairs + warps - 1) / warps)) *
+                                               sycl::range<3>(1, 1, THREADS),
+                                           sycl::range<3>(1, 1, THREADS)),
+                         [=](sycl::nd_item<3> /*item_ct1*/) [[sycl::reqd_sub_group_size(32)]] {
+                             gu_pair_swiglu_kernel(blob_base, slot_index, blob_bytes, x_q8_0, x_scales, gate_up, (int)n_hits,
+                                                   nullptr, nullptr, 0);
+                         });
+        check("moe_hit_grouped_s2/gu_swiglu", stream);
+    } else {
         launch_hit_gu(fast, blob_base, slot_index, blob_bytes, x_q8_0, x_scales, gate_up, n_hits, nullptr, nullptr, 0,
                       cs);
         check("moe_hit_grouped_s2/gu", stream);
-    }
-    // 2. silu(gate) * up.
-    {
+
         const long long pairs = n_hits * (long long)FF;
         const unsigned blocks = (unsigned)((pairs + THREADS - 1) / THREADS);
         cs->parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, blocks) * sycl::range<3>(1, 1, THREADS),
@@ -776,11 +832,24 @@ void moe_hit_grouped_s2_dev(const uint8_t* blob_base, const int32_t* slot_index,
     float* gate_up = (float*)scratch;
     uint8_t* h_q8_0 = (uint8_t*)scratch + gu_bytes;
     float* h_scales = (float*)((uint8_t*)scratch + gu_bytes + q8_bytes);
-    {
+    // 1 & 2. gate + up and silu(gate) * up (dual-column fused or separate)
+    const auto prof = strata::sycl_arch::get_xe2_tuning_profile(cs->get_device());
+    const bool dual_col = prof.enable_dual_column;
+    if (fast && dual_col) {
+        const int warps = THREADS / 32;
+        const long long pairs = cap * (long long)FF;
+        cs->parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, (unsigned)((pairs + warps - 1) / warps)) *
+                                               sycl::range<3>(1, 1, THREADS),
+                                           sycl::range<3>(1, 1, THREADS)),
+                         [=](sycl::nd_item<3> /*item_ct1*/) [[sycl::reqd_sub_group_size(32)]] {
+                             gu_pair_swiglu_kernel(blob_base, slot_index, blob_bytes, x_q8_0, x_scales, gate_up, (int)cap,
+                                                   d_count, nullptr, 0);
+                         });
+        check("moe_hit_grouped_s2_dev/gu_swiglu", stream);
+    } else {
         launch_hit_gu(fast, blob_base, slot_index, blob_bytes, x_q8_0, x_scales, gate_up, cap, d_count, nullptr, 0, cs);
         check("moe_hit_grouped_s2_dev/gu", stream);
-    }
-    {
+
         const long long pairs = cap * (long long)FF;
         cs->parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, (unsigned)((pairs + THREADS - 1) / THREADS)) *
                                                sycl::range<3>(1, 1, THREADS),
@@ -834,15 +903,28 @@ void moe_hit_grouped_s2_multi(const uint8_t* blob_base, const int32_t* slot_inde
     float* gate_up = (float*)scratch;
     uint8_t* h_q8_0 = (uint8_t*)scratch + gu_bytes;
     float* h_scales = (float*)((uint8_t*)scratch + gu_bytes + q8_bytes);
-    {
+    // 1 & 2. gate + up and silu(gate) * up (dual-column fused or separate)
+    const auto prof = strata::sycl_arch::get_xe2_tuning_profile(cs->get_device());
+    const bool dual_col = prof.enable_dual_column;
+    if (fast && dual_col) {
+        const int warps = THREADS / 32;
+        const long long pairs = cap * (long long)FF;
+        cs->parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, (unsigned)((pairs + warps - 1) / warps)) *
+                                               sycl::range<3>(1, 1, THREADS),
+                                           sycl::range<3>(1, 1, THREADS)),
+                         [=](sycl::nd_item<3> /*item_ct1*/) [[sycl::reqd_sub_group_size(32)]] {
+                             gu_pair_swiglu_kernel(blob_base, slot_index, blob_bytes, x_q8_0, x_scales, gate_up, (int)cap,
+                                                   d_count, dst_index, k_per_token);
+                         });
+        check("moe_hit_grouped_s2_multi/gu_swiglu", stream);
+    } else {
         launch_hit_gu(fast, blob_base, slot_index, blob_bytes, x_q8_0, x_scales, gate_up, cap, d_count, dst_index,
                       k_per_token, cs);
         check("moe_hit_grouped_s2_multi/gu", stream);
-    }
-    {
+
         const long long pairs = cap * (long long)FF;
-        cs->parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, (unsigned)((pairs + THREADS - 1) / THREADS)) *
-                                               sycl::range<3>(1, 1, THREADS),
+        const unsigned blocks = (unsigned)((pairs + THREADS - 1) / THREADS);
+        cs->parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, blocks) * sycl::range<3>(1, 1, THREADS),
                                            sycl::range<3>(1, 1, THREADS)),
                          [=](sycl::nd_item<3> /*item_ct1*/) { swiglu_kernel(gate_up, pairs); });
         check("moe_hit_grouped_s2_multi/swiglu", stream);

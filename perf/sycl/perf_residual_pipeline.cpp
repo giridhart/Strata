@@ -13,6 +13,8 @@
 
 #include <benchmark/benchmark.h>
 #include <sycl/sycl.hpp>
+#include <sycl/ext/intel/experimental/cache_control_properties.hpp>
+#include <sycl/ext/oneapi/experimental/annotated_ptr/annotated_ptr.hpp>
 
 #include "strata/core/sycl_arch.hpp"
 #include "strata/kernels/gr.hpp"
@@ -105,6 +107,38 @@ void residual_gemv_kernel(sycl::nd_item<1> item, const float* __restrict__ in,
     acc = sycl::reduce_over_group(sg, acc, sycl::plus<float>());
 
     // Direct reduction over subgroup
+    if (tid == 0) {
+        out[row] = acc;
+    }
+}
+
+/// 2b. Synthetic GEMV Projection with L3 Streaming Load Hints (Bypassing L3 cache for large weights)
+void residual_gemv_streaming_kernel(sycl::nd_item<1> item, const float* __restrict__ in,
+                                    const sycl::ext::oneapi::bfloat16* __restrict__ weight,
+                                    float* __restrict__ out) {
+    const int row = item.get_group(0);
+    if (row >= N_EMBD) return;
+
+    const int tid = item.get_local_id(0);
+    const int bsize = item.get_local_range(0);
+    const auto* w_row = weight + (size_t)row * N_EMBD;
+
+    auto stream_props = sycl::ext::oneapi::experimental::properties{
+        sycl::ext::intel::experimental::read_hint<
+            sycl::ext::intel::experimental::cache_control<
+                sycl::ext::intel::experimental::cache_mode::streaming,
+                sycl::ext::oneapi::experimental::cache_level::L3>>};
+    sycl::ext::oneapi::experimental::annotated_ptr<
+        const sycl::ext::oneapi::bfloat16, decltype(stream_props)> w_stream(w_row, stream_props);
+
+    float acc = 0.0f;
+    for (int col = tid; col < N_EMBD; col += bsize) {
+        acc += in[col] * float(sycl::ext::oneapi::bfloat16(w_stream[col]));
+    }
+
+    auto sg = item.get_sub_group();
+    acc = sycl::reduce_over_group(sg, acc, sycl::plus<float>());
+
     if (tid == 0) {
         out[row] = acc;
     }
@@ -484,6 +518,77 @@ static void BM_Xe2_Residual_Layer_Chaining(benchmark::State& state) {
     sycl::free(d_weight, q);
 }
 
+static void BM_Xe2_Residual_Streaming_Layer_Chaining(benchmark::State& state) {
+    const int num_layers = state.range(0);
+
+    sycl::queue q{sycl::default_selector_v,
+                 {sycl::property::queue::in_order(), sycl::property::queue::enable_profiling()}};
+
+    const size_t r_elements = (size_t)HC * N_EMBD;
+    const size_t w_elements = (size_t)N_EMBD * N_EMBD;
+
+    auto* d_R       = sycl::malloc_device<float>(r_elements, q);
+    auto* d_wnorm   = sycl::malloc_device<float>(r_elements, q);
+    auto* d_mixed   = sycl::malloc_device<float>(N_EMBD, q);
+    auto* d_xn      = sycl::malloc_device<float>(r_elements, q);
+    auto* d_out     = sycl::malloc_device<float>(N_EMBD, q);
+    auto* d_weight  = sycl::malloc_device<sycl::ext::oneapi::bfloat16>(w_elements, q);
+
+    q.fill(d_R, 1.0f, r_elements);
+    q.fill(d_wnorm, 1.0f, r_elements);
+    q.fill(d_mixed, 0.0f, N_EMBD);
+    q.fill(d_out, 0.5f, N_EMBD);
+    q.fill(d_weight, sycl::ext::oneapi::bfloat16(0.01f), w_elements);
+    q.wait();
+
+    for (auto _ : state) {
+        sycl::event first_ev, last_ev;
+
+        for (int l = 0; l < num_layers; ++l) {
+            auto ev = q.submit([&](sycl::handler& cgh) {
+                sycl::local_accessor<float, 1> lsums(sycl::range<1>(16), cgh);
+                cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(HC * 256), sycl::range<1>(256)),
+                                 [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
+                                     gr_norm_kernel(item, d_R, d_wnorm, d_mixed, d_xn, 1e-5f,
+                                                    lsums.get_multi_ptr<sycl::access::decorated::no>().get());
+                                 });
+            });
+            if (l == 0) first_ev = ev;
+
+            q.submit([&](sycl::handler& cgh) {
+                cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(N_EMBD * 16), sycl::range<1>(16)),
+                                 [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
+                                     residual_gemv_streaming_kernel(item, d_mixed, d_weight, d_out);
+                                 });
+            });
+
+            last_ev = q.submit([&](sycl::handler& cgh) {
+                cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(r_elements), sycl::range<1>(256)),
+                                 [=](sycl::nd_item<1> item) {
+                                     gr_write_kernel(item, d_R, d_out, 0.1f);
+                                 });
+            });
+        }
+        last_ev.wait();
+
+        const auto t0 = first_ev.get_profiling_info<sycl::info::event_profiling::command_start>();
+        const auto t1 = last_ev.get_profiling_info<sycl::info::event_profiling::command_end>();
+        state.SetIterationTime((t1 - t0) * 1e-9);
+    }
+
+    const double bytes_transferred = (double)num_layers * (r_elements * 2 * sizeof(float) + w_elements * sizeof(uint16_t));
+    state.counters["Bandwidth_GBps"] = benchmark::Counter(bytes_transferred, benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
+    state.counters["Chained_Layers"] = benchmark::Counter(num_layers);
+    state.counters["Streaming_Hint"] = benchmark::Counter(1);
+
+    sycl::free(d_R, q);
+    sycl::free(d_wnorm, q);
+    sycl::free(d_mixed, q);
+    sycl::free(d_xn, q);
+    sycl::free(d_out, q);
+    sycl::free(d_weight, q);
+}
+
 // ============================================================================
 // Benchmark 4: Multi-Token Hyper-Connection GR Read (Sequential vs Batched)
 // ============================================================================
@@ -841,6 +946,7 @@ static void BM_Xe2_GR_Write_Batched(benchmark::State& state) {
 BENCHMARK(BM_Xe2_Residual_Unfused)->UseManualTime();
 BENCHMARK(BM_Xe2_Residual_Fused)->UseManualTime();
 BENCHMARK(BM_Xe2_Residual_Layer_Chaining)->RangeMultiplier(2)->Range(1, 8)->UseManualTime();
+BENCHMARK(BM_Xe2_Residual_Streaming_Layer_Chaining)->RangeMultiplier(2)->Range(1, 8)->UseManualTime();
 BENCHMARK(BM_Xe2_GR_Read_Sequential)->Arg(1)->Arg(2)->Arg(4)->Arg(8)->UseManualTime();
 BENCHMARK(BM_Xe2_GR_Read_Batched)->Arg(1)->Arg(2)->Arg(4)->Arg(8)->UseManualTime();
 BENCHMARK(BM_Xe2_Fused_GR_Read_Batched)->Arg(1)->Arg(2)->Arg(4)->Arg(8)->UseManualTime();
