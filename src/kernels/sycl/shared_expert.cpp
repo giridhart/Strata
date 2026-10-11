@@ -74,10 +74,7 @@ void native_swiglu_kernel(const float* gate, const float* up, float* out, int n,
 }
 
 inline double warp_sum_d(sycl::sub_group sg, double v) {
-    for (int off = 16; off > 0; off >>= 1) {
-        v += sycl::shift_group_left(sg, v, off);
-    }
-    return sycl::select_from_group(sg, v, 0);
+    return sycl::reduce_over_group(sg, v, sycl::plus<double>());
 }
 
 void scalar_gate_kernel(const uint16_t* __restrict__ x_bf16, const uint16_t* __restrict__ w_bf16,
@@ -111,8 +108,8 @@ void native_scalar_sigmoid_kernel(float* gate) {
     gate[0] = 1.0f / (1.0f + sycl::native::exp(-gate[0]));
 }
 
-void native_scalar_sigmoid_multi_kernel(float* gate,
-                                        const sycl::nd_item<1>& item) {  // thread t = token t, same expression
+[[maybe_unused]] void native_scalar_sigmoid_multi_kernel(float* gate,
+                                                        const sycl::nd_item<1>& item) {  // thread t = token t, same expression
     const int idx = item.get_local_id(0);
     gate[idx] = 1.0f / (1.0f + sycl::native::exp(-gate[idx]));
 }

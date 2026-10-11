@@ -33,10 +33,7 @@ constexpr int UP_BLOCKS = N / UP_COLS;   // 80
 
 inline float warp_sum(float v) {
     auto sg = sycl::ext::oneapi::this_work_item::get_sub_group();
-#pragma unroll
-    for (int o = 16; o > 0; o >>= 1)
-        v += sycl::permute_group_by_xor(sg, v, o);
-    return v;
+    return sycl::reduce_over_group(sg, v, sycl::plus<float>());
 }
 inline float sigmoidf_(float x) { return 1.0f / (1.0f + sycl::native::exp(-x)); }
 
