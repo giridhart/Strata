@@ -6,9 +6,12 @@
 #include "strata/kernels/verify_kernels.hpp"
 #include "strata/kernels/dp4a.hpp"
 
+#include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <limits>
 
 namespace strata::kernels {
 namespace {
@@ -725,6 +728,240 @@ void gpu_stamp(unsigned long long* buf, int i, void* stream) {
     sycl::queue* q = stream ? static_cast<sycl::queue*>(stream) : &default_queue();
     q->parallel_for(sycl::nd_range<1>(sycl::range<1>(1), sycl::range<1>(1)),
                     [=](sycl::nd_item<1>) { gpu_stamp_kernel(buf, i); });
+}
+
+void gpu_noop(void* stream) {
+    sycl::queue* q = stream ? static_cast<sycl::queue*>(stream) : &default_queue();
+    q->parallel_for(sycl::nd_range<1>(sycl::range<1>(1), sycl::range<1>(1)), [=](sycl::nd_item<1>) {});
+}
+
+void copy_rows_strided(float* dst, const float* src, int64_t rows, int64_t w, int64_t src_w, void* stream) {
+    if (rows <= 0 || w <= 0) return;
+    if ((w & 3) || (src_w & 3) || src_w < w || ((uintptr_t)dst & 15) || ((uintptr_t)src & 15)) {
+        std::fprintf(stderr, "copy_rows_strided: widths must be multiples of 4 floats (src_w >= w), pointers 16-byte aligned\n");
+        std::exit(1);
+    }
+    const long long w4 = w / 4, src_w4 = src_w / 4;
+    const long long total = (long long)rows * w4;
+    const unsigned blocks = (unsigned)((total + 255) / 256 < 256 ? (total + 255) / 256 : 256);
+    sycl::queue* q = stream ? static_cast<sycl::queue*>(stream) : &default_queue();
+    q->parallel_for(sycl::nd_range<1>(sycl::range<1>(blocks * 256), sycl::range<1>(256)), [=](sycl::nd_item<1> item) {
+        for (long long i = (long long)item.get_global_id(0); i < total; i += (long long)item.get_global_range(0)) {
+            const long long r = i / w4, c = i - r * w4;
+            reinterpret_cast<sycl::float4*>(dst)[i] = reinterpret_cast<const sycl::float4*>(src)[r * src_w4 + c];
+        }
+    });
+}
+
+void wait_copy_i32_from_mapped(const uint32_t* flag, uint32_t value, int32_t* dst, const int32_t* src, int64_t n, void* stream) {
+    sycl::queue* q = stream ? static_cast<sycl::queue*>(stream) : &default_queue();
+    q->parallel_for(sycl::nd_range<1>(sycl::range<1>(128), sycl::range<1>(128)), [=](sycl::nd_item<1> item) {
+        if (item.get_local_id(0) == 0) {
+            while (*flag < value) {}
+        }
+        item.barrier(sycl::access::fence_space::local_space);
+        for (int i = (int)item.get_local_id(0); i < n; i += (int)item.get_local_range(0)) dst[i] = src[i];
+    });
+}
+
+void gdn_conv_ab_multi(const float* history, const float* qkv, const float* conv_w, float* h, int channels, int qk_heads,
+                       float eps, int n_tok, int t_begin, bool commit, const float* x, const uint16_t* w_alpha,
+                       const uint16_t* w_beta, const float* dt, const float* ssm_a, float* gate, float* beta, int n_embd,
+                       int h_v, void* stream) {
+    gdn_conv_l2_multi(history, qkv, conv_w, h, channels, qk_heads, eps, n_tok, stream, t_begin, commit);
+    gdn_ab_multi(x, w_alpha, w_beta, dt, ssm_a, gate, beta, n_embd, h_v, n_tok, stream);
+}
+
+namespace {
+constexpr int kArgMaxBlocks = 128;
+constexpr int kArgThreads = 256;
+constexpr int kTopBlocks = 8;
+
+struct ArgRow {
+    uint32_t counter;
+    uint32_t pad[3];
+    float v[kArgMaxBlocks];
+    int32_t i[kArgMaxBlocks];
+};
+
+struct TopRow {
+    uint32_t counter;
+    uint32_t pad[3];
+    float parts[32];
+};
+
+inline void arg_take(float ov, int oi, float& bv, int& bi) {
+    if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
+}
+
+inline void arg_block(float& bv, int& bi, int none, sycl::nd_item<2> item, float* sv, int* si) {
+    auto sg = item.get_sub_group();
+    for (int off = 16; off > 0; off >>= 1) {
+        const float ov = sycl::shift_group_left(sg, bv, off);
+        const int oi = sycl::shift_group_left(sg, bi, off);
+        arg_take(ov, oi, bv, bi);
+    }
+    const int warp = (int)(item.get_local_id(1) >> 5);
+    const int lane = (int)(item.get_local_id(1) & 31);
+    if (lane == 0) { sv[warp] = bv; si[warp] = bi; }
+    item.barrier(sycl::access::fence_space::local_space);
+    if (warp == 0) {
+        const int nw = (int)(item.get_local_range(1) >> 5);
+        bv = lane < nw ? sv[lane] : -std::numeric_limits<float>::infinity();
+        bi = lane < nw ? si[lane] : none;
+        for (int off = 16; off > 0; off >>= 1) {
+            const float ov = sycl::shift_group_left(sg, bv, off);
+            const int oi = sycl::shift_group_left(sg, bi, off);
+            arg_take(ov, oi, bv, bi);
+        }
+    }
+}
+}  // namespace
+
+uint64_t argmax_rows_scratch_bytes(int n_rows) {
+    return (uint64_t)n_rows * sizeof(ArgRow);
+}
+
+void argmax_rows(const float* logits, int n_rows, int n, void* scratch, int32_t* out, void* stream) {
+    if (n_rows <= 0) return;
+    const int nb = std::min(kArgMaxBlocks, std::max(1, (n + 4095) / 4096));
+    const int per_block = (n + nb - 1) / nb;
+    ArgRow* rows = static_cast<ArgRow*>(scratch);
+    sycl::queue* q = stream ? static_cast<sycl::queue*>(stream) : &default_queue();
+    q->submit([&](sycl::handler& cgh) {
+        sycl::local_accessor<float, 1> sv(sycl::range<1>(32), cgh);
+        sycl::local_accessor<int, 1> si(sycl::range<1>(32), cgh);
+        sycl::local_accessor<bool, 0> last(cgh);
+        cgh.parallel_for(
+            sycl::nd_range<2>(sycl::range<2>((size_t)n_rows, (size_t)nb * kArgThreads),
+                              sycl::range<2>(1, kArgThreads)),
+            [=](sycl::nd_item<2> item) [[sycl::reqd_sub_group_size(32)]] {
+                const int row = (int)item.get_group(0);
+                const int b = (int)item.get_group(1);
+                const int tid = (int)item.get_local_id(1);
+                float* pv = rows[row].v;
+                int* pi = rows[row].i;
+                const float* l = logits + (size_t)row * n;
+                const int lo = b * per_block, hi = sycl::min(n, lo + per_block);
+                float bv = -std::numeric_limits<float>::infinity();
+                int bi = n;
+                for (int v = lo + tid; v < hi; v += kArgThreads) {
+                    const float s = l[v];
+                    if (s > bv) { bv = s; bi = v; }
+                }
+                arg_block(bv, bi, n, item, sv.get_multi_ptr<sycl::access::decorated::no>().get(),
+                          si.get_multi_ptr<sycl::access::decorated::no>().get());
+                if (tid == 0) {
+                    pv[b] = bv;
+                    pi[b] = bi;
+                    sycl::atomic_ref<uint32_t, sycl::memory_order::seq_cst, sycl::memory_scope::device> cnt(rows[row].counter);
+                    last = (cnt.fetch_add(1u) == (uint32_t)(nb - 1));
+                }
+                item.barrier(sycl::access::fence_space::local_space);
+                if (!last) return;
+                bv = -std::numeric_limits<float>::infinity();
+                bi = n;
+                if (tid < nb) {
+                    bv = pv[tid];
+                    bi = pi[tid];
+                }
+                arg_block(bv, bi, n, item, sv.get_multi_ptr<sycl::access::decorated::no>().get(),
+                          si.get_multi_ptr<sycl::access::decorated::no>().get());
+                if (tid == 0) {
+                    out[row] = bi < n ? bi : 0;
+                    rows[row].counter = 0;
+                }
+            });
+    });
+}
+
+uint64_t row_top_prob_scratch_bytes(int n_rows) {
+    return (uint64_t)n_rows * sizeof(TopRow);
+}
+
+void row_top_prob_split(const float* logits, int n_rows, int n_vocab, const int32_t* ids, float* probs, void* scratch,
+                        void* stream) {
+    if (n_rows <= 0) return;
+    TopRow* rows = static_cast<TopRow*>(scratch);
+    sycl::queue* q = stream ? static_cast<sycl::queue*>(stream) : &default_queue();
+    q->submit([&](sycl::handler& cgh) {
+        sycl::local_accessor<bool, 0> last(cgh);
+        cgh.parallel_for(
+            sycl::nd_range<2>(sycl::range<2>((size_t)n_rows, (size_t)kTopBlocks * 128),
+                              sycl::range<2>(1, 128)),
+            [=](sycl::nd_item<2> item) [[sycl::reqd_sub_group_size(32)]] {
+                const int row = (int)item.get_group(0);
+                const int b = (int)item.get_group(1);
+                const int tid = (int)item.get_local_id(1);
+                float* parts = rows[row].parts;
+                const float* l = logits + (size_t)row * n_vocab;
+                const float m = l[ids[row]];
+                const int vt = b * 128 + tid;
+                float s = 0.0f;
+                for (int i = vt; i < n_vocab; i += 1024) s += sycl::native::exp(l[i] - m);
+                auto sg = item.get_sub_group();
+                s = sycl::reduce_over_group(sg, s, sycl::plus<float>());
+                if ((tid & 31) == 0) parts[vt >> 5] = s;
+                item.barrier(sycl::access::fence_space::local_space);
+                if (tid == 0) {
+                    sycl::atomic_ref<uint32_t, sycl::memory_order::seq_cst, sycl::memory_scope::device> cnt(rows[row].counter);
+                    last = (cnt.fetch_add(1u) == (uint32_t)(kTopBlocks - 1));
+                }
+                item.barrier(sycl::access::fence_space::local_space);
+                if (!last || tid != 0) return;
+                float tot = 0.0f;
+                for (int w = 0; w < 32; ++w) tot += parts[w];
+                probs[row] = 1.0f / tot;
+                rows[row].counter = 0;
+            });
+    });
+}
+
+void logits_nonfinite_rows(const float* logits, int n_rows, int n, uint32_t* flags, void* stream) {
+    if (n_rows <= 0 || n <= 0) return;
+    const int per_block = (n + kNonfiniteBlocks - 1) / kNonfiniteBlocks;
+    sycl::queue* q = stream ? static_cast<sycl::queue*>(stream) : &default_queue();
+    q->submit([&](sycl::handler& cgh) {
+        sycl::local_accessor<int, 1> s_bad(sycl::range<1>(8), cgh);
+        cgh.parallel_for(
+            sycl::nd_range<2>(sycl::range<2>((size_t)n_rows, (size_t)kNonfiniteBlocks * 256),
+                              sycl::range<2>(1, 256)),
+            [=](sycl::nd_item<2> item) [[sycl::reqd_sub_group_size(32)]] {
+                const int row = (int)item.get_group(0);
+                const int b = (int)item.get_group(1);
+                const int tid = (int)item.get_local_id(1);
+                const float* l = logits + (size_t)row * n;
+                const int lo = b * per_block, hi = sycl::min(n, lo + per_block);
+                int bad = 0;
+                for (int v = lo + tid; v < hi; v += 256) {
+                    uint32_t u = sycl::bit_cast<uint32_t>(l[v]);
+                    bad |= (u & 0x7f800000u) == 0x7f800000u;
+                }
+                auto sg = item.get_sub_group();
+                bad = sycl::reduce_over_group(sg, bad, sycl::bit_or<int>());
+                const int warp = tid >> 5;
+                const int lane = tid & 31;
+                if (lane == 0) s_bad[warp] = bad;
+                item.barrier(sycl::access::fence_space::local_space);
+                if (warp == 0) {
+                    int wbad = lane < 8 ? s_bad[lane] : 0;
+                    wbad = sycl::reduce_over_group(sg, wbad, sycl::bit_or<int>());
+                    if (lane == 0) flags[row * kNonfiniteBlocks + b] = wbad ? 1u : 0u;
+                }
+            });
+    });
+}
+
+bool multi_block_head_ops() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_MULTI_BLOCK_ARGMAX");
+        return v == nullptr || std::atoi(v) != 0;
+    }();
+    return on;
+}
+
+bool argmax_rows_wanted() {
+    return multi_block_head_ops();
 }
 
 }  // namespace strata::kernels
