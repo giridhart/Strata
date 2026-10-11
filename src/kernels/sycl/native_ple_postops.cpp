@@ -33,42 +33,39 @@ namespace strata::kernels {
 namespace {
 constexpr int N = 2560, H = 4, D = N * H, HISTORY = 9;
 
-inline float warp_sum(float x, const sycl::sub_group& sg) {
-#pragma unroll
-    for (int offset = 16; offset; offset >>= 1)
-        x += sycl::permute_group_by_xor(sg, x, offset);
-    return x;
-}
 
 void gate_kernel(const float* key, const float* query, float* gate, float scale, float* partials,
                  const sycl::nd_item<1>& item) {
     const int row = item.get_group(0);
     const int tid = item.get_local_id(0);
+    const int bsize = item.get_local_range(0);
     auto sg = item.get_sub_group();
 
-    float sums[8] = {};
-#pragma unroll
-    for (int j = 0; j < 8; ++j) {
-        const int d = tid + j * 512;
-        const float p = d < N ? key[row * N + d] * query[row * N + d] : 0.0f;
-        sums[j] += p;
-    }
     float sum = 0.0f;
-#pragma unroll
-    for (int j = 0; j < 8; ++j)
-        sum += sums[j];
+    for (int d = tid; d < N; d += bsize) {
+        sum += key[row * N + d] * query[row * N + d];
+    }
+    sum = sycl::reduce_over_group(sg, sum, sycl::plus<float>());
 
-    sum = warp_sum(sum, sg);
-    const int lane = tid % 32;
-    if (!lane) partials[tid / 32] = sum;
-    item.barrier(sycl::access::fence_space::local_space);
-    sum = lane < 16 ? partials[lane] : 0.0f;
-    sum = warp_sum(sum, sg);
-    if (tid == 0) {
-        const float s = sycl::fma(scale, sum, 0.0f);  // ggml SCALE's zero bias
-        const float mag = sycl::sqrt(sycl::fmax(sycl::fabs(s), 1e-6f));
-        const float sign = float((s > 0.0f) - (s < 0.0f));
-        gate[row] = 1.0f / (1.0f + sycl::native::exp(-sign * mag));
+    const int lane = sg.get_local_linear_id();
+    const int sg_id = sg.get_group_linear_id();
+    if (lane == 0) partials[sg_id] = sum;
+    sycl::group_barrier(item.get_group());
+
+    if (sg.get_group_linear_id() == 0) {
+        const int sg_sz = sg.get_local_range()[0];
+        const int num_sgs = bsize / sg_sz;
+        float total = 0.0f;
+        for (int s = lane; s < num_sgs; s += sg_sz) {
+            total += partials[s];
+        }
+        total = sycl::reduce_over_group(sg, total, sycl::plus<float>());
+        if (lane == 0) {
+            const float s = sycl::fma(scale, total, 0.0f);  // ggml SCALE's zero bias
+            const float mag = sycl::sqrt(sycl::fmax(sycl::fabs(s), 1e-6f));
+            const float sign = float((s > 0.0f) - (s < 0.0f));
+            gate[row] = 1.0f / (1.0f + sycl::native::exp(-sign * mag));
+        }
     }
 }
 
@@ -96,38 +93,6 @@ void conv_residual_kernel(const float* history, const float* normalized, const u
     result[c] = hidden[c] + gated[c] + activation;
 }
 
-// ---- the batch: T tokens, the same arithmetic per element as the kernels above
-// weighted_rms_norm (native_gr_norm.cu) with the gamma row repeating every H rows (one token's H groups)
-void rms_rep_kernel(const float* __restrict__ input, const float* __restrict__ gamma, float* __restrict__ output,
-                    float* sums, const sycl::nd_item<1>& item) {
-    constexpr int BlockSize = 1024;  // native_gr_rms_norm_weighted's choice for 2560 columns
-    const int tid = item.get_local_id(0);
-    const int row = item.get_group(0);
-    const size_t row_offset = size_t(row) * N;
-    const float* in = input + row_offset;
-    float* out = output + row_offset;
-    const float* g = gamma + size_t(row % H) * N;
-    auto sg = item.get_sub_group();
-
-    float partial = 0.0f;
-    for (int col = tid; col < N; col += BlockSize) {
-        const float value = in[col];
-        partial += value * value;
-    }
-
-    partial = warp_sum(partial, sg);
-    const int lane = tid % 32;
-    if (lane == 0) sums[tid / 32] = partial;
-    item.barrier(sycl::access::fence_space::local_space);
-    partial = 0.0f;
-    if (lane < BlockSize / 32) partial = sums[lane];
-    partial = warp_sum(partial, sg);
-    const float mean = partial / N;
-    const float scale = sycl::rsqrt(mean + NG_RMS_EPS);
-    for (int col = tid; col < N; col += BlockSize) {
-        out[col] = scale * in[col] * g[col];
-    }
-}
 
 void broadcast_batch_kernel(const float* value, const float* gate, float* gated, int T, const sycl::nd_item<1>& item) {
     const size_t i = item.get_global_id(0);
@@ -169,6 +134,29 @@ void history_batch_kernel(float* history, const float* normalized, int T, const 
 #pragma unroll
     for (int r = 0; r < HISTORY; ++r)
         history[size_t(c) * HISTORY + r] = h[r];
+}
+
+void history_batch_snap_kernel(float* history, const float* normalized, int T, float* snap,
+                               const sycl::nd_item<1>& item) {
+    const size_t c = item.get_global_id(0);
+    if (c >= D) return;
+    float h0[HISTORY];
+#pragma unroll
+    for (int r = 0; r < HISTORY; ++r)
+        h0[r] = history[size_t(c) * HISTORY + r];
+    for (int t = 0; t < T; ++t) {
+        float* out = snap + size_t(t) * HISTORY * D + size_t(c) * HISTORY;
+#pragma unroll
+        for (int r = 0; r < HISTORY; ++r) {
+            const int p = r + t + 1 - HISTORY;
+            out[r] = p >= 0 ? normalized[size_t(p) * D + c] : h0[r + t + 1];
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < HISTORY; ++r) {
+        const int p = r + T - HISTORY;
+        history[size_t(c) * HISTORY + r] = p >= 0 ? normalized[size_t(p) * D + c] : h0[r + T];
+    }
 }
 
 struct Span {
@@ -218,10 +206,10 @@ void native_ple_postops(const float* projected_key, const float* hidden, const f
     const float scale = 1.0f / std::sqrt(float(N));
 
     q->submit([&](sycl::handler& cgh) {
-        sycl::local_accessor<float, 1> partials_acc(sycl::range<1>(32), cgh);
+        sycl::local_accessor<float, 1> partials_acc(sycl::range<1>(64), cgh);
 
         cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(H * 512), sycl::range<1>(512)),
-                         [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(32)]] {
+                         [=](sycl::nd_item<1> item) {
                              gate_kernel(b.key, b.query, b.gate, scale,
                                          partials_acc.get_multi_ptr<sycl::access::decorated::no>().get(), item);
                          });
@@ -249,31 +237,14 @@ void native_ple_postops_batch(float* key, float* hidden, const float* value, flo
     const size_t blocks = ((size_t(T) * D + 255) / 256) * 256;
     const float scale = 1.0f / std::sqrt(float(N));
 
-    q->submit([&](sycl::handler& cgh) {
-        sycl::local_accessor<float, 1> sums_acc(sycl::range<1>(32), cgh);
-
-        cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(rows * 1024), sycl::range<1>(1024)),
-                         [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(32)]] {
-                             rms_rep_kernel(key, w.norm_key, key,
-                                            sums_acc.get_multi_ptr<sycl::access::decorated::no>().get(), item);
-                         });
-    });
+    native_gr_rms_norm_weighted_multi(key, w.norm_key, key, N, H, T, NG_RMS_EPS, stream);
+    native_gr_rms_norm_weighted_multi(hidden, w.norm_query, query_norm, N, H, T, NG_RMS_EPS, stream);
 
     q->submit([&](sycl::handler& cgh) {
-        sycl::local_accessor<float, 1> sums_acc(sycl::range<1>(32), cgh);
-
-        cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(rows * 1024), sycl::range<1>(1024)),
-                         [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(32)]] {
-                             rms_rep_kernel(hidden, w.norm_query, query_norm,
-                                            sums_acc.get_multi_ptr<sycl::access::decorated::no>().get(), item);
-                         });
-    });
-
-    q->submit([&](sycl::handler& cgh) {
-        sycl::local_accessor<float, 1> partials_acc(sycl::range<1>(32), cgh);
+        sycl::local_accessor<float, 1> partials_acc(sycl::range<1>(64), cgh);
 
         cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(rows * 512), sycl::range<1>(512)),
-                         [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(32)]] {
+                         [=](sycl::nd_item<1> item) {
                              gate_kernel(key, query_norm, gate, scale,
                                          partials_acc.get_multi_ptr<sycl::access::decorated::no>().get(), item);
                          });
@@ -282,15 +253,7 @@ void native_ple_postops_batch(float* key, float* hidden, const float* value, flo
     q->parallel_for(sycl::nd_range<1>(sycl::range<1>(blocks), sycl::range<1>(256)),
                     [=](sycl::nd_item<1> item) { broadcast_batch_kernel(value, gate, gated, T, item); });
 
-    q->submit([&](sycl::handler& cgh) {
-        sycl::local_accessor<float, 1> sums_acc(sycl::range<1>(32), cgh);
-
-        cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(rows * 1024), sycl::range<1>(1024)),
-                         [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(32)]] {
-                             rms_rep_kernel(gated, w.norm_conv, query_norm,
-                                            sums_acc.get_multi_ptr<sycl::access::decorated::no>().get(), item);
-                         });
-    });
+    native_gr_rms_norm_weighted_multi(gated, w.norm_conv, query_norm, N, H, T, NG_RMS_EPS, stream);
 
     q->parallel_for(sycl::nd_range<1>(sycl::range<1>(blocks), sycl::range<1>(256)), [=](sycl::nd_item<1> item) {
         conv_residual_batch_kernel(history, query_norm, w.conv1d_f16, hidden, gated, T, item);
@@ -298,6 +261,42 @@ void native_ple_postops_batch(float* key, float* hidden, const float* value, flo
 
     q->parallel_for(sycl::nd_range<1>(sycl::range<1>(D), sycl::range<1>(256)),
                     [=](sycl::nd_item<1> item) { history_batch_kernel(history, query_norm, T, item); });
+}
+
+void native_ple_postops_batch_snap(float* key, float* hidden, const float* value, float* history, const PleWeights& w,
+                                   float* query_norm, float* gated, float* gate, int T, float* snap, void* stream) {
+    if (!stream || T <= 0 || !key || !hidden || !value || !history || !query_norm || !gated || !gate || !snap)
+        throw std::invalid_argument("native PLE postops batch (snapshots): null input or empty batch");
+    auto* q = static_cast<sycl::queue*>(stream);
+
+    const unsigned rows = unsigned(T) * H;
+    const unsigned blocks = unsigned((size_t(T) * D + 255) / 256) * 256;
+    const float scale = 1.0f / std::sqrt(float(N));
+
+    native_gr_rms_norm_weighted_multi(key, w.norm_key, key, N, H, T, NG_RMS_EPS, stream);
+    native_gr_rms_norm_weighted_multi(hidden, w.norm_query, query_norm, N, H, T, NG_RMS_EPS, stream);
+
+    q->submit([&](sycl::handler& cgh) {
+        sycl::local_accessor<float, 1> partials_acc(sycl::range<1>(64), cgh);
+
+        cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(rows * 512), sycl::range<1>(512)),
+                         [=](sycl::nd_item<1> item) {
+                             gate_kernel(key, query_norm, gate, scale,
+                                         partials_acc.get_multi_ptr<sycl::access::decorated::no>().get(), item);
+                         });
+    });
+
+    q->parallel_for(sycl::nd_range<1>(sycl::range<1>(blocks), sycl::range<1>(256)),
+                    [=](sycl::nd_item<1> item) { broadcast_batch_kernel(value, gate, gated, T, item); });
+
+    native_gr_rms_norm_weighted_multi(gated, w.norm_conv, query_norm, N, H, T, NG_RMS_EPS, stream);
+
+    q->parallel_for(sycl::nd_range<1>(sycl::range<1>(blocks), sycl::range<1>(256)), [=](sycl::nd_item<1> item) {
+        conv_residual_batch_kernel(history, query_norm, w.conv1d_f16, hidden, gated, T, item);
+    });
+
+    q->parallel_for(sycl::nd_range<1>(sycl::range<1>(D), sycl::range<1>(256)),
+                    [=](sycl::nd_item<1> item) { history_batch_snap_kernel(history, query_norm, T, snap, item); });
 }
 
 }  // namespace strata::kernels
