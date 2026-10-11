@@ -21,6 +21,7 @@
 #include "strata/kernels/ple.hpp"
 #include "strata/kernels/native_ple_postops.hpp"
 #include "strata/kernels/iq_kernels.hpp"
+#include "strata/kernels/iq_dequant_expert.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/qsa.hpp"
 #include "strata/kernels/kv_stream.hpp"
@@ -4074,9 +4075,17 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                             if (lay.native) {
                                 // plan v0.3 P6: a native pack's layer, dequantized by llama.cpp's own formulas
                                 const auto& f = lay.fmt[(size_t) l];
-                                strata::kernels::iq_dequant_gu_f16(f.gu_type, blob_dev, blob_dev + f.up_off, f.n_ff, f.n_embd,
-                                                                   m.dq_gu[q], m.cs);
-                                strata::kernels::iq_dequant_f16(f.d_type, blob_dev + f.down_off, f.n_embd * f.n_ff, m.dq_d[q], m.cs);
+                                // 0.1.43: both matrices in one launch (the same values; STRATA_PF_DQ_FUSED=0: two launches)
+                                static const bool dq_one = [] { const char* v = std::getenv("STRATA_PF_DQ_FUSED"); return !(v && v[0] == '0'); }();
+                                if (dq_one) {
+                                    strata::kernels::iq_dequant_expert_f16(f.gu_type, f.d_type, blob_dev, blob_dev + f.up_off,
+                                                                           blob_dev + f.down_off, f.n_ff, f.n_embd, m.dq_gu[q],
+                                                                           m.dq_d[q], m.cs);
+                                } else {
+                                    strata::kernels::iq_dequant_gu_f16(f.gu_type, blob_dev, blob_dev + f.up_off, f.n_ff, f.n_embd,
+                                                                       m.dq_gu[q], m.cs);
+                                    strata::kernels::iq_dequant_f16(f.d_type, blob_dev + f.down_off, f.n_embd * f.n_ff, m.dq_d[q], m.cs);
+                                }
                             } else {
                                 blob_dequant_f16(blob_dev, m.dq_gu[q], m.dq_d[q], m.cs);
                             }

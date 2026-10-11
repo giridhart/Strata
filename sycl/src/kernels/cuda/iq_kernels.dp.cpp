@@ -10,6 +10,7 @@
 #include "strata/sycl_math.hpp"
 #include "strata/sycl_queue.hpp"
 #include "strata/kernels/iq_kernels.hpp"
+#include "strata/kernels/iq_dequant_expert.hpp"
 #include "strata/kernels/dp4a.hpp"
 #include "strata/kernels/q8_1_finite.hpp"
 #include "s26_tsum.dp.hpp"
@@ -4416,6 +4417,51 @@ void iq_dequant_gu_f16(int t, const void* gate, const void* up, int64_t n_ff, in
             });
     }
     check("iq_dequant_gu_f16");
+}
+
+// 0.1.43: gate/up and down of one expert in one launch.  Work-group g of the first 2 * n_ff * per_row is the gu kernel's
+// (row-superblock g / 2, parity g % 2); the rest are the flat kernel's superblocks of the down matrix.
+namespace {
+__dpct_inline__ void dequant_expert_kernel(int gt, int dt, const void *__restrict__ gate, const void *__restrict__ up,
+                                           const void *__restrict__ down, int64_t per_row, int64_t gu_wgs,
+                                           sycl::half *__restrict__ ygu, sycl::half *__restrict__ yd) {
+    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    const int64_t g = item_ct1.get_group(2);
+    if (g < gu_wgs) {
+        const int64_t i = g >> 1;
+        const int parity = (int) (g & 1);
+        const int64_t r = i / per_row, c = i % per_row;
+        dq_dispatch<sycl::half>(gt, parity ? up : gate, i, ygu + ((2 * r + parity) * per_row + c) * QK_K,
+                                item_ct1.get_local_id(2));
+    } else {
+        const int64_t j = g - gu_wgs;
+        dq_dispatch<sycl::half>(dt, down, j, yd + j * QK_K, item_ct1.get_local_id(2));
+    }
+}
+}  // namespace
+
+void iq_dequant_expert_f16(int gt, int dt, const void* gate, const void* up, const void* down, int64_t n_ff,
+                           int64_t n_embd, uint16_t* dst_gu, uint16_t* dst_d, void* stream) {
+    if (n_embd % 256 != 0 || (n_ff * n_embd) % 256 != 0 || !is_iq(gt) || !is_iq(dt)) {
+        std::fprintf(stderr, "iq_dequant_expert_f16: types %d/%d, %lld x %lld\n", gt, dt, (long long) n_ff, (long long) n_embd);
+        std::exit(1);
+    }
+    const int64_t per_row = n_embd / 256, gu_wgs = 2 * n_ff * per_row, d_wgs = n_ff * n_embd / 256;
+    {
+        auto exp_props = sycl::ext::oneapi::experimental::properties{
+            sycl::ext::oneapi::experimental::use_root_sync};
+        dpct::has_capability_or_fail(strata::q_of(stream)->get_device(), {sycl::aspect::fp16});
+        strata::q_of(stream)->submit([&](sycl::handler &cgh) {
+            cgh.parallel_for<dpct_kernel_name<class dequant_expert_kernel_7d2c41>>(
+                sycl::nd_range<3>(sycl::range(1, 1, (unsigned) (gu_wgs + d_wgs)) * sycl::range(1, 1, 32),
+                                  sycl::range(1, 1, 32)),
+                exp_props, [=](sycl::nd_item<3> item_ct1) {
+                    dequant_expert_kernel(gt, dt, gate, up, down, per_row, gu_wgs, (sycl::half *) dst_gu,
+                                          (sycl::half *) dst_d);
+                });
+        });
+    }
+    check("iq_dequant_expert_f16");
 }
 
 bool native_expert_supported(int gu_type, int d_type, int64_t n_embd, int64_t n_ff) noexcept {
