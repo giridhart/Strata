@@ -5,6 +5,7 @@
 // MIT license, third_party/ggml/LICENSE).  The block structs and codebook grids come from its ggml-common.h,
 // included unchanged.
 #include <sycl/sycl.hpp>
+#include "strata/core/sycl_arch.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/dp4a.hpp"
 
@@ -1300,7 +1301,7 @@ void native_gu_multi_kernel(const unsigned long long* __restrict__ grp_ptr, cons
                             float* __restrict__ up) {
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
     const int ng = *n_groups;
-    if (item_ct1.get_group(1) >= ng) return;
+    if (item_ct1.get_group(1) >= (size_t)ng) return;
     const int nb = (int)(L.n_embd / Fmt<TG>::qk), xb = (int)(L.n_embd / 32);
     if constexpr (SUB16) {
         if (xb == 80) {
@@ -1416,7 +1417,7 @@ void native_down_multi_kernel(const unsigned long long* __restrict__ grp_ptr, co
                               sycl::local_accessor<uint32_t, 1> s_hq_buf) {
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
     const int ng = *n_groups;
-    if (item_ct1.get_group(1) >= ng) return;
+    if (item_ct1.get_group(1) >= (size_t)ng) return;
     const int nb = (int)(L.n_ff / Fmt<TD>::qk), hb = (int)(L.n_ff / 32);
     if constexpr (SUB_DOWN && TD == 20) {
         if (hb == 20) {
@@ -2001,7 +2002,7 @@ bool env_on(const char* name) {
 }
 // STRATA_OLD_IQ_MMVQ=1 keeps the per-column kernels (bitwise equal to the new ones; kept for A/B timing)
 bool g_old_kernels = env_on("STRATA_OLD_IQ_MMVQ");
-bool g_no_sub16_gu = env_on("STRATA_NO_SUB16_GU");
+bool g_no_sub16_gu = strata::sycl_arch::IS_XE2 || env_on("STRATA_NO_SUB16_GU");
 
 template <int TY>
 void launch_mmvq(const uint8_t* W, size_t rb, const block_q8_1* X, float* y, int n_in, int n_out, int ncols,
