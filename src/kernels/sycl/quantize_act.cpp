@@ -44,8 +44,8 @@ constexpr int QK8_0 = 32;
 // inf, and this file's fixture is O(1) throughout, so it passed.  A numpy-generated oracle caught it on its
 // first run.  Three copies of a converter whose failure mode is silent wrong bits was two copies too many.
 
-void quantize_q8_0_kernel(const float* __restrict__ x, uint8_t* __restrict__ blocks, long long n_blocks) {
-    auto item = sycl::ext::oneapi::this_work_item::get_nd_item<1>();
+void quantize_q8_0_kernel(sycl::nd_item<1> item, const float* __restrict__ x, uint8_t* __restrict__ blocks,
+                           long long n_blocks) {
     const long long b = (long long)item.get_group(0) * item.get_local_range(0) + item.get_local_id(0);
     if (b >= n_blocks) return;
     const float* xb = x + b * QK8_0;
@@ -99,9 +99,8 @@ void quantize_q8_0_kernel(const float* __restrict__ x, uint8_t* __restrict__ blo
 /// `moe_hit_parity`.  This function's job is different: it must match **this engine's own CPU reference**,
 /// because a hit and a miss for the same expert on the same layer have to produce the same number.  The CPU
 /// path is the reference - C1 passes on it - so the hit path is brought to it, not the reverse.
-void quantize_q8_0_scaled_kernel(const float* __restrict__ x, uint8_t* __restrict__ blocks, float* __restrict__ scales,
-                                 long long n_blocks) {
-    auto item = sycl::ext::oneapi::this_work_item::get_nd_item<1>();
+void quantize_q8_0_scaled_kernel(sycl::nd_item<1> item, const float* __restrict__ x, uint8_t* __restrict__ blocks,
+                                  float* __restrict__ scales, long long n_blocks) {
     const long long b = (long long)item.get_group(0) * item.get_local_range(0) + item.get_local_id(0);
     if (b >= n_blocks) return;
     const float* xb = x + b * QK8_0;
@@ -130,8 +129,8 @@ void quantize_q8_0_scaled_kernel(const float* __restrict__ x, uint8_t* __restric
     }
 }
 
-void dequant_q8_0_kernel(const uint8_t* __restrict__ blocks, float* __restrict__ x, long long n_blocks) {
-    auto item = sycl::ext::oneapi::this_work_item::get_nd_item<1>();
+void dequant_q8_0_kernel(sycl::nd_item<1> item, const uint8_t* __restrict__ blocks, float* __restrict__ x,
+                         long long n_blocks) {
     const long long b = (long long)item.get_group(0) * item.get_local_range(0) + item.get_local_id(0);
     if (b >= n_blocks) return;
     const uint8_t* blk = blocks + b * 34;
@@ -163,8 +162,8 @@ inline int nearest_int_dev(float fval) {
     return (i & 0x007fffff) - 0x00400000;
 }
 
-void quantize_q8_K_kernel(const float* __restrict__ x, uint8_t* __restrict__ blocks, long long n_blocks) {
-    auto item = sycl::ext::oneapi::this_work_item::get_nd_item<1>();
+void quantize_q8_K_kernel(sycl::nd_item<1> item, const float* __restrict__ x, uint8_t* __restrict__ blocks,
+                           long long n_blocks) {
     const long long b = (long long)item.get_group(0) * item.get_local_range(0) + item.get_local_id(0);
     if (b >= n_blocks) return;
     const float* xb = x + b * QK_K;
@@ -214,8 +213,8 @@ void quantize_q8_K_kernel(const float* __restrict__ x, uint8_t* __restrict__ blo
     *d = v_d;
 }
 
-void dequant_q8_K_kernel(const uint8_t* __restrict__ blocks, float* __restrict__ x, long long n_blocks) {
-    auto item = sycl::ext::oneapi::this_work_item::get_nd_item<1>();
+void dequant_q8_K_kernel(sycl::nd_item<1> item, const uint8_t* __restrict__ blocks, float* __restrict__ x,
+                         long long n_blocks) {
     const long long b = (long long)item.get_group(0) * item.get_local_range(0) + item.get_local_id(0);
     if (b >= n_blocks) return;
     const uint8_t* blk = blocks + b * Q8K_BYTES;
@@ -242,7 +241,7 @@ void quantize_q8_0(const float* x, uint8_t* blocks, int64_t n, void* stream) {
     const int threads = 128;
     const unsigned grid = (unsigned)((nb + threads - 1) / threads);
     q->parallel_for(sycl::nd_range<1>(sycl::range<1>((grid) * (threads)), sycl::range<1>(threads)),
-                    [=](sycl::nd_item<1> /*item*/) { quantize_q8_0_kernel(x, blocks, nb); });
+                    [=](sycl::nd_item<1> item) { quantize_q8_0_kernel(item, x, blocks, nb); });
     if (!stream) default_queue.wait();
 }
 
@@ -266,7 +265,7 @@ void quantize_q8_0_scaled(const float* x, uint8_t* blocks, float* scales, int64_
     const int threads = 128;
     const unsigned grid = (unsigned)((nb + threads - 1) / threads);
     q->parallel_for(sycl::nd_range<1>(sycl::range<1>((grid) * (threads)), sycl::range<1>(threads)),
-                    [=](sycl::nd_item<1> /*item*/) { quantize_q8_0_scaled_kernel(x, blocks, scales, nb); });
+                    [=](sycl::nd_item<1> item) { quantize_q8_0_scaled_kernel(item, x, blocks, scales, nb); });
     if (!stream) default_queue.wait();
 }
 
@@ -279,7 +278,7 @@ void dequant_q8_0(const uint8_t* blocks, float* x, int64_t n, void* stream) {
     const int threads = 128;
     const unsigned grid = (unsigned)((nb + threads - 1) / threads);
     q->parallel_for(sycl::nd_range<1>(sycl::range<1>((grid) * (threads)), sycl::range<1>(threads)),
-                    [=](sycl::nd_item<1> /*item*/) { dequant_q8_0_kernel(blocks, x, nb); });
+                    [=](sycl::nd_item<1> item) { dequant_q8_0_kernel(item, blocks, x, nb); });
     if (!stream) default_queue.wait();
 }
 
@@ -296,7 +295,7 @@ void quantize_q8_K(const float* x, uint8_t* blocks, int64_t n, void* stream) {
     const int threads = 64;  // one block per thread, and a block is 256 elements
     const unsigned grid = (unsigned)((nb + threads - 1) / threads);
     q->parallel_for(sycl::nd_range<1>(sycl::range<1>((grid) * (threads)), sycl::range<1>(threads)),
-                    [=](sycl::nd_item<1> /*item*/) { quantize_q8_K_kernel(x, blocks, nb); });
+                    [=](sycl::nd_item<1> item) { quantize_q8_K_kernel(item, x, blocks, nb); });
     if (!stream) default_queue.wait();
 }
 
@@ -309,7 +308,7 @@ void dequant_q8_K(const uint8_t* blocks, float* x, int64_t n, void* stream) {
     const int threads = 64;
     const unsigned grid = (unsigned)((nb + threads - 1) / threads);
     q->parallel_for(sycl::nd_range<1>(sycl::range<1>((grid) * (threads)), sycl::range<1>(threads)),
-                    [=](sycl::nd_item<1> /*item*/) { dequant_q8_K_kernel(blocks, x, nb); });
+                    [=](sycl::nd_item<1> item) { dequant_q8_K_kernel(item, blocks, x, nb); });
     if (!stream) default_queue.wait();
 }
 
