@@ -41,10 +41,7 @@ static sycl::queue& default_queue() {
 }
 
 inline float warp_sum(sycl::sub_group sg, float value) {
-#pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1)
-        value += sycl::permute_group_by_xor(sg, value, offset);
-    return value;
+    return sycl::reduce_over_group(sg, value, sycl::plus<float>());
 }
 
 inline float norm_sum(sycl::sub_group sg, sycl::group<1> grp, float value, sycl::local_accessor<float, 1> sums,

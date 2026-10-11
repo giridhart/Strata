@@ -64,10 +64,8 @@ void gdn_step_norm_kernel(float* __restrict__ state, const float* __restrict__ q
         sq_part = oc * oc;
     }
     // RMS over the head's 128 outputs: warps of row group 0 are threads 0..127.
-    auto sg = sycl::ext::oneapi::this_work_item::get_sub_group();
-    for (int o2 = 16; o2 > 0; o2 >>= 1) {
-        sq_part += sycl::permute_group_by_xor(sg, sq_part, o2);
-    }
+    const auto sg = item_ct1.get_sub_group();
+    sq_part = sycl::reduce_over_group(sg, sq_part, sycl::plus<float>());
     if ((tid & 31) == 0) wsum[tid >> 5] = sq_part;
     item_ct1.barrier(sycl::access::fence_space::local_space);
     if (rg == 0) {
@@ -91,10 +89,8 @@ void gdn_conv_l2_kernel(float* __restrict__ hist, const float* __restrict__ qkv,
     float y = sum / (1.0f + sycl::native::exp(-sum));
     if (group_id < qk_heads) {
         float sq = y * y;
-        auto sg = sycl::ext::oneapi::this_work_item::get_sub_group();
-        for (int o = 16; o > 0; o >>= 1) {
-            sq += sycl::permute_group_by_xor(sg, sq, o);
-        }
+        const auto sg = item_ct1.get_sub_group();
+        sq = sycl::reduce_over_group(sg, sq, sycl::plus<float>());
         if ((local_id & 31) == 0) part[local_id >> 5] = sq;
         item_ct1.barrier(sycl::access::fence_space::local_space);
         const float ss = part[0] + part[1] + part[2] + part[3];
@@ -126,10 +122,8 @@ void gdn_ab_kernel(const float* __restrict__ x, const uint16_t* __restrict__ wa,
         acc = sycl::fma(sycl::bit_cast<float>(wv.w() << 16), (float)(xb.z()), acc);
         acc = sycl::fma(sycl::bit_cast<float>(wv.w() & 0xffff0000u), (float)(xb.w()), acc);
     }
-    auto sg = sycl::ext::oneapi::this_work_item::get_sub_group();
-    for (int o = 16; o > 0; o >>= 1) {
-        acc += sycl::permute_group_by_xor(sg, acc, o);
-    }
+    const auto sg = item_ct1.get_sub_group();
+    acc = sycl::reduce_over_group(sg, acc, sycl::plus<float>());
     if (lane != 0) return;
     if (is_beta) {
         beta[r] = 1.0f / (1.0f + sycl::native::exp(-acc));
