@@ -96,6 +96,61 @@ int test_native_router(sycl::queue& q, int n_tokens) {
                 id_bad ? "*** WRONG ***" : "exact", id_bad, worst, w_bad);
     return id_bad + w_bad;
 }
+int test_native_route_resident(sycl::queue& q) {
+    constexpr int n_tokens = 4;
+    constexpr int n_expert = 512, k = 10;
+    std::vector<float> logits((size_t)n_tokens * n_expert, 0.0f);
+    std::vector<int32_t> ids((size_t)n_tokens * k, 0);
+    std::vector<float> weights((size_t)n_tokens * k, 0.1f);
+    std::vector<int32_t> res(n_expert, 1);  // Most resident
+
+    // For token 0: ids[6] is non-resident (res = -1), logit = 5.0f
+    // Resident candidate expert 100 has logit = 4.8f (diff 0.2f <= margin 0.5f) -> should swap!
+    res[50] = -1;  // non-resident
+    ids[6] = 50;
+    logits[50] = 5.0f;
+    logits[100] = 4.8f;
+    res[100] = 1;  // resident
+
+    float* d_l = sycl::malloc_device<float>(logits.size(), q);
+    int32_t* d_ids = sycl::malloc_device<int32_t>(ids.size(), q);
+    float* d_w = sycl::malloc_device<float>(weights.size(), q);
+    int32_t* d_res = sycl::malloc_device<int32_t>(res.size(), q);
+    unsigned long long* d_stats = sycl::malloc_device<unsigned long long>(4, q);
+
+    q.memcpy(d_l, logits.data(), logits.size() * sizeof(float));
+    q.memcpy(d_ids, ids.data(), ids.size() * sizeof(int32_t));
+    q.memcpy(d_w, weights.data(), weights.size() * sizeof(float));
+    q.memcpy(d_res, res.data(), res.size() * sizeof(int32_t));
+    q.fill(d_stats, 0ULL, 4).wait();
+
+    strata::kernels::native_route_resident(d_l, d_ids, d_w, d_res, n_tokens, 0.5f, 6, 9, d_stats, &q);
+    q.wait();
+
+    std::vector<int32_t> out_ids(ids.size());
+    std::vector<unsigned long long> stats(4);
+    q.memcpy(out_ids.data(), d_ids, out_ids.size() * sizeof(int32_t));
+    q.memcpy(stats.data(), d_stats, 4 * sizeof(unsigned long long)).wait();
+
+    sycl::free(d_l, q);
+    sycl::free(d_ids, q);
+    sycl::free(d_w, q);
+    sycl::free(d_res, q);
+    sycl::free(d_stats, q);
+
+    int bad = 0;
+    if (out_ids[6] != 100) {
+        std::fprintf(stderr, "route_resident: expected id[6] == 100, got %d\n", out_ids[6]);
+        ++bad;
+    }
+    if (stats[1] != 1) {  // 1 swap
+        std::fprintf(stderr, "route_resident: expected 1 swap, got %llu\n", stats[1]);
+        ++bad;
+    }
+    std::printf("  native_route_resident: %s (swaps=%llu, tail=%llu)\n",
+                bad ? "*** WRONG ***" : "exact", stats[1], stats[0]);
+    return bad;
+}
 }  // namespace
 
 int main() {
@@ -105,6 +160,7 @@ int main() {
     fails += test_native_router(q, 4);
     fails += test_native_router(q, 16);
     fails += test_native_router(q, 128);
+    fails += test_native_route_resident(q);
 
     if (fails != 0) {
         std::fprintf(stderr, "native_router_test FAILED with %d failures\n", fails);
