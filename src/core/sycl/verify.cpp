@@ -1084,15 +1084,23 @@ bool Verifier::record_window(int T, sycl::queue* cs, std::string& err) try {
             else
                 copy_from_mapped(parts_ + (size_t)tb * K * N, m_ymiss_ + (size_t)tb * K * N, (int64_t)n * K * N, cs);
         }
-        moe_hit_add(parts_ + (size_t)tb * K * N, hit_out, p_dst, p_counts + 1, cap, N, cs);
-        if (dec_batch && n > 1 && native_moe_combine_enabled()) {  // one launch for the window's rows
+        const bool hits_in_combine = dec_batch && n > 1 &&
+            native_moe_combine_hits_supported(parts_ + (size_t)tb * K * N, shared_ + tb * N, bo_ + tb * N, N, K, n) &&
+            ((uintptr_t)hit_out & 15u) == 0;
+        if (!hits_in_combine)
+            moe_hit_add(parts_ + (size_t)tb * K * N, hit_out, p_dst, p_counts + 1, cap, N, cs);
+        if (hits_in_combine) {
+            try {
+                native_moe_combine_multi_hits_added(parts_ + (size_t)tb * K * N, hit_out, p_dst, p_counts + 1,
+                                                    w_ + tb * K, shared_ + tb * N, bo_ + tb * N, N, K, n, cs);
+            } catch (const std::exception& e) {
+                err = "verify combine: " + std::string(e.what());
+                return false;
+            }
+        } else if (dec_batch && n > 1 && native_moe_combine_enabled()) {
             try {
                 native_moe_combine_multi(parts_ + (size_t)tb * K * N, w_ + tb * K, shared_ + tb * N, bo_ + tb * N, N, K,
                                          n, cs);
-                /*
-                DPCT1109:36: Virtual functions cannot be called in SYCL device code.
-                You need to adjust the code.
-                */
             } catch (const std::exception& e) {
                 err = "verify combine: " + std::string(e.what());
                 return false;

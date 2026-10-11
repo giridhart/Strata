@@ -799,6 +799,67 @@ void gr_norm_split_kernel(GrMulti m, float* part, float& s_rs) {
     }
 }
 
+// 143-amdk: gr_norm_split_kernel with the loads of a thread's (at most three) float4 issued together
+// and the scaled product written once from registers. Eliminates the second global memory pass.
+void gr_norm_split_fast_kernel(GrMulti m, float* part, float& s_rs) {
+    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+
+    const FusedGrArgs& a = m.a[item_ct1.get_group(2)];
+    const int c = item_ct1.get_group(1);
+    float* xn = m.xn + (size_t)item_ct1.get_group(2) * D;
+    const int t = item_ct1.get_local_id(2), lane = t & 31, warp = t >> 5;
+    const float gw = a.apply ? 2.0f * sigmoidf_(a.inj_prev[c] / (float)HC) : 0.0f;
+    constexpr int KS = 3;
+    int k0 = (c * N - 4 * t + THREADS * 4 - 1) / (THREADS * 4);
+    if (k0 < 0) k0 = 0;
+    sycl::float4 r[KS], g[KS];
+    bool ok[KS];
+#pragma unroll
+    for (int j = 0; j < KS; ++j) {
+        const int i = t * 4 + (k0 + j) * THREADS * 4;
+        ok[j] = i < (c + 1) * N;
+        if (ok[j]) {
+            r[j] = *reinterpret_cast<const sycl::float4*>(a.R + i);
+            g[j] = *reinterpret_cast<const sycl::float4*>(a.w_norm + i);
+            if (a.apply) {
+                const sycl::float4 b = *reinterpret_cast<const sycl::float4*>(a.bo_prev + (i - c * N));
+                r[j].x() = sycl::fma(b.x(), gw, r[j].x());
+                r[j].y() = sycl::fma(b.y(), gw, r[j].y());
+                r[j].z() = sycl::fma(b.z(), gw, r[j].z());
+                r[j].w() = sycl::fma(b.w(), gw, r[j].w());
+            }
+        }
+    }
+    float ss = 0.0f;
+#pragma unroll
+    for (int j = 0; j < KS; ++j) {
+        if (ok[j]) {
+            const float sq = r[j].x() * r[j].x() + r[j].y() * r[j].y() + r[j].z() * r[j].z() + r[j].w() * r[j].w();
+            ss += sq;
+            r[j] = sycl::float4(r[j].x() * g[j].x(), r[j].y() * g[j].y(), r[j].z() * g[j].z(), r[j].w() * g[j].w());
+        }
+    }
+    const float v = warp_sum(ss);
+    if (lane == 0) part[warp] = v;
+    item_ct1.barrier();
+    if (t == 0) {
+        float s = 0.0f;
+        for (int w = 0; w < WARPS; ++w)
+            s += part[w];
+        s_rs = sycl::rsqrt(s / (float)N + a.eps);
+        a.rs[c] = s_rs;
+    }
+    item_ct1.barrier();
+    const float rs = s_rs;
+#pragma unroll
+    for (int j = 0; j < KS; ++j) {
+        if (ok[j]) {
+            *reinterpret_cast<sycl::float4*>(xn + t * 4 + (k0 + j) * THREADS * 4) =
+                sycl::float4(r[j].x() * rs, r[j].y() * rs, r[j].z() * rs, r[j].w() * rs);
+        }
+    }
+}
+
 inline void cp_async16(void* smem, const void* gmem) {
     *reinterpret_cast<sycl::float4*>(smem) = *reinterpret_cast<const sycl::float4*>(gmem);
 }
@@ -988,11 +1049,19 @@ void launch_multi(const GrMulti& m, int variant, sycl::queue* st, unsigned long 
             sycl::local_accessor<float, 1> part_acc_ct1(sycl::range<1>(8 /*WARPS*/), cgh);
             sycl::local_accessor<float, 0> s_rs_acc_ct1(cgh);
 
+            const bool norm_fast = [] {
+                const char* e = std::getenv("STRATA_GR_NORM_FAST");
+                return e == nullptr || std::atoi(e) != 0;
+            }();
             cgh.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, HC, (unsigned)n_tok) * sycl::range<3>(1, 1, THREADS),
                                                sycl::range<3>(1, 1, THREADS)),
                              [=](sycl::nd_item<3> /*item_ct1*/) [[sycl::reqd_sub_group_size(32)]] {
-                                 gr_norm_split_kernel(
-                                     m, part_acc_ct1.get_multi_ptr<sycl::access::decorated::no>().get(), s_rs_acc_ct1);
+                                 if (norm_fast)
+                                     gr_norm_split_fast_kernel(
+                                         m, part_acc_ct1.get_multi_ptr<sycl::access::decorated::no>().get(), s_rs_acc_ct1);
+                                 else
+                                     gr_norm_split_kernel(
+                                         m, part_acc_ct1.get_multi_ptr<sycl::access::decorated::no>().get(), s_rs_acc_ct1);
                              });
         });
     else
