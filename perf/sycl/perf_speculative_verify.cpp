@@ -18,9 +18,11 @@
 #include "strata/core/sycl_arch.hpp"
 #include "strata/kernels/kv_q8.hpp"
 #include "strata/kernels/native_qsa.hpp"
+#include "strata/kernels/native_qsa_indexer.hpp"
 #include "strata/kernels/native_rope.hpp"
 #include "strata/kernels/native_router.hpp"
 #include "strata/kernels/qsa.hpp"
+#include "strata/kernels/route_prior.hpp"
 
 #include <chrono>
 #include <cmath>
@@ -503,10 +505,170 @@ static void BM_Xe2_KV_Append_Batched(benchmark::State& state) {
     sycl::free(d_step, q);
 }
 
+static void BM_Xe2_Route_Prior(benchmark::State& state) {
+    const int B = state.range(0);
+    constexpr int NE = 512;
+    constexpr int K = 10;
+
+    sycl::queue q{sycl::default_selector_v, {sycl::property::queue::in_order(), sycl::property::queue::enable_profiling()}};
+
+    auto* d_logits  = sycl::malloc_device<float>(B * NE, q);
+    auto* d_ids     = sycl::malloc_device<int32_t>(B * K, q);
+    auto* d_weights = sycl::malloc_device<float>(B * K, q);
+    auto* d_res     = sycl::malloc_device<int32_t>(NE, q);
+
+    q.fill(d_logits, 0.1f, B * NE);
+    q.fill(d_ids, 0, B * K);
+    q.fill(d_weights, 0.1f, B * K);
+    q.fill(d_res, 1, NE).wait();
+
+    // Warmup
+    for (int w = 0; w < 3; ++w) {
+        strata::kernels::route_prior_top10(d_logits, d_res, 0.5f, d_ids, d_weights, B, &q);
+        q.wait();
+    }
+
+    for (auto _ : state) {
+        auto t0 = std::chrono::steady_clock::now();
+        strata::kernels::route_prior_top10(d_logits, d_res, 0.5f, d_ids, d_weights, B, &q);
+        q.wait();
+        auto t1 = std::chrono::steady_clock::now();
+        state.SetIterationTime(std::chrono::duration<double>(t1 - t0).count());
+    }
+
+    state.counters["Batch_B"] = benchmark::Counter((double)B);
+    state.counters["tokens_per_sec"] = benchmark::Counter((double)B, benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
+
+    sycl::free(d_logits, q);
+    sycl::free(d_ids, q);
+    sycl::free(d_weights, q);
+    sycl::free(d_res, q);
+}
+
+static void BM_Xe2_Indexer_Append_Sequential(benchmark::State& state) {
+    const int B = state.range(0);
+    const int64_t max_cells = 4096;
+    strata::kernels::QsaShapes shapes = strata::kernels::qsa_real_shapes();
+    strata::kernels::RopeScaling scaling{};
+
+    sycl::queue q{sycl::default_selector_v, {sycl::property::queue::in_order(), sycl::property::queue::enable_profiling()}};
+
+    auto* d_raw = sycl::malloc_device<float>(B * 128, q);
+    auto* d_pos = sycl::malloc_device<int32_t>(B, q);
+    auto* d_gamma = sycl::malloc_device<float>(128, q);
+    auto* d_tail = sycl::malloc_device<float>(3 * 128, q);
+    auto* d_dead = sycl::malloc_device<float>(128, q);
+    auto* d_pooled = sycl::malloc_device<float>((max_cells / 4 + 1) * 128, q);
+    auto* d_block_pos = sycl::malloc_device<int32_t>(1, q);
+
+    q.fill(d_raw, 0.5f, B * 128);
+    q.fill(d_gamma, 1.0f, 128);
+    q.fill(d_tail, 0.0f, 3 * 128);
+    q.fill(d_dead, 0.0f, 128);
+    q.fill(d_pooled, 0.0f, (max_cells / 4 + 1) * 128);
+    q.fill(d_block_pos, 0, 1);
+    std::vector<int32_t> h_pos(B);
+    for (int i = 0; i < B; ++i) h_pos[i] = i;
+    q.memcpy(d_pos, h_pos.data(), B * sizeof(int32_t)).wait();
+
+    strata::kernels::QsaIndexerBuffers buf{d_tail, d_dead, d_pooled, d_block_pos};
+
+    // Warmup
+    for (int w = 0; w < 3; ++w) {
+        for (int t = 0; t < B; ++t) {
+            strata::kernels::native_qsa_indexer_append(d_raw + t * 128, d_pos + t, 0,
+                                                       d_gamma, 1e-6f, buf, shapes, max_cells, scaling, &q);
+        }
+        q.wait();
+    }
+
+    for (auto _ : state) {
+        auto t0 = std::chrono::steady_clock::now();
+        for (int t = 0; t < B; ++t) {
+            strata::kernels::native_qsa_indexer_append(d_raw + t * 128, d_pos + t, 0,
+                                                       d_gamma, 1e-6f, buf, shapes, max_cells, scaling, &q);
+        }
+        q.wait();
+        auto t1 = std::chrono::steady_clock::now();
+        state.SetIterationTime(std::chrono::duration<double>(t1 - t0).count());
+    }
+
+    state.counters["Batch_B"] = benchmark::Counter((double)B);
+    state.counters["tokens_per_sec"] = benchmark::Counter((double)B, benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
+
+    sycl::free(d_raw, q);
+    sycl::free(d_pos, q);
+    sycl::free(d_gamma, q);
+    sycl::free(d_tail, q);
+    sycl::free(d_dead, q);
+    sycl::free(d_pooled, q);
+    sycl::free(d_block_pos, q);
+}
+
+static void BM_Xe2_Indexer_Append_Batched(benchmark::State& state) {
+    const int B = state.range(0);
+    const int64_t max_cells = 4096;
+    strata::kernels::QsaShapes shapes = strata::kernels::qsa_real_shapes();
+    strata::kernels::RopeScaling scaling{};
+
+    sycl::queue q{sycl::default_selector_v, {sycl::property::queue::in_order(), sycl::property::queue::enable_profiling()}};
+
+    auto* d_raw = sycl::malloc_device<float>(B * 128, q);
+    auto* d_pos = sycl::malloc_device<int32_t>(B, q);
+    auto* d_gamma = sycl::malloc_device<float>(128, q);
+    auto* d_tail = sycl::malloc_device<float>(3 * 128, q);
+    auto* d_dead = sycl::malloc_device<float>(128, q);
+    auto* d_pooled = sycl::malloc_device<float>((max_cells / 4 + 1) * 128, q);
+    auto* d_block_pos = sycl::malloc_device<int32_t>(1, q);
+
+    q.fill(d_raw, 0.5f, B * 128);
+    q.fill(d_gamma, 1.0f, 128);
+    q.fill(d_tail, 0.0f, 3 * 128);
+    q.fill(d_dead, 0.0f, 128);
+    q.fill(d_pooled, 0.0f, (max_cells / 4 + 1) * 128);
+    q.fill(d_block_pos, 0, 1);
+    std::vector<int32_t> h_pos(B);
+    for (int i = 0; i < B; ++i) h_pos[i] = i;
+    q.memcpy(d_pos, h_pos.data(), B * sizeof(int32_t)).wait();
+
+    strata::kernels::QsaIndexerBuffers buf{d_tail, d_dead, d_pooled, d_block_pos};
+
+    // Warmup
+    for (int w = 0; w < 3; ++w) {
+        strata::kernels::native_qsa_indexer_append_steps(d_raw, d_pos, 1, B, 0,
+                                                         d_gamma, 1e-6f, buf, shapes, max_cells, scaling, &q);
+        q.wait();
+    }
+
+    for (auto _ : state) {
+        auto t0 = std::chrono::steady_clock::now();
+        strata::kernels::native_qsa_indexer_append_steps(d_raw, d_pos, 1, B, 0,
+                                                         d_gamma, 1e-6f, buf, shapes, max_cells, scaling, &q);
+        q.wait();
+        auto t1 = std::chrono::steady_clock::now();
+        state.SetIterationTime(std::chrono::duration<double>(t1 - t0).count());
+    }
+
+    state.counters["Batch_B"] = benchmark::Counter((double)B);
+    state.counters["tokens_per_sec"] = benchmark::Counter((double)B, benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
+
+    sycl::free(d_raw, q);
+    sycl::free(d_pos, q);
+    sycl::free(d_gamma, q);
+    sycl::free(d_tail, q);
+    sycl::free(d_dead, q);
+    sycl::free(d_pooled, q);
+    sycl::free(d_block_pos, q);
+}
+
 BENCHMARK(BM_Xe2_Router_Sequential)->Arg(1)->Arg(2)->Arg(4)->Arg(8)->UseManualTime();
 BENCHMARK(BM_Xe2_Router_MultiToken)->Arg(1)->Arg(2)->Arg(4)->Arg(8)->UseManualTime();
 BENCHMARK(BM_Xe2_Route_Resident)->Arg(1)->Arg(2)->Arg(4)->Arg(8)->UseManualTime();
+BENCHMARK(BM_Xe2_Route_Prior)->Arg(1)->Arg(2)->Arg(4)->Arg(8)->UseManualTime();
 BENCHMARK(BM_Xe2_KV_Append_Sequential)->Arg(1)->Arg(2)->Arg(4)->Arg(8)->UseManualTime();
 BENCHMARK(BM_Xe2_KV_Append_Batched)->Arg(1)->Arg(2)->Arg(4)->Arg(8)->UseManualTime();
+BENCHMARK(BM_Xe2_Indexer_Append_Sequential)->Arg(1)->Arg(2)->Arg(4)->Arg(8)->UseManualTime();
+BENCHMARK(BM_Xe2_Indexer_Append_Batched)->Arg(1)->Arg(2)->Arg(4)->Arg(8)->UseManualTime();
 
 BENCHMARK_MAIN();
+
