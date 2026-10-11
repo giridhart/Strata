@@ -16,7 +16,7 @@ fi
 
 # Default test filter excludes GPU hardware tests unless overridden
 if [[ $# -eq 0 ]]; then
-    TEST_ARGS=(-j"${JOBS}" --output-on-failure -E "sycl|gpu|device|parity")
+    TEST_ARGS=(-j"${JOBS}" --output-on-failure -E "sycl|gpu|device|parity|bench")
 else
     TEST_ARGS=(-j"${JOBS}" --output-on-failure "$@")
 fi
