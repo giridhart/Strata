@@ -18,6 +18,7 @@
 #include "strata/core/sycl_arch.hpp"
 #include "strata/kernels/native_qsa.hpp"
 #include "strata/kernels/native_rope.hpp"
+#include "strata/kernels/native_router.hpp"
 
 #include <chrono>
 #include <cmath>
@@ -251,5 +252,127 @@ static void BM_Xe2_Fused_RMSNorm_RoPE(benchmark::State& state) {
 
 BENCHMARK(BM_Xe2_Unfused_RMSNorm_RoPE)->Arg(1)->Arg(2)->Arg(4)->Arg(8)->UseManualTime();
 BENCHMARK(BM_Xe2_Fused_RMSNorm_RoPE)->Arg(1)->Arg(2)->Arg(4)->Arg(8)->UseManualTime();
+
+// ============================================================================
+// Benchmark: BM_Xe2_Router_Sequential vs BM_Xe2_Router_MultiToken
+// ============================================================================
+
+static void BM_Xe2_Router_Sequential(benchmark::State& state) {
+    const int B = state.range(0);
+    constexpr int NE = 512;
+    constexpr int K = 10;
+
+    sycl::queue q{sycl::default_selector_v, {sycl::property::queue::in_order(), sycl::property::queue::enable_profiling()}};
+
+    auto* d_logits  = sycl::malloc_device<float>(B * NE, q);
+    auto* d_ids     = sycl::malloc_device<int32_t>(B * K, q);
+    auto* d_weights = sycl::malloc_device<float>(B * K, q);
+
+    q.fill(d_logits, 0.1f, B * NE).wait();
+
+    // Warmup
+    for (int w = 0; w < 3; ++w) {
+        for (int t = 0; t < B; ++t) {
+            strata::kernels::native_router_top10(d_logits + t * NE, d_ids + t * K, d_weights + t * K, &q);
+        }
+        q.wait();
+    }
+
+    for (auto _ : state) {
+        auto t0 = std::chrono::steady_clock::now();
+        for (int t = 0; t < B; ++t) {
+            strata::kernels::native_router_top10(d_logits + t * NE, d_ids + t * K, d_weights + t * K, &q);
+        }
+        q.wait();
+        auto t1 = std::chrono::steady_clock::now();
+        state.SetIterationTime(std::chrono::duration<double>(t1 - t0).count());
+    }
+
+    state.counters["Batch_B"] = benchmark::Counter((double)B);
+    state.counters["tokens_per_sec"] = benchmark::Counter((double)B, benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
+
+    sycl::free(d_logits, q);
+    sycl::free(d_ids, q);
+    sycl::free(d_weights, q);
+}
+
+static void BM_Xe2_Router_MultiToken(benchmark::State& state) {
+    const int B = state.range(0);
+    constexpr int NE = 512;
+    constexpr int K = 10;
+
+    sycl::queue q{sycl::default_selector_v, {sycl::property::queue::in_order(), sycl::property::queue::enable_profiling()}};
+
+    auto* d_logits  = sycl::malloc_device<float>(B * NE, q);
+    auto* d_ids     = sycl::malloc_device<int32_t>(B * K, q);
+    auto* d_weights = sycl::malloc_device<float>(B * K, q);
+
+    q.fill(d_logits, 0.1f, B * NE).wait();
+
+    // Warmup
+    for (int w = 0; w < 3; ++w) {
+        strata::kernels::native_router_top10_multi(d_logits, d_ids, d_weights, B, &q);
+        q.wait();
+    }
+
+    for (auto _ : state) {
+        auto t0 = std::chrono::steady_clock::now();
+        strata::kernels::native_router_top10_multi(d_logits, d_ids, d_weights, B, &q);
+        q.wait();
+        auto t1 = std::chrono::steady_clock::now();
+        state.SetIterationTime(std::chrono::duration<double>(t1 - t0).count());
+    }
+
+    state.counters["Batch_B"] = benchmark::Counter((double)B);
+    state.counters["tokens_per_sec"] = benchmark::Counter((double)B, benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
+
+    sycl::free(d_logits, q);
+    sycl::free(d_ids, q);
+    sycl::free(d_weights, q);
+}
+
+static void BM_Xe2_Route_Resident(benchmark::State& state) {
+    const int B = state.range(0);
+    constexpr int NE = 512;
+    constexpr int K = 10;
+
+    sycl::queue q{sycl::default_selector_v, {sycl::property::queue::in_order(), sycl::property::queue::enable_profiling()}};
+
+    auto* d_logits  = sycl::malloc_device<float>(B * NE, q);
+    auto* d_ids     = sycl::malloc_device<int32_t>(B * K, q);
+    auto* d_weights = sycl::malloc_device<float>(B * K, q);
+    auto* d_res     = sycl::malloc_device<int32_t>(NE, q);
+
+    q.fill(d_logits, 0.1f, B * NE);
+    q.fill(d_ids, 0, B * K);
+    q.fill(d_weights, 0.1f, B * K);
+    q.fill(d_res, 1, NE).wait();
+
+    // Warmup
+    for (int w = 0; w < 3; ++w) {
+        strata::kernels::native_route_resident(d_logits, d_ids, d_weights, d_res, B, 0.5f, 6, 9, nullptr, &q);
+        q.wait();
+    }
+
+    for (auto _ : state) {
+        auto t0 = std::chrono::steady_clock::now();
+        strata::kernels::native_route_resident(d_logits, d_ids, d_weights, d_res, B, 0.5f, 6, 9, nullptr, &q);
+        q.wait();
+        auto t1 = std::chrono::steady_clock::now();
+        state.SetIterationTime(std::chrono::duration<double>(t1 - t0).count());
+    }
+
+    state.counters["Batch_B"] = benchmark::Counter((double)B);
+    state.counters["tokens_per_sec"] = benchmark::Counter((double)B, benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
+
+    sycl::free(d_logits, q);
+    sycl::free(d_ids, q);
+    sycl::free(d_weights, q);
+    sycl::free(d_res, q);
+}
+
+BENCHMARK(BM_Xe2_Router_Sequential)->Arg(1)->Arg(2)->Arg(4)->Arg(8)->UseManualTime();
+BENCHMARK(BM_Xe2_Router_MultiToken)->Arg(1)->Arg(2)->Arg(4)->Arg(8)->UseManualTime();
+BENCHMARK(BM_Xe2_Route_Resident)->Arg(1)->Arg(2)->Arg(4)->Arg(8)->UseManualTime();
 
 BENCHMARK_MAIN();
