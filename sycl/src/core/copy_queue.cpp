@@ -55,6 +55,9 @@ bool load_ze(ZeFns& f) {
 
 bool copy_engine_active() { return g_active.load(); }
 
+namespace { std::atomic<const sycl::queue*> g_copy_q{nullptr}; }
+bool is_copy_engine_queue(const sycl::queue* q) { return q != nullptr && q == g_copy_q.load(); }
+
 sycl::queue* make_copy_engine_queue(const char* what) {
     static const bool off = [] { const char* v = std::getenv("STRATA_COPY_ENGINE"); return v && v[0] == '0'; }();
     if (off) return nullptr;
@@ -105,6 +108,7 @@ sycl::queue* make_copy_engine_queue(const char* what) {
             sycl::property_list{sycl::property::queue::in_order{}});
         auto* q = new sycl::queue(sycl::make_queue<sycl::backend::ext_oneapi_level_zero>(in, ctx));
         made = q;
+        g_copy_q.store(q);
         g_active.store(true);
         static std::atomic<bool> said{false};
         if (!said.exchange(true))

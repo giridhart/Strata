@@ -362,6 +362,7 @@ struct Stager {
     std::vector<std::vector<uint8_t>> pageable;   // the fallback when no more RAM can be pinned
     std::vector<dpct::event_ptr> dma_done;
     uint64_t* done_seq = nullptr;            // page-locked: the copy queue's last finished DMA per buffer
+    uint64_t* src_seq = nullptr;             // page-locked: the values a copy-engine queue copies into done_seq (it cannot run a fill kernel)
     std::vector<uint64_t> want;              // the sequence number each buffer's last DMA writes
     uint64_t issue_seq = 0;
     std::vector<Job> jobs;
@@ -387,6 +388,9 @@ struct Stager {
         done_seq = sycl::malloc_host<uint64_t>((size_t) kRing, dpct::get_in_order_queue());
         if (done_seq == nullptr) return false;
         for (int i = 0; i < kRing; ++i) done_seq[i] = 0;
+        src_seq = sycl::malloc_host<uint64_t>((size_t) 4 * kRing, dpct::get_in_order_queue());
+        if (src_seq == nullptr) return false;
+        for (int i = 0; i < 4 * kRing; ++i) src_seq[i] = 0;
         pageable.resize(kRing);
         for (int i = 0; i < kRing; ++i) {
             /*
@@ -419,6 +423,7 @@ struct Stager {
         cv.notify_all();
         for (auto& t : threads) t.join();
         if (done_seq) sycl::free(done_seq, dpct::get_in_order_queue());
+        if (src_seq) sycl::free(src_seq, dpct::get_in_order_queue());
         for (int i = 0; i < kRing; ++i) {
             if (dma_done[i]) dpct::destroy_event(dma_done[i]);
             if (buf[i] && pinned[i])
@@ -505,7 +510,13 @@ struct Stager {
     void issued_one(int j, dpct::queue_ptr copy) {
         const uint64_t s = ++issue_seq;
         want[(size_t) (j % kRing)] = s;
-        copy->fill<uint64_t>(done_seq + j % kRing, s, 1);
+        if (strata::is_copy_engine_queue(copy)) {   // a copy-only command list runs no kernels (a fill is one): a copy of the value
+            uint64_t* v = src_seq + (size_t) (s % (uint64_t) (4 * kRing));
+            *v = s;
+            copy->memcpy(done_seq + j % kRing, v, sizeof(uint64_t));
+        } else {
+            copy->fill<uint64_t>(done_seq + j % kRing, s, 1);
+        }
         issued.store(j + 1, std::memory_order_release);
     }
     bool buffer_free(int b) const {

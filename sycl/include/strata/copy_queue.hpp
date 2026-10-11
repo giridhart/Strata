@@ -21,4 +21,6 @@ namespace strata {
 sycl::queue* make_copy_engine_queue(const char* what);
 /// true once a copy-engine queue has been made in this process
 bool copy_engine_active();
+/// true for the queue make_copy_engine_queue() returned: it runs copies and barriers only, no kernel (not even queue::fill)
+bool is_copy_engine_queue(const sycl::queue* q);
 }  // namespace strata
