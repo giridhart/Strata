@@ -47,14 +47,11 @@ inline float warp_max(float value, const sycl::sub_group& sg) {
     return value;
 }
 
-void route(const float* __restrict__ logits, int32_t* __restrict__ ids, float* __restrict__ weights,
-           const sycl::nd_item<1>& item) {
-    const size_t tok = item.get_group(0);
+inline void route_token(const float* logits, int32_t* ids, float* weights, size_t tok, int lane,
+                        const sycl::sub_group& sg) {
     logits += tok * 512;
     ids += tok * 10;
     weights += tok * 10;
-    const int lane = item.get_local_id(0);
-    auto sg = item.get_sub_group();
 
     float values[16];
 #pragma unroll
@@ -113,6 +110,63 @@ void route(const float* __restrict__ logits, int32_t* __restrict__ ids, float* _
     if (lane < 10) weights[lane] = selected * inverse_selected_sum;
 }
 
+void route_resident_k(const float* __restrict__ logits, int32_t* __restrict__ ids, float* __restrict__ weights,
+                      const int32_t* __restrict__ res, int n_tok, float margin, int lo, int hi,
+                      unsigned long long* __restrict__ stats, const sycl::nd_item<1>& item) {
+    const int t = item.get_global_id(0);
+    if (t >= n_tok) return;
+    const float* l = logits + (size_t)t * 512;
+    int32_t* id = ids + (size_t)t * 10;
+    int swaps = 0, tail = 0, before = 0;
+    for (int r = 0; r < 10; ++r) before += (res[id[r]] < 0);
+    for (int r = lo; r <= hi && r < 10; ++r) {
+        const int e = id[r];
+        if (res[e] >= 0) continue;
+        ++tail;
+        int best = -1;
+        float bl = -INFINITY;
+        for (int f = 0; f < 512; ++f) {
+            if (res[f] < 0 || l[f] <= bl) continue;
+            bool used = false;
+            for (int q = 0; q < 10; ++q) used |= (id[q] == f);
+            if (!used) {
+                best = f;
+                bl = l[f];
+            }
+        }
+        if (best >= 0 && l[e] - bl <= margin) {
+            id[r] = best;
+            ++swaps;
+        }
+    }
+    int after = 0;
+    for (int r = 0; r < 10; ++r) after += (res[id[r]] < 0);
+    if (swaps) {
+        float m = -INFINITY;
+        for (int r = 0; r < 10; ++r) m = sycl::fmax(m, l[id[r]]);
+        float ex[10], sum = 0.0f;
+        for (int r = 0; r < 10; ++r) {
+            ex[r] = sycl::native::exp(l[id[r]] - m);
+            sum += ex[r];
+        }
+        for (int r = 0; r < 10; ++r) weights[(size_t)t * 10 + r] = ex[r] / sum;
+    }
+    if (stats) {
+        auto a_tail = sycl::atomic_ref<unsigned long long, sycl::memory_order::relaxed, sycl::memory_scope::device,
+                                       sycl::access::address_space::global_space>(stats[0]);
+        auto a_swaps = sycl::atomic_ref<unsigned long long, sycl::memory_order::relaxed, sycl::memory_scope::device,
+                                        sycl::access::address_space::global_space>(stats[1]);
+        auto a_before = sycl::atomic_ref<unsigned long long, sycl::memory_order::relaxed, sycl::memory_scope::device,
+                                         sycl::access::address_space::global_space>(stats[2]);
+        auto a_after = sycl::atomic_ref<unsigned long long, sycl::memory_order::relaxed, sycl::memory_scope::device,
+                                        sycl::access::address_space::global_space>(stats[3]);
+        a_tail.fetch_add((unsigned long long)tail);
+        a_swaps.fetch_add((unsigned long long)swaps);
+        a_before.fetch_add((unsigned long long)before);
+        a_after.fetch_add((unsigned long long)after);
+    }
+}
+
 bool valid(const void* p, size_t bytes) {
     const auto address = reinterpret_cast<uintptr_t>(p);
     return p && address % 4 == 0 && bytes <= UINTPTR_MAX - address;
@@ -137,8 +191,9 @@ void native_router_top10(const float* logits, int32_t* ids, float* weights, void
     sycl::queue* q = stream ? static_cast<sycl::queue*>(stream) : &default_queue;
 
     q->parallel_for(sycl::nd_range<1>(sycl::range<1>(32), sycl::range<1>(32)),
-                    [=](sycl::nd_item<1> item)
-                        [[sycl::reqd_sub_group_size(32)]] { route(logits, ids, weights, item); });
+                    [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(32)]] {
+                        route_token(logits, ids, weights, 0, (int)item.get_local_id(0), item.get_sub_group());
+                    });
 }
 
 void native_router_top10_multi(const float* logits, int32_t* ids, float* weights, int n_tok, void* stream) {
@@ -149,8 +204,35 @@ void native_router_top10_multi(const float* logits, int32_t* ids, float* weights
     static sycl::queue default_queue{sycl::property::queue::in_order()};
     sycl::queue* q = stream ? static_cast<sycl::queue*>(stream) : &default_queue;
 
-    q->parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t)n_tok * 32), sycl::range<1>(32)),
-                    [=](sycl::nd_item<1> item)
-                        [[sycl::reqd_sub_group_size(32)]] { route(logits, ids, weights, item); });
+    constexpr size_t warps_per_wg = 8;
+    constexpr size_t wg_size = warps_per_wg * 32;
+    const size_t total_warps = ((size_t)n_tok + warps_per_wg - 1) / warps_per_wg * warps_per_wg;
+    const size_t total_threads = total_warps * 32;
+
+    q->parallel_for(sycl::nd_range<1>(sycl::range<1>(total_threads), sycl::range<1>(wg_size)),
+                    [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(32)]] {
+                        const size_t global_tid = item.get_global_id(0);
+                        const size_t tok = global_tid / 32;
+                        if (tok >= (size_t)n_tok) return;
+                        const int lane = (int)(global_tid % 32);
+                        route_token(logits, ids, weights, tok, lane, item.get_sub_group());
+                    });
+}
+
+void native_route_resident(const float* logits, int32_t* ids, float* weights, const int32_t* res_layer, int n_tok,
+                           float margin, int rank_lo, int rank_hi, unsigned long long* stats, void* stream) {
+    if (!stream || n_tok < 1 || !res_layer)
+        throw std::invalid_argument("native_route_resident: bad arguments");
+
+    static sycl::queue default_queue{sycl::property::queue::in_order()};
+    sycl::queue* q = stream ? static_cast<sycl::queue*>(stream) : &default_queue;
+
+    const size_t wg = 32;
+    const size_t global = ((size_t)(n_tok + 31) / 32) * 32;
+    q->parallel_for(sycl::nd_range<1>(sycl::range<1>(global), sycl::range<1>(wg)),
+                    [=](sycl::nd_item<1> item) {
+                        route_resident_k(logits, ids, weights, res_layer, n_tok, margin, rank_lo, rank_hi, stats,
+                                         item);
+                    });
 }
 }  // namespace strata::kernels

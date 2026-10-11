@@ -896,6 +896,22 @@ bool Verifier::record_window(int T, sycl::queue* cs, std::string& err) try {
                 mb.weights = w_ + t * K;
                 if (!moe_route(wt, g, l, K, mb, mixed_ + t * N, cs, err, nullptr)) return false;
             }
+        static const auto route_resident_cfg = [] {
+            struct { float margin = 0.0f; int lo = 6, hi = 9; } c;
+            if (const char* v = std::getenv("STRATA_ROUTE_RESIDENT")) c.margin = (float)std::atof(v);
+            if (const char* v = std::getenv("STRATA_ROUTE_RESIDENT_RANKS")) std::sscanf(v, "%d-%d", &c.lo, &c.hi);
+            return c;
+        }();
+        if (route_resident_cfg.margin > 0.0f && NE == 512 && K == 10 && hits_.d_res != nullptr) {
+            try {
+                native_route_resident(logits_ + tb * NE, ids_ + tb * K, w_ + tb * K, hits_.d_res + l * g.n_expert, n,
+                                      route_resident_cfg.margin, route_resident_cfg.lo, route_resident_cfg.hi,
+                                      nullptr, cs);
+            } catch (const std::exception& e) {
+                err = "verify route-resident: " + std::string(e.what());
+                return false;
+            }
+        }
         if (device_plan_)  // E-6: every routed expert resident: this group's plan without the host
             resident_plan(ids_ + tb * K, n * (int)K, (int)K, hits_.d_res + l * g.n_expert, (int)g.n_expert,
                           hits_.cache_base, slot_off_d_, (long long)hits_.blob,
