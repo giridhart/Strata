@@ -18,6 +18,7 @@
 #include <sycl/ext/oneapi/matrix/matrix-unified.hpp>
 
 #include "strata/core/sycl_arch.hpp"
+#include "strata/kernels/quantize_act.hpp"
 
 #include <cmath>
 #include <cstdint>
@@ -292,6 +293,46 @@ static void BM_Xe2_Dequant_SLMBuffered(benchmark::State& state) {
     sycl::free(d_out, q);
 }
 
+/// Standalone Q8_0 Dequantization Benchmark
+/// Measures streaming throughput and bandwidth of dequant_q8_0
+void BM_Xe2_Dequant_Q8_0(benchmark::State& state) {
+    const size_t num_elements = state.range(0);
+    const size_t num_blocks = num_elements / 32;
+    const size_t block_bytes = num_blocks * 34;
+
+    sycl::queue q{sycl::default_selector_v, sycl::property::queue::in_order()};
+
+    std::vector<uint8_t> h_blocks(block_bytes, 0x12);
+    uint8_t* d_blocks = sycl::malloc_device<uint8_t>(block_bytes, q);
+    float* d_out = sycl::malloc_device<float>(num_elements, q);
+
+    q.memcpy(d_blocks, h_blocks.data(), block_bytes).wait();
+
+    // Warmup
+    for (int i = 0; i < 5; ++i) {
+        strata::kernels::dequant_q8_0(d_blocks, d_out, num_elements, &q);
+    }
+    q.wait();
+
+    for (auto _ : state) {
+        auto start = std::chrono::high_resolution_clock::now();
+        strata::kernels::dequant_q8_0(d_blocks, d_out, num_elements, &q);
+        q.wait();
+        auto end = std::chrono::high_resolution_clock::now();
+        auto elapsed = std::chrono::duration_cast<std::chrono::duration<double>>(end - start);
+        state.SetIterationTime(elapsed.count());
+    }
+
+    const double bytes = static_cast<double>(block_bytes + num_elements * sizeof(float));
+    state.counters["Bandwidth_GBps"] =
+        benchmark::Counter(bytes, benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
+    state.counters["elements_per_sec"] =
+        benchmark::Counter(static_cast<double>(num_elements), benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
+
+    sycl::free(d_blocks, q);
+    sycl::free(d_out, q);
+}
+
 // ============================================================================
 // Registration: Critical Decode Gate & Expert Projections
 // ============================================================================
@@ -311,6 +352,9 @@ BENCHMARK(BM_Xe2_Dequant_DirectRegister)->UseManualTime()->Args({32, 2560, 10240
 
 BENCHMARK(BM_Xe2_Dequant_SLMBuffered)->UseManualTime()->Args({16, 2560, 10240});
 BENCHMARK(BM_Xe2_Dequant_SLMBuffered)->UseManualTime()->Args({32, 2560, 10240});
+
+// Standalone Q8_0 Dequantization
+BENCHMARK(BM_Xe2_Dequant_Q8_0)->UseManualTime()->Arg(10240)->Arg(20480)->Arg(81920)->Arg(262144)->Arg(1048576);
 
 // ============================================================================
 // Main Entry Point

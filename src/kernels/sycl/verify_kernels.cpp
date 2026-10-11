@@ -350,7 +350,7 @@ void resident_plan_kernel(const int32_t* __restrict__ ids, int n, int k, const i
                           const uint8_t* cache_base, const unsigned long long* slot_off, long long blob,
                           int32_t* __restrict__ pl, long long capx, uint32_t* skip, uint32_t ring,
                           int32_t* s_ids, unsigned long long* s_ptr, int32_t* s_first, int32_t* s_cnt,
-                          int32_t* s_gstart, int* s_bad, sycl::nd_item<1> item) {
+                          int32_t* s_gstart, int* s_bad, sycl::nd_item<1> item, uint32_t* plan_err = nullptr) {
     const int tid = item.get_local_id(0);
     if (tid == 0) *s_bad = 0;
     item.barrier(sycl::access::fence_space::local_space);
@@ -369,7 +369,10 @@ void resident_plan_kernel(const int32_t* __restrict__ ids, int n, int k, const i
     }
     item.barrier(sycl::access::fence_space::local_space);
     if (*s_bad) {
-        if (tid == 0 && skip != nullptr) *skip = 0;
+        if (tid == 0) {
+            if (skip != nullptr) *skip = 0;
+            if (plan_err != nullptr) *plan_err = 1;
+        }
         return;
     }
 
@@ -641,16 +644,15 @@ void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const 
 void resident_plan(const int32_t* ids, int n_entries, int k, const int32_t* res_layer, int n_expert,
                    const uint8_t* cache_base, const unsigned long long* slot_off, long long blob, int32_t* plan,
                    long long capx, uint32_t* skip, uint32_t ring, void* stream, uint32_t* plan_err) {
-    (void)plan_err;
     sycl::queue* q = stream ? static_cast<sycl::queue*>(stream) : &default_queue();
     q->submit([&](sycl::handler& cgh) {
-        sycl::local_accessor<int32_t, 1> s_ids(sycl::range<1>(64), cgh);
-        sycl::local_accessor<unsigned long long, 1> s_ptr(sycl::range<1>(64), cgh);
-        sycl::local_accessor<int32_t, 1> s_first(sycl::range<1>(64), cgh);
-        sycl::local_accessor<int32_t, 1> s_cnt(sycl::range<1>(64), cgh);
-        sycl::local_accessor<int32_t, 1> s_gstart(sycl::range<1>(64), cgh);
+        sycl::local_accessor<int32_t, 1> s_ids(sycl::range<1>(128), cgh);
+        sycl::local_accessor<unsigned long long, 1> s_ptr(sycl::range<1>(128), cgh);
+        sycl::local_accessor<int32_t, 1> s_first(sycl::range<1>(128), cgh);
+        sycl::local_accessor<int32_t, 1> s_cnt(sycl::range<1>(128), cgh);
+        sycl::local_accessor<int32_t, 1> s_gstart(sycl::range<1>(128), cgh);
         sycl::local_accessor<int, 0> s_bad(cgh);
-        cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(64), sycl::range<1>(64)),
+        cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(128), sycl::range<1>(128)),
                          [=](sycl::nd_item<1> item) {
                              resident_plan_kernel(ids, n_entries, k, res_layer, n_expert, cache_base, slot_off, blob,
                                                   plan, capx, skip, ring,
@@ -660,7 +662,7 @@ void resident_plan(const int32_t* ids, int n_entries, int k, const int32_t* res_
                                                   s_cnt.get_multi_ptr<sycl::access::decorated::no>().get(),
                                                   s_gstart.get_multi_ptr<sycl::access::decorated::no>().get(),
                                                   s_bad.get_multi_ptr<sycl::access::decorated::no>().get(),
-                                                  item);
+                                                  item, plan_err);
                          });
     });
 }

@@ -66,3 +66,6 @@ build-vision-cuda12.bat
 scratch/
 MainSourceFiles.yaml
 bench_results/
+.agents/
+*.bundle
+*.patch
