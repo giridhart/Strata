@@ -4775,6 +4775,7 @@ int main(int argc, char **argv) try {
         // miss: 20 GiB of RAM for experts the other card then holds, or one 39 GiB pinned allocation that fails).
         const int64_t mirror_end = multi_gpu && !split_at.empty() ? split_at[0] : g.n_layers;
         std::vector<std::pair<int64_t, int64_t>> miss;
+        size_t n_true_miss = 0;   // the experts no slot holds; what follows them in `miss` are the lend candidates (below)
         for (const auto& pr : profile)   // the profile's order: the most-routed misses first, if the cap is reached
             if (pr.first < mirror_end && xcache.slot_of(pr.first, pr.second) == strata::core::kNotResident)
                 miss.push_back({pr.first, pr.second});
@@ -4783,6 +4784,24 @@ int main(int argc, char **argv) try {
                 if (xcache.slot_of(l, e) == strata::core::kNotResident &&
                     std::find(miss.begin(), miss.end(), std::pair<int64_t, int64_t>{l, e}) == miss.end())
                     miss.push_back({l, e});
+        n_true_miss = miss.size();
+        // 0.1.43: the experts in the last slots - the ones a prompt's loan takes (Prefill::relayout lends the TAIL of the
+        // cache) - are mirrored too, after the real misses (the cap drops them first).  A lent expert is streamed during
+        // the prompt and put back after it; from the GGUF that was a pread at ~2.3 GB/s per expert (~1 s for a 4K prompt's
+        // 930 slots, 0.26 s for a 600-token prompt's 284), from the pinned mirror it is a DMA.  Their mirror entries are never
+        // read by a decode window: it only looks at a mirror address for an expert that has no slot.
+        // STRATA_LEND_MIRROR=0 turns it off; =N: the last N slots (default 10% of the cache with a loan, at most 1,200).
+        if (!o.no_prefill_borrow && o.prefill_chunk > 0 && !multi_gpu) {
+            const char* lm = std::getenv("STRATA_LEND_MIRROR");
+            const int64_t want_tail = lm ? std::atoll(lm) : std::min<int64_t>(xcache.slots() / 10, 1200);
+            if (want_tail > 0) {
+                const int64_t first_tail = xcache.slots() - std::min<int64_t>(want_tail, xcache.slots());
+                for (int64_t l = 0; l < mirror_end; ++l)
+                    for (int64_t e = 0; e < g.n_expert; ++e)
+                        if (const int64_t sl = xcache.slot_of(l, e); sl != strata::core::kNotResident && sl >= first_tail)
+                            miss.push_back({l, e});
+            }
+        }
         uint64_t avail = 0;
         if (FILE* f = std::fopen("/proc/meminfo", "r")) {
             char key[64]; unsigned long long kb = 0;
@@ -4800,8 +4819,8 @@ int main(int argc, char **argv) try {
                              err.c_str());
                 err.clear();
             } else {
-                std::fprintf(stderr, "strata generate: %lld of %zu experts missing from VRAM mirrored in pinned host memory "
-                                     "(%.2f GiB, %.1f s); the GPU reads them over PCIe\n", (long long) got, miss.size(),
+                std::fprintf(stderr, "strata generate: %lld of %zu experts missing from VRAM (+ %zu in the prompt loan's slots) mirrored in pinned host memory "
+                                     "(%.2f GiB, %.1f s); the GPU reads them over PCIe\n", (long long) got, n_true_miss, miss.size() - n_true_miss,
                              (double) gguf_src.mirrored_bytes() / 1073741824.0,
                              std::chrono::duration<double>(Clock::now() - tm).count());
                 // the device-built verify plan's view of it: each (layer, expert) -> its mirror address, 0 = none
@@ -4814,7 +4833,7 @@ int main(int argc, char **argv) try {
                 dpct::get_in_order_queue().memcpy(mirror_table_d, tab.data(), tab.size() * sizeof(unsigned long long)).wait();
             }
         }
-        unmirrored_misses = (int64_t) miss.size() - (int64_t) (gguf_src.mirrored_bytes() ? std::count_if(miss.begin(), miss.end(),
+        unmirrored_misses = (int64_t) n_true_miss - (int64_t) (gguf_src.mirrored_bytes() ? std::count_if(miss.begin(), miss.begin() + (ptrdiff_t) n_true_miss,
             [&](const std::pair<int64_t, int64_t>& pr) { return gguf_src.pinned(pr.first, pr.second); }) : 0);
         const bool no_host = [] { const char* v = std::getenv("STRATA_VERIFY_NO_HOST"); return v && *v && std::strcmp(v, "0") != 0; }();
         if (unmirrored_misses > 0 && no_host) {
