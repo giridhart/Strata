@@ -1337,8 +1337,10 @@ bool adapt_overlap() {
         const char* e = std::getenv("STRATA_ADAPT_OVERLAP");
 #if defined(STRATA_USE_HIP)
         return e && e[0] == '1';      // HIP: not measured yet, opt-in
+#elif defined(_WIN32)
+        return e && e[0] == '1';      // Windows CUDA: opt-in (RTX 5070, Q2_0: -2.6% story decode with it, IQ3_XXS neutral)
 #else
-        return !(e && e[0] == '0');   // CUDA: on since 0.1.43 (same tokens, +5.5..8.3% decode on an A4000); =0 turns it off
+        return !(e && e[0] == '0');   // Linux CUDA: on since 0.1.43 (same tokens, +5.5..8.3% decode on an A4000, +4.4% P100); =0 turns it off
 #endif
     }();
     return v;
