@@ -37,7 +37,7 @@ std::optional<uint64_t> conversation_mem_available(std::istream& meminfo) {
     return result;
 }
 
-std::optional<uint64_t> conversation_available_memory() {
+std::optional<uint64_t> available_host_bytes() {
 #if defined(_WIN32)
     MEMORYSTATUSEX status{};
     status.dwLength = sizeof status;
