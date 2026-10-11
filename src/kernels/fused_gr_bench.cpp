@@ -24,6 +24,7 @@ static uint16_t bf16(float x) {
 
 int main(int argc, char** argv) {
     setvbuf(stdout, nullptr, _IONBF, 0);
+    K::fused_gr_check();   // the variant the engine runs (staged on Ampere), not the plain read
     const int iters = argc > 1 ? std::atoi(argv[1]) : 500;
     const int t_lo = argc > 2 ? std::atoi(argv[2]) : 1, t_hi = argc > 3 ? std::atoi(argv[3]) : 6;
     const int N = 2560, HC = 4, D = N * HC, LR = 320, TM = K::kFusedGrMaxT;
@@ -59,6 +60,14 @@ int main(int argc, char** argv) {
     cudaMemcpy(dwi, wi.data(), wi.size() * 2, cudaMemcpyHostToDevice);
     cudaStream_t s;
     cudaStreamCreate(&s);
+    constexpr int COPIES = 16;
+    uint16_t *cwd[COPIES], *cwu[COPIES];
+    for (int i = 0; i < COPIES; ++i) {
+        cudaMalloc((void**) &cwd[i], wd.size() * 2);
+        cudaMalloc((void**) &cwu[i], wu.size() * 2);
+        cudaMemcpy(cwd[i], wd.data(), wd.size() * 2, cudaMemcpyHostToDevice);
+        cudaMemcpy(cwu[i], wu.data(), wu.size() * 2, cudaMemcpyHostToDevice);
+    }
     cudaEvent_t e0, e1;
     cudaEventCreate(&e0);
     cudaEventCreate(&e1);
@@ -100,15 +109,21 @@ int main(int argc, char** argv) {
                         K::fused_gr_set_fast(f);
                         for (int i = 0; i < 20; ++i) K::fused_gr_read_multi(a, T, dxn, s);
                         cudaEventRecord(e0, s);
-                        for (int i = 0; i < iters; ++i) K::fused_gr_read_multi(a, T, dxn, s);
+                        // 143-dense: the weights cycle through COPIES sets (as the 48 layers' do), so every read starts L2-cold
+                        for (int i = 0; i < iters; ++i) {
+                            for (int t = 0; t < T; ++t) { a[t].w_down = cwd[i % COPIES]; a[t].w_up = cwu[i % COPIES]; }
+                            K::fused_gr_read_multi(a, T, dxn, s);
+                        }
                         cudaEventRecord(e1, s);
                         cudaEventSynchronize(e1);
                         float ms = 0;
                         cudaEventElapsedTime(&ms, e0, e1);
                         us[f] = std::fmin(us[f], 1e3 * ms / iters);
                     }
-                std::printf("T %d apply %d inject %d | old %6.1f us  fast %6.1f us | %s\n", T, apply, inject, us[0], us[1],
-                            same ? "bitwise equal" : "DIFFERS");
+                uint64_t hsh = 1469598103934665603ull;   // FNV-1a of the old read's outputs: compare two runs (e.g. STRATA_GR_TSUM=0 and 1)
+                for (float v : out[0]) { uint32_t b; std::memcpy(&b, &v, 4); hsh = (hsh ^ b) * 1099511628211ull; }
+                std::printf("T %d apply %d inject %d | old %6.1f us (%3.0f GB/s)  fast %6.1f us | %s | hash %016llx\n", T, apply, inject, us[0],
+                            13.1e3 / us[0], us[1], same ? "bitwise equal" : "DIFFERS", (unsigned long long) hsh);
                 if (!same) ++failures;
             }
     std::printf("fused_gr_bench: %d differing\n", failures);
