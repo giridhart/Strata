@@ -45,9 +45,7 @@ void block_scores_kernel(const float* __restrict__ pooled, const float* __restri
     for (int h = 0; h < IDX_HEADS; ++h) {
         const sycl::float4 q4 = *reinterpret_cast<const sycl::float4*>(q + h * IDX_DIM);
         float d = k4.x() * q4.x() + k4.y() * q4.y() + k4.z() * q4.z() + k4.w() * q4.w();
-#pragma unroll
-        for (int o = 16; o > 0; o >>= 1)
-            d += sycl::permute_group_by_xor(sg, d, o);
+        d = sycl::reduce_over_group(sg, d, sycl::plus<float>());
         score += d > 0.0f ? d : 0.0f;
     }
     if (lane == 0) {
@@ -89,9 +87,7 @@ void block_scores_multi_kernel(const float* __restrict__ pooled, const float* __
             for (int h = 0; h < IDX_HEADS; ++h) {
                 const sycl::float4 q4 = *reinterpret_cast<const sycl::float4*>(q + h * IDX_DIM);
                 float d = k4.x() * q4.x() + k4.y() * q4.y() + k4.z() * q4.z() + k4.w() * q4.w();
-#pragma unroll
-                for (int o = 16; o > 0; o >>= 1)
-                    d += sycl::permute_group_by_xor(sg, d, o);
+                d = sycl::reduce_over_group(sg, d, sycl::plus<float>());
                 score += d > 0.0f ? d : 0.0f;
             }
             if (lane == 0) {
@@ -410,11 +406,8 @@ void block_topk_wide_kernel(const float* __restrict__ scores, const int32_t* __r
         if (k > thr) gt += w;
         else if (k == thr) eq += w;
     }
-#pragma unroll
-    for (int o = 16; o > 0; o >>= 1) {
-        gt += sycl::permute_group_by_xor(sg, gt, o);
-        eq += sycl::permute_group_by_xor(sg, eq, o);
-    }
+    gt = sycl::reduce_over_group(sg, gt, sycl::plus<int>());
+    eq = sycl::reduce_over_group(sg, eq, sycl::plus<int>());
     if (lane == 0) { s_gt[warp] = gt; s_eq[warp] = eq; }
     item.barrier(sycl::access::fence_space::local_space);
     if (t == 0) {

@@ -43,9 +43,7 @@ void kv_append_q8_kernel(int8_t* __restrict__ k_q, int8_t* __restrict__ v_q, uin
     const int groups = head_dim / KV_Q8_GROUP;
     const float x = (is_v ? vcur : kcur)[h * head_dim + g * KV_Q8_GROUP + t];
     // max |x| over the 64 values: two warps, then combine through shared memory in a fixed order
-    float a = sycl::fabs(x);
-    for (int o = 16; o > 0; o >>= 1)
-        a = sycl::fmax(a, sycl::permute_group_by_xor(item.get_sub_group(), a, o));
+    const float a = sycl::reduce_over_group(item.get_sub_group(), sycl::fabs(x), sycl::maximum<float>());
 
     if ((t & 31) == 0) warp_max[t >> 5] = a;
     item.barrier(sycl::access::fence_space::local_space);

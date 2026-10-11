@@ -39,10 +39,7 @@ inline float f32_to_f16_to_f32(float v) {
 }
 
 inline float warp_sum(float x, const sycl::sub_group& sg) {
-#pragma unroll
-    for (int offset = 16; offset; offset >>= 1)
-        x += sycl::permute_group_by_xor(sg, x, offset);
-    return x;
+    return sycl::reduce_over_group(sg, x, sycl::plus<float>());
 }
 
 // TAB (#280, STRATA_ROPE_TABLE=1): the angles from the session's float64 table.  The host launches <false> whenever

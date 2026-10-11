@@ -58,7 +58,7 @@
 namespace strata::kernels {
 namespace {
 template <typename T>
-inline T permute_sub_group_by_xor(sycl::sub_group g, T x, unsigned int mask) {
+[[maybe_unused]] inline T permute_sub_group_by_xor(sycl::sub_group g, T x, unsigned int mask) {
     return sycl::permute_group_by_xor(g, x, mask);
 }
 
@@ -271,8 +271,7 @@ void qsa_index_kernel(const float* __restrict__ pooled, const float* __restrict_
 
         acc = acc + (double)pooled[(size_t)b * idx_dim + d] * (double)q_idx[(size_t)wid * idx_dim + d];
 
-    for (int o = 16; o > 0; o >>= 1)
-        acc = acc + permute_sub_group_by_xor(sycl::ext::oneapi::this_work_item::get_sub_group(), acc, o);
+    acc = sycl::reduce_over_group(sycl::ext::oneapi::this_work_item::get_sub_group(), acc, sycl::plus<double>());
     if (lane == 0) s_dot[wid] = acc;
     item_ct1.barrier(sycl::access::fence_space::local_space);
 
@@ -447,15 +446,11 @@ void kv_gather_kernel(const uint16_t* __restrict__ k_pool, const uint16_t* __res
 // ================= 6. qsa_attend =================
 
 inline float warp_max(float v) {
-    for (int o = 16; o > 0; o >>= 1)
-        v = sycl::fmax(v, permute_sub_group_by_xor(sycl::ext::oneapi::this_work_item::get_sub_group(), v, o));
-    return v;
+    return sycl::reduce_over_group(sycl::ext::oneapi::this_work_item::get_sub_group(), v, sycl::maximum<float>());
 }
 
 inline float warp_sum(float v) {
-    for (int o = 16; o > 0; o >>= 1)
-        v += permute_sub_group_by_xor(sycl::ext::oneapi::this_work_item::get_sub_group(), v, o);
-    return v;
+    return sycl::reduce_over_group(sycl::ext::oneapi::this_work_item::get_sub_group(), v, sycl::plus<float>());
 }
 
 /// One block per query head.  `s` holds the scores, which are then overwritten with the softmax weights.

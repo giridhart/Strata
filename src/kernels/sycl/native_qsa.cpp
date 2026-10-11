@@ -37,10 +37,7 @@ namespace {
 std::atomic<bool> enabled{false};
 
 inline float warp_sum(sycl::sub_group sg, float value) {
-#pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1)
-        value += sycl::permute_group_by_xor(sg, value, offset);
-    return value;
+    return sycl::reduce_over_group(sg, value, sycl::plus<float>());
 }
 
 template <int BlockSize>
