@@ -57,11 +57,12 @@ void combine_vec4(sycl::nd_item<2> item, const float* __restrict__ parts, const 
     for (int e = 0; e < k; ++e)
         w_reg[e] = weights[e];
 
-    sycl::vec<float, 4> sum(0.0f);
+    const auto p0 = *reinterpret_cast<const sycl::vec<float, 4>*>(parts + col4);
+    sycl::vec<float, 4> sum = p0 * w_reg[0];
 #pragma unroll
-    for (int expert = 0; expert < k; ++expert) {
+    for (int expert = 1; expert < k; ++expert) {
         const auto p = *reinterpret_cast<const sycl::vec<float, 4>*>(parts + int64_t(expert) * n_embd + col4);
-        sum += p * w_reg[expert];
+        sum = sycl::fma(p, sycl::vec<float, 4>(w_reg[expert]), sum);
     }
     if (shared) {
         sum += *reinterpret_cast<const sycl::vec<float, 4>*>(shared + col4);
@@ -84,10 +85,10 @@ void combine(sycl::nd_item<2> item, const float* __restrict__ parts, const float
     for (int e = 0; e < k; ++e)
         w_reg[e] = weights[e];
 
-    float sum = 0.0f;
+    float sum = parts[col] * w_reg[0];
 #pragma unroll
-    for (int expert = 0; expert < k; ++expert) {
-        sum += parts[int64_t(expert) * n_embd + col] * w_reg[expert];
+    for (int expert = 1; expert < k; ++expert) {
+        sum = sycl::fma(parts[int64_t(expert) * n_embd + col], w_reg[expert], sum);
     }
     if (shared) sum += shared[col];
     output[col] = sum;
@@ -138,6 +139,57 @@ void native_moe_combine(const float* parts, const float* weights, const float* s
     if (!stream) q->wait();
 }
 
+void combine_k10_vec4_hits(sycl::nd_item<2> item, sycl::local_accessor<int, 1> hit_mask_acc,
+                           const sycl::vec<float, 4>* __restrict__ parts4,
+                           const sycl::vec<float, 4>* __restrict__ hits4,
+                           const int32_t* __restrict__ dst, const int32_t* __restrict__ count,
+                           const float* __restrict__ weights,
+                           const sycl::vec<float, 4>* __restrict__ shared4,
+                           sycl::vec<float, 4>* __restrict__ output4, int64_t n4) {
+    const int64_t tk = item.get_group(0);
+    const int tid = (int)item.get_local_id(1);
+    if (tid == 0) hit_mask_acc[0] = 0;
+    sycl::group_barrier(item.get_group());
+    const int nh = *count;
+    for (int h = tid; h < nh; h += (int)item.get_local_range(1)) {
+        const int r = dst[h];
+        if (r / 10 == (int)tk) {
+            auto a_mask = sycl::atomic_ref<int, sycl::memory_order::relaxed, sycl::memory_scope::work_group,
+                                           sycl::access::address_space::local_space>(hit_mask_acc[0]);
+            a_mask.fetch_or(1 << (r % 10));
+        }
+    }
+    sycl::group_barrier(item.get_group());
+    const int mask = hit_mask_acc[0];
+    parts4 += tk * 10 * n4;
+    hits4 += tk * 10 * n4;
+    weights += tk * 10;
+    shared4 += tk * n4;
+    output4 += tk * n4;
+    const int64_t c4 = int64_t(item.get_group(1)) * item.get_local_range(1) + tid;
+    if (c4 >= n4) return;
+    const float w0 = weights[0];
+    sycl::vec<float, 4> p0 = parts4[c4];
+    if (mask & 1) {
+        const auto hh = hits4[c4];
+        p0 += hh;
+    }
+    sycl::vec<float, 4> sum = p0 * w0;
+#pragma unroll
+    for (int expert = 1; expert < 10; ++expert) {
+        const float w = weights[expert];
+        sycl::vec<float, 4> p = parts4[int64_t(expert) * n4 + c4];
+        if ((mask >> expert) & 1) {
+            const auto hh = hits4[int64_t(expert) * n4 + c4];
+            p += hh;
+        }
+        sum = sycl::fma(p, sycl::vec<float, 4>(w), sum);
+    }
+    const auto sh = shared4[c4];
+    sum += sh;
+    output4[c4] = sum;
+}
+
 void native_moe_combine_multi(const float* parts, const float* weights, const float* shared, float* output,
                               int64_t n_embd, int64_t k, int n_tok, void* stream) {
     if (!stream || n_embd <= 0 || k < 1 || k > 15 || n_tok < 1)
@@ -160,6 +212,35 @@ void native_moe_combine_multi(const float* parts, const float* weights, const fl
                         });
     }
     if (!stream) q->wait();
+}
+
+bool native_moe_combine_hits_supported(const float* parts, const float* shared, const float* output, int64_t n_embd,
+                                       int64_t k, int n_tok) {
+    return k == 10 && shared != nullptr && n_tok >= 1 && n_tok <= 8 && n_embd > 0 && (n_embd & 3) == 0 &&
+           (((uintptr_t)parts | (uintptr_t)shared | (uintptr_t)output) & 15u) == 0;
+}
+
+void native_moe_combine_multi_hits_added(const float* parts, const float* hits, const int32_t* dst,
+                                         const int32_t* count, const float* weights, const float* shared,
+                                         float* output, int64_t n_embd, int64_t k, int n_tok, void* stream) {
+    if (!stream || !native_moe_combine_hits_supported(parts, shared, output, n_embd, k, n_tok) ||
+        ((uintptr_t)hits & 15u) != 0)
+        throw std::invalid_argument("native MoE combine (hits added) requires k = 10, aligned spans, 1..8 tokens");
+    sycl::queue* q = stream ? static_cast<sycl::queue*>(stream) : &get_default_in_order_queue();
+    const int64_t n4 = n_embd >> 2;
+    const size_t cols = ((size_t)n4 + 127) / 128 * 128;
+    q->submit([&](sycl::handler& cgh) {
+        sycl::local_accessor<int, 1> hit_mask(sycl::range<1>(1), cgh);
+        cgh.parallel_for(sycl::nd_range<2>(sycl::range<2>((size_t)n_tok, cols), sycl::range<2>(1, 128)),
+                         [=](sycl::nd_item<2> item) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
+                             combine_k10_vec4_hits(item, hit_mask,
+                                                   reinterpret_cast<const sycl::vec<float, 4>*>(parts),
+                                                   reinterpret_cast<const sycl::vec<float, 4>*>(hits),
+                                                   dst, count, weights,
+                                                   reinterpret_cast<const sycl::vec<float, 4>*>(shared),
+                                                   reinterpret_cast<sycl::vec<float, 4>*>(output), n4);
+                         });
+    });
 }
 
 }  // namespace strata::kernels

@@ -110,60 +110,86 @@ inline void route_token(const float* logits, int32_t* ids, float* weights, size_
     if (lane < 10) weights[lane] = selected * inverse_selected_sum;
 }
 
+// One subgroup (32 lanes) per token.  This replaces the legacy one thread per token scanning
+// all 512 experts serially: lanes coalesced-read candidates f = lane, lane + 32, ... and reduce
+// across the subgroup via shift_group_left.  Bitwise identical to reference semantics.
 void route_resident_k(const float* __restrict__ logits, int32_t* __restrict__ ids, float* __restrict__ weights,
                       const int32_t* __restrict__ res, int n_tok, float margin, int lo, int hi,
                       unsigned long long* __restrict__ stats, const sycl::nd_item<1>& item) {
-    const int t = item.get_global_id(0);
+    const int t = item.get_group(0);
     if (t >= n_tok) return;
+    const int lane = (int)item.get_local_id(0);
+    const sycl::sub_group sg = item.get_sub_group();
     const float* l = logits + (size_t)t * 512;
     int32_t* id = ids + (size_t)t * 10;
+    int32_t my[10];
+    for (int r = 0; r < 10; ++r) my[r] = id[r];
     int swaps = 0, tail = 0, before = 0;
-    for (int r = 0; r < 10; ++r) before += (res[id[r]] < 0);
+    if (lane == 0) {
+        for (int r = 0; r < 10; ++r) before += (res[my[r]] < 0);
+    }
     for (int r = lo; r <= hi && r < 10; ++r) {
-        const int e = id[r];
-        if (res[e] >= 0) continue;
-        ++tail;
-        int best = -1;
-        float bl = -INFINITY;
-        for (int f = 0; f < 512; ++f) {
-            if (res[f] < 0 || l[f] <= bl) continue;
+        const int e = my[r];
+        if (res[e] >= 0) continue;  // already resident: uniform across subgroup
+        if (lane == 0) ++tail;
+        float bv = -INFINITY;
+        int bi = -1;
+        for (int f = lane; f < 512; f += 32) {
+            if (res[f] < 0) continue;
             bool used = false;
-            for (int q = 0; q < 10; ++q) used |= (id[q] == f);
-            if (!used) {
-                best = f;
-                bl = l[f];
+            for (int q = 0; q < 10; ++q) used |= (my[q] == f);
+            if (used) continue;
+            if (l[f] > bv) {
+                bv = l[f];
+                bi = f;
             }
         }
-        if (best >= 0 && l[e] - bl <= margin) {
-            id[r] = best;
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            const float ov = sycl::shift_group_left(sg, bv, off);
+            const int oi = sycl::shift_group_left(sg, bi, off);
+            if (ov > bv || (ov == bv && oi >= 0 && (bi < 0 || oi < bi))) {
+                bv = ov;
+                bi = oi;
+            }
+        }
+        if (lane == 0 && bi >= 0 && l[e] - bv <= margin) {
+            my[r] = bi;
             ++swaps;
         }
+        my[r] = sycl::select_from_group(sg, my[r], 0);  // all lanes keep same picked set
     }
     int after = 0;
-    for (int r = 0; r < 10; ++r) after += (res[id[r]] < 0);
-    if (swaps) {
+    if (lane == 0) {
+        for (int r = 0; r < 10; ++r) after += (res[my[r]] < 0);
+    }
+    const int sw = sycl::select_from_group(sg, swaps, 0);
+    if (sw) {
         float m = -INFINITY;
-        for (int r = 0; r < 10; ++r) m = sycl::fmax(m, l[id[r]]);
+        for (int r = 0; r < 10; ++r) m = sycl::fmax(m, l[my[r]]);
         float ex[10], sum = 0.0f;
         for (int r = 0; r < 10; ++r) {
-            ex[r] = sycl::native::exp(l[id[r]] - m);
+            ex[r] = sycl::exp(l[my[r]] - m);
             sum += ex[r];
         }
         for (int r = 0; r < 10; ++r) weights[(size_t)t * 10 + r] = ex[r] / sum;
     }
-    if (stats) {
-        auto a_tail = sycl::atomic_ref<unsigned long long, sycl::memory_order::relaxed, sycl::memory_scope::device,
-                                       sycl::access::address_space::global_space>(stats[0]);
-        auto a_swaps = sycl::atomic_ref<unsigned long long, sycl::memory_order::relaxed, sycl::memory_scope::device,
-                                        sycl::access::address_space::global_space>(stats[1]);
-        auto a_before = sycl::atomic_ref<unsigned long long, sycl::memory_order::relaxed, sycl::memory_scope::device,
-                                         sycl::access::address_space::global_space>(stats[2]);
-        auto a_after = sycl::atomic_ref<unsigned long long, sycl::memory_order::relaxed, sycl::memory_scope::device,
-                                        sycl::access::address_space::global_space>(stats[3]);
-        a_tail.fetch_add((unsigned long long)tail);
-        a_swaps.fetch_add((unsigned long long)swaps);
-        a_before.fetch_add((unsigned long long)before);
-        a_after.fetch_add((unsigned long long)after);
+    if (lane == 0) {
+        for (int r = 0; r < 10; ++r) id[r] = my[r];
+        if (stats) {
+            auto a_tail = sycl::atomic_ref<unsigned long long, sycl::memory_order::relaxed, sycl::memory_scope::device,
+                                           sycl::access::address_space::global_space>(stats[0]);
+            auto a_swaps = sycl::atomic_ref<unsigned long long, sycl::memory_order::relaxed, sycl::memory_scope::device,
+                                            sycl::access::address_space::global_space>(stats[1]);
+            auto a_before = sycl::atomic_ref<unsigned long long, sycl::memory_order::relaxed, sycl::memory_scope::device,
+                                             sycl::access::address_space::global_space>(stats[2]);
+            auto a_after = sycl::atomic_ref<unsigned long long, sycl::memory_order::relaxed, sycl::memory_scope::device,
+                                            sycl::access::address_space::global_space>(stats[3]);
+            a_tail.fetch_add((unsigned long long)tail);
+            a_swaps.fetch_add((unsigned long long)sw);
+            a_before.fetch_add((unsigned long long)before);
+            a_after.fetch_add((unsigned long long)after);
+        }
     }
 }
 
@@ -228,9 +254,9 @@ void native_route_resident(const float* logits, int32_t* ids, float* weights, co
     sycl::queue* q = stream ? static_cast<sycl::queue*>(stream) : &default_queue;
 
     const size_t wg = 32;
-    const size_t global = ((size_t)(n_tok + 31) / 32) * 32;
+    const size_t global = (size_t)n_tok * 32;
     q->parallel_for(sycl::nd_range<1>(sycl::range<1>(global), sycl::range<1>(wg)),
-                    [=](sycl::nd_item<1> item) {
+                    [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(32)]] {
                         route_resident_k(logits, ids, weights, res_layer, n_tok, margin, rank_lo, rank_hi, stats,
                                          item);
                     });

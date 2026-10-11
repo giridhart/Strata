@@ -202,6 +202,37 @@ void dequant_kernel(const uint8_t* __restrict__ blocks, int64_t row_bytes, int64
     group32<TYPE>(blocks + (row0 + r) * row_bytes, (int)gi, out + r * groups_per_row * 32 + gi * 32);
 }
 
+// Q8_0 with four threads per block, 8 values each: a subgroup of 32 reads 8 consecutive blocks and writes 512
+// consecutive bytes (a thread per block wrote 2-byte values 64 bytes apart: scattered DRAM stores)
+template <typename T>
+void dequant_q8_0_kernel(const uint8_t* __restrict__ blocks, int64_t row_bytes, int64_t row0, int64_t rows,
+                         int64_t groups_per_row, T* __restrict__ out, const sycl::nd_item<1>& item) {
+    const int64_t i = (int64_t)item.get_global_id(0);
+    if (i >= rows * groups_per_row * 4) return;
+    const int64_t g = i >> 2, r = g / groups_per_row, gi = g % groups_per_row;
+    const int piece = (int)(i & 3);
+    const uint8_t* b = blocks + (row0 + r) * row_bytes + gi * 34;
+    const float d = h2f(b);
+    const uint16_t* q = (const uint16_t*)(b + 2 + 8 * piece);  // blocks are 2-byte aligned
+    alignas(16) T v[8];
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        const uint16_t w = q[k];
+        put(v, 2 * k, (float)(int8_t)(w & 0xFF) * d);
+        put(v, 2 * k + 1, (float)(int8_t)(w >> 8) * d);
+    }
+    T* dst = out + g * 32 + 8 * piece;
+    if constexpr (sizeof(T) == 2) {
+        *reinterpret_cast<sycl::vec<uint32_t, 4>*>(dst) = *reinterpret_cast<const sycl::vec<uint32_t, 4>*>(v);
+    } else if constexpr (sizeof(T) == 4) {
+        reinterpret_cast<sycl::vec<float, 4>*>(dst)[0] = reinterpret_cast<const sycl::vec<float, 4>*>(v)[0];
+        reinterpret_cast<sycl::vec<float, 4>*>(dst)[1] = reinterpret_cast<const sycl::vec<float, 4>*>(v)[1];
+    } else {
+#pragma unroll
+        for (int k = 0; k < 8; ++k) dst[k] = v[k];
+    }
+}
+
 bool geometry(int type, int& block_elems, int& block_bytes) {
     switch (type) {
         case 2:
@@ -266,6 +297,20 @@ void launch(int type, const void* blocks, int64_t row0, int64_t rows, int64_t co
     const size_t grid = (size_t)((total + THREADS - 1) / THREADS);
     const uint8_t* p = (const uint8_t*)blocks;
     sycl::queue* q = stream ? static_cast<sycl::queue*>(stream) : &default_queue();
+
+    if (type == 8 && (reinterpret_cast<uintptr_t>(blocks) & 1) == 0 &&
+        (reinterpret_cast<uintptr_t>(out) & 15) == 0) {
+        const size_t total4 = (size_t)rows * gpr * 4;
+        const size_t grid4 = (total4 + THREADS - 1) / THREADS;
+        q->submit([&](sycl::handler& cgh) {
+            cgh.parallel_for(
+                sycl::nd_range<1>(sycl::range<1>(grid4 * THREADS), sycl::range<1>(THREADS)),
+                [=](sycl::nd_item<1> item) {
+                    dequant_q8_0_kernel<T>(p, row_bytes, row0, rows, gpr, out, item);
+                });
+        });
+        return;
+    }
 
 #define STRATA_DQ(TY)                                                                                             \
     case TY: {                                                                                                    \
