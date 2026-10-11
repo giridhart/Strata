@@ -25,6 +25,8 @@
 #include "strata/kernels/qsa.hpp"
 #include "strata/kernels/route_prior.hpp"
 #include "strata/kernels/s2_expert_grouped.hpp"
+#include "strata/kernels/sampler.hpp"
+#include "strata/kernels/verify_kernels.hpp"
 
 #include <chrono>
 #include <cmath>
@@ -769,6 +771,217 @@ static void BM_Xe2_Indexer_Append_Batched(benchmark::State& state) {
     sycl::free(d_block_pos, q);
 }
 
+// ============================================================================
+// Benchmark: BM_Xe2_Verify_Argmax_SingleBlock vs BM_Xe2_Verify_Argmax_MultiBlock
+// ============================================================================
+
+static void BM_Xe2_Verify_Argmax_SingleBlock(benchmark::State& state) {
+    const int B = state.range(0);
+    constexpr int N_VOCAB = 151936; // Qwen vocabulary dimension
+
+    sycl::queue q{sycl::default_selector_v, {sycl::property::queue::in_order(), sycl::property::queue::enable_profiling()}};
+
+    auto* d_logits = sycl::malloc_device<float>((size_t)B * N_VOCAB, q);
+    auto* d_out    = sycl::malloc_device<int32_t>(B, q);
+
+    q.fill(d_logits, 0.01f, (size_t)B * N_VOCAB);
+    q.fill(d_out, 0, B).wait();
+
+    strata::kernels::SamplerParams sp;
+    sp.greedy = true;
+    sp.temperature = 0.0f;
+
+    // Warmup
+    for (int w = 0; w < 3; ++w) {
+        strata::kernels::sample_tokens(d_logits, B, N_VOCAB, nullptr, 0, sp, d_out, &q);
+        q.wait();
+    }
+
+    for (auto _ : state) {
+        auto t0 = std::chrono::steady_clock::now();
+        strata::kernels::sample_tokens(d_logits, B, N_VOCAB, nullptr, 0, sp, d_out, &q);
+        q.wait();
+        auto t1 = std::chrono::steady_clock::now();
+        state.SetIterationTime(std::chrono::duration<double>(t1 - t0).count());
+    }
+
+    state.counters["Batch_B"] = benchmark::Counter((double)B);
+    state.counters["Vocab_N"] = benchmark::Counter((double)N_VOCAB);
+    state.counters["tokens_per_sec"] = benchmark::Counter((double)B, benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
+    const double bytes_transferred = (double)B * N_VOCAB * sizeof(float) + (double)B * sizeof(int32_t);
+    state.counters["Bandwidth_GBps"] = benchmark::Counter(bytes_transferred, benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
+
+    sycl::free(d_logits, q);
+    sycl::free(d_out, q);
+}
+
+static void BM_Xe2_Verify_Argmax_MultiBlock(benchmark::State& state) {
+    const int B = state.range(0);
+    constexpr int N_VOCAB = 151936; // Qwen vocabulary dimension
+
+    sycl::queue q{sycl::default_selector_v, {sycl::property::queue::in_order(), sycl::property::queue::enable_profiling()}};
+
+    const size_t scratch_bytes = strata::kernels::argmax_rows_scratch_bytes(B);
+    auto* d_logits  = sycl::malloc_device<float>((size_t)B * N_VOCAB, q);
+    auto* d_scratch = sycl::malloc_device<uint8_t>(scratch_bytes, q);
+    auto* d_out     = sycl::malloc_device<int32_t>(B, q);
+
+    q.fill(d_logits, 0.01f, (size_t)B * N_VOCAB);
+    q.memset(d_scratch, 0, scratch_bytes);
+    q.fill(d_out, 0, B).wait();
+
+    // Warmup
+    for (int w = 0; w < 3; ++w) {
+        strata::kernels::argmax_rows(d_logits, B, N_VOCAB, d_scratch, d_out, &q);
+        q.wait();
+    }
+
+    for (auto _ : state) {
+        auto t0 = std::chrono::steady_clock::now();
+        strata::kernels::argmax_rows(d_logits, B, N_VOCAB, d_scratch, d_out, &q);
+        q.wait();
+        auto t1 = std::chrono::steady_clock::now();
+        state.SetIterationTime(std::chrono::duration<double>(t1 - t0).count());
+    }
+
+    state.counters["Batch_B"] = benchmark::Counter((double)B);
+    state.counters["Vocab_N"] = benchmark::Counter((double)N_VOCAB);
+    state.counters["tokens_per_sec"] = benchmark::Counter((double)B, benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
+    const double bytes_transferred = (double)B * N_VOCAB * sizeof(float) + (double)B * sizeof(int32_t);
+    state.counters["Bandwidth_GBps"] = benchmark::Counter(bytes_transferred, benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
+
+    sycl::free(d_logits, q);
+    sycl::free(d_scratch, q);
+    sycl::free(d_out, q);
+}
+
+// ============================================================================
+// Benchmark: BM_Xe2_Verify_RowTopProb_SingleBlock vs BM_Xe2_Verify_RowTopProb_MultiBlock
+// ============================================================================
+
+static void BM_Xe2_Verify_RowTopProb_SingleBlock(benchmark::State& state) {
+    const int B = state.range(0);
+    constexpr int N_VOCAB = 151936;
+
+    sycl::queue q{sycl::default_selector_v, {sycl::property::queue::in_order(), sycl::property::queue::enable_profiling()}};
+
+    auto* d_logits = sycl::malloc_device<float>((size_t)B * N_VOCAB, q);
+    auto* d_ids    = sycl::malloc_device<int32_t>(B, q);
+    auto* d_probs  = sycl::malloc_device<float>(B, q);
+
+    q.fill(d_logits, 0.01f, (size_t)B * N_VOCAB);
+    q.fill(d_ids, 42, B);
+    q.fill(d_probs, 0.0f, B).wait();
+
+    // Warmup
+    for (int w = 0; w < 3; ++w) {
+        strata::kernels::row_top_prob(d_logits, B, N_VOCAB, d_ids, d_probs, &q);
+        q.wait();
+    }
+
+    for (auto _ : state) {
+        auto t0 = std::chrono::steady_clock::now();
+        strata::kernels::row_top_prob(d_logits, B, N_VOCAB, d_ids, d_probs, &q);
+        q.wait();
+        auto t1 = std::chrono::steady_clock::now();
+        state.SetIterationTime(std::chrono::duration<double>(t1 - t0).count());
+    }
+
+    state.counters["Batch_B"] = benchmark::Counter((double)B);
+    state.counters["Vocab_N"] = benchmark::Counter((double)N_VOCAB);
+    state.counters["tokens_per_sec"] = benchmark::Counter((double)B, benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
+    const double bytes_transferred = (double)B * N_VOCAB * sizeof(float) + (double)B * sizeof(float);
+    state.counters["Bandwidth_GBps"] = benchmark::Counter(bytes_transferred, benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
+
+    sycl::free(d_logits, q);
+    sycl::free(d_ids, q);
+    sycl::free(d_probs, q);
+}
+
+static void BM_Xe2_Verify_RowTopProb_MultiBlock(benchmark::State& state) {
+    const int B = state.range(0);
+    constexpr int N_VOCAB = 151936;
+
+    sycl::queue q{sycl::default_selector_v, {sycl::property::queue::in_order(), sycl::property::queue::enable_profiling()}};
+
+    const size_t scratch_bytes = strata::kernels::row_top_prob_scratch_bytes(B);
+    auto* d_logits  = sycl::malloc_device<float>((size_t)B * N_VOCAB, q);
+    auto* d_ids     = sycl::malloc_device<int32_t>(B, q);
+    auto* d_probs   = sycl::malloc_device<float>(B, q);
+    auto* d_scratch = sycl::malloc_device<uint8_t>(scratch_bytes, q);
+
+    q.fill(d_logits, 0.01f, (size_t)B * N_VOCAB);
+    q.fill(d_ids, 42, B);
+    q.memset(d_scratch, 0, scratch_bytes);
+    q.fill(d_probs, 0.0f, B).wait();
+
+    // Warmup
+    for (int w = 0; w < 3; ++w) {
+        strata::kernels::row_top_prob_split(d_logits, B, N_VOCAB, d_ids, d_probs, d_scratch, &q);
+        q.wait();
+    }
+
+    for (auto _ : state) {
+        auto t0 = std::chrono::steady_clock::now();
+        strata::kernels::row_top_prob_split(d_logits, B, N_VOCAB, d_ids, d_probs, d_scratch, &q);
+        q.wait();
+        auto t1 = std::chrono::steady_clock::now();
+        state.SetIterationTime(std::chrono::duration<double>(t1 - t0).count());
+    }
+
+    state.counters["Batch_B"] = benchmark::Counter((double)B);
+    state.counters["Vocab_N"] = benchmark::Counter((double)N_VOCAB);
+    state.counters["tokens_per_sec"] = benchmark::Counter((double)B, benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
+    const double bytes_transferred = (double)B * N_VOCAB * sizeof(float) + (double)B * sizeof(float);
+    state.counters["Bandwidth_GBps"] = benchmark::Counter(bytes_transferred, benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
+
+    sycl::free(d_logits, q);
+    sycl::free(d_ids, q);
+    sycl::free(d_probs, q);
+    sycl::free(d_scratch, q);
+}
+
+// ============================================================================
+// Benchmark: BM_Xe2_Verify_Logits_Nonfinite
+// ============================================================================
+
+static void BM_Xe2_Verify_Logits_Nonfinite(benchmark::State& state) {
+    const int B = state.range(0);
+    constexpr int N_VOCAB = 151936;
+
+    sycl::queue q{sycl::default_selector_v, {sycl::property::queue::in_order(), sycl::property::queue::enable_profiling()}};
+
+    const size_t flag_count = (size_t)B * strata::kernels::kNonfiniteBlocks;
+    auto* d_logits = sycl::malloc_device<float>((size_t)B * N_VOCAB, q);
+    auto* d_flags  = sycl::malloc_device<uint32_t>(flag_count, q);
+
+    q.fill(d_logits, 0.01f, (size_t)B * N_VOCAB);
+    q.fill(d_flags, 0u, flag_count).wait();
+
+    // Warmup
+    for (int w = 0; w < 3; ++w) {
+        strata::kernels::logits_nonfinite_rows(d_logits, B, N_VOCAB, d_flags, &q);
+        q.wait();
+    }
+
+    for (auto _ : state) {
+        auto t0 = std::chrono::steady_clock::now();
+        strata::kernels::logits_nonfinite_rows(d_logits, B, N_VOCAB, d_flags, &q);
+        q.wait();
+        auto t1 = std::chrono::steady_clock::now();
+        state.SetIterationTime(std::chrono::duration<double>(t1 - t0).count());
+    }
+
+    state.counters["Batch_B"] = benchmark::Counter((double)B);
+    state.counters["Vocab_N"] = benchmark::Counter((double)N_VOCAB);
+    state.counters["tokens_per_sec"] = benchmark::Counter((double)B, benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
+    const double bytes_transferred = (double)B * N_VOCAB * sizeof(float) + (double)flag_count * sizeof(uint32_t);
+    state.counters["Bandwidth_GBps"] = benchmark::Counter(bytes_transferred, benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
+
+    sycl::free(d_logits, q);
+    sycl::free(d_flags, q);
+}
+
 BENCHMARK(BM_Xe2_Router_Sequential)->Arg(1)->Arg(2)->Arg(4)->Arg(8)->UseManualTime();
 BENCHMARK(BM_Xe2_Router_MultiToken)->Arg(1)->Arg(2)->Arg(4)->Arg(8)->UseManualTime();
 BENCHMARK(BM_Xe2_Route_Resident)->Arg(1)->Arg(2)->Arg(4)->Arg(8)->UseManualTime();
@@ -779,6 +992,11 @@ BENCHMARK(BM_Xe2_KV_Append_Sequential)->Arg(1)->Arg(2)->Arg(4)->Arg(8)->UseManua
 BENCHMARK(BM_Xe2_KV_Append_Batched)->Arg(1)->Arg(2)->Arg(4)->Arg(8)->UseManualTime();
 BENCHMARK(BM_Xe2_Indexer_Append_Sequential)->Arg(1)->Arg(2)->Arg(4)->Arg(8)->UseManualTime();
 BENCHMARK(BM_Xe2_Indexer_Append_Batched)->Arg(1)->Arg(2)->Arg(4)->Arg(8)->UseManualTime();
+BENCHMARK(BM_Xe2_Verify_Argmax_SingleBlock)->Arg(1)->Arg(2)->Arg(4)->Arg(8)->UseManualTime();
+BENCHMARK(BM_Xe2_Verify_Argmax_MultiBlock)->Arg(1)->Arg(2)->Arg(4)->Arg(8)->UseManualTime();
+BENCHMARK(BM_Xe2_Verify_RowTopProb_SingleBlock)->Arg(1)->Arg(2)->Arg(4)->Arg(8)->UseManualTime();
+BENCHMARK(BM_Xe2_Verify_RowTopProb_MultiBlock)->Arg(1)->Arg(2)->Arg(4)->Arg(8)->UseManualTime();
+BENCHMARK(BM_Xe2_Verify_Logits_Nonfinite)->Arg(1)->Arg(2)->Arg(4)->Arg(8)->UseManualTime();
 
 BENCHMARK_MAIN();
 
