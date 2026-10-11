@@ -119,10 +119,7 @@ RopeTab rope_table_for(const RopeScaling& scaling) {
 
 namespace {
 inline float warp_sum(sycl::sub_group sg, float value) {
-#pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1)
-        value += sycl::permute_group_by_xor(sg, value, offset);
-    return value;
+    return sycl::reduce_over_group(sg, value, sycl::plus<float>());
 }
 
 template <bool TAB>
