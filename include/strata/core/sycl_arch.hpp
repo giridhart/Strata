@@ -40,7 +40,7 @@ inline Xe2TuningProfile get_xe2_tuning_profile(const sycl::device& dev) {
         // Desktop Intel Arc B580 (20 Xe-cores, 160 VEs)
         p.split_k_factor = 32;
         p.slm_pad_elements = 8;
-        p.enable_dual_column = true;
+        p.enable_dual_column = false;  // Opt-in via STRATA_XE2_DUAL_COLUMN=1 (preserves byte-exact parity)
         p.enable_streaming_hints = true;
         p.enable_xmx_moe = true;
     } else {
