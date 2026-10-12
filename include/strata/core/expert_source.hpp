@@ -498,6 +498,11 @@ public:
     /// Blobs touched, for the driver to report.  With `h = 0` this is `48 * k` per token and the number is only
     /// interesting once Phase 3 makes it not so.
     int64_t reads() const override { return reads_; }
+    /// The blob read from the model file(s) only, never from the RAM copy or an exchange buffer (STRATA_CHECK_SWAPS).
+    bool copy_blob_from_file(int64_t layer, int64_t expert, uint8_t* dst) const {
+        return base_ != nullptr && dst != nullptr && layer >= 0 && expert >= 0 && layer < n_layers_ && expert < n_expert_ &&
+               copy_from_files(layer, expert, dst);
+    }
 
 private:
     const uint8_t* mapped_blob(int64_t layer, int64_t expert) const;

@@ -296,6 +296,26 @@ bool resident_stage_swaps(strata::core::FileExpertSource& src, strata::core::Exp
     }
     if (!staged.empty()) {
         if (DPCT_CHECK_ERROR(stream->wait()) != 0) return false;
+        // STRATA_CHECK_SWAPS=1 (a test aid): each evicted expert's exchange buffer must hold the model file's bytes
+        if (const char* chk = std::getenv("STRATA_CHECK_SWAPS"); chk != nullptr && chk[0] != '\0' && chk[0] != '0') {
+            static std::atomic<int64_t> n_ok{0}, n_bad{0};
+            std::vector<uint8_t> ref;
+            int64_t bad = 0;
+            for (const Staged& x : staged) {
+                ref.resize((size_t) strata::kernels::cpu::expert_layout().blob_bytes(x.layer));
+                if (!src.copy_blob_from_file(x.layer, x.out, ref.data()) ||
+                    std::memcmp(ref.data(), src.exchange_buffer(x.q), ref.size()) != 0) {
+                    ++bad;
+                    std::fprintf(stderr, "strata: STRATA_CHECK_SWAPS: layer %d expert %d: the exchange buffer differs from the file\n",
+                                 (int) x.layer, (int) x.out);
+                } else {
+                    ++n_ok;
+                }
+            }
+            n_bad += bad;
+            std::fprintf(stderr, "strata: STRATA_CHECK_SWAPS: %zu staged, %lld differ (total %lld ok, %lld differ)\n",
+                         staged.size(), (long long) bad, (long long) n_ok.load(), (long long) n_bad.load());
+        }
         for (const Staged& x : staged)
             if (!src.stage_exchange(x.layer, x.in, x.out, x.q)) return false;
     }
@@ -981,16 +1001,20 @@ void stall_report(std::FILE* f, uint64_t layers_during) {
 
 /// STRATA_TRACE=1: the VRAM left at a step of the startup (finds what fills the card after the cache is sized)
 void mem_mark(const char* where) {
-    static const bool on = std::getenv("STRATA_TRACE") != nullptr;
-    if (!on) return;
+    static const char* const env = std::getenv("STRATA_TRACE");
+    if (env == nullptr) return;
     size_t free_b = 0, total_b = 0;
-    /*
-    DPCT1106:23: 'cudaMemGetInfo' was migrated with the Intel extensions for
-    device information which may not be supported by all compilers or runtimes.
-    You may need to adjust the code.
-    */
     dpct::get_current_device().get_memory_info(free_b, total_b);
     std::fprintf(stderr, "strata trace: %lld MiB free after %s\n", (long long)(free_b >> 20), where);
+    // STRATA_TRACE=2: wait for the device at each startup mark and name the first step after which it reports an error (#2013)
+    if (env[0] == '2') {
+        try {
+            dpct::get_current_device().queues_wait_and_throw();
+            std::fprintf(stderr, "strata trace: device ok after %s\n", where);
+        } catch (sycl::exception const& e) {
+            std::fprintf(stderr, "strata trace: device ERROR after %s: %s\n", where, e.what());
+        }
+    }
 }
 
 [[maybe_unused]] int argmax(const std::vector<float>& v) {
@@ -3559,6 +3583,29 @@ int main(int argc, char** argv) try {
     }
     if (multi_gpu)
         std::fprintf(stderr, "strata generate: layer split: CUDA0 runs layers 0-%lld\n", (long long)(split_at[0] - 1));
+    // #1980: the host mirror and the "REFUSED" count above cover the first stage only. A later stage whose cache does not
+    // hold all of its layers' experts has no mirror entry for the rest, and with STRATA_VERIFY_NO_HOST no host answers for
+    // them: the device plan reads a bad address and the card is lost at the first verify window (2x Arc Pro B60, xe CAT
+    // fault). Refuse at the start with the same message, and say how to get a complete load.
+    if (multi_gpu) {
+        const bool no_host_split = [] { const char* v = std::getenv("STRATA_VERIFY_NO_HOST"); return v && *v && std::strcmp(v, "0") != 0; }();
+        int64_t later_misses = 0;
+        for (auto& stp : stages) {
+            const GpuStage& st = *stp;
+            later_misses += std::max<int64_t>(0, (st.le - st.lb) * g.n_expert - (int64_t) st.cache.slots());
+        }
+        if (later_misses > 0 && no_host_split) {
+            std::fprintf(stderr, "strata generate: REFUSED: %lld experts of the later layer-split stages are neither in VRAM nor mirrored "
+                                 "(the host mirror covers the first stage only); with STRATA_VERIFY_NO_HOST the device plan cannot run them "
+                                 "and the card is lost at the first verify window - set STRATA_STAGE_TRIM=1 (with --layer-split N) to free "
+                                 "each card's duplicate dense weights, lower --max-context or --vram-reserve-mib, or unset "
+                                 "STRATA_VERIFY_NO_HOST\n", (long long) later_misses);
+            return 2;
+        }
+        if (later_misses > 0)
+            std::fprintf(stderr, "strata generate: layer split: %lld experts of the later stages are not in VRAM (served by the host)\n",
+                         (long long) later_misses);
+    }
 
     std::array<strata::core::RemoteExperts, 3> remote_experts;
     const bool multi_remote = o.expert_cache_remote[1] > 0 || o.expert_cache_remote[2] > 0;
@@ -6263,10 +6310,32 @@ int main(int argc, char** argv) try {
                         // resident again would hand the next window a prompt buffer in place of an expert
                         if (!refill_one(p, e)) return false;
                     }
-                    const strata::core::OnDevice on(p.dev);
-                    const int32_t first = std::max<int32_t>(p.first, (int32_t)(p.cache->slots() - part_slots(p, want)));
-                    if (want != p.sp->chunk() || first != p.first_now) {
-                        if (!p.sp->relayout(want, p.cache->device_slot(first), part_bytes(p, first), e)) return false;
+                    // #2090: the loan a chunk needs is NOT monotonic in the chunk: a chunk above the scan's small_max
+                    // lays out the byte-budget ring (199 slots at 5120), one at or below it 0.1.39's (384 at 4096), so
+                    // a request's smaller chunk can need MORE slots than the auto chunk's region (p.first) holds.  The
+                    // loan starts where the chunk itself needs it (the 128-slot floor aside); a chunk that cannot be
+                    // lent even then is halved until it can, instead of ending the engine.
+                    int64_t want_p = want;
+                    int64_t need_p = part_slots(p, want_p);
+                    while ((need_p <= 0 || need_p + 128 > p.cache->slots()) && want_p > 256) {
+                        want_p = std::max<int64_t>(256, want_p / 2 / 256 * 256);
+                        need_p = part_slots(p, want_p);
+                    }
+                    if (need_p <= 0 || need_p + 128 > p.cache->slots()) {
+                        e = "prefill: no chunk of this request fits the slots that can be lent (#2090)";
+                        return false;
+                    }
+                    if (want_p != want)
+                        std::fprintf(stderr, "strata serve: prompt chunk %lld -> %lld tokens for this request: its "
+                                     "buffers do not fit the slots that can be lent (#2090)\n", (long long) want,
+                                     (long long) want_p);
+                    if (need_p > p.cache->slots() - p.first)   // the case that ended the engine before (#2090)
+                        std::fprintf(stderr, "strata serve: the loan for a chunk of %lld tokens (%lld slots) is larger than the "
+                                     "auto chunk's (%lld slots): starting it earlier (#2090)\n", (long long) want_p,
+                                     (long long) need_p, (long long) (p.cache->slots() - p.first));
+                    const int32_t first = (int32_t) (p.cache->slots() - need_p);
+                    if (want_p != p.sp->chunk() || first != p.first_now) {
+                        if (!p.sp->relayout(want_p, p.cache->device_slot(first), part_bytes(p, first), e)) return false;
                         p.first_now = first;
                     }
                     for (int64_t l = p.lb; l < p.le; ++l)  // THIS participant's layers only
@@ -6278,7 +6347,7 @@ int main(int argc, char** argv) try {
                                 any = true;
                             }
                         }
-                    p.lent_chunk = want;
+                    p.lent_chunk = want_p;
                 }
                 if (any) res_upload();
                 if (trace) {

@@ -1,6 +1,7 @@
 #include <sycl/sycl.hpp>
 #include "strata/core/conversation_snapshot.hpp"
 #include "conversation_checked.hpp"
+#include "../conversation_copy.hpp"
 
 #include <algorithm>
 #include <array>
@@ -277,7 +278,7 @@ bool conversation_snapshot_save(SavedConversation& image, const ConversationView
     captured.live.ids = view.ids;
     captured.live.imgs = view.images;
     captured.cvec = view.cvec;
-    captured.checkpoints = view.checkpoints;
+    captured.checkpoints = conversation_detail::copy_checkpoints_beating(view.checkpoints);
     const int64_t unchanged = reuse.kv.empty() ? 0 : reuse.unchanged_tokens;
     captured.kv = std::move(reuse.kv);
     const size_t layers = owned_qsa(ss);

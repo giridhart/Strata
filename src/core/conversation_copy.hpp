@@ -3,7 +3,9 @@
 #include "strata/core/conversation_cache.hpp"
 #include "strata/core/progress.hpp"
 
+#if !defined(STRATA_ENABLE_SYCL)
 #include <cuda_runtime.h>
+#endif
 
 #include <algorithm>
 #include <chrono>
@@ -14,6 +16,7 @@
 
 namespace strata::core::conversation_detail {
 
+#if !defined(STRATA_ENABLE_SYCL)
 /// Conversation snapshot / checkpoint copies go through a private non-blocking stream of the current device
 /// instead of the legacy (null) stream.  A plain cudaMemcpy is ordered against every blocking stream of the
 /// device, and while another thread captures a graph on one (a drafter or a stage worker), HIP refuses it with
@@ -37,6 +40,7 @@ inline cudaError_t copy_nonblocking(void* dst, const void* src, size_t bytes) {
     core::progress_beat();   // #2049: a parked conversation is many of these; each one that lands is progress
     return e;
 }
+#endif
 
 /// #2049 #2065 #1971: a host-to-host copy that tells the watchdog it is moving.  Parked state (the running
 /// checkpoints, the K/V segments) sits in ordinary pageable memory for the whole session; when the OS has written
