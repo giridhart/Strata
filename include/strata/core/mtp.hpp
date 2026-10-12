@@ -241,6 +241,7 @@ private:
 #pragma once
 
 #include "strata/core/layer.hpp"
+#include "strata/core/pinned_ring.hpp"
 #include "strata/core/session.hpp"
 #include "strata/kernels/sampler.hpp"
 
@@ -448,6 +449,7 @@ private:
     cudaStream_t cs_ = nullptr;
     cudaGraphExec_t prefill_exec_[9] = {};
     cudaGraphExec_t prefill_dev_exec_[9] = {};
+    PinnedRing pf_ring_;          ///< #1996: the records above go up from a pinned slot, not from the pageable vector they are built in
     int32_t* pf_dev_ = nullptr;   ///< E-4: a prompt's rows' token / step / position records, uploaded at once
     int64_t pf_cap_ = 0;          ///< its capacity in ints
     cudaStream_t side_ = nullptr;                    // the shared expert's branch of the draft graphs (CUDA)

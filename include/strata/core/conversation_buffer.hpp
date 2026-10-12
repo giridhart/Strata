@@ -158,6 +158,8 @@ private:
 #else
 #pragma once
 
+#include "strata/core/progress.hpp"
+
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
@@ -236,6 +238,7 @@ public:
                 segment.resize(count, value);
                 segments_.push_back(std::move(segment));
                 size_ += count;
+                progress_beat();   // #2049: zero-filling 16 MiB of fresh pages is slow when the host is paging
             }
         } else {
             while (!segments_.empty() && size_ - segments_.back().size() >= n) {
