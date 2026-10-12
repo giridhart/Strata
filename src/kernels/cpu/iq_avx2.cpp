@@ -427,8 +427,8 @@ void q8k_quant_avx2(const float* x, void* vy, int64_t k) {
             __m256i v[4];
             for (int q = 0; q < 4; ++q) {
                 __m256 p = _mm256_mul_ps(vis, _mm256_loadu_ps(x + j + 8 * q));
-#if defined(__GNUC__) && !defined(__clang__)
-                // GCC fuses a multiply and an add into an FMA by default (-ffp-contract=fast); the reference rounds
+#if defined(__GNUC__) || defined(__clang__)
+                // GCC/Clang fuses a multiply and an add into an FMA by default (-ffp-contract=fast); the reference rounds
                 // the product before the add, so the product must stay a separate value
                 __asm__("" : "+x"(p));
 #endif
