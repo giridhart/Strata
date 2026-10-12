@@ -5165,6 +5165,8 @@ int main(int argc, char** argv) try {
         std::vector<int32_t> live;
         std::vector<ImgKey> live_imgs, req_imgs;
         bool live_ok = false;
+        // #879: a window met non-finite logits: the next request drops every cached state first and reads from token 0
+        bool nan_flush = false;
         std::vector<ConvCheckpoint> checks;
         uint64_t check_clock = 0;  // the checkpoints' LRU clock; creation and every use advance it
         bool cvec_cached = true;   // the control vector's state the live session and the checkpoints were read with
@@ -6006,6 +6008,33 @@ int main(int argc, char** argv) try {
                 std::printf("ERR %s\n", err.c_str());
                 return 1;
             }
+            // #879: this request met a window whose head logits were not all finite (nonfinite_hit): it ends with
+            // DONE ... nonfinite, emitting none of that window's tokens
+            bool nf_hit = false;
+            auto nonfinite_hit = [&](const strata::core::Verifier& v, const char* what) -> bool {
+                const int row = v.nonfinite_row();
+                if (row < 0) return false;
+                std::fprintf(stderr, "strata serve: non-finite logits (#879) in a %s window at position %lld (row %d): its "
+                                     "tokens are not emitted, the request ends (DONE nonfinite) and the next request reads "
+                                     "its prompt from token 0\n", what, (long long) v.nonfinite_pos(), row);
+                std::fflush(stderr);
+                nf_hit = true;
+                nan_flush = true;
+                return true;
+            };
+            // #879: an earlier window met non-finite logits.  The poison sits in a conversation's K/V and recurrent
+            // state, so nothing that may hold it is continued: the live session, every checkpoint, every parked
+            // conversation go, and this prompt is read from token 0 (resume == 0 below)
+            if (nan_flush) {
+                nan_flush = false;
+                const size_t n_checks = checks.size();
+                live_ok = false;
+                checks.clear();
+                const size_t n_parked = conversations.clear();
+                std::fprintf(stderr, "strata serve: after non-finite logits (#879): dropped the live session, %zu "
+                                     "checkpoint%s and %zu parked conversation%s; reading this prompt from token 0\n",
+                             n_checks, n_checks == 1 ? "" : "s", n_parked, n_parked == 1 ? "" : "s");
+            }
             int64_t resume = 0;
             bool from_live = false;
             if (o.prompt_cache > 0 && want_cvec == cvec_cached) {
@@ -6194,6 +6223,10 @@ int main(int argc, char** argv) try {
                     drive.d.failed = false;
                     if (!ver.run(T, win.data(), q, win_pool_fn, win_pool_user, outw.data(), e) || drive.d.failed) {
                         if (drive.d.failed && drive.d.fail) e = drive.d.fail;
+                        return false;
+                    }
+                    if (nonfinite_hit(ver, "prompt")) {
+                        e = "non-finite logits (#879)";
                         return false;
                     }
                     // STRATA_LOGPOS=<path>: the teacher-forced log-probability of every token read here (every
@@ -6580,6 +6613,15 @@ int main(int argc, char** argv) try {
                     std::printf("ERR %s\n", err.c_str());
                     return 1;
                 }
+                if (nonfinite_hit(ver, first_window ? "first decode" : "decode")) {  // #879: none of its tokens goes out
+                    if (adapt_thr.joinable()) adapt_thr.join();
+                    if (!adapt_ok) {
+                        std::printf("ERR an adaptive refill failed\n");
+                        return 1;
+                    }
+                    finish = "nonfinite";
+                    break;
+                }
                 // the window's first a + 1 tokens are in the session now (the last output is not: it is next x)
                 for (int i = 0; i <= a; ++i)
                     consumed.push_back(window[(size_t)i]);
@@ -6667,6 +6709,7 @@ int main(int argc, char** argv) try {
                 live.swap(consumed);
                 live_imgs = imgs_below(req_imgs, (int64_t)live.size());
                 live_ok = o.prompt_cache > 0;
+                if (nf_hit) live_ok = false;  // #879 (the next request's start drops the rest)
             }
             static const bool state_hash = std::getenv("STRATA_STATE_HASH") != nullptr;
             if (state_hash && live_ok) {
