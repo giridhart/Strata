@@ -10,6 +10,7 @@
 using strata::kernels::fused_gdn_ab;
 using strata::kernels::fused_gdn_conv_l2;
 using strata::kernels::fused_gdn_step_norm;
+using strata::kernels::fused_gdn_step_norm_silu;
 
 namespace {
 
@@ -329,6 +330,136 @@ int main() {
             if (diff / denom > 2e-3f && diff > 1e-3f) bad_step++;
         }
         printf("  fused_gdn_step_norm: bad = %d / %zu\n", bad_step, ref_y.size());
+        total_bad += bad_step;
+
+        sycl::free(d_state, q);
+        sycl::free(d_q, q);
+        sycl::free(d_k, q);
+        sycl::free(d_v, q);
+        sycl::free(d_gate, q);
+        sycl::free(d_beta, q);
+        sycl::free(d_z, q);
+        sycl::free(d_gamma, q);
+        sycl::free(d_y, q);
+    }
+
+    // 4. Test fused_gdn_step_norm_silu (Qwen3.6)
+    {
+        const int h_k = 16;
+        const int h_v = 32;
+        const int S = 128;
+        const float eps = 1e-5f;
+
+        std::vector<float> h_state(h_v * S * S);
+        std::vector<float> h_q(h_k * S);
+        std::vector<float> h_k_vec(h_k * S);
+        std::vector<float> h_v_vec(h_v * S);
+        std::vector<float> h_gate(h_v);
+        std::vector<float> h_beta(h_v);
+        std::vector<float> h_z(h_v * S);
+        std::vector<float> h_gamma(S);
+        std::vector<float> ref_y(h_v * S);
+        std::vector<float> ref_state(h_v * S * S);
+
+        for (auto& v : h_state)
+            v = dist(rng) * 0.05f;
+        for (auto& v : h_q)
+            v = dist(rng);
+        for (auto& v : h_k_vec)
+            v = dist(rng);
+        for (auto& v : h_v_vec)
+            v = dist(rng);
+        for (auto& v : h_gate)
+            v = -0.1f * std::fabs(dist(rng));
+        for (auto& v : h_beta)
+            v = sigmoid_f(dist(rng));
+        for (auto& v : h_z)
+            v = dist(rng);
+        for (auto& v : h_gamma)
+            v = 1.0f + 0.1f * dist(rng);
+
+        ref_state = h_state;
+
+        // CPU reference for fused_gdn_step_norm_silu
+        for (int head = 0; head < h_v; ++head) {
+            const int qh = head % h_k;
+            const float g = std::exp(h_gate[head]);
+            const float b = h_beta[head];
+
+            std::vector<float> kv_col(S, 0.0f);
+            for (int col = 0; col < S; ++col) {
+                float kv = 0.0f;
+                for (int r = 0; r < S; ++r) {
+                    float s_val = ref_state[(r * h_v + head) * S + col];
+                    kv += s_val * h_k_vec[qh * S + r];
+                }
+                kv_col[col] = kv;
+            }
+
+            std::vector<float> oc(S, 0.0f);
+            for (int col = 0; col < S; ++col) {
+                float delta = (h_v_vec[head * S + col] - g * kv_col[col]) * b;
+                float o = 0.0f;
+                for (int r = 0; r < S; ++r) {
+                    float s_val = ref_state[(r * h_v + head) * S + col];
+                    float s_new = g * s_val + h_k_vec[qh * S + r] * delta;
+                    o += s_new * h_q[qh * S + r];
+                    ref_state[(r * h_v + head) * S + col] = s_new;
+                }
+                oc[col] = o / std::sqrt((float)S);
+            }
+
+            float sum_sq = 0.0f;
+            for (int col = 0; col < S; ++col) {
+                sum_sq += oc[col] * oc[col];
+            }
+            float scale = 1.0f / std::sqrt(sum_sq / (float)S + eps);
+            for (int col = 0; col < S; ++col) {
+                float zz = h_z[head * S + col];
+                float silu_z = zz / (1.0f + std::exp(-zz));
+                ref_y[head * S + col] = oc[col] * scale * h_gamma[col] * silu_z;
+            }
+        }
+
+        float* d_state = sycl::malloc_device<float>(h_state.size(), q);
+        float* d_q = sycl::malloc_device<float>(h_q.size(), q);
+        float* d_k = sycl::malloc_device<float>(h_k_vec.size(), q);
+        float* d_v = sycl::malloc_device<float>(h_v_vec.size(), q);
+        float* d_gate = sycl::malloc_device<float>(h_gate.size(), q);
+        float* d_beta = sycl::malloc_device<float>(h_beta.size(), q);
+        float* d_z = sycl::malloc_device<float>(h_z.size(), q);
+        float* d_gamma = sycl::malloc_device<float>(h_gamma.size(), q);
+        float* d_y = sycl::malloc_device<float>(ref_y.size(), q);
+
+        q.memcpy(d_state, h_state.data(), h_state.size() * sizeof(float));
+        q.memcpy(d_q, h_q.data(), h_q.size() * sizeof(float));
+        q.memcpy(d_k, h_k_vec.data(), h_k_vec.size() * sizeof(float));
+        q.memcpy(d_v, h_v_vec.data(), h_v_vec.size() * sizeof(float));
+        q.memcpy(d_gate, h_gate.data(), h_gate.size() * sizeof(float));
+        q.memcpy(d_beta, h_beta.data(), h_beta.size() * sizeof(float));
+        q.memcpy(d_z, h_z.data(), h_z.size() * sizeof(float));
+        q.memcpy(d_gamma, h_gamma.data(), h_gamma.size() * sizeof(float));
+        q.wait();
+
+        fused_gdn_step_norm_silu(d_state, d_q, d_k, d_v, d_gate, d_beta, d_z, d_gamma, eps, d_y, h_k, h_v, &q);
+
+        std::vector<float> dev_y(ref_y.size()), dev_state(h_state.size());
+        q.memcpy(dev_y.data(), d_y, ref_y.size() * sizeof(float));
+        q.memcpy(dev_state.data(), d_state, h_state.size() * sizeof(float));
+        q.wait();
+
+        int bad_step = 0;
+        for (size_t i = 0; i < ref_y.size(); ++i) {
+            float diff = std::fabs(dev_y[i] - ref_y[i]);
+            float denom = std::max(std::fabs(ref_y[i]), 1e-4f);
+            if (diff / denom > 2e-3f && diff > 1e-3f) bad_step++;
+        }
+        for (size_t i = 0; i < ref_state.size(); ++i) {
+            float diff = std::fabs(dev_state[i] - ref_state[i]);
+            float denom = std::max(std::fabs(ref_state[i]), 1e-4f);
+            if (diff / denom > 2e-3f && diff > 1e-3f) bad_step++;
+        }
+        printf("  fused_gdn_step_norm_silu: bad = %d / %zu\n", bad_step, ref_y.size());
         total_bad += bad_step;
 
         sycl::free(d_state, q);
