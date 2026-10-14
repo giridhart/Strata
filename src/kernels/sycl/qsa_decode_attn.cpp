@@ -90,7 +90,7 @@ inline void load8(const QsaAttnPools& p, bool value, long long row, int d0, floa
         load8_q4(p, value, row, d0, out);
 }
 
-template <int KV_MODE>
+template <int KV_MODE, bool LANE_CELL = false>
 void attn_chunk_kernel(sycl::nd_item<3> item, const float* __restrict__ q, QsaAttnPools p,
                        const int32_t* __restrict__ ids, const int32_t* __restrict__ step, int n_kv_heads, int page_size,
                        float scale, float* __restrict__ part_acc, float* __restrict__ part_m,
@@ -129,23 +129,56 @@ void attn_chunk_kernel(sycl::nd_item<3> item, const float* __restrict__ q, QsaAt
         srow[t] = r;
     }
     sycl::group_barrier(item.get_group());
-
     auto sg = item.get_sub_group();
-    for (int c = warp; c < CHUNK; c += WARPS) {
+
+    if constexpr (LANE_CELL) {
+        // S25: STRATA_ATTN_LANECELL=1 - thread t scores cell t % 64 for heads 3 (t / 64) .. +2 by itself.
+        constexpr int HPT = G * CHUNK / THREADS;  // heads per thread (3)
+        const int c = t % CHUNK, h0 = (t / CHUNK) * HPT;
         if (c >= n_here || srow[c] < 0) {
-            if (lane < G) sp[lane][c] = -FLT_MAX;
-            continue;
-        }
-        float k8[8];
-        load8<KV_MODE>(p, false, srow[c], lane * 8, k8);
 #pragma unroll
-        for (int h = 0; h < G; ++h) {
-            const sycl::float4 qa = *reinterpret_cast<const sycl::float4*>(&sq[h][lane * 8]);
-            const sycl::float4 qb = *reinterpret_cast<const sycl::float4*>(&sq[h][lane * 8 + 4]);
-            float s = k8[0] * qa.x() + k8[1] * qa.y() + k8[2] * qa.z() + k8[3] * qa.w() + k8[4] * qb.x() +
-                      k8[5] * qb.y() + k8[6] * qb.z() + k8[7] * qb.w();
-            s = warp_sum(sg, s);
-            if (lane == 0) sp[h][c] = s * scale;
+            for (int j = 0; j < HPT; ++j) sp[h0 + j][c] = -FLT_MAX;
+        } else {
+            float a[HPT][32];
+#pragma unroll
+            for (int l = 0; l < 32; ++l) {
+                float k8[8];
+                load8<KV_MODE>(p, false, srow[c], l * 8, k8);
+#pragma unroll
+                for (int j = 0; j < HPT; ++j) {
+                    const sycl::float4 qa = *reinterpret_cast<const sycl::float4*>(&sq[h0 + j][l * 8]);
+                    const sycl::float4 qb = *reinterpret_cast<const sycl::float4*>(&sq[h0 + j][l * 8 + 4]);
+                    float s = k8[0] * qa.x() + k8[1] * qa.y() + k8[2] * qa.z() + k8[3] * qa.w() +
+                              k8[4] * qb.x() + k8[5] * qb.y() + k8[6] * qb.z() + k8[7] * qb.w();
+                    a[j][l] = s;
+                }
+            }
+#pragma unroll
+            for (int j = 0; j < HPT; ++j) {
+#pragma unroll
+                for (int o = 16; o > 0; o >>= 1)
+#pragma unroll
+                    for (int l = 0; l < o; ++l) a[j][l] = a[j][l] + a[j][l + o];
+                sp[h0 + j][c] = a[j][0] * scale;
+            }
+        }
+    } else {
+        for (int c = warp; c < CHUNK; c += WARPS) {
+            if (c >= n_here || srow[c] < 0) {
+                if (lane < G) sp[lane][c] = -FLT_MAX;
+                continue;
+            }
+            float k8[8];
+            load8<KV_MODE>(p, false, srow[c], lane * 8, k8);
+#pragma unroll
+            for (int h = 0; h < G; ++h) {
+                const sycl::float4 qa = *reinterpret_cast<const sycl::float4*>(&sq[h][lane * 8]);
+                const sycl::float4 qb = *reinterpret_cast<const sycl::float4*>(&sq[h][lane * 8 + 4]);
+                float s = k8[0] * qa.x() + k8[1] * qa.y() + k8[2] * qa.z() + k8[3] * qa.w() + k8[4] * qb.x() +
+                          k8[5] * qb.y() + k8[6] * qb.z() + k8[7] * qb.w();
+                s = warp_sum(sg, s);
+                if (lane == 0) sp[h][c] = s * scale;
+            }
         }
     }
     sycl::group_barrier(item.get_group());
@@ -229,7 +262,7 @@ void attn_merge_kernel(sycl::nd_item<2> item, const float* __restrict__ part_acc
     attn[(size_t)h * HD + d] = L > 0.0f ? acc / L : 0.0f;
 }
 
-template <int KV_MODE>
+template <int KV_MODE, bool LANE_CELL = false>
 void launch_attn_chunk(sycl::queue* st, const float* q, const QsaAttnPools& pools, const int32_t* ids,
                        const int32_t* steps, int n_kv_heads, int page_size, float scale, float* part_acc, float* part_m,
                        float* part_l, int n_chunks, int cap, long long stride, int n_q) {
@@ -242,7 +275,7 @@ void launch_attn_chunk(sycl::queue* st, const float* q, const QsaAttnPools& pool
 
         cgh.parallel_for(
             sycl::nd_range<3>(global_range, local_range), [=](sycl::nd_item<3> item) [[sycl::reqd_sub_group_size(32)]] {
-                attn_chunk_kernel<KV_MODE>(item, q, pools, ids, steps, n_kv_heads, page_size, scale, part_acc, part_m,
+                attn_chunk_kernel<KV_MODE, LANE_CELL>(item, q, pools, ids, steps, n_kv_heads, page_size, scale, part_acc, part_m,
                                            part_l, n_chunks, sq_acc, sp_acc,
                                            srow_acc.get_multi_ptr<sycl::access::decorated::no>().get(), cap, stride);
             });
@@ -270,18 +303,39 @@ void qsa_decode_attn_batch(const float* q, const QsaAttnPools& pools, const int3
     const float scale = 1.0f / sqrtf((float)HD);
     sycl::queue* st = stream ? static_cast<sycl::queue*>(stream) : &get_default_in_order_queue();
 
-    if (kv_mode == 3) {
-        launch_attn_chunk<3>(st, q, pools, ids, steps, (int)s.n_head_kv, (int)s.page_size, scale, part_acc, part_m,
-                             part_l, n_chunks, (int)cap, stride, (int)n_q);
-    } else if (kv_mode == 2) {
-        launch_attn_chunk<2>(st, q, pools, ids, steps, (int)s.n_head_kv, (int)s.page_size, scale, part_acc, part_m,
-                             part_l, n_chunks, (int)cap, stride, (int)n_q);
-    } else if (kv_mode == 1) {
-        launch_attn_chunk<1>(st, q, pools, ids, steps, (int)s.n_head_kv, (int)s.page_size, scale, part_acc, part_m,
-                             part_l, n_chunks, (int)cap, stride, (int)n_q);
+    static const bool lane_cell = [] {
+        const char* v = std::getenv("STRATA_ATTN_LANECELL");
+        return v && v[0] == '1';
+    }();
+
+    if (lane_cell) {
+        if (kv_mode == 3) {
+            launch_attn_chunk<3, true>(st, q, pools, ids, steps, (int)s.n_head_kv, (int)s.page_size, scale, part_acc, part_m,
+                                      part_l, n_chunks, (int)cap, stride, (int)n_q);
+        } else if (kv_mode == 2) {
+            launch_attn_chunk<2, true>(st, q, pools, ids, steps, (int)s.n_head_kv, (int)s.page_size, scale, part_acc, part_m,
+                                      part_l, n_chunks, (int)cap, stride, (int)n_q);
+        } else if (kv_mode == 1) {
+            launch_attn_chunk<1, true>(st, q, pools, ids, steps, (int)s.n_head_kv, (int)s.page_size, scale, part_acc, part_m,
+                                      part_l, n_chunks, (int)cap, stride, (int)n_q);
+        } else {
+            launch_attn_chunk<0, true>(st, q, pools, ids, steps, (int)s.n_head_kv, (int)s.page_size, scale, part_acc, part_m,
+                                      part_l, n_chunks, (int)cap, stride, (int)n_q);
+        }
     } else {
-        launch_attn_chunk<0>(st, q, pools, ids, steps, (int)s.n_head_kv, (int)s.page_size, scale, part_acc, part_m,
-                             part_l, n_chunks, (int)cap, stride, (int)n_q);
+        if (kv_mode == 3) {
+            launch_attn_chunk<3, false>(st, q, pools, ids, steps, (int)s.n_head_kv, (int)s.page_size, scale, part_acc, part_m,
+                                       part_l, n_chunks, (int)cap, stride, (int)n_q);
+        } else if (kv_mode == 2) {
+            launch_attn_chunk<2, false>(st, q, pools, ids, steps, (int)s.n_head_kv, (int)s.page_size, scale, part_acc, part_m,
+                                       part_l, n_chunks, (int)cap, stride, (int)n_q);
+        } else if (kv_mode == 1) {
+            launch_attn_chunk<1, false>(st, q, pools, ids, steps, (int)s.n_head_kv, (int)s.page_size, scale, part_acc, part_m,
+                                       part_l, n_chunks, (int)cap, stride, (int)n_q);
+        } else {
+            launch_attn_chunk<0, false>(st, q, pools, ids, steps, (int)s.n_head_kv, (int)s.page_size, scale, part_acc, part_m,
+                                       part_l, n_chunks, (int)cap, stride, (int)n_q);
+        }
     }
 
     st->parallel_for(sycl::nd_range<2>(sycl::range<2>((size_t)n_q, (size_t)s.n_head * HD), sycl::range<2>(1, HD)),

@@ -42,6 +42,7 @@
 //    argument in this file for keeping both.
 #include <sycl/sycl.hpp>
 #include "strata/core/emulate.hpp"
+#include "strata/core/sycl_arch.hpp"
 #include "strata/kernels/qsa.hpp"
 
 #include "strata/kernels/f16_bits.hpp"
@@ -540,6 +541,172 @@ void qsa_attend_kernel(const float* __restrict__ q, const uint16_t* __restrict__
     }
 }
 
+// Split-K FlashDecoding Stage 1: Partial softmax reductions partitioned across context tokens
+void qsa_attend_splitk_stage1_kernel(const float* __restrict__ q, const uint16_t* __restrict__ k_scratch,
+                                     const uint16_t* __restrict__ v_scratch, const int32_t* __restrict__ step,
+                                     int n_head, int n_head_kv, int head_dim, int num_splits,
+                                     float* __restrict__ part_acc, float* __restrict__ part_m,
+                                     float* __restrict__ part_l, uint8_t* local_mem,
+                                     const sycl::nd_item<3>& item) {
+    const long long n_ids = (long long)*(step + kStepWidth);
+    const int h = item.get_group(0);
+    const int split_id = item.get_group(1);
+    const int d = item.get_local_id(2);
+    const int threads = item.get_local_range(2);
+
+    const int slot = h * num_splits + split_id;
+    if (n_ids <= 0) {
+        if (d == 0) {
+            part_m[slot] = -FLT_MAX;
+            part_l[slot] = 0.0f;
+        }
+        part_acc[(size_t)slot * head_dim + d] = 0.0f;
+        return;
+    }
+
+    const long long tokens_per_split = (n_ids + num_splits - 1) / num_splits;
+    const long long t_start = split_id * tokens_per_split;
+    const long long t_end = sycl::min(t_start + tokens_per_split, n_ids);
+    const long long n_here = (t_start < t_end) ? (t_end - t_start) : 0;
+
+    if (n_here <= 0) {
+        if (d == 0) {
+            part_m[slot] = -FLT_MAX;
+            part_l[slot] = 0.0f;
+        }
+        part_acc[(size_t)slot * head_dim + d] = 0.0f;
+        return;
+    }
+
+    auto s_w = (float*)local_mem;
+    float* red = s_w;
+    float* w = s_w + 32;
+
+    const int kv = h / (n_head / n_head_kv);
+    const float scale = 1.0f / sycl::sqrt((float)head_dim);
+    const int lane = d & 31, wid = d >> 5, nwarp = (threads + 31) >> 5;
+
+    for (long long j_rel = d; j_rel < n_here; j_rel += threads) {
+        const long long j = t_start + j_rel;
+        const uint16_t* krow = k_scratch + (j * n_head_kv + kv) * head_dim;
+        float acc = 0.0f;
+        for (int i = 0; i < head_dim; ++i)
+            acc += h2f(krow[i]) * q[(size_t)h * head_dim + i];
+        w[j_rel] = acc * scale;
+    }
+
+    item.barrier();
+
+    float mx = -FLT_MAX;
+    for (long long j_rel = d; j_rel < n_here; j_rel += threads)
+        mx = sycl::fmax(mx, w[j_rel]);
+    mx = warp_max(mx);
+    if (lane == 0) red[wid] = mx;
+
+    item.barrier();
+    if (wid == 0) {
+        mx = (lane < nwarp) ? red[lane] : -FLT_MAX;
+        mx = warp_max(mx);
+        if (lane == 0) red[0] = mx;
+    }
+
+    item.barrier();
+    mx = red[0];
+    item.barrier();
+
+    float sum = 0.0f;
+    for (long long j_rel = d; j_rel < n_here; j_rel += threads) {
+        const float e = sycl::native::exp(w[j_rel] - mx);
+        w[j_rel] = e;
+        sum += e;
+    }
+    sum = warp_sum(sum);
+    if (lane == 0) red[wid] = sum;
+
+    item.barrier();
+    if (wid == 0) {
+        sum = (lane < nwarp) ? red[lane] : 0.0f;
+        sum = warp_sum(sum);
+        if (lane == 0) red[0] = sum;
+    }
+
+    item.barrier();
+    sum = red[0];
+    item.barrier();
+
+    float acc = 0.0f;
+    for (long long j_rel = 0; j_rel < n_here; ++j_rel) {
+        const long long j = t_start + j_rel;
+        acc += w[j_rel] * h2f(v_scratch[(j * n_head_kv + kv) * head_dim + d]);
+    }
+
+    if (d == 0) {
+        part_m[slot] = mx;
+        part_l[slot] = sum;
+    }
+    part_acc[(size_t)slot * head_dim + d] = acc;
+}
+
+// Split-K FlashDecoding Stage 2: Merge partial reductions across splits
+void qsa_attend_splitk_merge_kernel(const float* __restrict__ part_acc, const float* __restrict__ part_m,
+                                    const float* __restrict__ part_l, int num_splits, int head_dim,
+                                    float* __restrict__ attn, const sycl::nd_item<2>& item) {
+    const int h = item.get_group(0);
+    const int d = item.get_local_id(1);
+
+    float global_max = -FLT_MAX;
+    for (int s = 0; s < num_splits; ++s) {
+        const float m = part_m[h * num_splits + s];
+        global_max = sycl::fmax(global_max, m);
+    }
+
+    if (global_max <= -FLT_MAX + 1000.0f) {
+        attn[(size_t)h * head_dim + d] = 0.0f;
+        return;
+    }
+
+    float total_sum = 0.0f;
+    float total_acc = 0.0f;
+    for (int s = 0; s < num_splits; ++s) {
+        const float m = part_m[h * num_splits + s];
+        if (m <= -FLT_MAX + 1000.0f) continue;
+        const float weight = sycl::native::exp(m - global_max);
+        total_sum += part_l[h * num_splits + s] * weight;
+        total_acc += part_acc[((size_t)h * num_splits + s) * head_dim + d] * weight;
+    }
+
+    attn[(size_t)h * head_dim + d] = (total_sum > 0.0f) ? (total_acc / total_sum) : 0.0f;
+}
+
+struct SplitKScratch {
+    float* buf = nullptr;
+    size_t floats = 0;
+    sycl::queue* q = nullptr;
+
+    ~SplitKScratch() {
+        if (buf && q) {
+            try {
+                sycl::free(buf, *q);
+            } catch (...) {}
+            buf = nullptr;
+        }
+    }
+
+    void ensure(sycl::queue* queue, size_t needed_floats) {
+        if (!buf || floats < needed_floats || q != queue) {
+            if (buf && q) {
+                try {
+                    sycl::free(buf, *q);
+                } catch (...) {}
+                buf = nullptr;
+            }
+            buf = sycl::malloc_device<float>(needed_floats, *queue);
+            floats = needed_floats;
+            q = queue;
+        }
+    }
+};
+
 // ================= 7. qsa_gate_apply =================
 
 void qsa_gate_apply_kernel(const float* __restrict__ attn, const float* __restrict__ q_full, int n_head, int head_dim,
@@ -717,10 +884,56 @@ void qsa_attend_step(const float* q, const uint16_t* k_scratch, const uint16_t* 
     validate(s, "qsa_attend");
     if (step == nullptr) fail("qsa_attend: step is null");
     if (max_ids <= 0) fail("qsa_attend: max_ids must be positive");
-    const size_t smem = (size_t)(max_ids + 32) * sizeof(float);
-    static size_t s_configured = 0;
     static sycl::queue default_queue{sycl::property::queue::in_order()};
     sycl::queue* cs = stream ? static_cast<sycl::queue*>(stream) : &default_queue;
+
+    const auto prof = strata::sycl_arch::get_xe2_tuning_profile(cs->get_device());
+    int num_splits = prof.split_k_factor;
+    if (weights == nullptr && num_splits > 1 && max_ids >= 128) {
+        num_splits = std::min(num_splits, (int)((max_ids + 63) / 64));
+        num_splits = std::min(num_splits, 64);
+        if (num_splits > 1) {
+            const long long tokens_per_split = (max_ids + num_splits - 1) / num_splits;
+            const size_t split_smem = (size_t)(tokens_per_split + 32) * sizeof(float);
+            const size_t acc_floats = (size_t)s.n_head * num_splits * s.head_dim;
+            const size_t ml_floats = (size_t)s.n_head * num_splits;
+            const size_t total_floats = acc_floats + 2 * ml_floats;
+
+            static thread_local SplitKScratch scratch;
+            scratch.ensure(cs, total_floats);
+            float* part_acc = scratch.buf;
+            float* part_m = part_acc + acc_floats;
+            float* part_l = part_m + ml_floats;
+
+            cs->submit([&](sycl::handler& cgh) {
+                sycl::local_accessor<uint8_t, 1> local_acc(sycl::range<1>(split_smem), cgh);
+                cgh.parallel_for(
+                    sycl::nd_range<3>(sycl::range<3>((unsigned)s.n_head, (unsigned)num_splits, (unsigned)s.head_dim),
+                                      sycl::range<3>(1, 1, (unsigned)s.head_dim)),
+                    [=](sycl::nd_item<3> item) [[sycl::reqd_sub_group_size(32)]] {
+                        qsa_attend_splitk_stage1_kernel(q, k_scratch, v_scratch, step, (int)s.n_head, (int)s.n_head_kv,
+                                                        (int)s.head_dim, num_splits, part_acc, part_m, part_l,
+                                                        &local_acc[0], item);
+                    });
+            });
+
+            cs->submit([&](sycl::handler& cgh) {
+                cgh.parallel_for(
+                    sycl::nd_range<2>(sycl::range<2>((unsigned)s.n_head, (unsigned)s.head_dim),
+                                      sycl::range<2>(1, (unsigned)s.head_dim)),
+                    [=](sycl::nd_item<2> item) {
+                        qsa_attend_splitk_merge_kernel(part_acc, part_m, part_l, num_splits, (int)s.head_dim, attn, item);
+                    });
+            });
+
+            if (!stream) default_queue.wait();
+            check_launch("qsa_attend (split-k)");
+            return;
+        }
+    }
+
+    const size_t smem = (size_t)(max_ids + 32) * sizeof(float);
+    static size_t s_configured = 0;
     if (smem > s_configured) {
         int max_shared = (int)cs->get_device().get_info<sycl::info::device::local_mem_size>();
         max_shared = strata::smem_optin_of(max_shared);
