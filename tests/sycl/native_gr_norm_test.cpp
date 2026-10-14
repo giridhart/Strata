@@ -1,6 +1,8 @@
 // tests/sycl/native_gr_norm_test.cpp - Standalone unit test for native GR RMSNorm on SYCL/Xe2.
 #include <sycl/sycl.hpp>
 #include "strata/kernels/native_gr_norm.hpp"
+#include "strata/kernels/fused_gr.hpp"
+#include "strata/kernels/bf16_bits.hpp"
 
 #include <cmath>
 #include <cstdio>
@@ -96,6 +98,98 @@ int main() {
         sycl::free(d_in, q);
         sycl::free(d_gamma, q);
         sycl::free(d_out, q);
+    }
+
+    // Test fused_gr_quantize_q8_0 and fused_gr_dequant_q8_0
+    {
+        constexpr int64_t n_blocks = 128;
+        constexpr size_t total_elems = (size_t)n_blocks * 32;
+        std::vector<uint16_t> h_bf16(total_elems);
+        for (size_t i = 0; i < total_elems; ++i) {
+            h_bf16[i] = strata::kernels::bf16_from_f32(dist(rng));
+        }
+
+        // CPU reference quantization
+        std::vector<uint8_t> ref_q8((size_t)n_blocks * 34);
+        for (int64_t b = 0; b < n_blocks; ++b) {
+            float amax = 0.0f;
+            float vals[32];
+            for (int l = 0; l < 32; ++l) {
+                uint32_t u = (uint32_t)h_bf16[b * 32 + l] << 16;
+                float v;
+                std::memcpy(&v, &u, 4);
+                vals[l] = v;
+                amax = std::max(amax, std::fabs(v));
+            }
+            float d = amax / 127.0f;
+            float id = d != 0.0f ? 1.0f / d : 0.0f;
+            sycl::half h = (sycl::half)d;
+            uint16_t hu;
+            std::memcpy(&hu, &h, 2);
+            uint8_t* o = ref_q8.data() + b * 34;
+            o[0] = (uint8_t)(hu & 0xFF);
+            o[1] = (uint8_t)(hu >> 8);
+            for (int l = 0; l < 32; ++l) {
+                float q_val = std::round(vals[l] * id);
+                int q_clamped = std::max(-128, std::min(127, (int)q_val));
+                o[2 + l] = (uint8_t)(int8_t)q_clamped;
+            }
+        }
+
+        uint16_t* d_bf16 = sycl::malloc_device<uint16_t>(total_elems, q);
+        uint8_t* d_q8 = sycl::malloc_device<uint8_t>((size_t)n_blocks * 34, q);
+        uint16_t* d_dequant = sycl::malloc_device<uint16_t>(total_elems, q);
+
+        q.memcpy(d_bf16, h_bf16.data(), total_elems * sizeof(uint16_t)).wait();
+
+        strata::kernels::fused_gr_quantize_q8_0(d_bf16, d_q8, n_blocks, &q);
+        q.wait();
+
+        std::vector<uint8_t> act_q8((size_t)n_blocks * 34);
+        q.memcpy(act_q8.data(), d_q8, act_q8.size()).wait();
+
+        int bad_quant = 0;
+        for (size_t i = 0; i < act_q8.size(); ++i) {
+            if (act_q8[i] != ref_q8[i]) {
+                size_t l = i % 34;
+                if (l < 2) {
+                    bad_quant++; // scale must be bit-identical
+                } else {
+                    int diff = std::abs((int)(int8_t)act_q8[i] - (int)(int8_t)ref_q8[i]);
+                    if (diff > 1) bad_quant++;
+                }
+            }
+        }
+        printf("  fused_gr_quantize_q8_0: bad = %d / %zu\n", bad_quant, act_q8.size());
+        total_failures += bad_quant;
+
+        // Test dequant
+        strata::kernels::fused_gr_dequant_q8_0(d_q8, d_dequant, n_blocks, &q);
+        q.wait();
+
+        std::vector<uint16_t> act_dequant(total_elems);
+        q.memcpy(act_dequant.data(), d_dequant, total_elems * sizeof(uint16_t)).wait();
+
+        // CPU reference dequant
+        int bad_dequant = 0;
+        for (int64_t b = 0; b < n_blocks; ++b) {
+            const uint8_t* p = act_q8.data() + b * 34;
+            uint16_t hu = (uint16_t)(p[0] | ((uint16_t)p[1] << 8));
+            sycl::half h;
+            std::memcpy(&h, &hu, 2);
+            float d = (float)h;
+            for (int l = 0; l < 32; ++l) {
+                float expected = d * (float)(int8_t)p[2 + l];
+                uint16_t exp_bf16 = strata::kernels::bf16_from_f32(expected);
+                if (act_dequant[b * 32 + l] != exp_bf16) bad_dequant++;
+            }
+        }
+        printf("  fused_gr_dequant_q8_0: bad = %d / %zu\n", bad_dequant, total_elems);
+        total_failures += bad_dequant;
+
+        sycl::free(d_bf16, q);
+        sycl::free(d_q8, q);
+        sycl::free(d_dequant, q);
     }
 
     if (total_failures == 0) {

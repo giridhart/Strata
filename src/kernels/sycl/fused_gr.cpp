@@ -1682,4 +1682,60 @@ void fused_gr_check() {
 
 void fused_gr_set_fast(int) {}
 
+void fused_gr_quantize_q8_0(const uint16_t* bf16, uint8_t* out, int64_t n_blocks, void* stream) {
+    if (!bf16 || !out || n_blocks <= 0) return;
+    sycl::queue* q = stream ? static_cast<sycl::queue*>(stream) : &default_queue();
+    constexpr size_t threads_per_group = 256;
+    const size_t total_blocks = (size_t)n_blocks;
+    const size_t groups = (total_blocks * 32 + threads_per_group - 1) / threads_per_group;
+
+    q->parallel_for(sycl::nd_range<1>(sycl::range<1>(groups * threads_per_group), sycl::range<1>(threads_per_group)),
+                    [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(32)]] {
+                        const size_t global_tid = item.get_global_id(0);
+                        const int64_t b = (int64_t)(global_tid >> 5);
+                        const int lane = (int)(global_tid & 31);
+                        if (b >= n_blocks) return;
+
+                        const uint32_t u = (uint32_t)bf16[b * 32 + lane] << 16;
+                        const float v = sycl::bit_cast<float>(u);
+                        float amax = sycl::fabs(v);
+                        const auto sg = item.get_sub_group();
+                        amax = sycl::reduce_over_group(sg, amax, sycl::maximum<float>());
+
+                        const float d = amax / 127.0f;
+                        const float id = d != 0.0f ? 1.0f / d : 0.0f;
+                        uint8_t* o = out + b * 34;
+                        if (lane == 0) {
+                            sycl::half h = (sycl::half)d;
+                            uint16_t hu = sycl::bit_cast<uint16_t>(h);
+                            o[0] = (uint8_t)(hu & 0xFF);
+                            o[1] = (uint8_t)(hu >> 8);
+                        }
+                        const float q_val = sycl::round(v * id);
+                        o[2 + lane] = (uint8_t)(int8_t)sycl::clamp(q_val, -128.0f, 127.0f);
+                    });
+}
+
+void fused_gr_dequant_q8_0(const uint8_t* q8, uint16_t* bf16, int64_t n_blocks, void* stream) {
+    if (!q8 || !bf16 || n_blocks <= 0) return;
+    sycl::queue* q = stream ? static_cast<sycl::queue*>(stream) : &default_queue();
+    constexpr size_t threads_per_group = 256;
+    const size_t total_blocks = (size_t)n_blocks;
+    const size_t groups = (total_blocks * 32 + threads_per_group - 1) / threads_per_group;
+
+    q->parallel_for(sycl::nd_range<1>(sycl::range<1>(groups * threads_per_group), sycl::range<1>(threads_per_group)),
+                    [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(32)]] {
+                        const size_t global_tid = item.get_global_id(0);
+                        const int64_t b = (int64_t)(global_tid >> 5);
+                        const int lane = (int)(global_tid & 31);
+                        if (b >= n_blocks) return;
+
+                        const uint8_t* p = q8 + b * 34;
+                        const uint16_t hu = (uint16_t)(p[0] | ((uint16_t)p[1] << 8));
+                        const sycl::half h = sycl::bit_cast<sycl::half>(hu);
+                        const float d = (float)h;
+                        bf16[b * 32 + lane] = bf16_from_f32(d * (float)(int8_t)p[2 + lane]);
+                    });
+}
+
 }  // namespace strata::kernels
