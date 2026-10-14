@@ -20,17 +20,23 @@ inline sycl::queue& default_queue() {
 }  // namespace
 
 NativeHead::~NativeHead() {
+    unload();
+}
+
+void NativeHead::unload() {
     if (scratch_) {
         try {
             sycl::free((void*)scratch_, default_queue());
         } catch (...) {
         }
+        scratch_ = nullptr;
     }
     if (weights_) {
         try {
             sycl::free((void*)weights_, default_queue());
         } catch (...) {
         }
+        weights_ = nullptr;
     }
 }
 

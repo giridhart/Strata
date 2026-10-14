@@ -573,6 +573,7 @@ struct Options {
     /// result) goes through the verify windows, S tokens at a time, instead of the batched prompt path (0 = always
     /// the batched path)
     int64_t short_read = 64;
+    bool prefill_head_alias = false;   // lend the native output head's VRAM to prompt buffers between request phases
     /// The suffix drafter (prompt lookup): when the text being written repeats an earlier stretch of the context (code
     /// edits, quoted input, tool-call JSON) by at least this many tokens, the window may be filled with what followed
     /// it there instead of the MTP's drafts, where the MTP's own first guess agrees and the draft policy expects it to
@@ -676,6 +677,8 @@ void usage() {
         "  --turn-token ID      --serve: the token that opens a chat turn (default 248045, <|im_start|>)\n"
         "  --short-read N       --serve: read at most N fresh text tokens through the decode windows instead\n"
         "                       of the batched prompt path (default 64, 0 = off)\n"
+        "  --prefill-head-alias --serve: unload the native output head while each fresh prompt is read,\n"
+        "                       then release prompt buffers and reload it before decode\n"
         "  --suffix-draft N     prompt lookup: draft from an earlier repeat of the last N+ tokens of context\n"
         "                       when it pays (default 3; 0 = MTP only)\n"
         "  --mtp-max-t M        cap the MTP's windows at M tokens (0 = --spec; longer ones come from suffixes)\n"
@@ -1523,6 +1526,8 @@ int main(int argc, char** argv) try {
                 o.turn_token = std::atoll(next("--turn-token"));
             else if (a == "--short-read")
                 o.short_read = std::max(0LL, std::atoll(next("--short-read")));
+            else if (a == "--prefill-head-alias")
+                o.prefill_head_alias = true;
             else if (a == "--suffix-draft")
                 o.suffix_draft = std::max(0, std::atoi(next("--suffix-draft")));
             else if (a == "--mtp-max-t")
@@ -3272,6 +3277,29 @@ int main(int argc, char** argv) try {
         std::fprintf(stderr, "strata generate: the logits buffer failed\n");
         return 1;
     }
+    bool prefill_head_alias_bound = false;
+    const void* prefill_head_alias_at = nullptr;   // where the head came back the first time
+    if (o.prefill_head_alias) {
+        const char* why = !o.serve ? "it needs --serve"
+                        : multi_gpu || !stages.empty() ? "it supports one GPU only"
+                        : o.short_read > 0 ? "it needs --short-read 0"
+                        : o.expert_cache != 1 && o.expert_cache >= 0 ? "it needs --expert-cache 1 or auto"
+                        : o.mtp.empty() ? "it needs --mtp"
+                        : !native_head.loaded() ? "it needs the native output head"
+                        : nullptr;
+        if (why != nullptr) {
+            std::fprintf(stderr, "strata generate: --prefill-head-alias is unavailable: %s\n", why);
+            return 2;
+        }
+        if (!mtp.bind(wt, &native_head, nullptr, err)) {
+            std::fprintf(stderr, "strata generate: --prefill-head-alias: %s\n", err.c_str());
+            return 1;
+        }
+        native_head.unload();
+        prefill_head_alias_bound = true;
+        std::fprintf(stderr, "strata generate: --prefill-head-alias: the %llu-byte output head is prompt workspace\n",
+                     (unsigned long long)native_head.weight_bytes());
+    }
     const bool auto_cache = o.expert_cache < 0;
     if (o.expert_cache < 0) {
         size_t free_b = 0, total_b = 0;
@@ -3281,6 +3309,9 @@ int main(int argc, char** argv) try {
         runtimes. You may need to adjust the code.
         */
         dpct::get_current_device().get_memory_info(free_b, total_b);
+        if (free_b == 0 && o.prefill_head_alias) {
+            dpct::get_current_device().get_memory_info(free_b, total_b);
+        }
         // Plan v0.3 P5: the batched prompt path's chunk buffers are allocated later, so they are reserved here -
         // under WDDM an over-subscribed allocation does not fail, it pages to system memory and crawls.
         // (with borrowing - the default with a profile - the prompt path lends cache slots instead; `pf_borrow` is
@@ -4830,6 +4861,27 @@ int main(int argc, char** argv) try {
         } else if (o.prefill_auto && d_res == nullptr) {
             o.prefill_chunk = 1024;  // #85: no expert cache at all (a full 8 GB card): small buffers of its own
         }
+        if (o.prefill_head_alias) {
+            for (PfPart& p : pf_parts) {
+                p.first = p.cache->slots() > 1 ? 1 : -1;
+                p.first_now = p.first;
+            }
+            lend_first = pf_parts[0].first;
+            borrow = lend_first >= 0 ? xcache.device_slot(lend_first) : nullptr;
+            borrow_bytes = lend_first >= 0 ? part_bytes(pf_parts[0], lend_first) : 0;
+            size_t free_b = 0, total_b = 0;
+            dpct::get_current_device().get_memory_info(free_b, total_b);
+            static constexpr int64_t candidates[] = {2048, 1536, 1024, 512};
+            for (const int64_t candidate : candidates)
+                if (strata::prefill::Prefill::bytes_needed(g, ss, candidate) + (512ull << 20) <=
+                    free_b + borrow_bytes) {
+                    o.prefill_chunk = candidate;
+                    break;
+                }
+            std::fprintf(stderr, "strata serve: prompt chunk head alias: %lld tokens with %lld MiB borrowed and "
+                                 "%lld MiB free\n",
+                         (long long)o.prefill_chunk, (long long)(borrow_bytes >> 20), (long long)(free_b >> 20));
+        }
         bool any_loan = borrow != nullptr;
         for (size_t i = 1; i < pf_parts.size(); ++i)
             any_loan = any_loan || pf_parts[i].first >= 0;
@@ -4840,10 +4892,10 @@ int main(int argc, char** argv) try {
             for (size_t i = 1; i < pf_parts.size(); ++i)  // one loan per stage, from that stage's own cache
                 if (pf_parts[i].first >= 0)
                     std::fprintf(stderr,
-                                 "strata serve:   CUDA%d prompt path borrows %lld of its %lld slots (%.2f GiB)\n",
-                                 pf_parts[i].dev, (long long)(pf_parts[i].cache->slots() - pf_parts[i].first),
-                                 (long long)pf_parts[i].cache->slots(),
-                                 (double)part_bytes(pf_parts[i], pf_parts[i].first) / 1073741824.0);
+                                  "strata serve:   CUDA%d prompt path borrows %lld of its %lld slots (%.2f GiB)\n",
+                                  pf_parts[i].dev, (long long)(pf_parts[i].cache->slots() - pf_parts[i].first),
+                                  (long long)pf_parts[i].cache->slots(),
+                                  (double)part_bytes(pf_parts[i], pf_parts[i].first) / 1073741824.0);
         } else {
             std::fprintf(stderr,
                          "strata serve: the prompt path allocates its own buffers (too few cache slots to borrow)\n");
@@ -4875,7 +4927,7 @@ int main(int argc, char** argv) try {
             }
             if (multi_gpu) sp.set_stage(0, split_at[0], &stages[0]->sp);
             if (!sp.init(wt, g, ss, srcp, &xcache, host_res.data(), o.prefill_chunk, main_cs, err, borrow,
-                         borrow_bytes))
+                         borrow_bytes, o.prefill_head_alias))
                 return err.find("do not fit") != std::string::npos ? 2 : 1;
             return 0;
         };
@@ -5132,11 +5184,12 @@ int main(int argc, char** argv) try {
                           std::to_string(split_same ? 0 : stages[(size_t)st - 1]->dev) + ")";
             std::fprintf(stderr, "strata serve: layer split: layers %s, one hand-off per window\n", plan_s.c_str());
         }
-        if (!ver.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, o.spec, err) ||
-            !mtp.bind(last_st ? last_st->wt : wt, last_st ? &last_st->head : &native_head, ver.final_R_all(), err)) {
+        if (!ver.init(wt, g, ss, vh, native_head.loaded() || prefill_head_alias_bound ? &native_head : nullptr, o.spec, err) ||
+            (!prefill_head_alias_bound && !mtp.bind(last_st ? last_st->wt : wt, last_st ? &last_st->head : &native_head, ver.final_R_all(), err))) {
             std::fprintf(stderr, "strata serve: %s\n", err.c_str());
             return 1;
         }
+        if (prefill_head_alias_bound) mtp.set_window_R(ver.final_R_all());
         for (int st = 0; st < n_stages && n_stages > 1; ++st) {
             split_drive.plan[st] = stage_ver(st).plan_sink();
             if (st > 0) {
@@ -6008,6 +6061,17 @@ int main(int argc, char** argv) try {
                 std::printf("ERR %s\n", err.c_str());
                 return 1;
             }
+            if (o.prefill_head_alias && native_head.loaded()) {
+                const auto head_t0 = Clock::now();
+                native_head.unload();
+                sp.reset();
+                if (init_prompt_paths() != 0) {
+                    std::printf("ERR rebuilding the head-alias prompt path failed: %s\n", err.c_str());
+                    return 1;
+                }
+                std::fprintf(stderr, "strata serve: --prefill-head-alias: prompt workspace rebuilt in %.1f ms\n",
+                             std::chrono::duration<double, std::milli>(Clock::now() - head_t0).count());
+            }
             // #879: this request met a window whose head logits were not all finite (nonfinite_hit): it ends with
             // DONE ... nonfinite, emitting none of that window's tokens
             bool nf_hit = false;
@@ -6327,8 +6391,9 @@ int main(int argc, char** argv) try {
                 // prompt needs, so a large chunk costs a short prompt nothing
                 const int64_t want_full = request_chunk(tokens, o.prefill_chunk);
                 // #340: a short enough request reads in the stages' own S-token chunks (nothing lent)
-                const int64_t want =
-                    split_small > 0 && tokens <= split_small_max ? std::min(want_full, split_small) : want_full;
+                const int64_t want = o.prefill_head_alias ? o.prefill_chunk
+                                   : split_small > 0 && tokens <= split_small_max ? std::min(want_full, split_small)
+                                                                                  : want_full;
                 if (want <= 0) {
                     e = "prefill: cannot lend buffers for an empty request segment";
                     return false;
@@ -6343,30 +6408,34 @@ int main(int argc, char** argv) try {
                         // resident again would hand the next window a prompt buffer in place of an expert
                         if (!refill_one(p, e)) return false;
                     }
-                    // #2090: the loan a chunk needs is NOT monotonic in the chunk: a chunk above the scan's small_max
-                    // lays out the byte-budget ring (199 slots at 5120), one at or below it 0.1.39's (384 at 4096), so
-                    // a request's smaller chunk can need MORE slots than the auto chunk's region (p.first) holds.  The
-                    // loan starts where the chunk itself needs it (the 128-slot floor aside); a chunk that cannot be
-                    // lent even then is halved until it can, instead of ending the engine.
                     int64_t want_p = want;
-                    int64_t need_p = part_slots(p, want_p);
-                    while ((need_p <= 0 || need_p + 128 > p.cache->slots()) && want_p > 256) {
-                        want_p = std::max<int64_t>(256, want_p / 2 / 256 * 256);
-                        need_p = part_slots(p, want_p);
+                    int32_t first = p.first_now;
+                    // --prefill-head-alias: the loan laid out at start (slot 1 on) is kept; a hybrid layout cannot relayout
+                    if (!o.prefill_head_alias) {
+                        // #2090: the loan a chunk needs is NOT monotonic in the chunk: a chunk above the scan's small_max
+                        // lays out the byte-budget ring (199 slots at 5120), one at or below it 0.1.39's (384 at 4096), so
+                        // a request's smaller chunk can need MORE slots than the auto chunk's region (p.first) holds.  The
+                        // loan starts where the chunk itself needs it (the 128-slot floor aside); a chunk that cannot be
+                        // lent even then is halved until it can, instead of ending the engine.
+                        int64_t need_p = part_slots(p, want_p);
+                        while ((need_p <= 0 || need_p + 128 > p.cache->slots()) && want_p > 256) {
+                            want_p = std::max<int64_t>(256, want_p / 2 / 256 * 256);
+                            need_p = part_slots(p, want_p);
+                        }
+                        if (need_p <= 0 || need_p + 128 > p.cache->slots()) {
+                            e = "prefill: no chunk of this request fits the slots that can be lent (#2090)";
+                            return false;
+                        }
+                        if (want_p != want)
+                            std::fprintf(stderr, "strata serve: prompt chunk %lld -> %lld tokens for this request: its "
+                                         "buffers do not fit the slots that can be lent (#2090)\n", (long long) want,
+                                         (long long) want_p);
+                        if (need_p > p.cache->slots() - p.first)   // the case that ended the engine before (#2090)
+                            std::fprintf(stderr, "strata serve: the loan for a chunk of %lld tokens (%lld slots) is larger than the "
+                                         "auto chunk's (%lld slots): starting it earlier (#2090)\n", (long long) want_p,
+                                         (long long) need_p, (long long) (p.cache->slots() - p.first));
+                        first = (int32_t) (p.cache->slots() - need_p);
                     }
-                    if (need_p <= 0 || need_p + 128 > p.cache->slots()) {
-                        e = "prefill: no chunk of this request fits the slots that can be lent (#2090)";
-                        return false;
-                    }
-                    if (want_p != want)
-                        std::fprintf(stderr, "strata serve: prompt chunk %lld -> %lld tokens for this request: its "
-                                     "buffers do not fit the slots that can be lent (#2090)\n", (long long) want,
-                                     (long long) want_p);
-                    if (need_p > p.cache->slots() - p.first)   // the case that ended the engine before (#2090)
-                        std::fprintf(stderr, "strata serve: the loan for a chunk of %lld tokens (%lld slots) is larger than the "
-                                     "auto chunk's (%lld slots): starting it earlier (#2090)\n", (long long) want_p,
-                                     (long long) need_p, (long long) (p.cache->slots() - p.first));
-                    const int32_t first = (int32_t) (p.cache->slots() - need_p);
                     if (want_p != p.sp->chunk() || first != p.first_now) {
                         if (!p.sp->relayout(want_p, p.cache->device_slot(first), part_bytes(p, first), e)) return false;
                         p.first_now = first;
@@ -6497,6 +6566,23 @@ int main(int argc, char** argv) try {
             if (!refill(err)) {
                 std::printf("ERR refilling a lent slot failed: %s\n", err.c_str());
                 return 1;
+            }
+            if (o.prefill_head_alias) {
+                sp.reset();
+                const auto head_t0 = Clock::now();
+                if (!native_head.load(o.native_head_shards, g.n_embd, n_vocab, err)) {
+                    std::printf("ERR restoring the native output head failed: %s\n", err.c_str());
+                    return 1;
+                }
+                // the verify windows' captured graphs read the head at the address of their capture
+                if (prefill_head_alias_at == nullptr) prefill_head_alias_at = native_head.weights();
+                if (native_head.weights() != prefill_head_alias_at) {
+                    std::printf("ERR --prefill-head-alias: the output head was reloaded at another address, so the "
+                                "captured verify graphs would read freed memory\n");
+                    return 1;
+                }
+                std::fprintf(stderr, "strata serve: --prefill-head-alias: output head restored in %.1f ms before decode\n",
+                             std::chrono::duration<double, std::milli>(Clock::now() - head_t0).count());
             }
             tr("prompt done (slots refilled)");
             const double prompt_ms = std::chrono::duration<double, std::milli>(Clock::now() - r0).count();
