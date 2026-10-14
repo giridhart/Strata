@@ -1,6 +1,9 @@
 #include <sycl/sycl.hpp>
 #include "strata/kernels/verify_kernels.hpp"
 #include "strata/kernels/fused_gdn.hpp"
+#include "strata/kernels/native_qsa_indexer.hpp"
+#include "strata/kernels/qsa.hpp"
+#include "strata/kernels/rope_scaling.hpp"
 
 #include <cmath>
 #include <cstdio>
@@ -324,6 +327,189 @@ int main() {
         sycl::free(d_beta_s, q);
         sycl::free(d_gate_m, q);
         sycl::free(d_beta_m, q);
+    }
+
+    // 8. gdn_commit_layers parity test
+    {
+        constexpr int S_dim = 128, h_k = 1, h_v = 4, L = 5, MT = strata::kernels::kVerifyMaxT;
+        constexpr int qk = S_dim * h_k, C = 2 * qk + S_dim * h_v;
+        constexpr int64_t conv_off = (int64_t)S_dim * h_v * S_dim, stride = conv_off + (int64_t)C * 3;
+        std::vector<float> st0((size_t)(stride * L)), hb((size_t)L * MT * C), qkv((size_t)L * MT * C),
+            gt((size_t)L * MT * h_v), bt((size_t)L * MT * h_v), zdummy((size_t)MT * S_dim * h_v), gm(S_dim, 1.0f);
+        for (auto& x : st0) x = dist(rng) * 0.1f;
+        for (auto& x : hb) x = dist(rng) * 0.1f;
+        for (auto& x : qkv) x = dist(rng);
+        for (auto& x : gt) x = -(0.5f + (float)(rng() % 100) / 50.0f);
+        for (auto& x : bt) x = (float)(rng() % 100) / 100.0f;
+        float *d_a = sycl::malloc_device<float>(st0.size(), q);
+        float *d_b = sycl::malloc_device<float>(st0.size(), q);
+        float *d_h = sycl::malloc_device<float>(hb.size(), q);
+        float *d_qkv = sycl::malloc_device<float>(qkv.size(), q);
+        float *d_g = sycl::malloc_device<float>(gt.size(), q);
+        float *d_bt = sycl::malloc_device<float>(bt.size(), q);
+        float *d_z = sycl::malloc_device<float>(zdummy.size(), q);
+        float *d_y = sycl::malloc_device<float>(zdummy.size(), q);
+        float *d_gm = sycl::malloc_device<float>(gm.size(), q);
+        int32_t *d_nk = sycl::malloc_device<int32_t>(1, q);
+
+        q.memcpy(d_h, hb.data(), hb.size() * sizeof(float));
+        q.memcpy(d_qkv, qkv.data(), qkv.size() * sizeof(float));
+        q.memcpy(d_g, gt.data(), gt.size() * sizeof(float));
+        q.memcpy(d_bt, bt.data(), bt.size() * sizeof(float));
+        q.memcpy(d_gm, gm.data(), gm.size() * sizeof(float));
+        q.memset(d_z, 0, zdummy.size() * sizeof(float)).wait();
+
+        int lb_bad = 0;
+        for (int nk = 1; nk <= MT; ++nk) {
+            q.memcpy(d_nk, &nk, sizeof(int32_t));
+            q.memcpy(d_a, st0.data(), st0.size() * sizeof(float));
+            q.memcpy(d_b, st0.data(), st0.size() * sizeof(float)).wait();
+
+            for (int l = 0; l < L; ++l) {
+                float* stl = d_a + (size_t)l * stride;
+                strata::kernels::gdn_conv_commit(stl + conv_off, d_qkv + (size_t)l * MT * C, C, d_nk, &q);
+                strata::kernels::gdn_step_norm_multi(stl, d_h + (size_t)l * MT * C, C, d_g + (size_t)l * MT * h_v,
+                                                     d_bt + (size_t)l * MT * h_v, d_z, d_gm, 1e-6f, d_y, h_k, h_v, MT,
+                                                     d_nk, &q, MT);
+            }
+            bool launched = strata::kernels::gdn_commit_layers(d_b, stride, conv_off, d_qkv, (int64_t)MT * C, d_h,
+                                                               (int64_t)MT * C, d_g, d_bt, (int64_t)MT * h_v, C, h_k,
+                                                               h_v, MT, L, d_nk, &q);
+            if (!launched) {
+                std::printf("gdn_commit_layers failed to launch\n");
+                lb_bad++;
+                break;
+            }
+            q.wait();
+
+            std::vector<float> a(st0.size()), b(st0.size());
+            q.memcpy(a.data(), d_a, a.size() * sizeof(float));
+            q.memcpy(b.data(), d_b, b.size() * sizeof(float)).wait();
+
+            if (std::memcmp(a.data(), b.data(), a.size() * sizeof(float)) != 0 ||
+                std::memcmp(a.data(), st0.data(), a.size() * sizeof(float)) == 0) {
+                std::printf("    *** gdn_commit_layers n_keep=%d differs from per-layer commit ***\n", nk);
+                lb_bad++;
+            }
+        }
+        std::printf("gdn_commit_layers parity: %s (%d layers, MT=%d)\n", lb_bad == 0 ? "PASS" : "FAIL", L, MT);
+        total_failures += lb_bad;
+
+        sycl::free(d_a, q); sycl::free(d_b, q); sycl::free(d_h, q); sycl::free(d_qkv, q);
+        sycl::free(d_g, q); sycl::free(d_bt, q); sycl::free(d_z, q); sycl::free(d_y, q);
+        sycl::free(d_gm, q); sycl::free(d_nk, q);
+    }
+
+    // 9. native_qsa_indexer_append_steps_layers test
+    {
+        constexpr int NL = 3;
+        constexpr int IDXD = 128, R = 4, ROT = 64;
+        constexpr int64_t NB = 8;
+        constexpr int32_t BASE = 100;
+        constexpr int64_t MC = 1024;
+        constexpr size_t prows = (size_t)(MC / R + 1) * IDXD;
+        constexpr size_t trows = (size_t)(R - 1) * IDXD;
+        constexpr float EPS = 1e-6f;
+
+        strata::kernels::QsaShapes shapes{};
+        shapes.idx_dim = IDXD;
+        shapes.idx_block = R;
+        shapes.n_rot = ROT;
+        strata::kernels::RopeScaling scaling{};
+
+        std::vector<float> dw_kn(IDXD);
+        for (auto& x : dw_kn) x = 1.0f + 0.1f * dist(rng);
+        float* d_gamma = sycl::malloc_device<float>(IDXD, q);
+        q.memcpy(d_gamma, dw_kn.data(), IDXD * sizeof(float)).wait();
+
+        std::vector<float> rawL((size_t)NL * NB * IDXD);
+        for (auto& x : rawL) x = dist(rng);
+        float* d_rawL = sycl::malloc_device<float>(rawL.size(), q);
+        q.memcpy(d_rawL, rawL.data(), rawL.size() * sizeof(float)).wait();
+
+        std::vector<int32_t> hp((size_t)NB);
+        for (int64_t t = 0; t < NB; ++t) hp[(size_t)t] = (int32_t)(2 + t);
+        int32_t* d_posL = sycl::malloc_device<int32_t>(NB, q);
+        q.memcpy(d_posL, hp.data(), NB * sizeof(int32_t)).wait();
+
+        float *pr[NL], *dr[NL], *tr[NL], *pl[NL], *dl[NL], *tl[NL], *tsrc[NL];
+        int32_t *br[NL], *bl[NL];
+        for (int i = 0; i < NL; ++i) {
+            pr[i] = sycl::malloc_device<float>(prows, q);
+            dr[i] = sycl::malloc_device<float>(IDXD, q);
+            tr[i] = sycl::malloc_device<float>(trows, q);
+            pl[i] = sycl::malloc_device<float>(prows, q);
+            dl[i] = sycl::malloc_device<float>(IDXD, q);
+            tl[i] = sycl::malloc_device<float>(trows, q);
+            tsrc[i] = sycl::malloc_device<float>(trows, q);
+            br[i] = sycl::malloc_device<int32_t>(1, q);
+            bl[i] = sycl::malloc_device<int32_t>(1, q);
+
+            std::vector<float> ts(trows);
+            for (auto& x : ts) x = dist(rng);
+            q.memcpy(tsrc[i], ts.data(), trows * sizeof(float));
+
+            q.memset(pr[i], 0, prows * sizeof(float));
+            q.memset(dr[i], 0, IDXD * sizeof(float));
+            q.memset(tr[i], 0, trows * sizeof(float));
+            q.memset(pl[i], 0, prows * sizeof(float));
+            q.memset(dl[i], 0, IDXD * sizeof(float));
+            q.memset(tl[i], 0, trows * sizeof(float));
+            q.memset(br[i], 0, sizeof(int32_t));
+            q.memset(bl[i], 0, sizeof(int32_t));
+        }
+        q.wait();
+
+        strata::kernels::QsaIndexerLayers il;
+        for (int i = 0; i < NL; ++i) {
+            q.memcpy(tr[i], tsrc[i], trows * sizeof(float));
+            strata::kernels::QsaIndexerBuffers b{tr[i], dr[i], pr[i], br[i]};
+            strata::kernels::native_qsa_indexer_append_steps(d_rawL + (size_t)i * NB * IDXD, d_posL, 1, (int)NB, BASE,
+                                                             d_gamma, EPS, b, shapes, MC, scaling, &q);
+            il.gamma[i] = d_gamma;
+            il.tail_src[i] = tsrc[i];
+            il.tail[i] = tl[i];
+            il.dead[i] = dl[i];
+            il.pooled[i] = pl[i];
+            il.block_pos[i] = bl[i];
+        }
+        strata::kernels::native_qsa_indexer_append_steps_layers(d_rawL, (int64_t)NB * IDXD, d_posL, 1, (int)NB, BASE,
+                                                                EPS, il, NL, shapes, MC, scaling, &q);
+        q.wait();
+
+        int errs = 0;
+        for (int i = 0; i < NL; ++i) {
+            std::vector<float> h_pr(prows), h_pl(prows);
+            std::vector<float> h_dr(IDXD), h_dl(IDXD);
+            std::vector<float> h_tr(trows), h_tl(trows);
+            int32_t h_br = 0, h_bl = 0;
+            q.memcpy(h_pr.data(), pr[i], prows * sizeof(float));
+            q.memcpy(h_pl.data(), pl[i], prows * sizeof(float));
+            q.memcpy(h_dr.data(), dr[i], IDXD * sizeof(float));
+            q.memcpy(h_dl.data(), dl[i], IDXD * sizeof(float));
+            q.memcpy(h_tr.data(), tr[i], trows * sizeof(float));
+            q.memcpy(h_tl.data(), tl[i], trows * sizeof(float));
+            q.memcpy(&h_br, br[i], sizeof(int32_t));
+            q.memcpy(&h_bl, bl[i], sizeof(int32_t)).wait();
+
+            if (std::memcmp(h_pr.data(), h_pl.data(), prows * sizeof(float)) != 0 ||
+                std::memcmp(h_dr.data(), h_dl.data(), IDXD * sizeof(float)) != 0 ||
+                std::memcmp(h_tr.data(), h_tl.data(), trows * sizeof(float)) != 0 ||
+                h_br != h_bl) {
+                errs++;
+            }
+        }
+        std::printf("native_qsa_indexer_append_steps_layers parity: %s (mismatches: %d)\n", errs == 0 ? "PASS" : "FAIL", errs);
+        total_failures += errs;
+
+        for (int i = 0; i < NL; ++i) {
+            sycl::free(pr[i], q); sycl::free(dr[i], q); sycl::free(tr[i], q);
+            sycl::free(pl[i], q); sycl::free(dl[i], q); sycl::free(tl[i], q);
+            sycl::free(tsrc[i], q); sycl::free(br[i], q); sycl::free(bl[i], q);
+        }
+        sycl::free(d_gamma, q);
+        sycl::free(d_rawL, q);
+        sycl::free(d_posL, q);
     }
 
     std::printf("\nverify_kernels_test: %s (total failures: %d)\n", total_failures == 0 ? "PASSED" : "FAILED",

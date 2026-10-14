@@ -312,6 +312,85 @@ void native_qsa_indexer_append_steps(const float* raw, const int32_t* relative_p
     }
 }
 
+void native_qsa_indexer_append_steps_layers(const float* raw0, int64_t raw_stride, const int32_t* relative_pos_device,
+                                            int pos_stride, int n_steps, int32_t pos_base, float epsilon,
+                                            const QsaIndexerLayers& layers, int n_layers, const QsaShapes& s,
+                                            int64_t max_cells, const RopeScaling& scaling, void* stream) {
+    if (n_steps <= 0 || n_layers <= 0) return;
+    if (!stream || n_layers > QsaIndexerLayers::kMax || s.idx_dim != D || s.idx_block != R || s.n_rot != ROT ||
+        max_cells < 1 || max_cells > INT32_MAX || pos_base < 0 || pos_base % R ||
+        int64_t(pos_base) + max_cells > INT32_MAX || !std::isfinite(epsilon) || epsilon <= 0.0f ||
+        rope_scaling_invalid(scaling) != nullptr)
+        throw std::invalid_argument("native QSA indexer (layers): bad geometry, layer count or parameters");
+    for (int i = 0; i < n_layers; ++i) {
+        const std::size_t pos_span =
+            (n_steps == 1 || pos_stride <= 0) ? 4 : (std::size_t(n_steps - 1) * pos_stride + 1) * 4;
+        const Span spans[] = {{raw0 + (std::size_t)i * (std::size_t)raw_stride, std::size_t(n_steps) * D * 4},
+                              {relative_pos_device, pos_span},
+                              {layers.gamma[i], D * 4},
+                              {layers.tail[i], (R - 1) * D * 4},
+                              {layers.dead[i], D * 4},
+                              {layers.pooled[i], std::size_t(max_cells / R + 1) * D * 4},
+                              {layers.block_pos[i], 4}};
+        for (const auto& span : spans) validate(span);
+        for (int a = 0; a < 7; ++a)
+            for (int b = a + 1; b < 7; ++b)
+                if (overlaps(spans[a], spans[b])) throw std::invalid_argument("native QSA indexer buffers overlap");
+    }
+    const float theta_scale = powf((float)scaling.freq_base, -2.0f / ROT);
+    const RopeKernelArgs k = scaling.kernel_args(ROT);
+    const RopeTab rt = rope_table_for(scaling);
+    sycl::queue* q = static_cast<sycl::queue*>(stream);
+    const int32_t* mtab = mrope_table();
+    if (rt.cos != nullptr) {
+        q->submit([&](sycl::handler& cgh) {
+            sycl::local_accessor<float, 1> values_acc(sycl::range<1>(D), cgh);
+            sycl::local_accessor<float, 1> partials_acc(sycl::range<1>(32), cgh);
+
+            cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t)n_layers * THREADS), sycl::range<1>(THREADS)),
+                             [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(32)]] {
+                                 const int i = item.get_group(0);
+                                 float* tail = layers.tail[i];
+                                 if (layers.tail_src[i] != nullptr) {
+                                     for (int j = item.get_local_id(0); j < (R - 1) * D; j += item.get_local_range(0)) {
+                                         tail[j] = layers.tail_src[i][j];
+                                     }
+                                     item.barrier(sycl::access::fence_space::local_space);
+                                 }
+                                 append<true>(raw0 + (size_t)i * raw_stride, relative_pos_device, pos_stride, n_steps,
+                                              pos_base, layers.gamma[i], epsilon, tail, layers.dead[i],
+                                              layers.pooled[i], layers.block_pos[i], int(max_cells), theta_scale,
+                                              k.freq_scale, k.corr_low, k.corr_high, k.ext_factor, k.attn_factor, mtab,
+                                              rt, values_acc.get_multi_ptr<sycl::access::decorated::no>().get(),
+                                              partials_acc.get_multi_ptr<sycl::access::decorated::no>().get(), item);
+                             });
+        });
+    } else {
+        q->submit([&](sycl::handler& cgh) {
+            sycl::local_accessor<float, 1> values_acc(sycl::range<1>(D), cgh);
+            sycl::local_accessor<float, 1> partials_acc(sycl::range<1>(32), cgh);
+
+            cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t)n_layers * THREADS), sycl::range<1>(THREADS)),
+                             [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(32)]] {
+                                 const int i = item.get_group(0);
+                                 float* tail = layers.tail[i];
+                                 if (layers.tail_src[i] != nullptr) {
+                                     for (int j = item.get_local_id(0); j < (R - 1) * D; j += item.get_local_range(0)) {
+                                         tail[j] = layers.tail_src[i][j];
+                                     }
+                                     item.barrier(sycl::access::fence_space::local_space);
+                                 }
+                                 append<false>(raw0 + (size_t)i * raw_stride, relative_pos_device, pos_stride, n_steps,
+                                               pos_base, layers.gamma[i], epsilon, tail, layers.dead[i],
+                                               layers.pooled[i], layers.block_pos[i], int(max_cells), theta_scale,
+                                               k.freq_scale, k.corr_low, k.corr_high, k.ext_factor, k.attn_factor, mtab,
+                                               rt, values_acc.get_multi_ptr<sycl::access::decorated::no>().get(),
+                                               partials_acc.get_multi_ptr<sycl::access::decorated::no>().get(), item);
+                             });
+        });
+    }
+}
+
 void native_qsa_indexer_append(const float* raw, const int32_t* relative_pos_device, int32_t pos_base,
                                const float* gamma, float epsilon, const QsaIndexerBuffers& b, const QsaShapes& s,
                                int64_t max_cells, const RopeScaling& scaling, void* stream) {

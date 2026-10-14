@@ -72,6 +72,27 @@ void gdn_conv_commit_kernel(float* __restrict__ hist, const float* __restrict__ 
     hist[c * 3 + 2] = seq[2];
 }
 
+void gdn_conv_commit_layers_kernel(float* __restrict__ hist0, int64_t hist_stride, const float* __restrict__ qkv0,
+                                   int64_t qkv_stride, int C, const int32_t* __restrict__ n_keep,
+                                   sycl::nd_item<2> item) {
+    const size_t layer = item.get_group(0);
+    const int c = item.get_group(1) * item.get_local_range(1) + item.get_local_id(1);
+    if (c >= C) return;
+    const int n = *n_keep;
+    if (n <= 0) return;
+    float* hist = hist0 + (size_t)layer * hist_stride;
+    const float* qkv = qkv0 + (size_t)layer * qkv_stride;
+    float seq[3];
+#pragma unroll
+    for (int j = 0; j < 3; ++j) {
+        const int src = n + j;  // the last three of [hist(3) | x_0..x_{n-1}]
+        seq[j] = src < 3 ? hist[c * 3 + src] : qkv[(size_t)(src - 3) * C + c];
+    }
+    hist[c * 3] = seq[0];
+    hist[c * 3 + 1] = seq[1];
+    hist[c * 3 + 2] = seq[2];
+}
+
 void gdn_ab_multi_kernel(const float* __restrict__ x, const uint16_t* __restrict__ wa, const uint16_t* __restrict__ wb,
                          const float* __restrict__ dt, const float* __restrict__ ssm_a, float* __restrict__ gate,
                          float* __restrict__ beta, int n, int h_v, int T, sycl::nd_item<1> item) {
@@ -120,6 +141,42 @@ void gdn_ab_multi_kernel(const float* __restrict__ x, const uint16_t* __restrict
             gate[(size_t)t * h_v + r] = sp * ssm_a[r];
         }
     }
+}
+
+inline void gdn_step_commit_body(float* __restrict__ state, const float* __restrict__ hbuf, int C,
+                                 const float* __restrict__ gate, const float* __restrict__ beta,
+                                 int h_k, int h_v, int n,
+                                 sycl::local_accessor<float, 1> sk,
+                                 sycl::local_accessor<float, 2> red,
+                                 int head, int col_block, int rg, int col_local,
+                                 sycl::nd_item<3> item) {
+    const int col = col_block * 32 + col_local;
+    const int tid = rg * 32 + col_local;
+    const int qh = head % h_k;
+    const int qk = S * h_k;
+    float s[RPG];
+    float* base = state + ((size_t)(rg * RPG) * h_v + head) * S + col;
+    const size_t row_stride = (size_t)h_v * S;
+#pragma unroll
+    for (int r = 0; r < RPG; ++r) s[r] = base[r * row_stride];
+    for (int t = 0; t < n; ++t) {
+        const float* ht = hbuf + (size_t)t * C;
+        item.barrier(sycl::access::fence_space::local_space);
+        sk[tid] = ht[qk + qh * S + tid];
+        item.barrier(sycl::access::fence_space::local_space);
+        const float g = sycl::native::exp(gate[(size_t)t * h_v + head]);
+        float kv = 0.0f;
+#pragma unroll
+        for (int r = 0; r < RPG; ++r) kv = sycl::fma(s[r], sk[rg * RPG + r], kv);
+        red[rg][col_local] = kv;
+        item.barrier(sycl::access::fence_space::local_space);
+        const float kv_col = red[0][col_local] + red[1][col_local] + red[2][col_local] + red[3][col_local];
+        const float delta = (ht[2 * qk + head * S + col] - g * kv_col) * beta[(size_t)t * h_v + head];
+#pragma unroll
+        for (int r = 0; r < RPG; ++r) s[r] = sycl::fma(g, s[r], sk[rg * RPG + r] * delta);
+    }
+#pragma unroll
+    for (int r = 0; r < RPG; ++r) base[r * row_stride] = s[r];
 }
 
 void gdn_step_norm_multi_kernel(float* __restrict__ state, const float* __restrict__ hbuf, int C,
@@ -595,6 +652,48 @@ void gdn_conv_commit(float* history, const float* qkv, int channels, const int32
                     [=](sycl::nd_item<1> item) { gdn_conv_commit_kernel(history, qkv, channels, n_keep, item); });
 }
 
+bool gdn_commit_layers(float* state, int64_t state_stride, int64_t conv_off, const float* qkv, int64_t qkv_stride,
+                       const float* h, int64_t h_stride, const float* gate, const float* beta, int64_t gb_stride,
+                       int conv_channels, int h_k, int h_v, int n_max, int n_layers, const int32_t* n_keep, void* stream) {
+    static const bool per_layer = [] {
+        const char* sp = std::getenv("STRATA_GDN_SPLIT");
+        const char* cs = std::getenv("STRATA_GDN_COMMIT_SPLIT");
+        const char* dbg = std::getenv("STRATA_DBG_GDN");
+        return (sp && sp[0] == '1') || (cs && cs[0] == '0') || (dbg && dbg[0] == '1');
+    }();
+    if (per_layer || n_layers <= 0 || n_layers > 65535 || n_max < 1 || n_max > kVerifyMaxT || n_keep == nullptr ||
+        h_v <= 0 || h_k <= 0 || h_v % h_k != 0)
+        return false;
+    sycl::queue* q = stream ? static_cast<sycl::queue*>(stream) : &default_queue();
+    const size_t conv_blocks = ((size_t)conv_channels + 255) / 256;
+    q->parallel_for(sycl::nd_range<2>(sycl::range<2>((size_t)n_layers, conv_blocks * 256), sycl::range<2>(1, 256)),
+                    [=](sycl::nd_item<2> item) {
+                        gdn_conv_commit_layers_kernel(state + conv_off, state_stride, qkv, qkv_stride, conv_channels,
+                                                      n_keep, item);
+                    });
+    q->submit([&](sycl::handler& cgh) {
+        sycl::local_accessor<float, 1> sk(sycl::range<1>(S), cgh);
+        sycl::local_accessor<float, 2> red(sycl::range<2>(RG, 32), cgh);
+
+        cgh.parallel_for(sycl::nd_range<3>(sycl::range<3>((size_t)n_layers, 4 * RG, (size_t)h_v * 32),
+                                           sycl::range<3>(1, RG, 32)),
+                         [=](sycl::nd_item<3> item) [[sycl::reqd_sub_group_size(32)]] {
+                             const int n = *n_keep;
+                             if (n <= 0) return;
+                             const size_t z = item.get_group(0);
+                             const int col_block = item.get_group(1);
+                             const int head = item.get_group(2);
+                             const int rg = item.get_local_id(1);
+                             const int col_local = item.get_local_id(2);
+                             gdn_step_commit_body(state + z * state_stride, h + z * h_stride,
+                                                  conv_channels, gate + z * gb_stride,
+                                                  beta + z * gb_stride, h_k, h_v, n, sk, red, head, col_block,
+                                                  rg, col_local, item);
+                         });
+    });
+    return true;
+}
+
 void gdn_ab_multi(const float* x, const uint16_t* w_alpha, const uint16_t* w_beta, const float* dt, const float* ssm_a,
                   float* gate, float* beta, int n_embd, int h_v, int n_tok, void* stream) {
     if (n_embd % 8 != 0 || n_tok < 1 || n_tok > kVerifyMaxT) {
@@ -619,6 +718,30 @@ void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const 
         std::exit(1);
     }
     sycl::queue* q = stream ? static_cast<sycl::queue*>(stream) : &default_queue();
+    static const bool commit_split = [] {
+        const char* e = std::getenv("STRATA_GDN_COMMIT_SPLIT");
+        return !e || e[0] != '0';
+    }();
+    if (commit_split && n_keep != nullptr && t_out_begin >= n_tok) {
+        q->submit([&](sycl::handler& cgh) {
+            sycl::local_accessor<float, 1> sk(sycl::range<1>(S), cgh);
+            sycl::local_accessor<float, 2> red(sycl::range<2>(RG, 32), cgh);
+
+            cgh.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 4 * RG, (size_t)h_v * 32),
+                                               sycl::range<3>(1, RG, 32)),
+                             [=](sycl::nd_item<3> item) [[sycl::reqd_sub_group_size(32)]] {
+                                 const int n = *n_keep;
+                                 if (n <= 0) return;
+                                 const int col_block = item.get_group(1);
+                                 const int head = item.get_group(2);
+                                 const int rg = item.get_local_id(1);
+                                 const int col_local = item.get_local_id(2);
+                                 gdn_step_commit_body(state, h, conv_channels, gate, beta, h_k, h_v, n, sk, red, head,
+                                                      col_block, rg, col_local, item);
+                             });
+        });
+        return;
+    }
     q->submit([&](sycl::handler& cgh) {
         sycl::local_accessor<float, 1> sk(sycl::range<1>(S), cgh);
         sycl::local_accessor<float, 1> sq(sycl::range<1>(S), cgh);

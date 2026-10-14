@@ -1990,9 +1990,62 @@ bool Verifier::capture_commit(std::string& err) {
         copy_i32_from_mapped(commit_, m_commit_, 2 + MT, cs_);
         int64_t qsa_index = 0, gdn_index = 0;
         for (int64_t l = 0; l < lb_; ++l) (is_qsa_layer(g, l) ? qsa_index : gdn_index) += 1;
+        // engine-latency (STRATA_COMMIT_BATCH, default on; =0 keeps the per-layer loop): every GDN layer's conv history and
+        // state in two launches instead of two per layer (~70 graph nodes fewer; the same arithmetic per layer, bitwise).
+        // The commit runs between a window and the draft round, which on HIP waits for it.
+        static const bool commit_batch = [] { const char* e = std::getenv("STRATA_COMMIT_BATCH"); return !e || e[0] != '0'; }();
+        bool gdn_batched = false;
+        if (commit_batch) {
+            int64_t n_gdn = 0;
+            bool norms_ok = true;   // the per-layer loop checks each layer's ssm_norm.weight: keep that check
+            for (int64_t l = lb_; l < le_ && norms_ok; ++l)
+                if (!is_qsa_layer(g, l)) {
+                    ++n_gdn;
+                    norms_ok = need(LayerView(*wt_, l), "ssm_norm.weight", err) != nullptr;
+                }
+            if (!norms_ok) ok = false;
+            else if (n_gdn > 0)
+                gdn_batched = gdn_commit_layers(
+                    ss.gdn_state + (size_t) (gdn_index - ss.gdn_ord0) * gdn_floats, (int64_t) gdn_floats,
+                    (int64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size, qkv_L_ + (size_t) gdn_index * MT * C,
+                    MT * C, h_L_ + (size_t) gdn_index * MT * C, MT * C, gate_L_ + (size_t) gdn_index * MT * HV,
+                    beta_L_ + (size_t) gdn_index * MT * HV, MT * HV, (int) C, (int) g.ssm_k_heads, (int) HV, (int) MT,
+                    (int) n_gdn, commit_, cs_);
+        }
+        // the QSA layers' tail restore + indexer append, one launch for all of them (one block per layer)
+        bool qsa_batched = false;
+        if (commit_batch && ok && !g_no_batch_kv) {
+            QsaIndexerLayers il;
+            int nq = 0;
+            int64_t mc = -1;
+            bool fits = true;
+            for (int64_t l = lb_, qi = qsa_index; l < le_ && fits; ++l) {
+                if (!is_qsa_layer(g, l)) continue;
+                const WeightRef* wikn = need(LayerView(*wt_, l), "indexer.k_norm.weight", err);
+                if (!wikn) { ok = false; fits = false; break; }
+                const QsaState& st = ss.qsa_states[qi];
+                if (nq >= QsaIndexerLayers::kMax || (mc >= 0 && st.max_cells != mc)) { fits = false; break; }
+                mc = st.max_cells;
+                il.gamma[nq] = (const float*) wikn->data;
+                il.tail_src[nq] = tail_snap_ + (size_t) qi * TS;
+                il.tail[nq] = st.idx_tail; il.dead[nq] = st.idx_dead; il.pooled[nq] = st.idx_pooled;
+                il.block_pos[nq] = st.idx_block_pos;
+                ++nq;
+                ++qi;
+            }
+            if (ok && fits && nq > 0) {
+                native_qsa_indexer_append_steps_layers(idx_raw_L_ + (size_t) qsa_index * MT * ID, MT * ID, commit_ + 2, 1,
+                                                       (int) MT, 0, EPS, il, nq, s, mc, rope_scaling(), cs_);
+                qsa_batched = true;
+            }
+        }
         for (int64_t l = lb_; l < le_ && ok; ++l) {
             const LayerView v(*wt_, l);
-            if (!is_qsa_layer(g, l)) {
+            if (is_qsa_layer(g, l) && qsa_batched) {
+                ++qsa_index;
+            } else if (!is_qsa_layer(g, l) && gdn_batched) {
+                ++gdn_index;
+            } else if (!is_qsa_layer(g, l)) {
                 const WeightRef* wnm = need(v, "ssm_norm.weight", err);
                 if (!wnm) { ok = false; break; }
                 float* state = ss.gdn_state + (size_t) (gdn_index - ss.gdn_ord0) * gdn_floats;
@@ -2505,7 +2558,28 @@ bool Verifier::commit(int n_keep, std::string& err) {
         // a one-token window has advanced the state itself (record_window): no commit graph
     } else {
         std::atomic_thread_fence(std::memory_order_seq_cst);
+        // STRATA_COMMIT_TIMING=1 (measurement only): the commit graph's GPU time, from an event pair around it (read at the
+        // next commit, when the pair has long completed); printed every 300 commits
+        static struct CommitTiming {
+            bool on = false, pending = false;
+            cudaEvent_t b = nullptr, e = nullptr;
+            double ms = 0;
+            int64_t n = 0;
+            CommitTiming() { const char* v = std::getenv("STRATA_COMMIT_TIMING"); on = v != nullptr && v[0] == '1'; }
+        } ct;
+        if (ct.on && ct.b == nullptr &&
+            (cudaEventCreate(&ct.b) != cudaSuccess || cudaEventCreate(&ct.e) != cudaSuccess)) { ct.on = false; (void) cudaGetLastError(); }
+        if (ct.on && ct.pending) {
+            float ms = 0;
+            if (cudaEventSynchronize(ct.e) == cudaSuccess && cudaEventElapsedTime(&ms, ct.b, ct.e) == cudaSuccess) { ct.ms += ms; ++ct.n; }
+            ct.pending = false;
+            if (ct.n > 0 && ct.n % 300 == 0)
+                std::fprintf(stderr, "strata verify: commit graph %.3f ms GPU on average over %lld commits\n", ct.ms / (double) ct.n,
+                             (long long) ct.n);
+        }
+        if (ct.on) cudaEventRecord(ct.b, cs_);
         const cudaError_t le = cudaGraphLaunch(commit_exec_, cs_);
+        if (ct.on) { cudaEventRecord(ct.e, cs_); ct.pending = true; }
         if (le != cudaSuccess) { err = std::string("verify: commit launch: ") + cudaGetErrorString(le); return false; }
         // set_commit_async: no wait here - the next window runs on the same stream after it, and the drafter (its own
         // stream) reads only this window's final rows and its own K/V. h_commit_ is next written after the next window's

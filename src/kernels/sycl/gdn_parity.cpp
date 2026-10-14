@@ -20,6 +20,7 @@
 // filled with a value that encodes its own coordinates.
 #include <sycl/sycl.hpp>
 #include "strata/kernels/gdn.hpp"
+#include "strata/kernels/verify_kernels.hpp"
 
 #include <cmath>
 #include <cstdio>
@@ -439,6 +440,73 @@ int main(int argc, char** argv) {
         sycl::free(d_z, stream);
         sycl::free(d_sn, stream);
         sycl::free(d_y, stream);
+    }
+
+    // ================= 6. the layer-batched commit (engine-latency), bitwise against the per-layer calls =================
+    // gdn_commit_layers runs every layer's conv-history commit and state commit in one launch each; the per-layer loop
+    // (gdn_conv_commit + gdn_step_norm_multi with n_keep, no outputs) is the reference.  Several layers with their own
+    // state, rows and gate/beta; n_keep 1..T; memcmp on the whole state arena (states and conv histories).
+    {
+        const int qk = S * h_k, C = 2 * qk + S * h_v, L = 5, MT = strata::kernels::kVerifyMaxT;
+        const int64_t conv_off = (int64_t)S * h_v * S, stride = conv_off + (int64_t)C * 3;
+        std::vector<float> st0((size_t)(stride * L)), hb((size_t)L * MT * C), qkv((size_t)L * MT * C),
+            gt((size_t)L * MT * h_v), bt((size_t)L * MT * h_v), zdummy((size_t)MT * S * h_v), gm(S, 1.0f);
+        for (auto& x : st0) x = gauss(rng) * 0.1f;
+        for (auto& x : hb) x = gauss(rng) * 0.1f;
+        for (auto& x : qkv) x = gauss(rng);
+        for (auto& x : gt) x = -(0.5f + (float)(rng() % 100) / 50.0f);
+        for (auto& x : bt) x = (float)(rng() % 100) / 100.0f;
+        float *d_a = sycl::malloc_device<float>(st0.size(), stream);
+        float *d_b = sycl::malloc_device<float>(st0.size(), stream);
+        float *d_h = sycl::malloc_device<float>(hb.size(), stream);
+        float *d_qkv = sycl::malloc_device<float>(qkv.size(), stream);
+        float *d_g = sycl::malloc_device<float>(gt.size(), stream);
+        float *d_bt = sycl::malloc_device<float>(bt.size(), stream);
+        float *d_z = sycl::malloc_device<float>(zdummy.size(), stream);
+        float *d_y = sycl::malloc_device<float>(zdummy.size(), stream);
+        float *d_gm = sycl::malloc_device<float>(gm.size(), stream);
+        int32_t *d_nk = sycl::malloc_device<int32_t>(1, stream);
+        stream.memcpy(d_h, hb.data(), hb.size() * sizeof(float));
+        stream.memcpy(d_qkv, qkv.data(), qkv.size() * sizeof(float));
+        stream.memcpy(d_g, gt.data(), gt.size() * sizeof(float));
+        stream.memcpy(d_bt, bt.data(), bt.size() * sizeof(float));
+        stream.memcpy(d_gm, gm.data(), gm.size() * sizeof(float));
+        stream.memset(d_z, 0, zdummy.size() * sizeof(float)).wait();
+        int lb_bad = 0, lb_n = 0;
+        bool launched = true;
+        for (int nk = 1; nk <= MT && launched; ++nk) {
+            stream.memcpy(d_nk, &nk, sizeof(int32_t));
+            stream.memcpy(d_a, st0.data(), st0.size() * sizeof(float));
+            stream.memcpy(d_b, st0.data(), st0.size() * sizeof(float)).wait();
+            for (int l = 0; l < L; ++l) {   // the reference: the per-layer calls
+                float* stl = d_a + (size_t)l * stride;
+                strata::kernels::gdn_conv_commit(stl + conv_off, d_qkv + (size_t)l * MT * C, C, d_nk, &stream);
+                strata::kernels::gdn_step_norm_multi(stl, d_h + (size_t)l * MT * C, C, d_g + (size_t)l * MT * h_v,
+                                                     d_bt + (size_t)l * MT * h_v, d_z, d_gm, 1e-6f, d_y, h_k, h_v, MT, d_nk,
+                                                     &stream, MT);
+            }
+            launched = strata::kernels::gdn_commit_layers(d_b, stride, conv_off, d_qkv, (int64_t)MT * C, d_h, (int64_t)MT * C,
+                                                          d_g, d_bt, (int64_t)MT * h_v, C, h_k, h_v, MT, L, d_nk, &stream);
+            if (!launched) break;
+            stream.wait();
+            std::vector<float> a(st0.size()), b(st0.size());
+            stream.memcpy(a.data(), d_a, a.size() * sizeof(float));
+            stream.memcpy(b.data(), d_b, b.size() * sizeof(float)).wait();
+            ++lb_n;
+            if (std::memcmp(a.data(), b.data(), a.size() * sizeof(float)) != 0 || std::memcmp(a.data(), st0.data(), a.size() * sizeof(float)) == 0) {
+                std::printf("    *** gdn_commit_layers n_keep=%d differs from the per-layer commit (or wrote nothing) ***\n", nk);
+                ++lb_bad;
+            }
+        }
+        sycl::free(d_a, stream); sycl::free(d_b, stream); sycl::free(d_h, stream); sycl::free(d_qkv, stream);
+        sycl::free(d_g, stream); sycl::free(d_bt, stream); sycl::free(d_z, stream); sycl::free(d_y, stream);
+        sycl::free(d_gm, stream); sycl::free(d_nk, stream);
+        if (launched)
+            std::printf("  %-42s %s (%d cases, %d layers)\n", "gdn_commit_layers == per-layer commit", lb_bad ? "*** NO ***" : "bitwise",
+                        lb_n, L);
+        else
+            std::printf("  %-42s skipped (the per-layer commit is not the state-only kernel here)\n", "gdn_commit_layers");
+        bad += lb_bad;
     }
 
     std::printf("\ngdn: %d failures\n", bad);
