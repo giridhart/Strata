@@ -41,41 +41,44 @@ inline float warp_max(float value, const sycl::sub_group& sg) {
     return sycl::reduce_over_group(sg, value, sycl::maximum<float>());
 }
 
-inline void route_token(const float* logits, int32_t* ids, float* weights, size_t tok, int lane,
-                        const sycl::sub_group& sg) {
-    logits += tok * 512;
-    ids += tok * 10;
-    weights += tok * 10;
+template <int NE = 512, int K = 10>
+inline void route_token_k(const float* logits, int32_t* ids, float* weights, size_t tok, int lane,
+                          const sycl::sub_group& sg) {
+    static_assert(NE % 32 == 0 && K <= 32, "experts in whole warps, at most 32 picks");
+    constexpr int V = NE / 32;
+    logits += tok * NE;
+    ids += tok * K;
+    weights += tok * K;
 
-    float values[16];
+    float values[V];
 #pragma unroll
-    for (int i = 0; i < 16; ++i)
+    for (int i = 0; i < V; ++i)
         values[i] = logits[lane + i * 32];
 
     float maximum = -INFINITY;
 #pragma unroll
-    for (int i = 0; i < 16; ++i)
+    for (int i = 0; i < V; ++i)
         maximum = sycl::fmax(maximum, values[i]);
     maximum = warp_max(maximum, sg);
 
     float sum = 0.0f;
 #pragma unroll
-    for (int i = 0; i < 16; ++i) {
+    for (int i = 0; i < V; ++i) {
         values[i] = sycl::native::exp(values[i] - maximum);
         sum += values[i];
     }
     const float reciprocal = 1.0f / warp_sum(sum, sg);
 #pragma unroll
-    for (int i = 0; i < 16; ++i) {
+    for (int i = 0; i < V; ++i) {
         values[i] *= reciprocal;
         if (sycl::isnan(values[i])) values[i] = -FLT_MAX;
     }
     float selected = 0.0f, selected_sum = 0.0f;
-    for (int rank = 0; rank < 10; ++rank) {
+    for (int rank = 0; rank < K; ++rank) {
         float best = values[0];
         int expert = lane;
 #pragma unroll
-        for (int i = 1; i < 16; ++i) {
+        for (int i = 1; i < V; ++i) {
             if (values[i] > best) {
                 best = values[i];
                 expert = lane + i * 32;
@@ -101,7 +104,12 @@ inline void route_token(const float* logits, int32_t* ids, float* weights, size_
     }
     selected_sum = sycl::fmax(warp_sum(selected_sum, sg), 6.103515625e-5f);
     const float inverse_selected_sum = 1.0f / selected_sum;
-    if (lane < 10) weights[lane] = selected * inverse_selected_sum;
+    if (lane < K) weights[lane] = selected * inverse_selected_sum;
+}
+
+inline void route_token(const float* logits, int32_t* ids, float* weights, size_t tok, int lane,
+                        const sycl::sub_group& sg) {
+    route_token_k<512, 10>(logits, ids, weights, tok, lane, sg);
 }
 
 // One subgroup (32 lanes) per token.  This replaces the legacy one thread per token scanning
@@ -237,6 +245,41 @@ void native_router_top10_multi(const float* logits, int32_t* ids, float* weights
                         const int lane = (int)(global_tid % 32);
                         route_token(logits, ids, weights, tok, lane, item.get_sub_group());
                     });
+}
+
+bool native_router_topk_supported(int n_expert, int k) {
+    return (n_expert == 512 && k == 10) || (n_expert == 256 && k == 8);
+}
+
+void native_router_topk(const float* logits, int32_t* ids, float* weights, int n_expert, int k, int n_tok, void* stream) {
+    if (n_expert == 512 && k == 10) {   // Flash-Next
+        if (n_tok == 1) native_router_top10(logits, ids, weights, stream);
+        else native_router_top10_multi(logits, ids, weights, n_tok, stream);
+        return;
+    }
+    if (!stream || n_tok < 1 || !native_router_topk_supported(n_expert, k) ||
+        !valid(logits, (size_t)n_tok * n_expert * 4) || !valid(ids, (size_t)n_tok * k * 4) ||
+        !valid(weights, (size_t)n_tok * k * 4))
+        throw std::invalid_argument("native_router_topk: a stream, a supported (experts, k) and aligned buffers");
+
+    static sycl::queue default_queue{sycl::property::queue::in_order()};
+    sycl::queue* q = stream ? static_cast<sycl::queue*>(stream) : &default_queue;
+
+    constexpr size_t warps_per_wg = 8;
+    constexpr size_t wg_size = warps_per_wg * 32;
+    const size_t total_warps = ((size_t)n_tok + warps_per_wg - 1) / warps_per_wg * warps_per_wg;
+    const size_t total_threads = total_warps * 32;
+
+    if (n_expert == 256 && k == 8) {
+        q->parallel_for(sycl::nd_range<1>(sycl::range<1>(total_threads), sycl::range<1>(wg_size)),
+                        [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(32)]] {
+                            const size_t global_tid = item.get_global_id(0);
+                            const size_t tok = global_tid / 32;
+                            if (tok >= (size_t)n_tok) return;
+                            const int lane = (int)(global_tid % 32);
+                            route_token_k<256, 8>(logits, ids, weights, tok, lane, item.get_sub_group());
+                        });
+    }
 }
 
 void native_route_resident(const float* logits, int32_t* ids, float* weights, const int32_t* res_layer, int n_tok,
