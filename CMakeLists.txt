@@ -1736,6 +1736,13 @@ if(STRATA_NATIVE_EXPERTS)
     set_source_files_properties(src/kernels/cpu/iq_avx1.cpp PROPERTIES COMPILE_OPTIONS
                                 "-msse4.2;-mavx;-mno-avx2;-mno-fma;-mno-f16c")
   endif()
+  # icpx (IntelLLVM): prevent SVML polynomial approximation drift between scalar expf (nt=1) and vectorized
+  # __svml_expf4/__svml_expf8 in unrolled multi-token SwiGLU loops (nt=2..8). -fp-model=precise preserves exact
+  # IEEE-754 semantics and ensures bit-identical evaluation across batch sizes (issue #152 parity contract).
+  if(CMAKE_CXX_COMPILER_ID MATCHES "IntelLLVM")
+    set_property(SOURCE src/kernels/cpu/expert.cpp src/kernels/cpu/iq_avx512.cpp src/kernels/cpu/iq_avx2.cpp src/kernels/cpu/iq_avx1.cpp
+                 APPEND PROPERTY COMPILE_OPTIONS "-fp-model=precise")
+  endif()
   set_property(SOURCE src/kernels/cpu/iq_avx2.cpp APPEND PROPERTY COMPILE_DEFINITIONS ${_strata_avxvnni})
   if(STRATA_ISA_FLOOR STREQUAL "avx")
     target_compile_definitions(strata_kernels_cpu PRIVATE STRATA_ISA_FLOOR_AVX=1)
