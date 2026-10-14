@@ -1327,6 +1327,13 @@ endif()
     add_test(NAME sycl_dequant_bf16 COMMAND sycl_dequant_bf16)
   endif()
 
+  if(STRATA_ENABLE_SYCL AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/sycl/dequant_wide_test.cpp")
+    add_executable(sycl_dequant_wide tests/sycl/dequant_wide_test.cpp)
+    target_include_directories(sycl_dequant_wide PRIVATE ${_strata_gpu_include_directories})
+    target_link_libraries(sycl_dequant_wide PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+    add_test(NAME sycl_dequant_wide COMMAND sycl_dequant_wide)
+  endif()
+
   if(STRATA_ENABLE_SYCL AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/sycl/verify_kernels_test.cpp")
     add_executable(sycl_verify_kernels tests/sycl/verify_kernels_test.cpp)
     target_include_directories(sycl_verify_kernels PRIVATE ${_strata_gpu_include_directories})
