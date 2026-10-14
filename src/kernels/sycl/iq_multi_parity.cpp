@@ -75,13 +75,15 @@ const char* name_of(int t) {
             return "IQ4_XS";
         case 29:
             return "IQ1_M";
+        case 40:
+            return "NVFP4";
         case 42:
             return "Q2_0";
         default:
             return "?";
     }
 }
-int block_values(int t) { return t == 20 ? 32 : t == 42 ? 64 : 256; }
+int block_values(int t) { return t == 20 ? 32 : (t == 42 || t == 40) ? 64 : 256; }
 
 // `rows` rows of `n` values of format t: random bytes, then a finite fp16 scale in every block
 std::vector<uint8_t> random_rows(int t, int64_t rows, int64_t n, std::mt19937& rng) {
@@ -96,6 +98,12 @@ std::vector<uint8_t> random_rows(int t, int64_t rows, int64_t n, std::mt19937& r
             // sign and the exponent's top bits: 0x1 / 0x2 (or 0x9 / 0xA) keeps it in 2^-11 .. 2^-3
             const uint8_t nib = (uint8_t)((sgn(rng) == 0 ? 0x8 : 0x0) | (1 + (byte(rng) & 1)));
             w[o + 55] = (uint8_t)((w[o + 55] & 0x0F) | (nib << 4));
+        } else if (t == 40) {
+            // NVFP4: 4 bytes of UE4M3 scales in bytes 0..3 of each 36-byte block
+            std::uniform_int_distribution<int> uexp(4, 10), uman(0, 7);
+            for (int s = 0; s < 4; ++s) {
+                w[o + s] = (uint8_t)((uexp(rng) << 3) | uman(rng));
+            }
         } else {
             const uint16_t h = (uint16_t)((sgn(rng) == 0 ? 0x8000 : 0) | (ex(rng) << 10) | man(rng));  // 2^-13 .. 2^-6
             std::memcpy(&w[o], &h, 2);
@@ -231,6 +239,11 @@ struct Grouped {
             auto b = random_rows(gu, 2 * FF, H, rng);
             const auto d = random_rows(dt, H, FF, rng);
             b.insert(b.end(), d.begin(), d.end());
+            if (L.tail_off) {
+                const float tail[4] = {0.85f, 1.15f, 0.95f, 0.0f};
+                const auto* tp = reinterpret_cast<const uint8_t*>(tail);
+                b.insert(b.end(), tp, tp + 16);
+            }
             if (b.size() != L.bytes) {
                 std::fprintf(stderr, "blob size %zu != %zu\n", b.size(), L.bytes);
                 std::exit(2);
@@ -381,12 +394,12 @@ int main(int argc, char** argv) {
     const bool do_bench = argc > 1 && std::string(argv[1]) == "--bench";
     sycl::queue* s = &q_ct1;
     std::mt19937 rng(18);
-    for (int t : {16, 17, 18, 20, 21, 22, 23, 29, 42}) {
+    for (int t : {16, 17, 18, 20, 21, 22, 23, 29, 40, 42}) {
         check_mmvq(t, 2560, 67, s, rng);  // the model's n_embd; 67 rows: a partial block of 4 rows
         check_mmvq(t, 1024, 5, s, rng);
     }
-    for (int gu : {16, 17, 18, 21, 22, 23, 29, 42}) {
-        for (int dt : {20, 42})
+    for (int gu : {16, 17, 18, 21, 22, 23, 29, 40, 42}) {
+        for (int dt : {20, 40, 42})
             check_grouped(gu, dt, 2560, 640, s, rng);  // the model's shape
         check_grouped(gu, 23, 1024, 512, s, rng);      // IQ4_XS down needs n_ff % 256 == 0
     }
