@@ -88,5 +88,7 @@ void native_expert_set_mode(int mode, int phase);
 /// bitwise the same results.  Set before graph capture; captured graphs keep the kernels they captured.
 void iq_set_old_kernels(bool old);
 bool iq_old_kernels();
+void native_expert_set_kq_split(bool on);
 
 }  // namespace strata::kernels
+

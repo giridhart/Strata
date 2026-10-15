@@ -79,11 +79,21 @@ const char* name_of(int t) {
             return "NVFP4";
         case 42:
             return "Q2_0";
+        case 12:
+            return "Q4_K";
+        case 13:
+            return "Q5_K";
+        case 14:
+            return "Q6_K";
+        case 7:
+            return "Q5_1";
+        case 8:
+            return "Q8_0";
         default:
             return "?";
     }
 }
-int block_values(int t) { return t == 20 ? 32 : (t == 42 || t == 40) ? 64 : 256; }
+int block_values(int t) { return (t == 20 || t == 7 || t == 8) ? 32 : (t == 42 || t == 40) ? 64 : 256; }
 
 // `rows` rows of `n` values of format t: random bytes, then a finite fp16 scale in every block
 std::vector<uint8_t> random_rows(int t, int64_t rows, int64_t n, std::mt19937& rng) {
@@ -105,8 +115,14 @@ std::vector<uint8_t> random_rows(int t, int64_t rows, int64_t n, std::mt19937& r
                 w[o + s] = (uint8_t)((uexp(rng) << 3) | uman(rng));
             }
         } else {
-            const uint16_t h = (uint16_t)((sgn(rng) == 0 ? 0x8000 : 0) | (ex(rng) << 10) | man(rng));  // 2^-13 .. 2^-6
-            std::memcpy(&w[o], &h, 2);
+            const int e = (t == 12 || t == 13) ? 1 + ex(rng) % 4 : ex(rng);
+            const uint16_t h = (uint16_t)((sgn(rng) == 0 ? 0x8000 : 0) | (e << 10) | man(rng));
+            std::memcpy(&w[o + (t == 14 ? 208 : 0)], &h, 2);
+            if (t == 12 || t == 13 || t == 7) {
+                const int em = (t == 7) ? ex(rng) : 1 + ex(rng) % 4;
+                const uint16_t m = (uint16_t)((sgn(rng) == 0 ? 0x8000 : 0) | (em << 10) | man(rng));
+                std::memcpy(&w[o + 2], &m, 2);
+            }
         }
     }
     return w;
@@ -402,6 +418,10 @@ int main(int argc, char** argv) {
         for (int dt : {20, 40, 42})
             check_grouped(gu, dt, 2560, 640, s, rng);  // the model's shape
         check_grouped(gu, 23, 1024, 512, s, rng);      // IQ4_XS down needs n_ff % 256 == 0
+    }
+    // K-quant & Q8_0 grouped expert weight reuse (KqSplit): bitwise vs per-entry
+    for (const auto& pr : {std::pair{12, 7}, std::pair{12, 8}, std::pair{13, 8}, std::pair{8, 8}, std::pair{13, 7}}) {
+        check_grouped(pr.first, pr.second, 2560, 640, s, rng);
     }
     if (do_bench) bench(s, rng);
     std::printf("iq_multi_parity: %d failures\n", g_fail);
