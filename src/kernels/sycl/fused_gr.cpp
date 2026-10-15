@@ -202,35 +202,45 @@ struct GrMulti {
     int T;
 };
 
+template <class F, std::size_t... J>
+inline auto gr_pick_impl(const GrMulti& m, int k, F f, std::index_sequence<J...>) {
+    auto v = f(m.a[0]);
+    ((v = (k == (int) J) ? f(m.a[J]) : v), ...);
+    return v;
+}
+#define GR_PICK(m, k, field) \
+    gr_pick_impl((m), (k), [](const FusedGrArgs& x_) { return x_.field; }, std::make_index_sequence<kFusedGrMaxT>{})
+
 // Step 1 of `gr_down_kernel`, one block per token, same threads and reduction order: rs[t] and xn[t] to global.
-/*
-DPCT1110:15: The total declared local variable size in device function
-gr_norm_multi_kernel exceeds 128 bytes and may cause high register pressure.
-Consult with your hardware vendor to find the total register size available and
-adjust the code, or use smaller sub-group size to avoid high register pressure.
-*/
 void gr_norm_multi_kernel(GrMulti m, float part[8 /*WARPS*/][4 /*HC*/], float* s_rs) {
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
 
-    const FusedGrArgs& a = m.a[item_ct1.get_group(2)];
-    float* xn = m.xn + (size_t)item_ct1.get_group(2) * D;
+    const int tok = item_ct1.get_group(2);
+    const float* const aR = GR_PICK(m, tok, R);
+    const bool aapply = GR_PICK(m, tok, apply);
+    const float* const abo = GR_PICK(m, tok, bo_prev);
+    const float* const awn = GR_PICK(m, tok, w_norm);
+    const float aeps = GR_PICK(m, tok, eps);
+    float* const ars = GR_PICK(m, tok, rs);
+    const float* const ainj = GR_PICK(m, tok, inj_prev);
+    float* xn = m.xn + (size_t)tok * D;
     const int t = item_ct1.get_local_id(2), lane = t & 31, warp = t >> 5;
     float gw[HC];
 #pragma unroll
     for (int c = 0; c < HC; ++c)
-        gw[c] = a.apply ? 2.0f * sigmoidf_(a.inj_prev[c] / (float)HC) : 0.0f;
+        gw[c] = aapply ? 2.0f * sigmoidf_(ainj[c] / (float)HC) : 0.0f;
     float ss[HC] = {0.0f, 0.0f, 0.0f, 0.0f};
     for (int i = t * 4; i < D; i += THREADS * 4) {
         const int c = i / N, d = i - c * N;
-        sycl::float4 r = *reinterpret_cast<const sycl::float4*>(a.R + i);
-        if (a.apply) {
-            const sycl::float4 b = *reinterpret_cast<const sycl::float4*>(a.bo_prev + d);
+        sycl::float4 r = *reinterpret_cast<const sycl::float4*>(aR + i);
+        if (aapply) {
+            const sycl::float4 b = *reinterpret_cast<const sycl::float4*>(abo + d);
             r.x() = sycl::fma((float)(b.x()), gw[c], r.x());
             r.y() = sycl::fma((float)(b.y()), gw[c], r.y());
             r.z() = sycl::fma((float)(b.z()), gw[c], r.z());
             r.w() = sycl::fma((float)(b.w()), gw[c], r.w());
         }
-        const sycl::float4 g = *reinterpret_cast<const sycl::float4*>(a.w_norm + i);
+        const sycl::float4 g = *reinterpret_cast<const sycl::float4*>(awn + i);
         float sq = r.x() * r.x() + r.y() * r.y() + r.z() * r.z() + r.w() * r.w();
 #pragma unroll
         for (int cc = 0; cc < HC; ++cc)
@@ -253,8 +263,8 @@ void gr_norm_multi_kernel(GrMulti m, float part[8 /*WARPS*/][4 /*HC*/], float* s
         float s = 0.0f;
         for (int w = 0; w < WARPS; ++w)
             s += part[w][t];
-        s_rs[t] = sycl::rsqrt(s / (float)N + a.eps);
-        a.rs[t] = s_rs[t];
+        s_rs[t] = sycl::rsqrt(s / (float)N + aeps);
+        ars[t] = s_rs[t];
     }
     /*
     DPCT1065:255: Consider replacing sycl::nd_item::barrier() with
@@ -357,10 +367,10 @@ void gr_down_multi_kernel(GrMulti m, uint8_t* smem_raw) {
     for (int k = 0; k < kFusedGrMaxT; ++k) {
         if (k >= T || lane != k) continue;
         if (inject_block) {
-            m.a[k].inject_out[row] = s[k];
+            GR_PICK(m, k, inject_out)[row] = s[k];
         } else {
             const float x = s[k] / (float)HC;
-            m.a[k].lo[row] = x / (1.0f + sycl::native::exp(-x));
+            GR_PICK(m, k, lo)[row] = x / (1.0f + sycl::native::exp(-x));
         }
     }
 }
@@ -384,40 +394,24 @@ void gr_up_multi_kernel(GrMulti m, float lo[8 /*kFusedGrMaxT*/][320 /*LR*/],
     const int T = m.T;
     const int d0 = item_ct1.get_group(2) * UPM_COLS;
     for (int i = t; i < T * LR; i += THREADS)
-        lo[i / LR][i % LR] = m.a[i / LR].lo[i % LR];
-    /*
-    DPCT1065:259: Consider replacing sycl::nd_item::barrier() with
-    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
-    performance if there is no access to global memory.
-    */
+        lo[i / LR][i % LR] = GR_PICK(m, i / LR, lo)[i % LR];
     item_ct1.barrier();
     for (int r = warp; r < HC * UPM_COLS; r += WARPS) {
         const int c = r / UPM_COLS, dd = r - c * UPM_COLS, i = c * N + d0 + dd;
         const sycl::uint4* w4 = reinterpret_cast<const sycl::uint4*>(m.a[0].w_up + (size_t)i * LR);
-        /*
-        DPCT1098:261: The '*' expression is used instead of the __ldg call.
-        These two expressions do not provide the exact same functionality. Check
-        the generated code for potential precision and/or performance issues.
-        */
         const sycl::uint4 wa = *(w4 + lane);
-        /*
-        DPCT1098:262: The '*' expression is used instead of the __ldg call.
-        These two expressions do not provide the exact same functionality. Check
-        the generated code for potential precision and/or performance issues.
-        */
         const sycl::uint4 wb = lane < LR / 8 - 32 ? *(w4 + 32 + lane) : sycl::uint4(0, 0, 0, 0);
         // the epilogue inputs of this lane's token, fetched while the dots run
         float rv = 0.0f, wn = 0.0f, rsc = 0.0f, bo = 0.0f, ip = 0.0f;
         bool apply = false;
         if (lane < T) {
-            const FusedGrArgs& a = m.a[lane];
-            rv = a.R[i];
-            wn = a.w_norm[i];
-            rsc = a.rs[c];
-            apply = a.apply;
+            rv = GR_PICK(m, lane, R)[i];
+            wn = GR_PICK(m, lane, w_norm)[i];
+            rsc = GR_PICK(m, lane, rs)[c];
+            apply = GR_PICK(m, lane, apply);
             if (apply) {
-                bo = a.bo_prev[d0 + dd];
-                ip = a.inj_prev[c];
+                bo = GR_PICK(m, lane, bo_prev)[d0 + dd];
+                ip = GR_PICK(m, lane, inj_prev)[c];
             }
         }
         float mine = 0.0f;
@@ -432,17 +426,12 @@ void gr_up_multi_kernel(GrMulti m, float lo[8 /*kFusedGrMaxT*/][320 /*LR*/],
         if (lane < T) {
             if (apply) {
                 rv = sycl::fma(bo, 2.0f * sigmoidf_(ip / (float)HC), rv);
-                m.a[lane].R_out[i] = rv;
+                GR_PICK(m, lane, R_out)[i] = rv;
             }
             const float x = rv * wn * rsc;
             g[lane][c][dd] = x * sigmoidf_(mine);
         }
     }
-    /*
-    DPCT1065:260: Consider replacing sycl::nd_item::barrier() with
-    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
-    performance if there is no access to global memory.
-    */
     item_ct1.barrier();
     for (int i = t; i < T * UPM_COLS; i += THREADS) {
         const int k = i / UPM_COLS, col = i - k * UPM_COLS;
@@ -450,7 +439,7 @@ void gr_up_multi_kernel(GrMulti m, float lo[8 /*kFusedGrMaxT*/][320 /*LR*/],
 #pragma unroll
         for (int c = 0; c < HC; ++c)
             s += g[k][c][col];
-        m.a[k].mixed[d0 + col] = s / (float)HC;
+        GR_PICK(m, k, mixed)[d0 + col] = s / (float)HC;
     }
 }
 
@@ -512,15 +501,19 @@ void gr_down_v3_kernel(GrMulti m, float* __restrict__ part, float* __restrict__ 
     for (int k = 0; k < kFusedGrMaxT; ++k) {
         ssp[k] = 0.0f;
         if (k >= T) continue;
-        const FusedGrArgs& a = m.a[k];
-        const float gw = a.apply ? 2.0f * sigmoidf_(a.inj_prev[c] / (float)HC) : 0.0f;
-        const sycl::float4* R4 = reinterpret_cast<const sycl::float4*>(a.R + (size_t)c * N + (size_t)h * SL);
-        const sycl::float4* G4 = reinterpret_cast<const sycl::float4*>(a.w_norm + (size_t)c * N + (size_t)h * SL);
-        const sycl::float4* B4 = reinterpret_cast<const sycl::float4*>(a.bo_prev + (size_t)h * SL);
+        const float* const aR = GR_PICK(m, k, R);
+        const float* const awn = GR_PICK(m, k, w_norm);
+        const float* const abo = GR_PICK(m, k, bo_prev);
+        const float* const ainj = GR_PICK(m, k, inj_prev);
+        const bool aapply = GR_PICK(m, k, apply);
+        const float gw = aapply ? 2.0f * sigmoidf_(ainj[c] / (float)HC) : 0.0f;
+        const sycl::float4* R4 = reinterpret_cast<const sycl::float4*>(aR + (size_t)c * N + (size_t)h * SL);
+        const sycl::float4* G4 = reinterpret_cast<const sycl::float4*>(awn + (size_t)c * N + (size_t)h * SL);
+        const sycl::float4* B4 = reinterpret_cast<const sycl::float4*>(abo + (size_t)h * SL);
         sycl::float4* X4 = reinterpret_cast<sycl::float4*>(xs + (size_t)k * SL);
         for (int i = t; i < SL / 4; i += THREADS) {
             sycl::float4 r = R4[i];
-            if (a.apply) {
+            if (aapply) {
                 const sycl::float4 b = B4[i];
                 r.x() = sycl::fma((float)(b.x()), (float)gw, r.x());
                 r.y() = sycl::fma((float)(b.y()), (float)gw, r.y());
@@ -597,15 +590,10 @@ void gr_up_v3_kernel(GrMulti m, const float* __restrict__ part, const float* __r
 #pragma unroll
         for (int h = 0; h < S; ++h)
             ss += ssg[t * S + h];
-        const float r = sycl::rsqrt(ss / (float)N + m.a[k].eps);
+        const float r = sycl::rsqrt(ss / (float)N + GR_PICK(m, k, eps));
         rsS[k][c] = r;
-        if (item_ct1.get_group(2) == 0) m.a[k].rs[c] = r;
+        if (item_ct1.get_group(2) == 0) GR_PICK(m, k, rs)[c] = r;
     }
-    /*
-    DPCT1065:267: Consider replacing sycl::nd_item::barrier() with
-    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
-    performance if there is no access to global memory.
-    */
     item_ct1.barrier();
     for (int i = t; i < T * LR; i += THREADS) {
         const int k = i / LR, r = i - k * LR;
@@ -623,7 +611,7 @@ void gr_up_v3_kernel(GrMulti m, const float* __restrict__ part, const float* __r
     }
     if (item_ct1.get_group(2) == 0 && t < T * HC) {
         const int k = t / HC, cc = t - k * HC;
-        if (m.a[k].w_inject != nullptr) {
+        if (GR_PICK(m, k, w_inject) != nullptr) {
             float sum = 0.0f;
 #pragma unroll
             for (int c = 0; c < HC; ++c) {
@@ -633,7 +621,7 @@ void gr_up_v3_kernel(GrMulti m, const float* __restrict__ part, const float* __r
                     p += part[(((size_t)k * HC + c) * S + h) * PR + LR + cc];
                 sum = sycl::fma(rsS[k][c], p, sum);
             }
-            m.a[k].inject_out[cc] = sum;
+            GR_PICK(m, k, inject_out)[cc] = sum;
         }
     }
     /*
@@ -642,33 +630,30 @@ void gr_up_v3_kernel(GrMulti m, const float* __restrict__ part, const float* __r
     performance if there is no access to global memory.
     */
     item_ct1.barrier();
+    // this lane's token (lane < T), picked once - not per row
+    const int pk = lane < T ? lane : 0;
+    const float* const pR = GR_PICK(m, pk, R);
+    const float* const pWn = GR_PICK(m, pk, w_norm);
+    const bool pApply = GR_PICK(m, pk, apply);
+    const float* const pBo = GR_PICK(m, pk, bo_prev);
+    const float* const pIp = GR_PICK(m, pk, inj_prev);
+    float* const pRout = GR_PICK(m, pk, R_out);
 #pragma unroll
     for (int q = 0; q < RPW; ++q) {
         const int r = warp + q * WARPS;
         const int c = r / UPM_COLS, dd = r - c * UPM_COLS, i = c * N + d0 + dd;
         const sycl::uint4* w4 = reinterpret_cast<const sycl::uint4*>(m.a[0].w_up + (size_t)i * LR);
-        /*
-        DPCT1098:265: The '*' expression is used instead of the __ldg call.
-        These two expressions do not provide the exact same functionality. Check
-        the generated code for potential precision and/or performance issues.
-        */
         const sycl::uint4 wa = *(w4 + lane);
-        /*
-        DPCT1098:266: The '*' expression is used instead of the __ldg call.
-        These two expressions do not provide the exact same functionality. Check
-        the generated code for potential precision and/or performance issues.
-        */
         const sycl::uint4 wb = lane < LR / 8 - 32 ? *(w4 + 32 + lane) : sycl::uint4(0, 0, 0, 0);
         float rv = 0.0f, wn = 0.0f, bo = 0.0f, ip = 0.0f;
         bool apply = false;
         if (lane < T) {
-            const FusedGrArgs& a = m.a[lane];
-            rv = a.R[i];
-            wn = a.w_norm[i];
-            apply = a.apply;
+            rv = pR[i];
+            wn = pWn[i];
+            apply = pApply;
             if (apply) {
-                bo = a.bo_prev[d0 + dd];
-                ip = a.inj_prev[c];
+                bo = pBo[d0 + dd];
+                ip = pIp[c];
             }
         }
         float mine = 0.0f;
@@ -683,17 +668,12 @@ void gr_up_v3_kernel(GrMulti m, const float* __restrict__ part, const float* __r
         if (lane < T) {
             if (apply) {
                 rv = sycl::fma(bo, 2.0f * sigmoidf_(ip / (float)HC), rv);
-                m.a[lane].R_out[i] = rv;
+                pRout[i] = rv;
             }
             const float x = rv * wn * rsS[lane][c];
             g[lane][c][dd] = x * sigmoidf_(mine);
         }
     }
-    /*
-    DPCT1065:269: Consider replacing sycl::nd_item::barrier() with
-    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
-    performance if there is no access to global memory.
-    */
     item_ct1.barrier();
     for (int i = t; i < T * UPM_COLS; i += THREADS) {
         const int k = i / UPM_COLS, col = i - k * UPM_COLS;
@@ -701,7 +681,7 @@ void gr_up_v3_kernel(GrMulti m, const float* __restrict__ part, const float* __r
 #pragma unroll
         for (int c = 0; c < HC; ++c)
             sum += g[k][c][col];
-        m.a[k].mixed[d0 + col] = sum / (float)HC;
+        GR_PICK(m, k, mixed)[d0 + col] = sum / (float)HC;
     }
 }
 // ================================ #315: split / staged - the same arithmetic, split differently ==================
@@ -737,18 +717,24 @@ adjust the code, or use smaller sub-group size to avoid high register pressure.
 void gr_norm_split_kernel(GrMulti m, float* part, float& s_rs) {
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
 
-    const FusedGrArgs& a = m.a[item_ct1.get_group(2)];
+    const int tok = item_ct1.get_group(2);
+    const float* const aR = GR_PICK(m, tok, R);
+    const bool aapply = GR_PICK(m, tok, apply);
+    const float* const abo = GR_PICK(m, tok, bo_prev);
+    const float* const awn = GR_PICK(m, tok, w_norm);
+    const float aeps = GR_PICK(m, tok, eps);
+    float* const ars = GR_PICK(m, tok, rs);
     const int c = item_ct1.get_group(1);
-    float* xn = m.xn + (size_t)item_ct1.get_group(2) * D;
+    float* xn = m.xn + (size_t)tok * D;
     const int t = item_ct1.get_local_id(2), lane = t & 31, warp = t >> 5;
-    const float gw = a.apply ? 2.0f * sigmoidf_(a.inj_prev[c] / (float)HC) : 0.0f;
+    const float gw = aapply ? 2.0f * sigmoidf_(GR_PICK(m, tok, inj_prev)[c] / (float)HC) : 0.0f;
     float ss = 0.0f;
     for (int i = t * 4; i < D; i += THREADS * 4) {
         if (i / N != c) continue;  // another stream's element: another block's
         const int d = i - c * N;
-        sycl::float4 r = *reinterpret_cast<const sycl::float4*>(a.R + i);
-        if (a.apply) {
-            const sycl::float4 b = *reinterpret_cast<const sycl::float4*>(a.bo_prev + d);
+        sycl::float4 r = *reinterpret_cast<const sycl::float4*>(aR + i);
+        if (aapply) {
+            const sycl::float4 b = *reinterpret_cast<const sycl::float4*>(abo + d);
             r.x() = sycl::fma((float)(b.x()), (float)gw, r.x());
             r.y() = sycl::fma((float)(b.y()), (float)gw, r.y());
             r.z() = sycl::fma((float)(b.z()), (float)gw, r.z());
@@ -759,38 +745,28 @@ void gr_norm_split_kernel(GrMulti m, float* part, float& s_rs) {
     }
     const float v = warp_sum(ss);
     if (lane == 0) part[warp] = v;
-    /*
-    DPCT1065:270: Consider replacing sycl::nd_item::barrier() with
-    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
-    performance if there is no access to global memory.
-    */
     item_ct1.barrier();
     if (t == 0) {
         float s = 0.0f;
         for (int w = 0; w < WARPS; ++w)
             s += part[w];
-        s_rs = sycl::rsqrt(s / (float)N + a.eps);
-        a.rs[c] = s_rs;
+        s_rs = sycl::rsqrt(s / (float)N + aeps);
+        ars[c] = s_rs;
     }
-    /*
-    DPCT1065:271: Consider replacing sycl::nd_item::barrier() with
-    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
-    performance if there is no access to global memory.
-    */
     item_ct1.barrier();
     const float rs = s_rs;
     for (int i = t * 4; i < D; i += THREADS * 4) {
         if (i / N != c) continue;
         const int d = i - c * N;
-        sycl::float4 r = *reinterpret_cast<const sycl::float4*>(a.R + i);
-        if (a.apply) {
-            const sycl::float4 b = *reinterpret_cast<const sycl::float4*>(a.bo_prev + d);
+        sycl::float4 r = *reinterpret_cast<const sycl::float4*>(aR + i);
+        if (aapply) {
+            const sycl::float4 b = *reinterpret_cast<const sycl::float4*>(abo + d);
             r.x() = sycl::fma((float)(b.x()), (float)gw, r.x());
             r.y() = sycl::fma((float)(b.y()), (float)gw, r.y());
             r.z() = sycl::fma((float)(b.z()), (float)gw, r.z());
             r.w() = sycl::fma((float)(b.w()), (float)gw, r.w());
         }
-        const sycl::float4 g = *reinterpret_cast<const sycl::float4*>(a.w_norm + i);
+        const sycl::float4 g = *reinterpret_cast<const sycl::float4*>(awn + i);
         const float px = r.x() * g.x(), py = r.y() * g.y(), pz = r.z() * g.z(), pw = r.w() * g.w();
         *reinterpret_cast<sycl::float4*>(xn + i) = sycl::float4(px * rs, py * rs, pz * rs, pw * rs);
     }
@@ -801,11 +777,17 @@ void gr_norm_split_kernel(GrMulti m, float* part, float& s_rs) {
 void gr_norm_split_fast_kernel(GrMulti m, float* part, float& s_rs) {
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
 
-    const FusedGrArgs& a = m.a[item_ct1.get_group(2)];
+    const int tok = item_ct1.get_group(2);
+    const float* const aR = GR_PICK(m, tok, R);
+    const bool aapply = GR_PICK(m, tok, apply);
+    const float* const abo = GR_PICK(m, tok, bo_prev);
+    const float* const awn = GR_PICK(m, tok, w_norm);
+    const float aeps = GR_PICK(m, tok, eps);
+    float* const ars = GR_PICK(m, tok, rs);
     const int c = item_ct1.get_group(1);
-    float* xn = m.xn + (size_t)item_ct1.get_group(2) * D;
+    float* xn = m.xn + (size_t)tok * D;
     const int t = item_ct1.get_local_id(2), lane = t & 31, warp = t >> 5;
-    const float gw = a.apply ? 2.0f * sigmoidf_(a.inj_prev[c] / (float)HC) : 0.0f;
+    const float gw = aapply ? 2.0f * sigmoidf_(GR_PICK(m, tok, inj_prev)[c] / (float)HC) : 0.0f;
     constexpr int KS = 3;
     int k0 = (c * N - 4 * t + THREADS * 4 - 1) / (THREADS * 4);
     if (k0 < 0) k0 = 0;
@@ -816,10 +798,10 @@ void gr_norm_split_fast_kernel(GrMulti m, float* part, float& s_rs) {
         const int i = t * 4 + (k0 + j) * THREADS * 4;
         ok[j] = i < (c + 1) * N;
         if (ok[j]) {
-            r[j] = *reinterpret_cast<const sycl::float4*>(a.R + i);
-            g[j] = *reinterpret_cast<const sycl::float4*>(a.w_norm + i);
-            if (a.apply) {
-                const sycl::float4 b = *reinterpret_cast<const sycl::float4*>(a.bo_prev + (i - c * N));
+            r[j] = *reinterpret_cast<const sycl::float4*>(aR + i);
+            g[j] = *reinterpret_cast<const sycl::float4*>(awn + i);
+            if (aapply) {
+                const sycl::float4 b = *reinterpret_cast<const sycl::float4*>(abo + (i - c * N));
                 r[j].x() = sycl::fma(b.x(), gw, r[j].x());
                 r[j].y() = sycl::fma(b.y(), gw, r[j].y());
                 r[j].z() = sycl::fma(b.z(), gw, r[j].z());
@@ -843,8 +825,8 @@ void gr_norm_split_fast_kernel(GrMulti m, float* part, float& s_rs) {
         float s = 0.0f;
         for (int w = 0; w < WARPS; ++w)
             s += part[w];
-        s_rs = sycl::rsqrt(s / (float)N + a.eps);
-        a.rs[c] = s_rs;
+        s_rs = sycl::rsqrt(s / (float)N + aeps);
+        ars[c] = s_rs;
     }
     item_ct1.barrier();
     const float rs = s_rs;
@@ -992,10 +974,10 @@ void gr_down_staged_kernel(GrMulti m, uint8_t* smem_raw) {
     for (int k = 0; k < kFusedGrMaxT; ++k) {
         if (k >= T || lane != k) continue;
         if (inject_block) {
-            m.a[k].inject_out[row] = s[k];
+            GR_PICK(m, k, inject_out)[row] = s[k];
         } else {
             const float x = s[k] / (float)HC;
-            m.a[k].lo[row] = x / (1.0f + sycl::native::exp(-x));
+            GR_PICK(m, k, lo)[row] = x / (1.0f + sycl::native::exp(-x));
         }
     }
 }
