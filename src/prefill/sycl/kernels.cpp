@@ -819,15 +819,18 @@ void gather_rows16_kernel(const uint16_t* __restrict__ x, const int32_t* __restr
 }
 void moe_combine_kernel(const float* __restrict__ Dm, const int32_t* __restrict__ slot, const float* __restrict__ w,
                         const float* __restrict__ shared, const float* __restrict__ sg, float* __restrict__ bo,
-                        int64_t T) {
+                        int64_t T, const float* __restrict__ row_sd = nullptr) {
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
     const int64_t i = (int64_t)item_ct1.get_group(2) * item_ct1.get_local_range(2) + item_ct1.get_local_id(2);
     if (i >= T * N) return;
     const int64_t t = i / N, d = i % N;
     float s = 0.0f;
 #pragma unroll
-    for (int k = 0; k < 10; ++k)
-        s = sycl::fma((float)(w[t * 10 + k]), (float)(Dm[(int64_t)slot[t * 10 + k] * N + d]), s);
+    for (int k = 0; k < 10; ++k) {
+        const int64_t r = slot[t * 10 + k];
+        const float v = row_sd ? Dm[r * N + d] * row_sd[r] : Dm[r * N + d];
+        s = sycl::fma((float)(w[t * 10 + k]), v, s);
+    }
     bo[i] = s + shared[i] * sigm(sg[t]);
 }
 
@@ -1347,11 +1350,11 @@ void gather_rows16(const uint16_t* x16, const int32_t* src, uint16_t* dst16, int
     check("gather_rows16");
 }
 void moe_combine(const float* Dm, const int32_t* slot, const float* w, const float* shared, const float* sg, float* bo,
-                 int64_t T, void* stream) {
+                 int64_t T, void* stream, const float* row_sd) {
     static_cast<sycl::queue*>(stream)->parallel_for(
         sycl::nd_range<3>(sycl::range<3>(1, 1, blocks_for(T * N)) * sycl::range<3>(1, 1, 256),
                           sycl::range<3>(1, 1, 256)),
-        [=](sycl::nd_item<3> /*item_ct1*/) { moe_combine_kernel(Dm, slot, w, shared, sg, bo, T); });
+        [=](sycl::nd_item<3> /*item_ct1*/) { moe_combine_kernel(Dm, slot, w, shared, sg, bo, T, row_sd); });
     check("moe_combine");
 }
 void rms_rows(float* x, const float* w, int64_t rows, int64_t cols, int64_t ld, float eps, void* stream) {

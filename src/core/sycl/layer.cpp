@@ -810,17 +810,6 @@ bool moe_layer(const WeightTable& tables, const ModelGeometry& g, int64_t layer,
 namespace {
 using strata::kernels::QsaIndexerBuffers;
 using strata::kernels::QsaShapes;
-/// The geometry the QSA kernels want, from the one place that defines it.  `ModelGeometry` carries the widths
-/// the LAYOUT needs; `QsaShapes` adds `n_rot`, `idx_block` and `idx_top_k`, which are kernel contracts.
-QsaShapes qsa_shapes(const ModelGeometry& g) {
-    QsaShapes s = strata::kernels::qsa_real_shapes();
-    s.n_head = g.n_head;
-    s.n_head_kv = g.n_head_kv;
-    s.head_dim = g.head_dim;
-    s.idx_n_head = g.idx_q_heads;
-    s.idx_dim = g.idx_key_dim;
-    return s;
-}
 uint64_t align_up16(uint64_t n) { return (n + 15) & ~15ull; }
 /// One cursor over an arena, so every region is 16-byte aligned without a list of hand-added offsets.
 struct Cursor {
