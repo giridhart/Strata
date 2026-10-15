@@ -32,6 +32,7 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 
 namespace strata::kernels {
 namespace {
@@ -1196,6 +1197,26 @@ void native_mmvq_multi_kernel(const typename F::Block* __restrict__ w, const Q81
     }
 }
 
+// MODEL-UPDATE: the dense Q8_0 projections of Unsloth's files (all of attention, SSM and the shared expert are Q8_0
+// there) take one row per block where that was measured faster - the same per-row sums and reduction as two rows per
+// block (each row its own partials), so every output is the same bits.
+// On Intel Xe2 (IS_XE2), n_out >= 2048 benefits from 1-row blocks (+occupancy on wide projections).
+template <typename F>
+bool q8_0_rows1(int n_in, int n_out) {
+    if constexpr (!std::is_same_v<F, SmallTraits<Q80Block, 8>>) {
+        (void)n_in;
+        (void)n_out;
+        return false;
+    } else {
+        static const int env = [] {
+            const char* v = std::getenv("STRATA_NO_MMVQ_ROWS2");
+            return v == nullptr || v[0] == '\0' ? -1 : v[0] != '0';
+        }();
+        if (env == 0) return false;
+        return n_out >= 2048;
+    }
+}
+
 template <typename F, int NCOLS>
 void launch_multi_n(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, sycl::queue* s) {
     const auto* w = static_cast<const typename F::Block*>(weights);
@@ -1203,70 +1224,26 @@ void launch_multi_n(const void* weights, const void* x_q8_1, float* y, int n_in,
     if (!g_multi_exact) {
         constexpr int NW = NCOLS <= 4 ? 4 : 2;
         const unsigned blocks = unsigned((std::size_t(n_out) + 1) / 2);
-        /*
-        DPCT1049:52: The work-group size passed to the SYCL kernel may exceed
-        the limit. To get the device limit, query
-        info::device::max_work_group_size. Adjust the work-group size if needed.
-        */
-        {
-            s->submit([&](sycl::handler& cgh) {
-                /*
-                DPCT1101:833: 'WARP' expression was replaced with a value.
-                Modify the code to use the original expression, provided in
-                comments, if it is correct.
-                */
-                /*
-                DPCT1060:834: SYCL range can only be a 1D, 2D, or 3D vector.
-                Adjust the code.
-                */
-                sycl::local_accessor<float[NW - 1 > 0 ? NW - 1 : 1][NCOLS][2][32 /*WARP*/], 0> partial_acc_ct1(cgh);
+        s->submit([&](sycl::handler& cgh) {
+            sycl::local_accessor<float[NW - 1 > 0 ? NW - 1 : 1][NCOLS][2][32 /*WARP*/], 0> partial_acc_ct1(cgh);
 
-                cgh.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, blocks) * sycl::range<3>(1, NW, WARP),
-                                                   sycl::range<3>(1, NW, WARP)),
-                                 [=](sycl::nd_item<3> /*item_ct1*/) [[sycl::reqd_sub_group_size(32)]] {
-                                     native_mmvq_multi_kernel<F, NCOLS, NW, 2>(w, x, y, n_in, n_out, partial_acc_ct1);
-                                 });
-            });
-        }
+            cgh.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, blocks) * sycl::range<3>(1, NW, WARP),
+                                               sycl::range<3>(1, NW, WARP)),
+                             [=](sycl::nd_item<3> /*item_ct1*/) [[sycl::reqd_sub_group_size(32)]] {
+                                 native_mmvq_multi_kernel<F, NCOLS, NW, 2>(w, x, y, n_in, n_out, partial_acc_ct1);
+                             });
+        });
         return;
     }
     const sycl::range<3> threads(1, WARPS, WARP);
-    if (n_in / F::DIV < F::BPI) {
-        const unsigned blocks = unsigned((std::size_t(n_out) + WARPS - 1) / WARPS);
-        /*
-        DPCT1049:53: The work-group size passed to the SYCL kernel may exceed
-        the limit. To get the device limit, query
-        info::device::max_work_group_size. Adjust the work-group size if needed.
-        */
-        {
-            s->submit([&](sycl::handler& cgh) {
-                /*
-                DPCT1101:835: 'WARP' expression was replaced with a value.
-                Modify the code to use the original expression, provided in
-                comments, if it is correct.
-                */
-                sycl::local_accessor<float[WARPS - 1 > 0 ? WARPS - 1 : 1][NCOLS][WARPS][32 /*WARP*/], 0> partial_acc_ct1(
-                    cgh);
-
-                cgh.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, blocks) * threads, threads),
-                                 [=](sycl::nd_item<3> /*item_ct1*/) [[sycl::reqd_sub_group_size(32)]] {
-                                     native_mmvq_multi_kernel<F, NCOLS, WARPS, WARPS>(w, x, y, n_in, n_out,
-                                                                                      partial_acc_ct1);
-                                 });
-            });
-        }
-    } else {
-        /*
-        DPCT1049:54: The work-group size passed to the SYCL kernel may exceed
-        the limit. To get the device limit, query
-        info::device::max_work_group_size. Adjust the work-group size if needed.
-        */
+    // #783 PR-h (stuchapin909): two rows per block for every K, not only small K - each row keeps its own partial sums and
+    // reduction, so a row's result does not depend on its neighbour; STRATA_NO_MMVQ_ROWS2=1 keeps one row for large K
+    static const bool rows1 = [] {
+        const char* v = std::getenv("STRATA_NO_MMVQ_ROWS2");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
+    if ((rows1 || q8_0_rows1<F>(n_in, n_out)) && n_in / F::DIV >= F::BPI) {
         s->submit([&](sycl::handler& cgh) {
-            /*
-            DPCT1101:837: 'WARP' expression was replaced with a value. Modify
-            the code to use the original expression, provided in comments, if
-            it is correct.
-            */
             sycl::local_accessor<float[WARPS - 1 > 0 ? WARPS - 1 : 1][NCOLS][1][32 /*WARP*/], 0> partial_acc_ct1(cgh);
 
             cgh.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, unsigned(n_out)) * threads, threads),
@@ -1274,7 +1251,32 @@ void launch_multi_n(const void* weights, const void* x_q8_1, float* y, int n_in,
                                  native_mmvq_multi_kernel<F, NCOLS, WARPS, 1>(w, x, y, n_in, n_out, partial_acc_ct1);
                              });
         });
+        return;
     }
+    if (n_in / F::DIV < F::BPI) {
+        const unsigned blocks = unsigned((std::size_t(n_out) + WARPS - 1) / WARPS);
+        s->submit([&](sycl::handler& cgh) {
+            sycl::local_accessor<float[WARPS - 1 > 0 ? WARPS - 1 : 1][NCOLS][WARPS][32 /*WARP*/], 0> partial_acc_ct1(
+                cgh);
+
+            cgh.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, blocks) * threads, threads),
+                             [=](sycl::nd_item<3> /*item_ct1*/) [[sycl::reqd_sub_group_size(32)]] {
+                                 native_mmvq_multi_kernel<F, NCOLS, WARPS, WARPS>(w, x, y, n_in, n_out,
+                                                                                  partial_acc_ct1);
+                             });
+        });
+        return;
+    }
+    constexpr int ROWS = 2;
+    const unsigned blocks = unsigned((std::size_t(n_out) + ROWS - 1) / ROWS);
+    s->submit([&](sycl::handler& cgh) {
+        sycl::local_accessor<float[WARPS - 1 > 0 ? WARPS - 1 : 1][NCOLS][ROWS][32 /*WARP*/], 0> partial_acc_ct1(cgh);
+
+        cgh.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, blocks) * threads, threads),
+                         [=](sycl::nd_item<3> /*item_ct1*/) [[sycl::reqd_sub_group_size(32)]] {
+                             native_mmvq_multi_kernel<F, NCOLS, WARPS, ROWS>(w, x, y, n_in, n_out, partial_acc_ct1);
+                         });
+    });
 }
 
 template <typename F>
