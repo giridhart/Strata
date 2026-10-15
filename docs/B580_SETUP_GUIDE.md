@@ -56,9 +56,9 @@ cd ..
 ```
 
 #### 2. Copy the files to the target B580 machine
-Transfer the directory over your local network:
+Transfer the directory over your local network to `${ROOT}/../Strata-data/models/IQ2_XS/`:
 ```bash
-rsync -avP ./strata_iq2xs_shards/ user@target-machine:/data/models/IQ2_XS/
+rsync -avP ./strata_iq2xs_shards/ user@target-machine:${ROOT}/../Strata-data/models/IQ2_XS/
 ```
 
 ---
@@ -69,7 +69,7 @@ Run Strata's installer in non-interactive download mode:
 ```bash
 python3 setup.py --model IQ2_XS --no-start --yes
 ```
-This automatically downloads both shards into `../Strata-data/models/IQ2_XS/`, builds the native pack, and prepares the speculative decoding MTP layer.
+This automatically downloads both shards into `${ROOT}/../Strata-data/models/IQ2_XS/`, builds the native pack, and prepares the speculative decoding MTP layer.
 
 ---
 
@@ -78,8 +78,13 @@ This automatically downloads both shards into `../Strata-data/models/IQ2_XS/`, b
 Ensure Intel oneAPI 2025.3 / 2026.1 (`icpx`, `icx`), Level Zero drivers, and compute runtimes are installed.
 
 ### Step 3.1: Configure Environment Variables
-Always set these three variables before building or running anything on the B580:
+Always set these variables in your terminal (from the Strata repository root) before building or running anything on the B580:
 ```bash
+# 0. Define Strata repository root and model storage directory
+export ROOT="$(pwd)"   # Run this from the cloned Strata repository directory
+export MODELS_DIR="${ROOT}/../Strata-data/models"
+mkdir -p "${MODELS_DIR}"
+
 # 1. Source Intel oneAPI environment
 source /opt/intel/oneapi/setvars.sh --force 2>/dev/null
 
@@ -88,6 +93,15 @@ export SYCL_CACHE_PERSISTENT=0
 
 # 3. Explicitly select the discrete Intel Arc B580 (avoid CPU iGPU)
 export ONEAPI_DEVICE_SELECTOR=level_zero:0
+
+# 4. Enable Level Zero Sysman metrics (allows querying free VRAM for --expert-cache auto)
+export ZES_ENABLE_SYSMAN=1
+
+# 5. Handle Linux memory locking limit (prevents "mlock failed (raise ulimit -l)"):
+# Either raise memlock limit if permitted:
+ulimit -l unlimited 2>/dev/null || true
+# Or tell Strata to use pageable memory (bypasses mlock entirely, no root required):
+export STRATA_RESIDENT_PIN=0
 ```
 
 ### Step 3.2: Build Using the Quiet Wrapper (Recommended)
@@ -213,16 +227,21 @@ Empirical results from the `perf/` benchmarks directly map to zero-recompile run
 If you copied raw GGUF files without running `setup.py`, build the pack index locally (takes ~10 seconds on CPU):
 ```bash
 python3 tools/iq_pack.py \
-  --gguf /data/models/IQ2_XS/Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf \
-  --out /data/models/IQ2_XS/pack
+  --gguf "${ROOT}/../Strata-data/models/IQ2_XS/Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf" \
+  --out "${ROOT}/../Strata-data/models/IQ2_XS/pack"
 ```
 
-### Step 7.2: Generate Workload Expert Profile (Optional but Recommended)
-To pre-warm B580's VRAM with the hottest experts for your domain:
+### Step 7.2: Workload Expert Profile
+You do **not** need to generate an expert profile from scratch. Strata includes pre-computed, optimized profiles in the `data/` directory:
+* **`data/expert-profile-sycl.bin` (Recommended for Arc B580)**: Pre-ranked specifically for Intel Arc GPUs from 45 prompt routing traces.
+* **`data/expert-profile.bin`**: Standard full-model profile.
+* **`data/expert-profile-coder.bin`**: Calibrated for the Coder variant.
+
+*(Optional)* If you ever want to profile a custom corpus from scratch, note that `tools/collect_profile_traces.py` takes `CONFIG.json` and an `OUTDIR` (not `--out`), followed by `tools/make_profile_mix.py`:
 ```bash
-python3 tools/collect_profile_traces.py \
-  --corpus bench/profile_corpus.json \
-  --out data/expert-profile.bin
+# Optional: only if generating a custom profile across 45 prompts (~30 min):
+python3 tools/collect_profile_traces.py strata-b580-iq2xs.json ./traces/
+python3 tools/make_profile_mix.py ./traces/c*.trace:1 --out data/expert-profile-custom.bin
 ```
 
 ---
@@ -230,61 +249,69 @@ python3 tools/collect_profile_traces.py \
 ## 8. Starting the Resident Server on Arc B580
 
 ### Key Rules for Arc B580 (12 GB VRAM) + 64 GB+ RAM:
-* `--resident-experts`: **Mandatory**. Pins the cold experts in your 64 GB+ RAM arena.
-* `--expert-cache auto`: Automatically fills free VRAM on the B580 with hot experts.
+* `--resident-experts`: **Mandatory**. Pins the cold experts in your 64 GB+ RAM arena. (Do not use `--stream-experts`; that flag was experimental in container builds).
+* `--expert-cache auto` or `--expert-cache 2500`: Fills free VRAM on the B580 with hot experts (~2,500–3,500 slots fit).
 * `--vram-reserve-mib 1536`: **Mandatory safety buffer**. Prevents Intel `xe` driver out-of-memory livelocks.
-* `--kv q8_0`: Quantizes the attention KV cache to 8-bit to save VRAM for longer contexts (~0.6 GB per 32k context).
+* `--kv int8`: **Mandatory**. Quantizes attention KV cache to 8-bit (`--kv q8_0` is invalid in Strata's CLI; use `int8`).
 * `SYCL_CACHE_PERSISTENT=0`: **Mandatory**. Prevents Xe2 JIT persistent cache crashes.
+* `ONEAPI_DEVICE_SELECTOR=level_zero:0`: Targets the discrete Arc B580 GPU.
+* `ZES_ENABLE_SYSMAN=1`: Enables Level Zero system management to query free VRAM for `--expert-cache auto`.
 * **Do NOT use `STRATA_VERIFY_NO_HOST=1`**: The B580 cannot fit all experts in VRAM, so host-device synchronization is required.
 
 ---
 
 ### Step 8A: Single-Prompt CLI Pre-flight Sanity Test
-Before launching the resident HTTP server, run a quick 32-token CLI prompt test to confirm VRAM allocation, PCIe streaming, and drafter verification:
+Before launching the resident HTTP server, run a quick 32-token CLI prompt test to confirm VRAM allocation, PCIe streaming, and drafter verification. Note: `--tokens` takes integer token IDs (e.g. `32`), not raw strings:
 ```bash
 source /opt/intel/oneapi/setvars.sh --force 2>/dev/null
 export SYCL_CACHE_PERSISTENT=0
 export ONEAPI_DEVICE_SELECTOR=level_zero:0
+export ZES_ENABLE_SYSMAN=1
 
 ./build_sycl/strata \
-  --pack /data/models/IQ2_XS/pack \
-  --native /data/models/IQ2_XS/Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf \
-  --ple-gguf /data/models/IQ2_XS/Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00002-of-00002.gguf \
-  --expert-profile data/expert-profile.bin \
+  --pack "${ROOT}/../Strata-data/models/IQ2_XS/pack" \
+  --native "${ROOT}/../Strata-data/models/IQ2_XS/Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf" \
+  --ple-gguf "${ROOT}/../Strata-data/models/IQ2_XS/Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00002-of-00002.gguf" \
+  --expert-profile data/expert-profile-sycl.bin \
   --expert-cache auto \
   --resident-experts \
   --vram-reserve-mib 1536 \
   --max-context 32768 \
-  --kv q8_0 \
+  --kv int8 \
   --prefill auto \
   --tokens 32 \
   --max-new 32
 ```
-*If this outputs text and exits cleanly (status 0), your hardware and driver are ready for serving.*
+*If this outputs generated tokens and exits cleanly (status 0), your hardware and driver are ready for serving.*
 
 ---
 
 ### Step 8B: Calibrated Server Configuration File (`strata-b580-iq2xs.json`)
-Create `strata-b580-iq2xs.json` incorporating both memory flags and the perf-calibrated environment overrides:
+Create `strata-b580-iq2xs.json` incorporating both memory flags and the perf-calibrated environment overrides (relative paths `../Strata-data/...` work directly when launching from `$ROOT`):
 ```json
 {
   "backend": "sycl",
   "exe": "build_sycl/strata",
+  "tokenizer": "../Strata-data/models/IQ2_XS/pack/tokenizer",
+  "host": "0.0.0.0",
+  "port": 8080,
+  "api_key": "your-secret-key",
   "args": [
-    "--pack", "/data/models/IQ2_XS/pack",
-    "--native", "/data/models/IQ2_XS/Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf",
-    "--ple-gguf", "/data/models/IQ2_XS/Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00002-of-00002.gguf",
-    "--expert-profile", "data/expert-profile.bin",
+    "--pack", "../Strata-data/models/IQ2_XS/pack",
+    "--native", "../Strata-data/models/IQ2_XS/Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf",
+    "--ple-gguf", "../Strata-data/models/IQ2_XS/Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00002-of-00002.gguf",
+    "--expert-profile", "data/expert-profile-sycl.bin",
     "--expert-cache", "auto",
     "--resident-experts",
     "--vram-reserve-mib", "1536",
     "--max-context", "32768",
-    "--kv", "q8_0",
+    "--kv", "int8",
     "--prefill", "auto"
   ],
   "env": {
     "SYCL_CACHE_PERSISTENT": "0",
     "ONEAPI_DEVICE_SELECTOR": "level_zero:0",
+    "ZES_ENABLE_SYSMAN": "1",
     "STRATA_XE2_SPLIT_K": "32",
     "STRATA_XE2_SLM_PAD": "8",
     "STRATA_XE2_CACHE_HINT": "1",
@@ -295,19 +322,28 @@ Create `strata-b580-iq2xs.json` incorporating both memory flags and the perf-cal
 
 ---
 
-### Step 8C: Running the Resident OpenAI / Anthropic Server & Web App
+### Step 8C: Running the Resident Server & Remote Access
 Start the server (includes Xe GPU telemetry for Arc GPUs):
 ```bash
 source /opt/intel/oneapi/setvars.sh --force 2>/dev/null
 export SYCL_CACHE_PERSISTENT=0
 export ONEAPI_DEVICE_SELECTOR=level_zero:0
+export ZES_ENABLE_SYSMAN=1
 
 python3 sycl/serve/server_intel.py --engine strata --config strata-b580-iq2xs.json --port 8080
 ```
 
-The Web UI is live at `http://localhost:8080`, and OpenAI/Anthropic API endpoints (`/v1/chat/completions`, `/v1/messages`) are active immediately.
-
----
+#### Accessing Remotely:
+* **Option A (Direct Network Access)**: With `"host": "0.0.0.0"` and `"api_key"` set, allow port 8080 through the firewall:
+  ```bash
+  sudo ufw allow 8080/tcp
+  ```
+  Then browse to `http://<remote-ip>:8080/` (or use API at `http://<remote-ip>:8080/v1` with Header `Authorization: Bearer your-secret-key`).
+* **Option B (SSH Port Forwarding - Recommended)**: From your local client machine:
+  ```bash
+  ssh -N -L 8080:127.0.0.1:8080 user@<remote-ip>
+  ```
+  Then connect locally at `http://localhost:8080`.
 
 ## 9. Coding-Optimized Setup: Qwen3.8-Flash-Next Coder (for OpenCode)
 
@@ -327,7 +363,7 @@ Coding agents require long context windows (multi-file context, lint outputs, te
 1. **Hybrid Architecture Sizing**:
    Only 12 of the model's 48 layers are full attention (Query-Shared Attention, QSA); the remaining 36 layers are Gated-Delta-Net (GDN) linear recurrent layers. The GDN state has a fixed footprint that does **not** grow with context length.
 2. **KV Footprint**:
-   With 8-bit quantized KV (`--kv q8_0`), the KV cache consumes only **~20 KiB per token** (~0.6 GB per 32,768 tokens in VRAM):
+   With 8-bit quantized KV (`--kv int8`), the KV cache consumes only **~20 KiB per token** (~0.6 GB per 32,768 tokens in VRAM):
    * **32,768 (32K) Context**: ~0.6 GB VRAM KV cache. (Standard single-file / short coding sessions)
    * **65,536 (64K) Context**: ~1.2 GB VRAM KV cache. (Recommended baseline for OpenCode)
    * **131,072 (128K) Context**: ~2.4 GB VRAM KV cache. (Deep repository multi-file context)
@@ -363,7 +399,7 @@ wget -c "${HF_BASE}/Qwen3.8-Flash-Next-GSQ-RCO-Coder-IQ1_M-00002-of-00002.gguf"
 cd ..
 
 # Transfer to target B580 machine:
-rsync -avP ./strata_coder_shards/ user@target-machine:/data/models/Coder/
+rsync -avP ./strata_coder_shards/ user@target-machine:${ROOT}/../Strata-data/models/Coder/
 ```
 
 #### Option B: Download on Target Machine via `setup.py`
@@ -378,8 +414,8 @@ python3 setup.py --family coder --model Coder --no-start --yes
 If transferred manually, build the Coder native pack index (takes ~5–10 seconds on CPU):
 ```bash
 python3 tools/iq_pack.py \
-  --gguf /data/models/Coder/Qwen3.8-Flash-Next-GSQ-RCO-Coder-IQ1_M-00001-of-00002.gguf \
-  --out /data/models/Coder/pack
+  --gguf "${ROOT}/../Strata-data/models/Coder/Qwen3.8-Flash-Next-GSQ-RCO-Coder-IQ1_M-00001-of-00002.gguf" \
+  --out "${ROOT}/../Strata-data/models/Coder/pack"
 ```
 
 ---
@@ -396,15 +432,15 @@ Recommended baseline for general multi-file editing and agentic workflows. Uses 
   "backend": "sycl",
   "exe": "build_sycl/strata",
   "args": [
-    "--pack", "/data/models/Coder/pack",
-    "--native", "/data/models/Coder/Qwen3.8-Flash-Next-GSQ-RCO-Coder-IQ1_M-00001-of-00002.gguf",
-    "--ple-gguf", "/data/models/Coder/Qwen3.8-Flash-Next-GSQ-RCO-Coder-IQ1_M-00002-of-00002.gguf",
+    "--pack", "../Strata-data/models/Coder/pack",
+    "--native", "../Strata-data/models/Coder/Qwen3.8-Flash-Next-GSQ-RCO-Coder-IQ1_M-00001-of-00002.gguf",
+    "--ple-gguf", "../Strata-data/models/Coder/Qwen3.8-Flash-Next-GSQ-RCO-Coder-IQ1_M-00002-of-00002.gguf",
     "--expert-profile", "data/expert-profile-coder.bin",
     "--expert-cache", "auto",
     "--resident-experts",
     "--vram-reserve-mib", "2048",
     "--max-context", "65536",
-    "--kv", "q8_0",
+    "--kv", "int8",
     "--prefill", "4096"
   ]
 }
@@ -418,15 +454,15 @@ Ideal for large codebases, full repository AST maps, and long debugging/test his
   "backend": "sycl",
   "exe": "build_sycl/strata",
   "args": [
-    "--pack", "/data/models/Coder/pack",
-    "--native", "/data/models/Coder/Qwen3.8-Flash-Next-GSQ-RCO-Coder-IQ1_M-00001-of-00002.gguf",
-    "--ple-gguf", "/data/models/Coder/Qwen3.8-Flash-Next-GSQ-RCO-Coder-IQ1_M-00002-of-00002.gguf",
+    "--pack", "../Strata-data/models/Coder/pack",
+    "--native", "../Strata-data/models/Coder/Qwen3.8-Flash-Next-GSQ-RCO-Coder-IQ1_M-00001-of-00002.gguf",
+    "--ple-gguf", "../Strata-data/models/Coder/Qwen3.8-Flash-Next-GSQ-RCO-Coder-IQ1_M-00002-of-00002.gguf",
     "--expert-profile", "data/expert-profile-coder.bin",
     "--expert-cache", "auto",
     "--resident-experts",
     "--vram-reserve-mib", "2048",
     "--max-context", "131072",
-    "--kv", "q8_0",
+    "--kv", "int8",
     "--prefill", "4096"
   ]
 }
@@ -444,15 +480,15 @@ Because keeping a full 256K KV cache in VRAM would take ~4.8 GB and reduce the h
   "backend": "sycl",
   "exe": "build_sycl/strata",
   "args": [
-    "--pack", "/data/models/Coder/pack",
-    "--native", "/data/models/Coder/Qwen3.8-Flash-Next-GSQ-RCO-Coder-IQ1_M-00001-of-00002.gguf",
-    "--ple-gguf", "/data/models/Coder/Qwen3.8-Flash-Next-GSQ-RCO-Coder-IQ1_M-00002-of-00002.gguf",
+    "--pack", "../Strata-data/models/Coder/pack",
+    "--native", "../Strata-data/models/Coder/Qwen3.8-Flash-Next-GSQ-RCO-Coder-IQ1_M-00001-of-00002.gguf",
+    "--ple-gguf", "../Strata-data/models/Coder/Qwen3.8-Flash-Next-GSQ-RCO-Coder-IQ1_M-00002-of-00002.gguf",
     "--expert-profile", "data/expert-profile-coder.bin",
     "--expert-cache", "auto",
     "--resident-experts",
     "--vram-reserve-mib", "2048",
     "--max-context", "262144",
-    "--kv", "q8_0",
+    "--kv", "int8",
     "--kv-resident", "32768",
     "--prefill", "4096"
   ]
@@ -498,3 +534,131 @@ By default, the Coder model reasons inside `<think>...</think>` tags before gene
   }
   ```
   Or configure OpenCode to pass `chat_template_kwargs: {"enable_thinking": false}` in completion requests.
+
+---
+
+## 10. High-Precision Full-Model Setup: Qwen3.8-Flash-Next IQ3_S
+
+If you want the highest precision across all 512 experts and general reasoning, mathematics, multilingual, and code tasks, you can run the **`IQ3_S`** quantization variant.
+
+### 10.1 Hardware & Sizing Constraints on Arc B580 (12 GB VRAM) + 64 GB RAM
+* **Shard 1 File Size**: ~54.8 GB.
+* **System RAM Footprint**: `IQ3_S` retains all 512 experts with ~50.0 GB of expert weights resident in system RAM. On a 64 GB RAM machine, OS and desktop services leave very tight headroom. Setting `export STRATA_RESIDENT_PIN=0` (or passing `--resident-budget-gib 46`) prevents Linux out-of-memory or memory-locking (`mlock`) aborts.
+* **VRAM Expert Cache**: Each `IQ3_S` expert blob is larger (~4.1 MB vs ~2.9 MB for IQ2_XS). On the 12 GB Arc B580, free VRAM fits ~**1,000 slots**. Use `--expert-cache 1000` (or `auto`).
+* **Expected Performance**: ~46–53 tok/s decode on Arc B580.
+
+---
+
+### Step 10.2: Download IQ3_S Shards
+
+The IQ3_S model consists of two shards:
+* **Shard 1 (`...-IQ3_S-00001-of-00002.gguf`, ~54.8 GB)**: Attention, dense weights, and 512 experts.
+* **Shard 2 (`...-IQ3_S-00002-of-00002.gguf`, ~28.8 GB)**: Layer 1 n-gram PLE lookup table (`per_layer_token_embd.weight`).
+
+#### Option A: Download via `huggingface-cli` or `wget`
+```bash
+# Using huggingface-cli:
+huggingface-cli download ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF \
+  --include "IQ3_S/*" \
+  --local-dir "${ROOT}/../Strata-data/models/IQ3_S/"
+
+# Or using wget:
+mkdir -p "${ROOT}/../Strata-data/models/IQ3_S" && cd "${ROOT}/../Strata-data/models/IQ3_S"
+HF_BASE="https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/resolve/main/IQ3_S"
+wget -c "${HF_BASE}/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf"
+wget -c "${HF_BASE}/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00002-of-00002.gguf"
+cd "${ROOT}"
+```
+
+#### Option B: Download via `setup.py`
+```bash
+python3 setup.py --model IQ3_S --no-start --yes
+```
+
+---
+
+### Step 10.3: Build the Native Pack Index for IQ3_S
+You must generate a pack index specifically for `IQ3_S` (do not reuse the `IQ2_XS` pack):
+```bash
+python3 tools/iq_pack.py \
+  --gguf "${ROOT}/../Strata-data/models/IQ3_S/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf" \
+  --out "${ROOT}/../Strata-data/models/IQ3_S/pack"
+```
+
+---
+
+### Step 10.4: Single-Prompt CLI Pre-flight Sanity Test
+Verify hardware allocation, pinned RAM residency, and Level Zero kernel execution before launching the server:
+```bash
+source /opt/intel/oneapi/setvars.sh --force 2>/dev/null
+export SYCL_CACHE_PERSISTENT=0
+export ONEAPI_DEVICE_SELECTOR=level_zero:0
+export ZES_ENABLE_SYSMAN=1
+export STRATA_RESIDENT_PIN=0
+
+./build_sycl/strata \
+  --pack "${ROOT}/../Strata-data/models/IQ3_S/pack" \
+  --native "${ROOT}/../Strata-data/models/IQ3_S/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf" \
+  --ple-gguf "${ROOT}/../Strata-data/models/IQ3_S/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00002-of-00002.gguf" \
+  --expert-profile data/expert-profile-sycl.bin \
+  --expert-cache 1000 \
+  --resident-experts \
+  --vram-reserve-mib 1536 \
+  --max-context 32768 \
+  --kv int8 \
+  --prefill auto \
+  --tokens 32 \
+  --max-new 32
+```
+*If this generates tokens and exits with status 0, `IQ3_S` is ready for serving.*
+
+---
+
+### Step 10.5: Create IQ3_S Server Configuration (`strata-b580-iq3s.json`)
+Save this as `strata-b580-iq3s.json` (relative paths `../Strata-data/...` work directly when launching from `$ROOT`):
+```json
+{
+  "backend": "sycl",
+  "exe": "build_sycl/strata",
+  "tokenizer": "../Strata-data/models/IQ3_S/pack/tokenizer",
+  "host": "0.0.0.0",
+  "port": 8080,
+  "api_key": "your-secret-key",
+  "args": [
+    "--pack", "../Strata-data/models/IQ3_S/pack",
+    "--native", "../Strata-data/models/IQ3_S/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf",
+    "--ple-gguf", "../Strata-data/models/IQ3_S/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00002-of-00002.gguf",
+    "--expert-profile", "data/expert-profile-sycl.bin",
+    "--expert-cache", "1000",
+    "--resident-experts",
+    "--vram-reserve-mib", "1536",
+    "--max-context", "32768",
+    "--kv", "int8",
+    "--prefill", "auto"
+  ],
+  "env": {
+    "SYCL_CACHE_PERSISTENT": "0",
+    "ONEAPI_DEVICE_SELECTOR": "level_zero:0",
+    "ZES_ENABLE_SYSMAN": "1",
+    "STRATA_RESIDENT_PIN": "0",
+    "STRATA_XE2_SPLIT_K": "32",
+    "STRATA_XE2_SLM_PAD": "8",
+    "STRATA_XE2_CACHE_HINT": "1",
+    "STRATA_XE2_DUAL_COLUMN": "0"
+  }
+}
+```
+
+---
+
+### Step 10.6: Launch the IQ3_S Server
+Start the resident server with Xe telemetry:
+```bash
+source /opt/intel/oneapi/setvars.sh --force 2>/dev/null
+export SYCL_CACHE_PERSISTENT=0
+export ONEAPI_DEVICE_SELECTOR=level_zero:0
+export ZES_ENABLE_SYSMAN=1
+
+python3 sycl/serve/server_intel.py --engine strata --config strata-b580-iq3s.json --port 8080
+```
+Open `http://localhost:8080/` (or `http://<remote-ip>:8080/`) to chat or connect your API client.
