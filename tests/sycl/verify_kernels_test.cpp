@@ -5,14 +5,17 @@
 #include "strata/kernels/qsa.hpp"
 #include "strata/kernels/rope_scaling.hpp"
 
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <random>
+#include <string>
 #include <vector>
 
-int main() {
+int main(int argc, char** argv) {
+    const bool bench = argc > 1 && std::string(argv[1]) == "--bench";
     sycl::queue q{sycl::default_selector_v, sycl::property::queue::in_order()};
     std::printf("Running verify_kernels_test on: %s\n", q.get_device().get_info<sycl::info::device::name>().c_str());
 
@@ -514,5 +517,92 @@ int main() {
 
     std::printf("\nverify_kernels_test: %s (total failures: %d)\n", total_failures == 0 ? "PASSED" : "FAILED",
                 total_failures);
+
+    if (bench && total_failures == 0) {
+        std::printf("\n--- Batch Commit Microbenchmarks (STRATA_COMMIT_BATCH) ---\n");
+        constexpr int reps = 50;
+        constexpr int S_dim = 128, h_k = 1, h_v = 4, L = 48, MT = strata::kernels::kVerifyMaxT;
+        constexpr int qk = S_dim * h_k, C = 2 * qk + S_dim * h_v;
+        constexpr int64_t conv_off = (int64_t)S_dim * h_v * S_dim, stride = conv_off + (int64_t)C * 3;
+
+        float* d_st = sycl::malloc_device<float>((size_t)stride * L, q);
+        float* d_qkv = sycl::malloc_device<float>((size_t)L * MT * C, q);
+        float* d_h = sycl::malloc_device<float>((size_t)L * MT * C, q);
+        float* d_g = sycl::malloc_device<float>((size_t)L * MT * h_v, q);
+        float* d_bt = sycl::malloc_device<float>((size_t)L * MT * h_v, q);
+        float* d_z = sycl::malloc_device<float>((size_t)MT * S_dim * h_v, q);
+        float* d_gm = sycl::malloc_device<float>(S_dim, q);
+        float* d_y = sycl::malloc_device<float>((size_t)MT * S_dim * h_v, q);
+        int32_t* d_nk = sycl::malloc_device<int32_t>(1, q);
+
+        q.fill(d_st, 0.01f, (size_t)stride * L);
+        q.fill(d_qkv, 0.05f, (size_t)L * MT * C);
+        q.fill(d_h, 0.05f, (size_t)L * MT * C);
+        q.fill(d_g, -0.5f, (size_t)L * MT * h_v);
+        q.fill(d_bt, 0.8f, (size_t)L * MT * h_v);
+        q.fill(d_z, 0.2f, (size_t)MT * S_dim * h_v);
+        q.fill(d_gm, 1.0f, S_dim);
+        q.wait();
+
+        for (int nk : {1, 2, 4, 8}) {
+            q.fill(d_nk, nk, 1).wait();
+
+            // 1. Sequential per-layer commit
+            for (int i = 0; i < 3; ++i) {
+                for (int l = 0; l < L; ++l) {
+                    float* stl = d_st + (size_t)l * stride;
+                    strata::kernels::gdn_conv_commit(stl + conv_off, d_qkv + (size_t)l * MT * C, C, d_nk, &q);
+                    strata::kernels::gdn_step_norm_multi(stl, d_h + (size_t)l * MT * C, C, d_g + (size_t)l * MT * h_v,
+                                                         d_bt + (size_t)l * MT * h_v, d_z, d_gm, 1e-6f, d_y, h_k, h_v, MT,
+                                                         d_nk, &q, MT);
+                }
+            }
+            q.wait();
+            auto t0 = std::chrono::steady_clock::now();
+            for (int i = 0; i < reps; ++i) {
+                for (int l = 0; l < L; ++l) {
+                    float* stl = d_st + (size_t)l * stride;
+                    strata::kernels::gdn_conv_commit(stl + conv_off, d_qkv + (size_t)l * MT * C, C, d_nk, &q);
+                    strata::kernels::gdn_step_norm_multi(stl, d_h + (size_t)l * MT * C, C, d_g + (size_t)l * MT * h_v,
+                                                         d_bt + (size_t)l * MT * h_v, d_z, d_gm, 1e-6f, d_y, h_k, h_v, MT,
+                                                         d_nk, &q, MT);
+                }
+            }
+            q.wait();
+            auto t1 = std::chrono::steady_clock::now();
+            double us_seq = std::chrono::duration<double, std::micro>(t1 - t0).count() / reps;
+
+            // 2. Batched gdn_commit_layers
+            for (int i = 0; i < 3; ++i) {
+                strata::kernels::gdn_commit_layers(d_st, stride, conv_off, d_qkv, (int64_t)MT * C, d_h,
+                                                   (int64_t)MT * C, d_g, d_bt, (int64_t)MT * h_v, C, h_k,
+                                                   h_v, MT, L, d_nk, &q);
+            }
+            q.wait();
+            t0 = std::chrono::steady_clock::now();
+            for (int i = 0; i < reps; ++i) {
+                strata::kernels::gdn_commit_layers(d_st, stride, conv_off, d_qkv, (int64_t)MT * C, d_h,
+                                                   (int64_t)MT * C, d_g, d_bt, (int64_t)MT * h_v, C, h_k,
+                                                   h_v, MT, L, d_nk, &q);
+            }
+            q.wait();
+            t1 = std::chrono::steady_clock::now();
+            double us_batched = std::chrono::duration<double, std::micro>(t1 - t0).count() / reps;
+
+            std::printf("BENCH GDN Commit L=%2d steps=%d | sequential: %7.2f us | batched: %7.2f us | speedup: %.2fx\n",
+                        L, nk, us_seq, us_batched, us_seq / us_batched);
+        }
+
+        sycl::free(d_st, q);
+        sycl::free(d_qkv, q);
+        sycl::free(d_h, q);
+        sycl::free(d_g, q);
+        sycl::free(d_bt, q);
+        sycl::free(d_z, q);
+        sycl::free(d_gm, q);
+        sycl::free(d_y, q);
+        sycl::free(d_nk, q);
+    }
+
     return total_failures == 0 ? 0 : 1;
 }

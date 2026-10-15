@@ -1,10 +1,12 @@
 #include <sycl/sycl.hpp>
 #include "strata/kernels/fused_gdn.hpp"
 
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <random>
+#include <string>
 #include <vector>
 
 using strata::kernels::fused_gdn_ab;
@@ -18,7 +20,8 @@ float sigmoid_f(float x) { return 1.0f / (1.0f + std::exp(-x)); }
 
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    const bool bench = argc > 1 && std::string(argv[1]) == "--bench";
     sycl::queue q{sycl::property::queue::in_order()};
     printf("Running fused_gdn SYCL test on device: %s\n", q.get_device().get_info<sycl::info::device::name>().c_str());
 
@@ -475,9 +478,81 @@ int main() {
 
     if (total_bad == 0) {
         printf("fused_gdn SYCL parity OK (0 failures)\n");
-        return 0;
     } else {
         printf("fused_gdn SYCL parity FAILED (%d bad)\n", total_bad);
         return 1;
     }
+
+    if (bench) {
+        std::printf("\n--- Fused GDN Microbenchmarks ---\n");
+        constexpr int reps = 100;
+        const int h_v = 16, h_k = 16;
+        constexpr int S = 128;
+        const size_t state_sz = (size_t)S * S * h_v;
+        const size_t qk_sz = (size_t)S * h_k;
+        const size_t out_sz = (size_t)S * h_v;
+
+        float* d_state = sycl::malloc_device<float>(state_sz, q);
+        float* d_q = sycl::malloc_device<float>(qk_sz, q);
+        float* d_k = sycl::malloc_device<float>(qk_sz, q);
+        float* d_v = sycl::malloc_device<float>(out_sz, q);
+        float* d_gate = sycl::malloc_device<float>(h_v, q);
+        float* d_beta = sycl::malloc_device<float>(h_v, q);
+        float* d_z = sycl::malloc_device<float>(out_sz, q);
+        float* d_gamma = sycl::malloc_device<float>(S, q);
+        float* d_y = sycl::malloc_device<float>(out_sz, q);
+
+        q.fill(d_state, 0.01f, state_sz);
+        q.fill(d_q, 0.05f, qk_sz);
+        q.fill(d_k, 0.05f, qk_sz);
+        q.fill(d_v, 0.1f, out_sz);
+        q.fill(d_gate, -0.5f, h_v);
+        q.fill(d_beta, 0.8f, h_v);
+        q.fill(d_z, 0.2f, out_sz);
+        q.fill(d_gamma, 1.0f, S);
+        q.wait();
+
+        // Warmup step_norm
+        for (int i = 0; i < 5; ++i) {
+            fused_gdn_step_norm(d_state, d_q, d_k, d_v, d_gate, d_beta, d_z, d_gamma, 1e-5f, d_y, h_k, h_v, &q);
+        }
+        q.wait();
+
+        auto t0 = std::chrono::steady_clock::now();
+        for (int i = 0; i < reps; ++i) {
+            fused_gdn_step_norm(d_state, d_q, d_k, d_v, d_gate, d_beta, d_z, d_gamma, 1e-5f, d_y, h_k, h_v, &q);
+        }
+        q.wait();
+        auto t1 = std::chrono::steady_clock::now();
+        double us_step_norm = std::chrono::duration<double, std::micro>(t1 - t0).count() / reps;
+
+        // Warmup step_norm_silu
+        for (int i = 0; i < 5; ++i) {
+            fused_gdn_step_norm_silu(d_state, d_q, d_k, d_v, d_gate, d_beta, d_z, d_gamma, 1e-5f, d_y, h_k, h_v, &q);
+        }
+        q.wait();
+
+        t0 = std::chrono::steady_clock::now();
+        for (int i = 0; i < reps; ++i) {
+            fused_gdn_step_norm_silu(d_state, d_q, d_k, d_v, d_gate, d_beta, d_z, d_gamma, 1e-5f, d_y, h_k, h_v, &q);
+        }
+        q.wait();
+        t1 = std::chrono::steady_clock::now();
+        double us_step_silu = std::chrono::duration<double, std::micro>(t1 - t0).count() / reps;
+
+        const double bytes = (double)(state_sz * 2 + qk_sz * 2 + out_sz * 3) * sizeof(float);
+        std::printf("BENCH GDN StepNorm     : %6.2f us (%6.1f GB/s)\n", us_step_norm, bytes / us_step_norm / 1e3);
+        std::printf("BENCH GDN StepNorm+SiLU: %6.2f us (%6.1f GB/s)\n", us_step_silu, bytes / us_step_silu / 1e3);
+
+        sycl::free(d_state, q);
+        sycl::free(d_q, q);
+        sycl::free(d_k, q);
+        sycl::free(d_v, q);
+        sycl::free(d_gate, q);
+        sycl::free(d_beta, q);
+        sycl::free(d_z, q);
+        sycl::free(d_gamma, q);
+        sycl::free(d_y, q);
+    }
+    return 0;
 }

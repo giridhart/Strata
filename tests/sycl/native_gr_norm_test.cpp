@@ -4,10 +4,12 @@
 #include "strata/kernels/fused_gr.hpp"
 #include "strata/kernels/bf16_bits.hpp"
 
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <random>
+#include <string>
 #include <vector>
 
 namespace {
@@ -31,7 +33,8 @@ void cpu_rmsnorm(const float* x, const float* gamma, float* y, int n_cols, int n
 
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    const bool bench = argc > 1 && std::string(argv[1]) == "--bench";
     sycl::queue q{sycl::default_selector_v, sycl::property::queue::in_order()};
     printf("Running native_gr_norm SYCL test on: %s\n", q.get_device().get_info<sycl::info::device::name>().c_str());
 
@@ -192,11 +195,82 @@ int main() {
         sycl::free(d_dequant, q);
     }
 
-    if (total_failures == 0) {
-        printf("native_gr_norm SYCL test OK (0 failures)\n");
-        return 0;
-    } else {
+    if (total_failures != 0) {
         printf("native_gr_norm SYCL test FAILED with %d errors\n", total_failures);
         return 1;
     }
+    printf("native_gr_norm SYCL test OK (0 failures)\n");
+
+    if (bench) {
+        printf("\n--- Native GR Norm & Fused Q8_0 Microbenchmarks ---\n");
+        constexpr int reps = 100;
+        constexpr int n_cols = 10240, n_rows = 16;
+        constexpr size_t total_elems = (size_t)n_cols * n_rows;
+        constexpr int64_t n_blocks = (int64_t)total_elems / 32;
+
+        float* d_in = sycl::malloc_device<float>(total_elems, q);
+        float* d_gamma = sycl::malloc_device<float>(total_elems, q);
+        float* d_out = sycl::malloc_device<float>(total_elems, q);
+        uint16_t* d_bf16 = sycl::malloc_device<uint16_t>(total_elems, q);
+        uint8_t* d_q8 = sycl::malloc_device<uint8_t>((size_t)n_blocks * 34, q);
+        uint16_t* d_dequant = sycl::malloc_device<uint16_t>(total_elems, q);
+
+        q.fill(d_in, 0.5f, total_elems);
+        q.fill(d_gamma, 1.0f, total_elems);
+        q.fill(d_bf16, (uint16_t)0x3F80, total_elems);
+        q.wait();
+
+        // 1. RMSNorm
+        for (int i = 0; i < 5; ++i) {
+            strata::kernels::native_gr_rms_norm_weighted(d_in, d_gamma, d_out, n_cols, n_rows, eps, &q);
+        }
+        q.wait();
+        auto t0 = std::chrono::steady_clock::now();
+        for (int i = 0; i < reps; ++i) {
+            strata::kernels::native_gr_rms_norm_weighted(d_in, d_gamma, d_out, n_cols, n_rows, eps, &q);
+        }
+        q.wait();
+        auto t1 = std::chrono::steady_clock::now();
+        double us_norm = std::chrono::duration<double, std::micro>(t1 - t0).count() / reps;
+        double bytes_norm = (double)total_elems * sizeof(float) * 3; // in, gamma, out
+        printf("BENCH RMSNorm [%5d x %2d]  : %6.2f us (%6.1f GB/s)\n", n_cols, n_rows, us_norm, bytes_norm / us_norm / 1e3);
+
+        // 2. Fused GR Quantize Q8_0
+        for (int i = 0; i < 5; ++i) {
+            strata::kernels::fused_gr_quantize_q8_0(d_bf16, d_q8, n_blocks, &q);
+        }
+        q.wait();
+        t0 = std::chrono::steady_clock::now();
+        for (int i = 0; i < reps; ++i) {
+            strata::kernels::fused_gr_quantize_q8_0(d_bf16, d_q8, n_blocks, &q);
+        }
+        q.wait();
+        t1 = std::chrono::steady_clock::now();
+        double us_quant = std::chrono::duration<double, std::micro>(t1 - t0).count() / reps;
+        double bytes_quant = (double)total_elems * sizeof(uint16_t) + (double)n_blocks * 34;
+        printf("BENCH Quantize Q8_0 [%6lld blk]: %6.2f us (%6.1f GB/s)\n", (long long)n_blocks, us_quant, bytes_quant / us_quant / 1e3);
+
+        // 3. Fused GR Dequant Q8_0
+        for (int i = 0; i < 5; ++i) {
+            strata::kernels::fused_gr_dequant_q8_0(d_q8, d_dequant, n_blocks, &q);
+        }
+        q.wait();
+        t0 = std::chrono::steady_clock::now();
+        for (int i = 0; i < reps; ++i) {
+            strata::kernels::fused_gr_dequant_q8_0(d_q8, d_dequant, n_blocks, &q);
+        }
+        q.wait();
+        t1 = std::chrono::steady_clock::now();
+        double us_dequant = std::chrono::duration<double, std::micro>(t1 - t0).count() / reps;
+        double bytes_dequant = (double)total_elems * sizeof(uint16_t) + (double)n_blocks * 34;
+        printf("BENCH Dequant Q8_0  [%6lld blk]: %6.2f us (%6.1f GB/s)\n", (long long)n_blocks, us_dequant, bytes_dequant / us_dequant / 1e3);
+
+        sycl::free(d_in, q);
+        sycl::free(d_gamma, q);
+        sycl::free(d_out, q);
+        sycl::free(d_bf16, q);
+        sycl::free(d_q8, q);
+        sycl::free(d_dequant, q);
+    }
+    return 0;
 }

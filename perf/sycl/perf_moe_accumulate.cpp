@@ -295,13 +295,12 @@ static void BM_Xe2_MoE_SubgroupReduce(benchmark::State& state) {
 // Grouped MoE Expert GEMV Projections (16-Lane Subgroup vs Legacy 32-Lane)
 // ============================================================================
 
-template <bool SUB16>
+template <int GU_TYPE = 2, int D_TYPE = 2, bool SUB16 = true>
 static void BM_Xe2_MoE_GroupedExpert(benchmark::State& state) {
     const int NT = static_cast<int>(state.range(0));
     sycl::queue q{sycl::default_selector_v, {sycl::property::queue::enable_profiling()}};
 
-    // Use Q4_0 gate/up and Q4_0 down projections (2560 x 640)
-    const int gu_type = 2, d_type = 2;
+    const int gu_type = GU_TYPE, d_type = D_TYPE;
     strata::kernels::NativeExpertLayout L = strata::kernels::native_expert_layout(gu_type, d_type, N_EMBD, 640);
     const size_t scratch_bytes = strata::kernels::native_expert_scratch_bytes(NT, 640);
 
@@ -604,8 +603,10 @@ BENCHMARK(BM_Xe2_MoE_SubgroupReduce)->UseManualTime()->Args({8});
 BENCHMARK(BM_Xe2_MoE_SubgroupReduce)->UseManualTime()->Args({16});
 BENCHMARK(BM_Xe2_MoE_SubgroupReduce)->UseManualTime()->Args({32});
 
-BENCHMARK(BM_Xe2_MoE_GroupedExpert<true>)->Name("BM_Xe2_MoE_GroupedExpert_Sub16")->UseManualTime()->Args({1})->Args({4})->Args({8});
-BENCHMARK(BM_Xe2_MoE_GroupedExpert<false>)->Name("BM_Xe2_MoE_GroupedExpert_Legacy32")->UseManualTime()->Args({1})->Args({4})->Args({8});
+BENCHMARK(BM_Xe2_MoE_GroupedExpert<2, 2, true>)->Name("BM_Xe2_MoE_GroupedExpert_Q4_0_Sub16")->UseManualTime()->Args({1})->Args({4})->Args({8});
+BENCHMARK(BM_Xe2_MoE_GroupedExpert<2, 2, false>)->Name("BM_Xe2_MoE_GroupedExpert_Q4_0_Legacy32")->UseManualTime()->Args({1})->Args({4})->Args({8});
+BENCHMARK(BM_Xe2_MoE_GroupedExpert<40, 40, true>)->Name("BM_Xe2_MoE_GroupedExpert_NVFP4")->UseManualTime()->Args({1})->Args({4})->Args({8});
+BENCHMARK(BM_Xe2_MoE_GroupedExpert<17, 20, true>)->Name("BM_Xe2_MoE_GroupedExpert_IQ2_XS_IQ4NL")->UseManualTime()->Args({1})->Args({4})->Args({8});
 
 BENCHMARK(BM_Xe2_MoE_Separate_Gate_Up_SwiGLU)->UseManualTime()->Args({1})->Args({4})->Args({8})->Args({16})->Args({32});
 BENCHMARK(BM_Xe2_MoE_DualColumn_SwiGLU)->UseManualTime()->Args({1})->Args({4})->Args({8})->Args({16})->Args({32});

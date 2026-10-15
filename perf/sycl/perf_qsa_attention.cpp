@@ -13,7 +13,10 @@
 #include <sycl/sycl.hpp>
 
 #include "strata/core/sycl_arch.hpp"
+#include "strata/kernels/native_qsa_score.hpp"
+#include "strata/kernels/qsa.hpp"
 
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -251,6 +254,92 @@ static void BM_Xe2_QSA_TopK_Gather(benchmark::State& state) {
 }
 
 // ============================================================================
+// Benchmark: BM_Xe2_QSA_LaneCell_Scoring
+// ============================================================================
+
+static void BM_Xe2_QSA_LaneCell_Scoring(benchmark::State& state) {
+    const int n_cells = static_cast<int>(state.range(0));
+    constexpr int D = 128;
+    constexpr int HEADS = 4;
+    constexpr int R = 4;
+    const int max_blocks = n_cells / R + 1;
+    const int max_cells = n_cells;
+
+    sycl::queue q{sycl::default_selector_v, {sycl::property::queue::enable_profiling()}};
+
+    float* d_pooled = sycl::malloc_device<float>(static_cast<size_t>(max_blocks) * D, q);
+    float* d_query = sycl::malloc_device<float>(HEADS * D, q);
+    float* d_bias = sycl::malloc_device<float>(max_blocks, q);
+    float* d_scores = sycl::malloc_device<float>(max_cells, q);
+    int32_t* d_step = sycl::malloc_device<int32_t>(strata::kernels::kStepCount, q);
+
+    if (!d_pooled || !d_query || !d_bias || !d_scores || !d_step) {
+        state.SkipWithError("Failed to allocate USM memory for QSA LaneCell Scoring benchmark");
+        if (d_pooled) sycl::free(d_pooled, q);
+        if (d_query) sycl::free(d_query, q);
+        if (d_bias) sycl::free(d_bias, q);
+        if (d_scores) sycl::free(d_scores, q);
+        if (d_step) sycl::free(d_step, q);
+        return;
+    }
+
+    int32_t h_step[strata::kernels::kStepCount] = {
+        n_cells - 1,
+        n_cells,
+        n_cells / R,
+        n_cells < 2051 ? n_cells : 2051
+    };
+
+    q.fill(d_pooled, 0.05f, static_cast<size_t>(max_blocks) * D);
+    q.fill(d_query, 0.05f, HEADS * D);
+    q.fill(d_bias, 0.01f, max_blocks);
+    q.fill(d_scores, 0.0f, max_cells);
+    q.memcpy(d_step, h_step, sizeof(h_step));
+    q.wait_and_throw();
+
+    strata::kernels::QsaShapes shapes = strata::kernels::qsa_real_shapes();
+
+    // Warmup
+    for (int i = 0; i < 5; ++i) {
+        strata::kernels::native_qsa_score(d_pooled, d_query, d_bias, shapes, d_step,
+                                         max_blocks, max_cells, d_scores, &q);
+        q.wait();
+    }
+
+    // Benchmark loop
+    for (auto _ : state) {
+        auto t_start = std::chrono::high_resolution_clock::now();
+        strata::kernels::native_qsa_score(d_pooled, d_query, d_bias, shapes, d_step,
+                                         max_blocks, max_cells, d_scores, &q);
+        q.wait();
+        auto t_end = std::chrono::high_resolution_clock::now();
+        std::chrono::duration<double> diff = t_end - t_start;
+        state.SetIterationTime(diff.count());
+    }
+
+    // Flops: for each block, HEADS * D * 2 flops (dot product) = max_blocks * HEADS * D * 2
+    const double flops = static_cast<double>(max_blocks) * HEADS * D * 2.0;
+    // Bytes transferred: pooled (read) + query (read) + bias (read) + scores (write)
+    const double bytes = static_cast<double>(max_blocks * D) * sizeof(float) +
+                         static_cast<double>(HEADS * D) * sizeof(float) +
+                         static_cast<double>(max_blocks) * sizeof(float) +
+                         static_cast<double>(max_cells) * sizeof(float);
+
+    state.counters["Bandwidth_GBps"] =
+        benchmark::Counter(bytes, benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
+    state.counters["GFLOPS"] =
+        benchmark::Counter(flops * 1e-9, benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
+    state.counters["cells_per_sec"] =
+        benchmark::Counter(static_cast<double>(n_cells), benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
+
+    sycl::free(d_pooled, q);
+    sycl::free(d_query, q);
+    sycl::free(d_bias, q);
+    sycl::free(d_scores, q);
+    sycl::free(d_step, q);
+}
+
+// ============================================================================
 // Registration: Attention Context Sweeps & Sparse Top-K Gather
 // ============================================================================
 
@@ -266,6 +355,12 @@ BENCHMARK(BM_Xe2_QSA_TopK_Gather)->UseManualTime()->Args({4096});
 BENCHMARK(BM_Xe2_QSA_TopK_Gather)->UseManualTime()->Args({16384});
 BENCHMARK(BM_Xe2_QSA_TopK_Gather)->UseManualTime()->Args({32768});
 BENCHMARK(BM_Xe2_QSA_TopK_Gather)->UseManualTime()->Args({65536});
+
+// 3. Lane-Cell Scoring across sequence context lengths
+BENCHMARK(BM_Xe2_QSA_LaneCell_Scoring)->UseManualTime()->Args({1024});
+BENCHMARK(BM_Xe2_QSA_LaneCell_Scoring)->UseManualTime()->Args({4096});
+BENCHMARK(BM_Xe2_QSA_LaneCell_Scoring)->UseManualTime()->Args({16384});
+BENCHMARK(BM_Xe2_QSA_LaneCell_Scoring)->UseManualTime()->Args({65536});
 
 // ============================================================================
 // Main Entry Point

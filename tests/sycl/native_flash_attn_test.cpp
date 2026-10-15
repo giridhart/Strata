@@ -2,10 +2,12 @@
 #include "strata/kernels/native_flash_attn.hpp"
 #include "strata/kernels/qsa.hpp"
 
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <random>
+#include <string>
 #include <vector>
 
 using strata::kernels::kNativeFlashAttnSuccess;
@@ -16,6 +18,7 @@ using strata::kernels::kStepNKv;
 using strata::kernels::kStepPos;
 using strata::kernels::kStepWidth;
 using strata::kernels::native_flash_attn_short_step;
+using strata::kernels::qsa_real_shapes;
 using strata::kernels::QsaShapes;
 
 namespace {
@@ -69,7 +72,8 @@ void cpu_reference_attend(const float* q, const uint16_t* k, const uint16_t* v, 
 
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    const bool bench = argc > 1 && std::string(argv[1]) == "--bench";
     sycl::queue q{sycl::property::queue::in_order()};
     printf("Running native_flash_attn SYCL test on device: %s\n",
            q.get_device().get_info<sycl::info::device::name>().c_str());
@@ -168,11 +172,65 @@ int main() {
         sycl::free(d_status, q);
     }
 
-    if (total_bad == 0) {
-        printf("native_flash_attn SYCL parity OK (0 failures)\n");
-        return 0;
-    } else {
+    if (total_bad != 0) {
         printf("native_flash_attn SYCL parity FAILED (%d bad)\n", total_bad);
         return 1;
     }
+    printf("native_flash_attn SYCL parity OK (0 failures)\n");
+
+    if (bench) {
+        printf("\n--- Native FlashAttention Microbenchmarks ---\n");
+        constexpr int reps = 100;
+        constexpr int64_t capacity = 256;
+        constexpr int max_context = 256;
+        const QsaShapes shapes = qsa_real_shapes();
+
+        for (int width : {64, 128, 192, 256}) {
+            const size_t q_sz = 24 * 256;
+            const size_t kv_sz = capacity * 2 * 256;
+            std::vector<int32_t> h_step(kStepCount);
+            h_step[kStepPos] = width - 1;
+            h_step[kStepNKv] = width;
+            h_step[kStepNBid] = width / 4;
+            h_step[kStepWidth] = width;
+
+            float* d_q = sycl::malloc_device<float>(q_sz, q);
+            uint16_t* d_k = sycl::malloc_device<uint16_t>(kv_sz, q);
+            uint16_t* d_v = sycl::malloc_device<uint16_t>(kv_sz, q);
+            int32_t* d_step = sycl::malloc_device<int32_t>(kStepCount, q);
+            float* d_out = sycl::malloc_device<float>(q_sz, q);
+            int32_t* d_status = sycl::malloc_device<int32_t>(1, q);
+
+            q.fill(d_q, 0.05f, q_sz);
+            q.fill(d_k, (uint16_t)0x3C00, kv_sz);
+            q.fill(d_v, (uint16_t)0x3C00, kv_sz);
+            q.memcpy(d_step, h_step.data(), kStepCount * sizeof(int32_t));
+            q.wait();
+
+            // Warmup
+            for (int i = 0; i < 5; ++i) {
+                native_flash_attn_short_step(d_q, d_k, d_v, d_step, capacity, max_context, shapes, d_out, d_status, nullptr, &q);
+            }
+            q.wait();
+
+            auto t0 = std::chrono::steady_clock::now();
+            for (int i = 0; i < reps; ++i) {
+                native_flash_attn_short_step(d_q, d_k, d_v, d_step, capacity, max_context, shapes, d_out, d_status, nullptr, &q);
+            }
+            q.wait();
+            auto t1 = std::chrono::steady_clock::now();
+            double us = std::chrono::duration<double, std::micro>(t1 - t0).count() / reps;
+            double bytes = (double)(q_sz * sizeof(float) + (size_t)width * 2 * 256 * 2 * sizeof(uint16_t) + q_sz * sizeof(float));
+            printf("BENCH FlashAttn width=%3d: %6.2f us (%7.1f tok/s, %5.1f GB/s)\n",
+                   width, us, (1.0 / us) * 1e6, bytes / us / 1e3);
+
+            sycl::free(d_q, q);
+            sycl::free(d_k, q);
+            sycl::free(d_v, q);
+            sycl::free(d_step, q);
+            sycl::free(d_out, q);
+            sycl::free(d_status, q);
+        }
+    }
+    return 0;
 }

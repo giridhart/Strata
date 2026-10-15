@@ -3,11 +3,13 @@
 #include "strata/kernels/native_router.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <numeric>
 #include <random>
+#include <string>
 #include <vector>
 
 namespace {
@@ -200,9 +202,74 @@ int test_native_router_topk_256_8(sycl::queue& q, int n_tokens) {
                 id_bad ? "*** WRONG ***" : "exact", id_bad, worst, w_bad);
     return id_bad + w_bad;
 }
+
+void bench_native_router(sycl::queue& q) {
+    std::printf("\n--- Native Router Microbenchmarks ---\n");
+    std::mt19937 rng(42);
+    std::normal_distribution<float> dist(0.0f, 2.0f);
+    constexpr int reps = 100;
+
+    for (int n_tokens : {1, 4, 16, 64}) {
+        // 512 / 10
+        std::vector<float> l_512((size_t)n_tokens * 512);
+        for (auto& x : l_512) x = dist(rng);
+        float* d_l512 = sycl::malloc_device<float>(l_512.size(), q);
+        int32_t* d_ids512 = sycl::malloc_device<int32_t>((size_t)n_tokens * 10, q);
+        float* d_w512 = sycl::malloc_device<float>((size_t)n_tokens * 10, q);
+        q.memcpy(d_l512, l_512.data(), l_512.size() * sizeof(float)).wait();
+
+        // Warmup
+        for (int i = 0; i < 5; ++i) {
+            if (n_tokens == 1) strata::kernels::native_router_top10(d_l512, d_ids512, d_w512, &q);
+            else strata::kernels::native_router_top10_multi(d_l512, d_ids512, d_w512, n_tokens, &q);
+        }
+        q.wait();
+
+        auto t0 = std::chrono::steady_clock::now();
+        for (int i = 0; i < reps; ++i) {
+            if (n_tokens == 1) strata::kernels::native_router_top10(d_l512, d_ids512, d_w512, &q);
+            else strata::kernels::native_router_top10_multi(d_l512, d_ids512, d_w512, n_tokens, &q);
+        }
+        q.wait();
+        auto t1 = std::chrono::steady_clock::now();
+        double us_512 = std::chrono::duration<double, std::micro>(t1 - t0).count() / reps;
+
+        // 256 / 8
+        std::vector<float> l_256((size_t)n_tokens * 256);
+        for (auto& x : l_256) x = dist(rng);
+        float* d_l256 = sycl::malloc_device<float>(l_256.size(), q);
+        int32_t* d_ids256 = sycl::malloc_device<int32_t>((size_t)n_tokens * 8, q);
+        float* d_w256 = sycl::malloc_device<float>((size_t)n_tokens * 8, q);
+        q.memcpy(d_l256, l_256.data(), l_256.size() * sizeof(float)).wait();
+
+        for (int i = 0; i < 5; ++i) {
+            strata::kernels::native_router_topk(d_l256, d_ids256, d_w256, 256, 8, n_tokens, &q);
+        }
+        q.wait();
+
+        t0 = std::chrono::steady_clock::now();
+        for (int i = 0; i < reps; ++i) {
+            strata::kernels::native_router_topk(d_l256, d_ids256, d_w256, 256, 8, n_tokens, &q);
+        }
+        q.wait();
+        t1 = std::chrono::steady_clock::now();
+        double us_256 = std::chrono::duration<double, std::micro>(t1 - t0).count() / reps;
+
+        std::printf("BENCH Router T=%-2d | 512/10: %6.2f us (%7.1f tok/s) | 256/8: %6.2f us (%7.1f tok/s) | speedup: %.2fx\n",
+                    n_tokens, us_512, (n_tokens / us_512) * 1e6, us_256, (n_tokens / us_256) * 1e6, us_512 / us_256);
+
+        sycl::free(d_l512, q);
+        sycl::free(d_ids512, q);
+        sycl::free(d_w512, q);
+        sycl::free(d_l256, q);
+        sycl::free(d_ids256, q);
+        sycl::free(d_w256, q);
+    }
+}
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    const bool bench = argc > 1 && std::string(argv[1]) == "--bench";
     sycl::queue q{sycl::property::queue::in_order()};
     int fails = 0;
     fails += test_native_router(q, 1);
@@ -221,5 +288,9 @@ int main() {
         return 1;
     }
     std::puts("native_router SYCL parity OK (0 failures)");
+
+    if (bench) {
+        bench_native_router(q);
+    }
     return 0;
 }
