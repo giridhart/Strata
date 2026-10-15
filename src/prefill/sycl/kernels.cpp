@@ -1,13 +1,16 @@
 // src/prefill/kernels.cu - see include/strata/prefill/kernels.hpp.
 #include <sycl/sycl.hpp>
 #include "strata/prefill/kernels.hpp"
+#include "strata/prefill/gdn_xe.hpp"
 #include "strata/kernels/mrope.hpp"
 #include "strata/kernels/router_top10.hpp"
 
+#include <algorithm>
 #include <cfloat>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <stdexcept>
 
 namespace strata::prefill {
 namespace {
@@ -1144,40 +1147,47 @@ void gdn_conv(float* history, const float* qkv, const float* conv_w, float* h, i
     });
     check("gdn_conv");
 }
-void gdn_recurrence(float* state, const float* h, const float* gate, const float* beta, const float* z,
-                    const float* gamma, float eps, float* y, uint16_t* y16, int64_t T, void* stream,
-                    int64_t ldy) {
-    (void)ldy;
+// Variant 6, the Xe sub-group recurrence (gdn_xe.hpp): one barrier per token instead of five, the same bits.
+// Arc A770 (Coder IQ1_M, 128K context, int8 KV): recurrence 1.83 -> 0.92 s on an 8K prompt (+5% prompt tok/s),
+// 7.3 -> 3.65 s on 32K (+8%), the same output tokens.  On by default on Alchemist only (not measured on other cards).
+// STRATA_GDN_XE=0: the column kernels everywhere; STRATA_GDN_XE=1: variant 6 on any Intel GPU with 16-lane sub-groups.
+static bool gdn_xe_device(void* stream) {
+    if (!stream) return false;
+    auto* q = static_cast<sycl::queue*>(stream);
+    const auto device = q->get_device();
+    const auto subgroups = device.get_info<sycl::info::device::sub_group_sizes>();
+    const bool sg16 = std::find(subgroups.begin(), subgroups.end(), size_t(16)) != subgroups.end();
+    return sg16 && device.is_gpu() && device.get_info<sycl::info::device::vendor_id>() == 0x8086;
+}
+static bool gdn_xe_on(void* stream) {
+    static const bool on = [stream] {
+        const char* v = std::getenv("STRATA_GDN_XE");
+        if (v && *v) return std::atoi(v) != 0 && gdn_xe_device(stream);
+        try {
+            auto* q = static_cast<sycl::queue*>(stream);
+            std::string n = q->get_device().get_info<sycl::info::device::name>();
+            if (n.find("Alchemist") != std::string::npos || n.find("Arc(TM) A") != std::string::npos)
+                return gdn_xe_device(stream);
+        } catch (...) {}
+        return false;
+    }();
+    return on;
+}
+
+void gdn_recurrence_variant(int variant, float* state, const float* h, const float* gate, const float* beta,
+                            const float* z, const float* gamma, float eps, float* y, uint16_t* y16, int64_t T,
+                            void* stream, int64_t ld16) {
+    (void)ld16;
+    auto* q = static_cast<sycl::queue*>(stream);
     static const bool serial = std::getenv("STRATA_GDN_REC_HEADS") != nullptr;  // the one-block-per-head kernel (A/B)
-    if (serial || T <= 0) {
-        /*
-        DPCT1049:61: The work-group size passed to the SYCL kernel may exceed
-        the limit. To get the device limit, query
-        info::device::max_work_group_size. Adjust the work-group size if needed.
-        */
-        static_cast<sycl::queue*>(stream)->submit([&](sycl::handler& cgh) {
-            /*
-            DPCT1101:554: 'S' expression was replaced with a value. Modify
-            the code to use the original expression, provided in comments,
-            if it is correct.
-            */
+    const bool xe = T > 0 && !serial && variant == 6;
+    if (xe && !gdn_xe_device(stream)) {
+        throw std::runtime_error("GDN Xe variant requires an Intel GPU with 16-lane sub-groups");
+    }
+    if (!xe && (serial || T <= 0 || variant == 2)) {
+        q->submit([&](sycl::handler& cgh) {
             sycl::local_accessor<float, 1> sk_acc_ct1(sycl::range<1>(128 /*S*/), cgh);
-            /*
-            DPCT1101:555: 'S' expression was replaced with a value. Modify
-            the code to use the original expression, provided in comments,
-            if it is correct.
-            */
             sycl::local_accessor<float, 1> sq_acc_ct1(sycl::range<1>(128 /*S*/), cgh);
-            /*
-            DPCT1101:556: 'RG' expression was replaced with a value. Modify
-            the code to use the original expression, provided in comments,
-            if it is correct.
-            */
-            /*
-            DPCT1101:557: 'S' expression was replaced with a value. Modify
-            the code to use the original expression, provided in comments,
-            if it is correct.
-            */
             sycl::local_accessor<float[4 /*RG*/][128 /*S*/], 0> red_acc_ct1(cgh);
             sycl::local_accessor<float, 1> wsum_acc_ct1(sycl::range<1>(16), cgh);
 
@@ -1191,81 +1201,45 @@ void gdn_recurrence(float* state, const float* h, const float* gate, const float
                 });
         });
     } else {
-        static const bool pipe = [] {
-            const char* v = std::getenv("STRATA_GDN_PIPELINE");
-            return v == nullptr || std::atoi(v) != 0;
-        }();
-        if (pipe)  // the software-pipelined loads (same bits)
-            static_cast<sycl::queue*>(stream)->submit([&](sycl::handler& cgh) {
-                /*
-                DPCT1101:558: 'S' expression was replaced with a value.
-                Modify the code to use the original expression, provided in
-                comments, if it is correct.
-                */
-                sycl::local_accessor<float, 1> sk_acc_ct1(sycl::range<1>(128 /*S*/), cgh);
-                /*
-                DPCT1101:559: 'S' expression was replaced with a value.
-                Modify the code to use the original expression, provided in
-                comments, if it is correct.
-                */
-                sycl::local_accessor<float, 1> sq_acc_ct1(sycl::range<1>(128 /*S*/), cgh);
-                /*
-                DPCT1101:560: 'RG' expression was replaced with a value.
-                Modify the code to use the original expression, provided in
-                comments, if it is correct.
-                */
-                /*
-                DPCT1101:561: 'CB' expression was replaced with a value.
-                Modify the code to use the original expression, provided in
-                comments, if it is correct.
-                */
-                sycl::local_accessor<float[4 /*RG*/][32 /*CB*/], 0> red_acc_ct1(cgh);
+        if (xe) {
+            detail::gdn_xe_launch(*q, state, h, gate, beta, y, T);
+        } else {
+            static const bool pipe = [] {
+                const char* v = std::getenv("STRATA_GDN_PIPELINE");
+                return v == nullptr || std::atoi(v) != 0;
+            }();
+            if (pipe)  // the software-pipelined loads (same bits)
+                q->submit([&](sycl::handler& cgh) {
+                    sycl::local_accessor<float, 1> sk_acc_ct1(sycl::range<1>(128 /*S*/), cgh);
+                    sycl::local_accessor<float, 1> sq_acc_ct1(sycl::range<1>(128 /*S*/), cgh);
+                    sycl::local_accessor<float[4 /*RG*/][32 /*CB*/], 0> red_acc_ct1(cgh);
 
-                cgh.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, HV * NCB) * sycl::range<3>(1, RG, CB),
-                                                   sycl::range<3>(1, RG, CB)),
-                                 [=](sycl::nd_item<3> /*item_ct1*/) {
-                                     gdn_rec_cols_pipe_kernel(
-                                         state, h, gate, beta, y, T,
-                                         sk_acc_ct1.get_multi_ptr<sycl::access::decorated::no>().get(),
-                                         sq_acc_ct1.get_multi_ptr<sycl::access::decorated::no>().get(), red_acc_ct1);
-                                 });
-            });
-        else
-            static_cast<sycl::queue*>(stream)->submit([&](sycl::handler& cgh) {
-                /*
-                DPCT1101:562: 'S' expression was replaced with a value.
-                Modify the code to use the original expression, provided in
-                comments, if it is correct.
-                */
-                sycl::local_accessor<float, 1> sk_acc_ct1(sycl::range<1>(128 /*S*/), cgh);
-                /*
-                DPCT1101:563: 'S' expression was replaced with a value.
-                Modify the code to use the original expression, provided in
-                comments, if it is correct.
-                */
-                sycl::local_accessor<float, 1> sq_acc_ct1(sycl::range<1>(128 /*S*/), cgh);
-                /*
-                DPCT1101:564: 'RG' expression was replaced with a value.
-                Modify the code to use the original expression, provided in
-                comments, if it is correct.
-                */
-                /*
-                DPCT1101:565: 'CB' expression was replaced with a value.
-                Modify the code to use the original expression, provided in
-                comments, if it is correct.
-                */
-                sycl::local_accessor<float[4 /*RG*/][32 /*CB*/], 0> red_acc_ct1(cgh);
+                    cgh.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, HV * NCB) * sycl::range<3>(1, RG, CB),
+                                                       sycl::range<3>(1, RG, CB)),
+                                     [=](sycl::nd_item<3> /*item_ct1*/) {
+                                         gdn_rec_cols_pipe_kernel(
+                                             state, h, gate, beta, y, T,
+                                             sk_acc_ct1.get_multi_ptr<sycl::access::decorated::no>().get(),
+                                             sq_acc_ct1.get_multi_ptr<sycl::access::decorated::no>().get(), red_acc_ct1);
+                                     });
+                });
+            else
+                q->submit([&](sycl::handler& cgh) {
+                    sycl::local_accessor<float, 1> sk_acc_ct1(sycl::range<1>(128 /*S*/), cgh);
+                    sycl::local_accessor<float, 1> sq_acc_ct1(sycl::range<1>(128 /*S*/), cgh);
+                    sycl::local_accessor<float[4 /*RG*/][32 /*CB*/], 0> red_acc_ct1(cgh);
 
-                cgh.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, HV * NCB) * sycl::range<3>(1, RG, CB),
-                                                   sycl::range<3>(1, RG, CB)),
-                                 [=](sycl::nd_item<3> /*item_ct1*/) {
-                                     gdn_rec_cols_kernel(state, h, gate, beta, y, T,
-                                                         sk_acc_ct1.get_multi_ptr<sycl::access::decorated::no>().get(),
-                                                         sq_acc_ct1.get_multi_ptr<sycl::access::decorated::no>().get(),
-                                                         red_acc_ct1);
-                                 });
-            });
-        static_cast<sycl::queue*>(stream)->submit([&](sycl::handler& cgh) {
+                    cgh.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, HV * NCB) * sycl::range<3>(1, RG, CB),
+                                                       sycl::range<3>(1, RG, CB)),
+                                     [=](sycl::nd_item<3> /*item_ct1*/) {
+                                         gdn_rec_cols_kernel(state, h, gate, beta, y, T,
+                                                             sk_acc_ct1.get_multi_ptr<sycl::access::decorated::no>().get(),
+                                                             sq_acc_ct1.get_multi_ptr<sycl::access::decorated::no>().get(),
+                                                             red_acc_ct1);
+                                     });
+                });
+        }
+        q->submit([&](sycl::handler& cgh) {
             sycl::local_accessor<float, 1> wsum_acc_ct1(sycl::range<1>(4), cgh);
 
             cgh.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, HV, (unsigned)T) * sycl::range<3>(1, 1, S),
@@ -1276,7 +1250,15 @@ void gdn_recurrence(float* state, const float* h, const float* gate, const float
                              });
         });
     }
-    check("gdn_recurrence");
+    check("gdn_recurrence_variant");
+}
+
+void gdn_recurrence(float* state, const float* h, const float* gate, const float* beta, const float* z,
+                    const float* gamma, float eps, float* y, uint16_t* y16, int64_t T, void* stream,
+                    int64_t ldy) {
+    static const bool serial = std::getenv("STRATA_GDN_REC_HEADS") != nullptr;
+    const int v = (!serial && gdn_xe_on(stream)) ? 6 : 0;
+    gdn_recurrence_variant(v, state, h, gate, beta, z, gamma, eps, y, y16, T, stream, ldy);
 }
 void route(const float* logits, int32_t* ids, float* weights, int64_t T, int64_t n_expert, void* stream) {
     if (n_expert == 512)

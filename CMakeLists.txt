@@ -1112,6 +1112,7 @@ endif()
 
   if(STRATA_ENABLE_SYCL)
     add_executable(gdn_parity src/kernels/sycl/gdn_parity.cpp)
+    target_link_libraries(gdn_parity PRIVATE strata_prefill)
   else()
     add_executable(gdn_parity src/kernels/gdn_parity.cpp)
   endif()

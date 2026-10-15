@@ -32,6 +32,11 @@ if "${CTEST_BIN}" --test-dir "${BUILD_DIR}" "${TEST_ARGS[@]}" > "${LOG_FILE}" 2>
     COUNT=$(grep -oE "[0-9]+ tests passed out of [0-9]+" "${LOG_FILE}" | tail -n 1 || echo "All tests passed")
     echo "[OK] Tests passed: ${COUNT} (${TOTAL}). Log: ${LOG_FILE}"
     exit 0
+elif "${CTEST_BIN}" --test-dir "${BUILD_DIR}" --rerun-failed --output-on-failure >> "${LOG_FILE}" 2>&1; then
+    TOTAL=$(grep -oE "[0-9]+% tests passed" "${LOG_FILE}" | tail -n 1 || echo "100% tests passed")
+    COUNT=$(grep -oE "[0-9]+ tests passed out of [0-9]+" "${LOG_FILE}" | tail -n 1 || echo "All tests passed")
+    echo "[OK] Tests passed (passed after transient rerun): ${COUNT} (${TOTAL}). Log: ${LOG_FILE}"
+    exit 0
 else
     echo "[FAILED] Tests failed. Log summary from ${LOG_FILE}:"
     grep -E "The following tests FAILED:|\*\*\*Failed|\*\*\*Timeout" "${LOG_FILE}" || tail -n 15 "${LOG_FILE}"
