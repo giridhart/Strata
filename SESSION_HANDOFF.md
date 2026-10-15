@@ -2,7 +2,7 @@
 
 **Date**: 2026-10-15  
 **Branch**: `sycl-b580`  
-**Current HEAD**: `e1239d81`  
+**Current HEAD**: `7b11d88e`  
 **Target Hardware**: Intel Arc B580 (Xe2-HPG Battlemage) & Core Ultra (Xe2-LPG Lunar Lake, `Intel(R) Graphics [0x64a0]`)  
 **Toolchain**: Intel oneAPI 2026.1 (`icpx -fsycl -qmkl`)  
 
@@ -27,6 +27,15 @@
    - Updated `tools/test_sycl.sh` so that running `./tools/test_sycl.sh` with `all` or without arguments defaults to executing all 121 hardware and CPU test suites with automated single-retry on transient timeouts.
 5. **"pressed esc by mistake continue with the work"**
    - Continued and completed full build (`warnings: 0`), diagnosed and resolved FMA contraction disparity in `s2_expert_grouped.cpp`, achieved 121/121 passing tests, and executed full Xe2 microbenchmarks.
+6. **"Have you added new perf tests? if we have any missing perf coverage add them"**
+   - Audited all existing Google Benchmark suites in `perf/sycl/`.
+   - Linked `strata_prefill` to tier 2 perf benchmarks in `CMakeLists.txt`.
+   - Added microbenchmarks for all newly ported v0.1.44.1 features:
+     - `BM_Xe2_Dense_Q8_0_MMVQ` in `perf/sycl/perf_xe2_gemv.cpp` (1-row vs 2-row dispatch).
+     - `BM_Xe2_GDN_Prefill_Prompt_Recurrence_XE` in `perf/sycl/perf_fused_gdn.cpp` (STRATA_GDN_XE variant 6 vs variant 0 across $T=64..1024$).
+     - `BM_Xe2_MoE_KqSplit_WeightReuse` in `perf/sycl/perf_moe_accumulate.cpp` (multi-token decode weight reuse across $T=1..8$ in Q4_K and Q8_0).
+     - `BM_Xe2_Dequant_Coalesced_StoreRun` in `perf/sycl/perf_dequant_dpas.cpp` (vectorized coalesced stores across `IQ2_XXS`, `IQ2_XS`, `IQ3_XXS`, `IQ3_S`, `IQ4_NL`, `NVFP4`, `Q5_1`, `Q8_0`).
+   - Verified 0 compiler warnings, executed benchmarks on live Intel GPU, and verified 121/121 tests passing.
 
 ---
 
@@ -42,6 +51,7 @@
 | `8f938b2b` | `perf(sycl)` | Port KqSplit grouped MoE weight reuse (with `-fp-model=precise` in CMake) |
 | `a862c704` | `perf(sycl)` | Dispatch 1-row blocks in dense Q8_0 GEMV for n_out >= 2048 |
 | `e1239d81` | `fix(sycl)` | Unify float accumulation in gu_grouped_kernel to match FMA contraction |
+| `7b11d88e` | `test(sycl)` | Add perf microbenchmarks for MMVQ, GDN XE, KqSplit, and dequant |
 
 ---
 
@@ -87,9 +97,44 @@ Hardware tested: `Intel(R) Graphics [0x64a0]` (Lunar Lake Xe2-LPG, matching Batt
 ### Xe2 GEMV Microbenchmarks (`perf_xe2_gemv`)
 - **Peak Bandwidth**: Up to **101.8 GB/s** (2560 x 10240, 1 token).
 - **Peak Compute**: Up to **210.5 GFLOPS** (10240 x 320, 24 tokens).
+- **Dense Q8_0 MMVQ Dynamic Occupancy (`BM_Xe2_Dense_Q8_0_MMVQ`)**:
+  - $N=512, ncols=1$: 241.7 µs (Rows_Per_WG = 2, 5.78 GB/s, 10.8 GFLOPS).
+  - $N=1024, ncols=1$: 302.4 µs (Rows_Per_WG = 2, 9.23 GB/s, 17.3 GFLOPS).
+  - $N=2048, ncols=1$: 440.3 µs (Rows_Per_WG = 1, 12.68 GB/s, 23.8 GFLOPS) — successfully transitions to 1-row block dispatch.
+  - $N=2560, ncols=1$: 543.3 µs (Rows_Per_WG = 1, 12.84 GB/s, 24.1 GFLOPS).
+  - $N=10240, ncols=4$: 1873.5 µs (Rows_Per_WG = 1, 14.96 GB/s, **111.9 GFLOPS**).
 
-### Prefill GDN Recurrence (`gdn_parity`)
-- **Bitwise & Relative Parity**: 0 mismatches across $T=1, 7, 256, 1000$ (relative error $\le 2.06 \times 10^{-7}$).
+### Prefill GDN Recurrence (`BM_Xe2_GDN_Prefill_Prompt_Recurrence_XE` in `perf_fused_gdn`)
+- **Bitwise & Relative Parity**: 0 mismatches across $T=1, 7, 256, 1000$ in `gdn_parity` (relative error $\le 2.06 \times 10^{-7}$).
+- **Throughput & Latency Comparison (Baseline Variant 0 vs STRATA_GDN_XE Variant 6)**:
+  - $T=64$: Variant 0 = 750.9 µs (85.2k tok/s, 17.14 GB/s) vs Variant 6 = 1261.0 µs (50.8k tok/s).
+  - $T=128$: Variant 0 = 1232.4 µs (103.9k tok/s, 15.78 GB/s) vs Variant 6 = 1849.0 µs (69.2k tok/s).
+  - $T=256$: Variant 0 = 2081.8 µs (123.0k tok/s, 15.66 GB/s) vs Variant 6 = 3372.6 µs (75.9k tok/s).
+  - $T=512$: Variant 0 = 3870.6 µs (132.3k tok/s, 15.22 GB/s) vs Variant 6 = 6572.3 µs (77.9k tok/s).
+  - $T=1024$: Variant 0 = 7297.1 µs (**140.3k tok/s**, 15.29 GB/s) vs Variant 6 = 12548.6 µs (81.6k tok/s).
+
+### MoE Multi-Token Weight Reuse (`BM_Xe2_MoE_KqSplit_WeightReuse` in `perf_moe_accumulate`)
+| Format & Workload | $NT$ (Tokens) | `KqSplit=0` (per-token) | `KqSplit=1` (decode once) | Speedup / Impact |
+|---|---|---|---|---|
+| **Q4_K MoE** | $NT=1$ | 214.6 µs (45.8 GFLOPS) | 227.7 µs (43.2 GFLOPS) | Baseline 1-token decode |
+| **Q4_K MoE** | $NT=2$ | 260.6 µs (75.4 GFLOPS) | 248.9 µs (79.0 GFLOPS) | **1.05x faster** |
+| **Q4_K MoE** | $NT=4$ | 304.7 µs (129.1 GFLOPS) | 309.9 µs (126.9 GFLOPS) | Breakeven across 4 entries |
+| **Q4_K MoE** | $NT=8$ | 434.3 µs (181.1 GFLOPS) | **359.9 µs (218.5 GFLOPS)** | **1.21x faster (+20.6% TFLOPS)** |
+| **Q8_0 MoE** | $NT=1$ | 240.2 µs (40.9 GFLOPS) | 248.7 µs (39.5 GFLOPS) | Baseline 1-token decode |
+| **Q8_0 MoE** | $NT=2$ | 285.9 µs (68.8 GFLOPS) | 266.2 µs (73.8 GFLOPS) | **1.07x faster** |
+| **Q8_0 MoE** | $NT=4$ | 312.1 µs (126.0 GFLOPS) | 300.9 µs (130.7 GFLOPS) | **1.04x faster** |
+| **Q8_0 MoE** | $NT=8$ | 428.5 µs (183.5 GFLOPS) | **336.5 µs (233.7 GFLOPS)** | **1.27x faster (+27.4% TFLOPS)** |
+
+### Coalesced `store_run` Dequantizers (`BM_Xe2_Dequant_Coalesced_StoreRun` in `perf_dequant_dpas`)
+- **1,048,576 Elements (1M) Sustained Dequant Throughput**:
+  - `Q8_0`: 207.9 µs (**15.45 GB/s**, 5.04 Gelem/s)
+  - `IQ4_NL`: 191.6 µs (**14.03 GB/s**, 5.47 Gelem/s)
+  - `NVFP4`: 193.7 µs (**13.87 GB/s**, 5.41 Gelem/s)
+  - `Q5_1`: 209.1 µs (**13.79 GB/s**, 5.02 Gelem/s)
+  - `IQ3_XXS`: 190.5 µs (**13.11 GB/s**, 5.50 Gelem/s)
+  - `IQ2_XXS`: 182.4 µs (**12.98 GB/s**, 5.75 Gelem/s)
+  - `IQ2_XS`: 189.5 µs (**12.67 GB/s**, 5.53 Gelem/s)
+  - `IQ3_S`: 343.2 µs (**7.73 GB/s**, 3.05 Gelem/s)
 
 ---
 
