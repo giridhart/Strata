@@ -2,7 +2,7 @@
 
 **Date**: 2026-10-15  
 **Branch**: `sycl-b580`  
-**Current HEAD**: [`e1239d81`](https://github.com/Strata/Strata/commit/e1239d81)  
+**Current HEAD**: `e1239d81`  
 **Target Hardware**: Intel Arc B580 (Xe2-HPG Battlemage) & Core Ultra (Xe2-LPG Lunar Lake, `Intel(R) Graphics [0x64a0]`)  
 **Toolchain**: Intel oneAPI 2026.1 (`icpx -fsycl -qmkl`)  
 
@@ -34,14 +34,14 @@
 
 | Commit | Scope | Description |
 |---|---|---|
-| [`b7cdf920`](https://github.com/Strata/Strata/commit/b7cdf920) | `merge` | Merge branch 'upstream/main' into sycl-b580 (v0.1.44.1, 212 commits) |
-| [`23d4990e`](https://github.com/Strata/Strata/commit/23d4990e) | `feat(test)` | Make all tests default in test_sycl.sh and support explicit all/cpu modes |
-| [`7c9e4614`](https://github.com/Strata/Strata/commit/7c9e4614) | `perf(sycl)` | Port GR_PICK compile-time selects to eliminate private memory spill |
-| [`381ac803`](https://github.com/Strata/Strata/commit/381ac803) | `perf(sycl)` | Port neighbour-lane coalesced dequantization and store_run vector stores |
-| [`5f71020e`](https://github.com/Strata/Strata/commit/5f71020e) | `perf(sycl)` | Port STRATA_GDN_XE subgroup shuffle prompt recurrence |
-| [`8f938b2b`](https://github.com/Strata/Strata/commit/8f938b2b) | `perf(sycl)` | Port KqSplit grouped MoE weight reuse (with `-fp-model=precise` in CMake) |
-| [`a862c704`](https://github.com/Strata/Strata/commit/a862c704) | `perf(sycl)` | Dispatch 1-row blocks in dense Q8_0 GEMV for n_out >= 2048 |
-| [`e1239d81`](https://github.com/Strata/Strata/commit/e1239d81) | `fix(sycl)` | Unify float accumulation in gu_grouped_kernel to match FMA contraction |
+| `b7cdf920` | `merge` | Merge branch 'upstream/main' into sycl-b580 (v0.1.44.1, 212 commits) |
+| `23d4990e` | `feat(test)` | Make all tests default in test_sycl.sh and support explicit all/cpu modes |
+| `7c9e4614` | `perf(sycl)` | Port GR_PICK compile-time selects to eliminate private memory spill |
+| `381ac803` | `perf(sycl)` | Port neighbour-lane coalesced dequantization and store_run vector stores |
+| `5f71020e` | `perf(sycl)` | Port STRATA_GDN_XE subgroup shuffle prompt recurrence |
+| `8f938b2b` | `perf(sycl)` | Port KqSplit grouped MoE weight reuse (with `-fp-model=precise` in CMake) |
+| `a862c704` | `perf(sycl)` | Dispatch 1-row blocks in dense Q8_0 GEMV for n_out >= 2048 |
+| `e1239d81` | `fix(sycl)` | Unify float accumulation in gu_grouped_kernel to match FMA contraction |
 
 ---
 
