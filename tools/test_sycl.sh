@@ -14,14 +14,20 @@ if [[ -f /opt/intel/oneapi/setvars.sh ]]; then
     source /opt/intel/oneapi/setvars.sh --force >/dev/null 2>&1
 fi
 
-# Default test filter excludes GPU hardware tests unless overridden
-if [[ $# -eq 0 ]]; then
-    TEST_ARGS=(-j"${JOBS}" --output-on-failure -E "sycl|gpu|device|parity|bench|pool|expert_multi")
+# Argument handling: 'all' or empty runs all tests by default
+CTEST_BIN="$(command -v /usr/bin/ctest || command -v ctest)"
+
+if [[ $# -eq 0 ]] || [[ "$1" == "all" ]]; then
+    shift 2>/dev/null || true
+    TEST_ARGS=(-j"${JOBS}" --output-on-failure "$@")
+elif [[ "$1" == "cpu" ]] || [[ "$1" == "fast" ]]; then
+    shift
+    TEST_ARGS=(-j"${JOBS}" --output-on-failure -E "sycl|gpu|device|parity|bench|pool|expert_multi" "$@")
 else
     TEST_ARGS=(-j"${JOBS}" --output-on-failure "$@")
 fi
 
-if /usr/bin/ctest --test-dir "${BUILD_DIR}" "${TEST_ARGS[@]}" > "${LOG_FILE}" 2>&1; then
+if "${CTEST_BIN}" --test-dir "${BUILD_DIR}" "${TEST_ARGS[@]}" > "${LOG_FILE}" 2>&1; then
     TOTAL=$(grep -oE "[0-9]+% tests passed" "${LOG_FILE}" | tail -n 1 || echo "100% tests passed")
     COUNT=$(grep -oE "[0-9]+ tests passed out of [0-9]+" "${LOG_FILE}" | tail -n 1 || echo "All tests passed")
     echo "[OK] Tests passed: ${COUNT} (${TOTAL}). Log: ${LOG_FILE}"
