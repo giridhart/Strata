@@ -957,7 +957,7 @@ constexpr int D_ROWS = 64;   // down rows per block: 8 per warp
 
 // One activation chunk's contribution, `row_dot_s2_q8`'s inner body with the 32 int8 of the chunk already in
 // aligned words: same dp4a sequence, same float expression, so the result is bitwise the per-entry kernel's.
-inline float chunk_dot(sycl::uint2 cb, const int* xw, float dw, float dx) {
+inline int chunk_int_diff(sycl::uint2 cb, const int* xw) {
     const uint8_t* cbytes = (const uint8_t*)&cb;
     int s = 0, hx = 0;
     const int ones = 0x01010101;
@@ -969,7 +969,7 @@ inline float chunk_dot(sycl::uint2 cb, const int* xw, float dw, float dx) {
         s = dp4a(cw, xw[j], s);
         hx = dp4a(ones, xw[j], hx);
     }
-    return dw * dx * (float)(s - hx);
+    return s - hx;
 }
 
 // Gate/up: a block = GU_ROWS rows of ONE group.  The group's activations (each entry's token row of x_q8_0 and
@@ -1023,7 +1023,7 @@ void gu_grouped_kernel(const unsigned long long* __restrict__ grp_ptr, const int
             for (int q = 0; q < GU_CHUNKS; ++q) {
                 const int c = lane + 32 * q;
                 if (c >= H / 32) break;
-                acc += chunk_dot(cb[q], &xs_q[k][c * 8], dw[q], xs_d[k][c]);
+                acc += dw[q] * xs_d[k][c] * (float)chunk_int_diff(cb[q], &xs_q[k][c * 8]);
             }
             const float sum = warp_sum(acc);
             if (lane == 0) {
@@ -1076,7 +1076,7 @@ void down_grouped_kernel(const unsigned long long* __restrict__ grp_ptr, const i
         }
         for (int k = 0; k < ne; ++k) {
             float acc = 0.0f;
-            if (c < FF / 32) acc += chunk_dot(cb, &hs_q[k][c * 8], dw, hs_d[k][c]);
+            if (c < FF / 32) acc += dw * hs_d[k][c] * (float)chunk_int_diff(cb, &hs_q[k][c * 8]);
             const float sum = warp_sum(acc);
             if (lane == 0) out[(size_t)ent_dst[e0 + k] * H + r] = sum;
         }
