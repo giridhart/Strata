@@ -21,6 +21,7 @@
 #include "strata/kernels/quantize_act.hpp"
 #include "strata/kernels/s2_gemv_q8.hpp"
 #include "strata/kernels/dequant_s2.hpp"
+#include "strata/kernels/iq_kernels.hpp"
 
 #include <cmath>
 #include <cstdint>
@@ -428,6 +429,54 @@ static void BM_Xe2_S2_GEMV_Q8(benchmark::State& state) {
     sycl::free(d_y, q);
 }
 
+/// Vectorized Coalesced Block Dequantizer (Task 2)
+/// Measures bandwidth across block dequantization formats (IQ2_XXS, IQ2_XS, IQ3_XXS, IQ3_S, IQ4_NL, NVFP4, Q5_1, Q8_0)
+template <int GGML_TYPE>
+static void BM_Xe2_Dequant_Coalesced_StoreRun(benchmark::State& state) {
+    const int64_t num_elements = state.range(0);
+    sycl::queue q{sycl::default_selector_v, {sycl::property::queue::in_order(), sycl::property::queue::enable_profiling()}};
+
+    const size_t src_bytes = strata::kernels::iq_row_bytes(GGML_TYPE, num_elements);
+    const size_t dst_bytes = (size_t)num_elements * sizeof(uint16_t);
+
+    uint8_t* d_src = sycl::malloc_device<uint8_t>(src_bytes, q);
+    uint16_t* d_dst = sycl::malloc_device<uint16_t>(num_elements, q);
+
+    if (!d_src || !d_dst) {
+        state.SkipWithError("USM allocation failure in BM_Xe2_Dequant_Coalesced_StoreRun");
+        if (d_src) sycl::free(d_src, q);
+        if (d_dst) sycl::free(d_dst, q);
+        return;
+    }
+
+    q.memset(d_src, 0x33, src_bytes).wait();
+    q.memset(d_dst, 0, dst_bytes).wait();
+
+    // Warmup
+    for (int i = 0; i < 5; ++i) {
+        strata::kernels::iq_dequant_f16(GGML_TYPE, d_src, num_elements, d_dst, &q);
+    }
+    q.wait();
+
+    for (auto _ : state) {
+        auto start = std::chrono::high_resolution_clock::now();
+        strata::kernels::iq_dequant_f16(GGML_TYPE, d_src, num_elements, d_dst, &q);
+        q.wait();
+        auto end = std::chrono::high_resolution_clock::now();
+        auto elapsed = std::chrono::duration_cast<std::chrono::duration<double>>(end - start);
+        state.SetIterationTime(elapsed.count());
+    }
+
+    const double bytes = static_cast<double>(src_bytes + dst_bytes);
+    state.counters["Bandwidth_GBps"] =
+        benchmark::Counter(bytes, benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
+    state.counters["elements_per_sec"] =
+        benchmark::Counter(static_cast<double>(num_elements), benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
+
+    sycl::free(d_src, q);
+    sycl::free(d_dst, q);
+}
+
 // ============================================================================
 // Registration: Critical Decode Gate & Expert Projections
 // ============================================================================
@@ -456,6 +505,16 @@ BENCHMARK(BM_Xe2_Dequant_S2)->UseManualTime()->Arg(10240)->Arg(20480)->Arg(81920
 
 // S2 GEMV with Q8_0 Activations
 BENCHMARK(BM_Xe2_S2_GEMV_Q8)->UseManualTime()->Args({2560, 6144})->Args({2560, 10240});
+
+// Coalesced store_run block dequantizers (Task 2)
+BENCHMARK(BM_Xe2_Dequant_Coalesced_StoreRun<16>)->Name("BM_Xe2_Dequant_Coalesced_StoreRun_IQ2_XXS")->UseManualTime()->Arg(262144)->Arg(1048576);
+BENCHMARK(BM_Xe2_Dequant_Coalesced_StoreRun<17>)->Name("BM_Xe2_Dequant_Coalesced_StoreRun_IQ2_XS")->UseManualTime()->Arg(262144)->Arg(1048576);
+BENCHMARK(BM_Xe2_Dequant_Coalesced_StoreRun<18>)->Name("BM_Xe2_Dequant_Coalesced_StoreRun_IQ3_XXS")->UseManualTime()->Arg(262144)->Arg(1048576);
+BENCHMARK(BM_Xe2_Dequant_Coalesced_StoreRun<23>)->Name("BM_Xe2_Dequant_Coalesced_StoreRun_IQ3_S")->UseManualTime()->Arg(262144)->Arg(1048576);
+BENCHMARK(BM_Xe2_Dequant_Coalesced_StoreRun<20>)->Name("BM_Xe2_Dequant_Coalesced_StoreRun_IQ4_NL")->UseManualTime()->Arg(262144)->Arg(1048576);
+BENCHMARK(BM_Xe2_Dequant_Coalesced_StoreRun<40>)->Name("BM_Xe2_Dequant_Coalesced_StoreRun_NVFP4")->UseManualTime()->Arg(262144)->Arg(1048576);
+BENCHMARK(BM_Xe2_Dequant_Coalesced_StoreRun<7>)->Name("BM_Xe2_Dequant_Coalesced_StoreRun_Q5_1")->UseManualTime()->Arg(262144)->Arg(1048576);
+BENCHMARK(BM_Xe2_Dequant_Coalesced_StoreRun<8>)->Name("BM_Xe2_Dequant_Coalesced_StoreRun_Q8_0")->UseManualTime()->Arg(262144)->Arg(1048576);
 
 // ============================================================================
 // Main Entry Point

@@ -19,6 +19,7 @@
 #include "strata/core/sycl_arch.hpp"
 #include "strata/kernels/bf16_gemv.hpp"
 #include "strata/kernels/bf16_bits.hpp"
+#include "strata/kernels/native_mmvq.hpp"
 
 #include <algorithm>
 #include <cstdint>
@@ -364,9 +365,69 @@ static void BM_Xe2_GEMV_SplitReduction(benchmark::State& state) {
     sycl::free(out, q);
 }
 
+/// Dense Q8_0 GEMV (native_mmvq) benchmark evaluating 1-row vs 2-row block dispatch.
+/// For N >= 2048, 1-row blocks are dispatched to double EU occupancy on wide layers.
+static void BM_Xe2_Dense_Q8_0_MMVQ(benchmark::State& state) {
+    const int K = state.range(0);
+    const int N = state.range(1);
+    const int ncols = state.range(2);
+
+    sycl::queue q{sycl::default_selector_v, {sycl::property::queue::enable_profiling()}};
+
+    const size_t w_bytes = (size_t)N * (K / 32) * 34;
+    const size_t q8_1_bytes = strata::kernels::native_q8_1_bytes(K, ncols);
+    const size_t out_elements = (size_t)N * ncols;
+
+    auto* d_w = sycl::malloc_device<uint8_t>(w_bytes, q);
+    auto* d_x_q8_1 = sycl::malloc_device<uint8_t>(q8_1_bytes, q);
+    auto* d_y = sycl::malloc_device<float>(out_elements, q);
+
+    q.memset(d_w, 0x55, w_bytes).wait();
+    q.memset(d_x_q8_1, 0xAA, q8_1_bytes).wait();
+    q.fill(d_y, 0.0f, out_elements).wait();
+
+    // Warmup
+    for (int w = 0; w < 3; ++w) {
+        strata::kernels::native_q8_0_mmvq(d_w, d_x_q8_1, d_y, K, N, ncols, &q);
+    }
+    q.wait();
+
+    for (auto _ : state) {
+        auto t0 = std::chrono::steady_clock::now();
+        strata::kernels::native_q8_0_mmvq(d_w, d_x_q8_1, d_y, K, N, ncols, &q);
+        q.wait();
+        auto t1 = std::chrono::steady_clock::now();
+        state.SetIterationTime(std::chrono::duration<double>(t1 - t0).count());
+    }
+
+    const double bytes_read = (double)w_bytes + (double)q8_1_bytes;
+    const double bytes_written = (double)out_elements * sizeof(float);
+    state.counters["Bandwidth_GBps"] = benchmark::Counter(
+        bytes_read + bytes_written, benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
+    state.counters["TFLOPS"] = benchmark::Counter(
+        2.0 * (double)K * N * ncols, benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
+    state.counters["tokens_per_sec"] = benchmark::Counter(
+        (double)ncols, benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
+    state.counters["Rows_Per_WG"] = benchmark::Counter(N >= 2048 ? 1.0 : 2.0);
+
+    sycl::free(d_w, q);
+    sycl::free(d_x_q8_1, q);
+    sycl::free(d_y, q);
+}
+
 // ============================================================================
 // Registration: Qwen3.8-Flash-Next Decode & Prefill Projections
 // ============================================================================
+
+// Register Dense Q8_0 MMVQ sweeping N across the 1-row threshold (N >= 2048)
+BENCHMARK(BM_Xe2_Dense_Q8_0_MMVQ)->UseManualTime()->Args({2560, 512, 1});
+BENCHMARK(BM_Xe2_Dense_Q8_0_MMVQ)->UseManualTime()->Args({2560, 1024, 1});
+BENCHMARK(BM_Xe2_Dense_Q8_0_MMVQ)->UseManualTime()->Args({2560, 2048, 1});
+BENCHMARK(BM_Xe2_Dense_Q8_0_MMVQ)->UseManualTime()->Args({2560, 2560, 1});
+BENCHMARK(BM_Xe2_Dense_Q8_0_MMVQ)->UseManualTime()->Args({2560, 4096, 1});
+BENCHMARK(BM_Xe2_Dense_Q8_0_MMVQ)->UseManualTime()->Args({2560, 10240, 1});
+BENCHMARK(BM_Xe2_Dense_Q8_0_MMVQ)->UseManualTime()->Args({2560, 2560, 4});
+BENCHMARK(BM_Xe2_Dense_Q8_0_MMVQ)->UseManualTime()->Args({2560, 10240, 4});
 
 // Register all 8 Qwen3.8-Flash-Next decode projections (B=1)
 BENCHMARK(BM_Xe2_GEMV)->UseManualTime()->Args({2560, 48, 1});    // ssm_alpha / ssm_beta [2560, 48]

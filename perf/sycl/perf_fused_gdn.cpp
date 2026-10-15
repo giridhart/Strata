@@ -19,6 +19,7 @@
 
 #include "strata/core/sycl_arch.hpp"
 #include "strata/kernels/fused_gdn.hpp"
+#include "strata/prefill/kernels.hpp"
 
 #include <cmath>
 #include <cstdint>
@@ -476,6 +477,88 @@ static void BM_Xe2_GDN_Fused_Production_StepNormSiLU(benchmark::State& state) {
     sycl::free(d_y, q);
 }
 
+/// Prefill GDN Recurrence Benchmark: compares STRATA_GDN_XE (variant 6, 16-lane subgroup shuffle)
+/// against baseline column-split recurrence (variant 0) across prompt sequence lengths T.
+static void BM_Xe2_GDN_Prefill_Prompt_Recurrence_XE(benchmark::State& state) {
+    const int64_t T = state.range(0);
+    const int variant = state.range(1); // 0 = baseline column-split, 6 = STRATA_GDN_XE subgroup-shuffle
+
+    sycl::queue q{sycl::default_selector_v, {sycl::property::queue::enable_profiling()}};
+
+    constexpr int HV_P = 48;
+    constexpr int C_P = 10240;
+    constexpr int S_P = 128;
+
+    const size_t state_elements = (size_t)S_P * HV_P * S_P;
+    const size_t h_elements = (size_t)T * C_P;
+    const size_t gb_elements = (size_t)T * HV_P;
+    const size_t z_elements = (size_t)T * HV_P * S_P;
+    const size_t y_elements = (size_t)T * HV_P * S_P;
+
+    auto* d_state = sycl::malloc_device<float>(state_elements, q);
+    auto* d_h     = sycl::malloc_device<float>(h_elements, q);
+    auto* d_gate  = sycl::malloc_device<float>(gb_elements, q);
+    auto* d_beta  = sycl::malloc_device<float>(gb_elements, q);
+    auto* d_z     = sycl::malloc_device<float>(z_elements, q);
+    auto* d_gamma = sycl::malloc_device<float>(S_P, q);
+    auto* d_y     = sycl::malloc_device<float>(y_elements, q);
+    auto* d_y16   = sycl::malloc_device<uint16_t>(y_elements, q);
+
+    if (!d_state || !d_h || !d_gate || !d_beta || !d_z || !d_gamma || !d_y || !d_y16) {
+        state.SkipWithError("USM allocation failure in BM_Xe2_GDN_Prefill_Prompt_Recurrence_XE");
+        if (d_state) sycl::free(d_state, q);
+        if (d_h)     sycl::free(d_h, q);
+        if (d_gate)  sycl::free(d_gate, q);
+        if (d_beta)  sycl::free(d_beta, q);
+        if (d_z)     sycl::free(d_z, q);
+        if (d_gamma) sycl::free(d_gamma, q);
+        if (d_y)     sycl::free(d_y, q);
+        if (d_y16)   sycl::free(d_y16, q);
+        return;
+    }
+
+    q.fill(d_state, 0.01f, state_elements);
+    q.fill(d_h, 0.05f, h_elements);
+    q.fill(d_gate, -0.5f, gb_elements);
+    q.fill(d_beta, 0.8f, gb_elements);
+    q.fill(d_z, 0.2f, z_elements);
+    q.fill(d_gamma, 1.0f, S_P);
+    q.wait();
+
+    // Warmup
+    for (int w = 0; w < 3; ++w) {
+        strata::prefill::gdn_recurrence_variant(variant, d_state, d_h, d_gate, d_beta, d_z, d_gamma, 1e-6f, d_y, d_y16, T, &q);
+    }
+    q.wait();
+
+    for (auto _ : state) {
+        auto t0 = std::chrono::steady_clock::now();
+        strata::prefill::gdn_recurrence_variant(variant, d_state, d_h, d_gate, d_beta, d_z, d_gamma, 1e-6f, d_y, d_y16, T, &q);
+        q.wait();
+        auto t1 = std::chrono::steady_clock::now();
+        state.SetIterationTime(std::chrono::duration<double>(t1 - t0).count());
+    }
+
+    const double bytes_transferred = (double)(h_elements + gb_elements * 2 + z_elements + y_elements) * sizeof(float)
+                                   + (double)y_elements * sizeof(uint16_t)
+                                   + (double)state_elements * sizeof(float) * 2;
+    state.counters["tokens_per_sec"] = benchmark::Counter(
+        (double)T, benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
+    state.counters["Bandwidth_GBps"] = benchmark::Counter(
+        bytes_transferred, benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
+    state.counters["Variant"] = benchmark::Counter(variant);
+    state.counters["SeqLen_T"] = benchmark::Counter(T);
+
+    sycl::free(d_state, q);
+    sycl::free(d_h, q);
+    sycl::free(d_gate, q);
+    sycl::free(d_beta, q);
+    sycl::free(d_z, q);
+    sycl::free(d_gamma, q);
+    sycl::free(d_y, q);
+    sycl::free(d_y16, q);
+}
+
 // Register Benchmarks
 BENCHMARK(BM_Xe2_GDN_Unfused)->Args({DEFAULT_HV, DEFAULT_HK})->Args({DEFAULT_HV, 4})->UseManualTime();
 BENCHMARK(BM_Xe2_GDN_Fused_SLM)->Args({DEFAULT_HV, DEFAULT_HK})->Args({DEFAULT_HV, 4})->UseManualTime();
@@ -485,6 +568,13 @@ BENCHMARK(BM_Xe2_GDN_Fused_Production_StepNormSiLU)->Args({DEFAULT_HV, DEFAULT_H
 BENCHMARK(BM_Xe2_GDN_Fused_SLM_Padded<4>)->Args({DEFAULT_HV, DEFAULT_HK})->Args({DEFAULT_HV, 4})->UseManualTime();
 BENCHMARK(BM_Xe2_GDN_Fused_SLM_Padded<8>)->Args({DEFAULT_HV, DEFAULT_HK})->Args({DEFAULT_HV, 4})->UseManualTime();
 BENCHMARK(BM_Xe2_GDN_Fused_SLM_Padded<16>)->Args({DEFAULT_HV, DEFAULT_HK})->Args({DEFAULT_HV, 4})->UseManualTime();
+
+// Register Prefill GDN Recurrence (Baseline Variant 0 vs STRATA_GDN_XE Variant 6)
+BENCHMARK(BM_Xe2_GDN_Prefill_Prompt_Recurrence_XE)->UseManualTime()->Args({64, 0})->Args({64, 6});
+BENCHMARK(BM_Xe2_GDN_Prefill_Prompt_Recurrence_XE)->UseManualTime()->Args({128, 0})->Args({128, 6});
+BENCHMARK(BM_Xe2_GDN_Prefill_Prompt_Recurrence_XE)->UseManualTime()->Args({256, 0})->Args({256, 6});
+BENCHMARK(BM_Xe2_GDN_Prefill_Prompt_Recurrence_XE)->UseManualTime()->Args({512, 0})->Args({512, 6});
+BENCHMARK(BM_Xe2_GDN_Prefill_Prompt_Recurrence_XE)->UseManualTime()->Args({1024, 0})->Args({1024, 6});
 
 BENCHMARK_MAIN();
 
