@@ -3864,6 +3864,12 @@ int main(int argc, char** argv) try {
         strata::core::stage_timing_name(14, "  gdn: z + out_norm");
         strata::core::stage_timing_name(15, "  gdn: out gemv");
     }
+    if (o.dump_routing.empty()) {
+        const char* usage_dump = std::getenv("STRATA_USAGE_DUMP");
+        if (usage_dump != nullptr && *usage_dump != '\0') {
+            o.dump_routing = usage_dump;
+        }
+    }
     std::FILE* routing = nullptr;
     if (!o.dump_routing.empty()) {
         if (o.no_pool) {
