@@ -11832,7 +11832,7 @@ int main(int argc, char **argv) try {
     // ---- plan v0.3 P5: the prompt's conditioning positions [0, n_prompt - 1) in batched chunks.  The token loop
     // then starts at the last prompt position, whose prediction is the first generated token.
     int64_t pos_start = 0;
-    int64_t spec_pos = 0;   // plan v0.3 P6: where the speculative loop starts (0 = not used)
+    int64_t spec_pos = -1;   // plan v0.3 P6: where the speculative loop starts (-1 = not used)
     strata::prefill::Prefill prefill;
     bool kvg_started = false;   // the elastic K/V took this run's cells
     double prefill_batched_ms = 0;
@@ -12240,7 +12240,7 @@ int main(int argc, char **argv) try {
     // round emits (accepted drafts + 1) tokens.  `commit` keeps the state of the tokens that were emitted.
     const bool ended = o.stop_eos && !produced.empty() &&
                        std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) produced.back()) != o.eos_ids.end();
-    if (spec_pos > 0 && (int64_t) produced.size() < o.max_new && !ended) {
+    if (spec_pos >= 0 && (int64_t) produced.size() < o.max_new && !ended) {
         auto read_ids = [](const std::string& path, std::vector<int64_t>& ids) {
             std::ifstream in(path);
             std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());

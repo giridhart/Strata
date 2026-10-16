@@ -829,6 +829,10 @@ bool session_loop(const ModelGeometry& g, int64_t pos, int32_t pos_base, Session
             }
             if (complete) break;  // the graph has ended
             if (rang) break;      // rung, and the graph is still running: the overlap
+            if (std::chrono::steady_clock::now() - t_launch > std::chrono::seconds(20)) {
+                err = "session_loop: timed out waiting for layer " + std::to_string(l);
+                return false;
+            }
             STRATA_SPIN_PAUSE();
         }
         if (mid_graph) ++gr.rings_mid_graph;
@@ -1099,7 +1103,7 @@ bool session_run_token(const ModelGeometry& g, int64_t pos, int32_t pos_base, Se
                     is_empty = cs->ext_oneapi_empty();
                 } catch (...) {
                 }
-                if (!is_empty && *seq < want) {
+                if (is_empty && *seq < want) {
                     err = "session_run_token: layer " + std::to_string(l) + " never rang";
                     return false;
                 }

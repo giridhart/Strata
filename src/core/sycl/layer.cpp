@@ -3,6 +3,7 @@
 // src/core/layer.cpp - the GDN layer, composed.  See the header for the operation order and its traps.
 #include <sycl/sycl.hpp>
 #include "strata/core/layer.hpp"
+#include "strata/core/sycl_doorbell.hpp"
 
 namespace {
 inline sycl::queue& get_default_queue() {
@@ -1577,9 +1578,9 @@ uint64_t doorbell_init(const ModelGeometry& g, int64_t k, Doorbell& db) {
     db.k = k;
     uint64_t bytes = 0;
     auto alloc = [&](size_t n, void** h, void** d, const char* what) -> bool {
-        *h = sycl::malloc_host(n, get_default_queue());
+        *h = strata::host_malloc_polled(n, get_default_queue());
         if (!*h) {
-            std::fprintf(stderr, "doorbell_init: malloc_host(%s) failed\n", what);
+            std::fprintf(stderr, "doorbell_init: host_malloc_polled(%s) failed\n", what);
             return false;
         }
         *d = *h;
@@ -1596,11 +1597,11 @@ uint64_t doorbell_init(const ModelGeometry& g, int64_t k, Doorbell& db) {
 }
 
 void doorbell_free(Doorbell& db) {
-    if (db.h_x_f) sycl::free(db.h_x_f, get_default_queue());
-    if (db.h_ids) sycl::free(db.h_ids, get_default_queue());
-    if (db.h_weights) sycl::free(db.h_weights, get_default_queue());
-    if (db.h_seq) sycl::free(db.h_seq, get_default_queue());
-    if (db.h_flag) sycl::free(db.h_flag, get_default_queue());
+    if (db.h_x_f) strata::host_free_polled(db.h_x_f, get_default_queue());
+    if (db.h_ids) strata::host_free_polled(db.h_ids, get_default_queue());
+    if (db.h_weights) strata::host_free_polled(db.h_weights, get_default_queue());
+    if (db.h_seq) strata::host_free_polled(db.h_seq, get_default_queue());
+    if (db.h_flag) strata::host_free_polled(db.h_flag, get_default_queue());
     db = Doorbell{};
 }
 void doorbell_reset(const Doorbell& db) {

@@ -433,12 +433,12 @@ void ple_block(const float* emb, const float* hidden, const float* hist_rows, co
     // ---- the intermediates the oracle comparison needs.  `key` is the NORMALISED key, because the source's
     //      `cb(key, ...)` capture is after `gnorm`; `value` is the projection before the gate.  Each stage the
     //      oracle records is reproduced here so a mismatch can be attributed instead of guessed at.
-    if (out.key) q->memcpy(out.key, normalized_key, hc_dim * sizeof(float)).wait();
-    if (out.value) q->memcpy(out.value, d_value, n_embd * sizeof(float)).wait();
-    if (out.gate) q->memcpy(out.gate, d_gate, hc * sizeof(float)).wait();
-    if (out.gated) q->memcpy(out.gated, d_gated, hc_dim * sizeof(float)).wait();
-    if (out.normalized) q->memcpy(out.normalized, d_norm, hc_dim * sizeof(float)).wait();
-    if (out.conv) q->memcpy(out.conv, d_conv, hc_dim * sizeof(float)).wait();
+    if (out.key) q->memcpy(out.key, normalized_key, hc_dim * sizeof(float));
+    if (out.value) q->memcpy(out.value, d_value, n_embd * sizeof(float));
+    if (out.gate) q->memcpy(out.gate, d_gate, hc * sizeof(float));
+    if (out.gated) q->memcpy(out.gated, d_gated, hc_dim * sizeof(float));
+    if (out.normalized) q->memcpy(out.normalized, d_norm, hc_dim * sizeof(float));
+    if (out.conv) q->memcpy(out.conv, d_conv, hc_dim * sizeof(float));
 }
 
 void ple_block_projected(const float* projected_key, const float* projected_value, const float* hidden,

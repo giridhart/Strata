@@ -5,6 +5,7 @@
 #include <sycl/sycl.hpp>
 #include "strata/kernels/verify_kernels.hpp"
 #include "strata/kernels/dp4a.hpp"
+#include "strata/core/sycl_doorbell.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -478,27 +479,27 @@ void resident_plan_kernel(const int32_t* __restrict__ ids, int n, int k, const i
         counts[2] = 0;
         if (skip != nullptr) {
             sycl::atomic_fence(sycl::memory_order::acq_rel, sycl::memory_scope::system);
-            *skip = ring;
+            strata::sys_store(skip, ring);
         }
     }
 }
 
-void wait_flag_ge_kernel(const volatile uint32_t* flag, uint32_t value) {
-    while (*flag < value)
+void wait_flag_ge_kernel(const volatile uint32_t* flag, uint32_t value, uint32_t spin_max) {
+    for (uint32_t spin = 0; spin < spin_max && strata::sys_load(flag) < value; ++spin)
         strata_spin_pause();
     sycl::atomic_fence(sycl::memory_order::acq_rel, sycl::memory_scope::system);
 }
 
-void wait_flag_ge_or_kernel(const volatile uint32_t* flag, uint32_t value, const volatile uint32_t* skip) {
-    if (*skip == value) return;
-    while (*flag < value)
+void wait_flag_ge_or_kernel(const volatile uint32_t* flag, uint32_t value, const volatile uint32_t* skip, uint32_t spin_max) {
+    if (strata::sys_load(skip) == value) return;
+    for (uint32_t spin = 0; spin < spin_max && strata::sys_load(flag) < value; ++spin)
         strata_spin_pause();
     sycl::atomic_fence(sycl::memory_order::acq_rel, sycl::memory_scope::system);
 }
 
 void copy_i32_unless_kernel(int32_t* __restrict__ dst, const volatile int32_t* src, int n, const uint32_t* skip,
                             uint32_t value, sycl::nd_item<1> item) {
-    if (*skip == value) return;
+    if (strata::sys_load(skip) == value) return;
     for (int i = item.get_local_id(0); i < n; i += item.get_local_range(0)) {
         dst[i] = src[i];
     }
@@ -506,7 +507,7 @@ void copy_i32_unless_kernel(int32_t* __restrict__ dst, const volatile int32_t* s
 
 void copy_or_zero_kernel(sycl::float4* __restrict__ dst, const sycl::float4* src, long long n4, const uint32_t* skip,
                          uint32_t value, sycl::nd_item<1> item) {
-    const bool zero = *skip == value;
+    const bool zero = strata::sys_load(skip) == value;
     for (long long i = item.get_global_id(0); i < n4; i += item.get_global_range(0)) {
         dst[i] = zero ? sycl::float4(0.f, 0.f, 0.f, 0.f) : src[i];
     }
@@ -784,8 +785,9 @@ void resident_plan(const int32_t* ids, int n_entries, int k, const int32_t* res_
 
 void wait_flag_ge_or(const uint32_t* flag, uint32_t value, const uint32_t* skip, void* stream) {
     sycl::queue* q = stream ? static_cast<sycl::queue*>(stream) : &default_queue();
+    const uint32_t spin_max = strata::spin_max(*q);
     q->parallel_for(sycl::nd_range<1>(sycl::range<1>(1), sycl::range<1>(1)),
-                    [=](sycl::nd_item<1>) { wait_flag_ge_or_kernel(flag, value, skip); });
+                    [=](sycl::nd_item<1>) { wait_flag_ge_or_kernel(flag, value, skip, spin_max); });
 }
 
 void copy_i32_from_mapped_unless(int32_t* dst, const int32_t* src, long long n, const uint32_t* skip, uint32_t value,
@@ -811,8 +813,9 @@ void copy_or_zero_from_mapped(float* dst, const float* src, long long n, const u
 
 void wait_flag_ge(const uint32_t* flag, uint32_t value, void* stream) {
     sycl::queue* q = stream ? static_cast<sycl::queue*>(stream) : &default_queue();
+    const uint32_t spin_max = strata::spin_max(*q);
     q->parallel_for(sycl::nd_range<1>(sycl::range<1>(1), sycl::range<1>(1)),
-                    [=](sycl::nd_item<1>) { wait_flag_ge_kernel(flag, value); });
+                    [=](sycl::nd_item<1>) { wait_flag_ge_kernel(flag, value, spin_max); });
 }
 
 void embedding_gather_dev(const uint8_t* codes, const float* scales, const float* offsets, const int32_t* tokens,
@@ -872,9 +875,13 @@ void copy_rows_strided(float* dst, const float* src, int64_t rows, int64_t w, in
 
 void wait_copy_i32_from_mapped(const uint32_t* flag, uint32_t value, int32_t* dst, const int32_t* src, int64_t n, void* stream) {
     sycl::queue* q = stream ? static_cast<sycl::queue*>(stream) : &default_queue();
+    const uint32_t spin_max = strata::spin_max(*q);
     q->parallel_for(sycl::nd_range<1>(sycl::range<1>(128), sycl::range<1>(128)), [=](sycl::nd_item<1> item) {
         if (item.get_local_id(0) == 0) {
-            while (*flag < value) {}
+            for (uint32_t spin = 0; spin < spin_max && strata::sys_load(flag) < value; ++spin) {
+                strata_spin_pause();
+            }
+            sycl::atomic_fence(sycl::memory_order::acq_rel, sycl::memory_scope::system);
         }
         item.barrier(sycl::access::fence_space::local_space);
         for (int i = (int)item.get_local_id(0); i < n; i += (int)item.get_local_range(0)) dst[i] = src[i];

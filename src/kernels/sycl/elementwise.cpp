@@ -4,6 +4,7 @@
 #include <algorithm>
 #include "strata/kernels/elementwise.hpp"
 #include "strata/kernels/dp4a.hpp"
+#include "strata/core/sycl_doorbell.hpp"
 
 #include "strata/kernels/bf16_bits.hpp"
 #include "strata/kernels/f16_bits.hpp"
@@ -228,13 +229,12 @@ void silu_inplace(float* x, int64_t n, void* stream) {
 /// memory stays in the GPU's L2 until the stream is synchronized - the host never saw the ring (tests/hip/handoff:
 /// 0 of 100 rings seen without a sync; volatile, a system-scope atomic store or a fence after the store: 100 of 100).
 void doorbell_ring_kernel(uint32_t* seq) {
-    sycl::atomic_fence(sycl::memory_order::acq_rel, sycl::memory_scope::system);
-    *(volatile uint32_t*)seq = *(volatile uint32_t*)seq + 1u;
+    strata::sys_store(seq, strata::sys_load(seq) + 1u);
 }
 
-void doorbell_wait_kernel(const volatile uint32_t* flag, const volatile uint32_t* seq) {
-    const uint32_t want = *seq;
-    while (*flag != want)
+void doorbell_wait_kernel(const volatile uint32_t* flag, const volatile uint32_t* seq, uint32_t spin_max) {
+    const uint32_t want = strata::sys_load(seq);
+    for (uint32_t spin = 0; spin < spin_max && strata::sys_load(flag) != want; ++spin)
         strata_spin_pause();
     sycl::atomic_fence(sycl::memory_order::acq_rel, sycl::memory_scope::system);
 }
@@ -244,8 +244,9 @@ void doorbell_wait(const uint32_t* d_flag, const uint32_t* d_seq, void* stream) 
     sycl::queue* q = stream ? static_cast<sycl::queue*>(stream) : &default_queue;
 
     if (d_flag == nullptr || d_seq == nullptr) return;
+    const uint32_t spin_max = strata::spin_max(*q);
     q->parallel_for(sycl::nd_range<1>(sycl::range<1>(1), sycl::range<1>(1)),
-                    [=](sycl::nd_item<1> /*item*/) { doorbell_wait_kernel(d_flag, d_seq); });
+                    [=](sycl::nd_item<1> /*item*/) { doorbell_wait_kernel(d_flag, d_seq, spin_max); });
     check_launch("doorbell_wait");
 }
 
@@ -335,8 +336,7 @@ void doorbell_publish_kernel(const float* __restrict__ x, const int32_t* __restr
     sycl::atomic_fence(sycl::memory_order::acq_rel, sycl::memory_scope::system);
     item.barrier();
     if (item.get_local_id(0) == 0) {
-        sycl::atomic_fence(sycl::memory_order::acq_rel, sycl::memory_scope::system);
-        *(volatile uint32_t*)seq = *(volatile uint32_t*)seq + 1u;
+        strata::sys_store(seq, strata::sys_load(seq) + 1u);
     }
 }
 
@@ -381,8 +381,7 @@ void doorbell_publish_res_kernel(const float* __restrict__ x, const int32_t* __r
     }
     item.barrier();
     if (item.get_local_id(0) == 0) {
-        sycl::atomic_fence(sycl::memory_order::acq_rel, sycl::memory_scope::system);
-        *(volatile uint32_t*)seq = *(volatile uint32_t*)seq + 1u;
+        strata::sys_store(seq, strata::sys_load(seq) + 1u);
     }
 }
 
@@ -421,9 +420,7 @@ void doorbell_publish_value_kernel(const float* __restrict__ x, const int32_t* _
     sycl::atomic_fence(sycl::memory_order::acq_rel, sycl::memory_scope::system);
     item.barrier();
     if (item.get_local_id(0) == 0) {
-        sycl::atomic_fence(sycl::memory_order::acq_rel, sycl::memory_scope::system);
-        *(volatile uint32_t*)seq = value;
-        sycl::atomic_fence(sycl::memory_order::acq_rel, sycl::memory_scope::system);
+        strata::sys_store(seq, value);
     }
 }
 

@@ -2,6 +2,7 @@
 // src/core/mtp.cpp - see include/strata/core/mtp.hpp.
 #include <sycl/sycl.hpp>
 #include "strata/core/mtp.hpp"
+#include "strata/core/sycl_doorbell.hpp"
 #include "strata/core/coupled_draft.hpp"
 #include "strata/core/on_device.hpp"
 #include "strata/core/device.hpp"
@@ -66,7 +67,7 @@ struct Bump {
 
 bool mapped(size_t bytes, void** h, void** d) {
     try {
-        *h = sycl::malloc_host(bytes, default_queue());
+        *h = strata::host_malloc_polled(bytes, default_queue());
         if (!*h) return false;
         std::memset(*h, 0, bytes);
         *d = *h;
@@ -159,7 +160,7 @@ MtpDrafter::~MtpDrafter() {
     if (dvocab_) sycl::free(dvocab_, default_queue());
     void* hosts[] = {h_tok_, h_step_, h_pos_, h_row_, h_out_, h_prob_};
     for (void* h : hosts)
-        if (h) sycl::free(h, default_queue());
+        if (h) strata::host_free_polled(h, default_queue());
 }
 
 const float* MtpDrafter::f32(const char* name) const {

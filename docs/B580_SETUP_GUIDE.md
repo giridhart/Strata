@@ -244,6 +244,36 @@ python3 tools/collect_profile_traces.py strata-b580-iq2xs.json ./traces/
 python3 tools/make_profile_mix.py ./traces/c*.trace:1 --out data/expert-profile-custom.bin
 ```
 
+### Step 7.3: Preparing or Transferring the MTP Draft Layer
+The Multi-Token Prediction (MTP) draft layer accelerates speculative decoding (~2x faster output) and is **shared across all model quants** (IQ2_XS, IQ3_S, Coder).
+
+#### Option A: Transfer MTP from Another Machine
+If you already fetched MTP tensors or built the MTP layer on another machine, copy the folder to `${ROOT}/../Strata-data/mtp/`:
+```bash
+# From the target B580 machine:
+mkdir -p "${ROOT}/../Strata-data/mtp"
+rsync -avP user@machine-a:/path/to/Strata-data/mtp/ "${ROOT}/../Strata-data/mtp/"
+```
+* If the remote folder already contains `rt/` (`experts.bin`, `dense.bin`, `dense.txt`), it is immediately ready to use.
+* If only the raw tensors were transferred (`tensors/` and `mtp-manifest.json`), pack and generate the runtime files on the target machine:
+  ```bash
+  python3 tools/mtp_pack.py --src "${ROOT}/../Strata-data/mtp" --experts q2_0 --out "${ROOT}/../Strata-data/mtp/mtp-q2_0.gguf"
+  python3 tools/mtp_rt.py --gguf "${ROOT}/../Strata-data/mtp/mtp-q2_0.gguf" --out "${ROOT}/../Strata-data/mtp/rt"
+  ```
+
+#### Option B: Fetch & Build Directly on Target Machine (No CUDA Required)
+The MTP tools run on CPU and do not require CUDA:
+```bash
+# 1. Fetch the 31 mtp.* tensors (~5.2 GB) via HTTP range requests
+python3 tools/mtp_fetch.py fetch --out "${ROOT}/../Strata-data/mtp"
+
+# 2. Pack the draft layer into Q2_0 GGUF
+python3 tools/mtp_pack.py --src "${ROOT}/../Strata-data/mtp" --experts q2_0 --out "${ROOT}/../Strata-data/mtp/mtp-q2_0.gguf"
+
+# 3. Relayout runtime weights for the engine
+python3 tools/mtp_rt.py --gguf "${ROOT}/../Strata-data/mtp/mtp-q2_0.gguf" --out "${ROOT}/../Strata-data/mtp/rt"
+```
+
 ---
 
 ## 8. Starting the Resident Server on Arc B580
@@ -279,9 +309,13 @@ export ZES_ENABLE_SYSMAN=1
   --max-context 32768 \
   --kv int8 \
   --prefill auto \
-  --tokens 32 \
+  --spec 4 \
+  --spec-min-p 0.5 \
+  --mtp "${ROOT}/../Strata-data/mtp/rt" \
+  --tokens "32,33" \
   --max-new 32
 ```
+*(Note: `--mtp` enables neural multi-token draft speculative decoding; if MTP runtime is not yet prepared, omit the `--mtp` line to use suffix/lookup drafting).*
 *If this outputs generated tokens and exits cleanly (status 0), your hardware and driver are ready for serving.*
 
 ---
@@ -306,7 +340,10 @@ Create `strata-b580-iq2xs.json` incorporating both memory flags and the perf-cal
     "--vram-reserve-mib", "1536",
     "--max-context", "32768",
     "--kv", "int8",
-    "--prefill", "auto"
+    "--prefill", "auto",
+    "--spec", "4",
+    "--spec-min-p", "0.5",
+    "--mtp", "../Strata-data/mtp/rt"
   ],
   "env": {
     "SYCL_CACHE_PERSISTENT": "0",
@@ -441,7 +478,10 @@ Recommended baseline for general multi-file editing and agentic workflows. Uses 
     "--vram-reserve-mib", "2048",
     "--max-context", "65536",
     "--kv", "int8",
-    "--prefill", "4096"
+    "--prefill", "4096",
+    "--spec", "4",
+    "--spec-min-p", "0.5",
+    "--mtp", "../Strata-data/mtp/rt"
   ]
 }
 ```
@@ -463,7 +503,10 @@ Ideal for large codebases, full repository AST maps, and long debugging/test his
     "--vram-reserve-mib", "2048",
     "--max-context", "131072",
     "--kv", "int8",
-    "--prefill", "4096"
+    "--prefill", "4096",
+    "--spec", "4",
+    "--spec-min-p", "0.5",
+    "--mtp", "../Strata-data/mtp/rt"
   ]
 }
 ```
@@ -490,7 +533,10 @@ Because keeping a full 256K KV cache in VRAM would take ~4.8 GB and reduce the h
     "--max-context", "262144",
     "--kv", "int8",
     "--kv-resident", "32768",
-    "--prefill", "4096"
+    "--prefill", "4096",
+    "--spec", "4",
+    "--spec-min-p", "0.5",
+    "--mtp", "../Strata-data/mtp/rt"
   ]
 }
 ```
@@ -607,9 +653,13 @@ export STRATA_RESIDENT_PIN=0
   --max-context 32768 \
   --kv int8 \
   --prefill auto \
-  --tokens 32 \
+  --spec 4 \
+  --spec-min-p 0.5 \
+  --mtp "${ROOT}/../Strata-data/mtp/rt" \
+  --tokens "32,33" \
   --max-new 32
 ```
+*(Note: `--mtp` enables neural multi-token draft speculative decoding; if MTP runtime is not yet prepared, omit the `--mtp` line to use suffix/lookup drafting).*
 *If this generates tokens and exits with status 0, `IQ3_S` is ready for serving.*
 
 ---
@@ -634,7 +684,10 @@ Save this as `strata-b580-iq3s.json` (relative paths `../Strata-data/...` work d
     "--vram-reserve-mib", "1536",
     "--max-context", "32768",
     "--kv", "int8",
-    "--prefill", "auto"
+    "--prefill", "auto",
+    "--spec", "4",
+    "--spec-min-p", "0.5",
+    "--mtp", "../Strata-data/mtp/rt"
   ],
   "env": {
     "SYCL_CACHE_PERSISTENT": "0",

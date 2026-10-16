@@ -2,6 +2,7 @@
 // src/core/verify.cpp - see include/strata/core/verify.hpp.
 #include <sycl/sycl.hpp>
 #include "strata/core/verify.hpp"
+#include "strata/core/sycl_doorbell.hpp"
 
 namespace {
 inline sycl::queue& get_default_queue() {
@@ -89,7 +90,7 @@ struct Bump {
 
 bool mapped(size_t bytes, void** h, void** d) {
     try {
-        *h = sycl::malloc_host(bytes, get_default_queue());
+        *h = strata::host_malloc_polled(bytes, get_default_queue());
         if (!*h) return false;
     } catch (...) {
         return false;
@@ -232,7 +233,7 @@ Verifier::~Verifier() {
                      h_ids_, h_w_,    h_seq_,  h_flag_,   h_ymiss_, h_flagA_,     h_plan_,
                      h_flagB_, h_plan_err_, h_nf_};
     for (void* h : hosts)
-        if (h) sycl::free(h, get_default_queue());
+        if (h) strata::host_free_polled(h, get_default_queue());
 }
 
 bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState& ss, const VerifyHits& hits,
@@ -1457,7 +1458,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
                     is_empty = cs_->ext_oneapi_empty();
                 } catch (...) {
                 }
-                if (!is_empty && *seq < want) {
+                if (is_empty && *seq < want) {
                     err = "verify: layer " + std::to_string(l) + " never rang";
                     return false;
                 }
