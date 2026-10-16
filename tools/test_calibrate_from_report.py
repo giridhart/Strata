@@ -95,6 +95,18 @@ class CalibrateFromReportTest(unittest.TestCase):
         self.assertEqual(params["STRATA_XE2_SPLIT_K"], 1)
         self.assertEqual(params["STRATA_XE2_SLM_PAD"], 0)
 
+    def test_cli_path_options(self):
+        import subprocess
+        real_lnl_path = str(Path(__file__).resolve().parent.parent / "bench_results/tier3_run/report.md")
+
+        for flag in ["--path", "-p", "--report", "-r"]:
+            cmd = ["python3", "tools/calibrate_from_report.py", flag, real_lnl_path, "--json"]
+            res = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            import json
+            data = json.loads(res.stdout)
+            self.assertIn("parameters", data)
+            self.assertEqual(data["parameters"]["STRATA_XE2_SPLIT_K"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()

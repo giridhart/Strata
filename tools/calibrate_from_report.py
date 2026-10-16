@@ -327,6 +327,12 @@ def main():
         help="Path to report.md, results directory, or JSON file. Omit with --latest to find the newest report.",
     )
     parser.add_argument(
+        "--path", "-p",
+        "--report", "-r",
+        dest="report_opt",
+        help="Explicit path to report.md, results directory, or JSON file.",
+    )
+    parser.add_argument(
         "--latest",
         action="store_true",
         help="Automatically locate and parse the most recent report.md in bench_results/",
@@ -350,8 +356,9 @@ def main():
     args = parser.parse_args()
 
     report_path: Optional[Path] = None
-    if args.report:
-        p = Path(args.report)
+    input_target = args.report_opt or args.report
+    if input_target:
+        p = Path(input_target)
         if p.is_dir():
             md_cand = p / "report.md"
             if md_cand.exists():
