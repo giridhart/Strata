@@ -301,6 +301,24 @@ Measures non-temporal streaming load hints (`.nt` / `uncached`) to prevent bulk 
 
 ---
 
+### Step 6.3: Automated Calibration via `tools/calibrate_from_report.py`
+
+Instead of manually extracting parameters from the benchmark tables, you can use the automated report calibrator [`tools/calibrate_from_report.py`](file:///home/girtam/projects/Strata/tools/calibrate_from_report.py):
+
+```bash
+# Analyze a specific benchmark report (e.g. transferred from your B580 run):
+python3 tools/calibrate_from_report.py /path/to/report.md
+
+# Or auto-discover the most recent report in bench_results/ or perf/results/:
+python3 tools/calibrate_from_report.py --latest
+
+# Directly inject the calibrated environment variables into your server JSON config:
+python3 tools/calibrate_from_report.py /path/to/report.md --write-config strata-b580-iq2xs.json
+
+# Or export them directly into your current shell session:
+eval $(python3 tools/calibrate_from_report.py /path/to/report.md --export)
+```
+
 ## 7. Preparing the Pack Index & Workload Profile
 
 ### Step 7.1: Build the Pack Index (If Transferring Shards Manually)
