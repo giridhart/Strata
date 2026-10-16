@@ -334,12 +334,7 @@ You do **not** need to generate an expert profile from scratch. Strata includes 
 * **`data/expert-profile.bin`**: Standard full-model profile.
 * **`data/expert-profile-coder.bin`**: Calibrated for the Coder variant.
 
-*(Optional)* If you ever want to profile a custom corpus from scratch, note that `tools/collect_profile_traces.py` takes `CONFIG.json` and an `OUTDIR` (not `--out`), followed by `tools/make_profile_mix.py`:
-```bash
-# Optional: only if generating a custom profile across 45 prompts (~30 min):
-python3 tools/collect_profile_traces.py strata-b580-iq2xs.json ./traces/
-python3 tools/make_profile_mix.py ./traces/c*.trace:1 --out data/expert-profile-custom.bin
-```
+*(Optional)* If you want to generate a specialized profile (e.g. coding-focused, custom languages, or domain-specific corpora), see **[Section 11: Generating Custom Expert Routing Traces & Workload Profiles](#11-generating-custom-expert-routing-traces--workload-profiles)** for step-by-step trace collection and aggregation workflows.
 
 ### Step 7.3: Preparing or Transferring the MTP Draft Layer
 The Multi-Token Prediction (MTP) draft layer accelerates speculative decoding (~2x faster output) and is **shared across all model quants** (IQ2_XS, IQ3_S, Coder).
@@ -812,3 +807,107 @@ export ZES_ENABLE_SYSMAN=1
 python3 sycl/serve/server_intel.py --engine strata --config strata-b580-iq3s.json --port 8080
 ```
 Open `http://localhost:8080/` (or `http://<remote-ip>:8080/`) to chat or connect your API client.
+
+---
+
+## 11. Generating Custom Expert Routing Traces & Workload Profiles
+
+Strata's two-tier architecture keeps an active subset of experts (~2,500–3,800 slots on Arc B580) resident in GPU VRAM (`--expert-cache auto`), while remaining experts reside in host system RAM (`--resident-experts`). 
+
+The `--expert-profile` file dictates **which experts** are loaded into VRAM. By creating a custom workload profile, you can ensure that the VRAM cache is populated with the specific experts needed for your target tasks (such as coding, math, or specific languages) on full-weight models (IQ3_S or IQ2_XS) without having to download a pruned model.
+
+---
+
+### Step 11.1: Understanding Trace Collection
+
+1. **How it works**: [`tools/collect_profile_traces.py`](../tools/collect_profile_traces.py) feeds prompts to the engine one at a time and logs hardware routing counts via `STRATA_USAGE_DUMP` (`--mode usage` on Intel Arc SYCL).
+2. **Resumable**: If trace collection is interrupted, the script automatically checks if a `.trace` file already exists and skips finished prompts.
+3. **Execution time**: Each prompt requires an engine startup, weight mapping, and generation of 250 tokens (~25–35 seconds per prompt).
+   * 12 coding prompts: ~6–7 minutes
+   * 30–50 prompts: ~15–25 minutes
+
+---
+
+### Step 11.2: Scenario A — Generating a Coding-Only Profile from Built-in Corpus
+
+The default corpus [`bench/profile_corpus.json`](../bench/profile_corpus.json) contains 45 diverse prompts. Prompts `0` through `11` are dedicated to programming across Python, C++, Rust, Go, JavaScript/TypeScript, SQL, Bash, regex, and debugging.
+
+To build a code-focused profile on your B580:
+
+```bash
+# 1. Ensure Intel environment variables are set
+source /opt/intel/oneapi/setvars.sh --force 2>/dev/null
+export SYCL_CACHE_PERSISTENT=0
+export ONEAPI_DEVICE_SELECTOR=level_zero:0
+export ZES_ENABLE_SYSMAN=1
+
+# 2. Collect device routing traces for the 12 coding prompts (prompts 0 to 11)
+python3 tools/collect_profile_traces.py strata-b580-iq3s.json ./traces_code \
+  --corpus bench/profile_corpus.json \
+  --only 0,1,2,3,4,5,6,7,8,9,10,11 \
+  --mode usage
+
+# 3. Aggregate the traces into a normalized profile
+python3 tools/make_profile_mix.py ./traces_code/c*.trace --out data/expert-profile-code.bin
+```
+
+---
+
+### Step 11.3: Scenario B — Using an Extended Custom Prompt Corpus
+
+To achieve broader coverage or specialize in a specific domain (e.g., your private codebase, data science, or web frameworks), you can create your own prompt corpus.
+
+#### 1. Create a Custom JSON File (e.g. `bench/custom_code_corpus.json`)
+The format is an array of objects with description `"d"` and prompt `"p"`:
+```json
+[
+  {"d": "python_async", "p": "Write a high-performance asyncio TCP socket server with custom framing and backpressure in Python."},
+  {"d": "cpp_lockfree", "p": "Write a lock-free single-producer single-consumer circular queue in C++20 using atomic memory orders."},
+  {"d": "rust_simd", "p": "Show an example of using std::simd in Rust to calculate the dot product of two f32 vectors."},
+  {"d": "sql_window", "p": "Write a PostgreSQL query using dense_rank() and lag() to detect consecutive transaction anomalies."},
+  {"d": "docker_compose", "p": "Write a multi-stage Dockerfile and docker-compose.yml for a production Go web application."}
+]
+```
+*(Tip: 30 to 50 prompts is the optimal sweet spot to saturate the B580's ~2,500–3,500 VRAM slots with general coding experts without diminishing returns).*
+
+#### 2. Run Trace Collection on Your Custom Corpus
+```bash
+python3 tools/collect_profile_traces.py strata-b580-iq3s.json ./traces_custom \
+  --corpus bench/custom_code_corpus.json \
+  --mode usage
+```
+
+#### 3. Merge Traces into a Profile
+```bash
+python3 tools/make_profile_mix.py ./traces_custom/c*.trace --out data/expert-profile-custom.bin
+```
+
+---
+
+### Step 11.4: Scenario C — Hands-Free Self-Learning Profile (`expert_profile_save`)
+
+If you do not want to wait for offline trace generation, Strata can record real-world routing counts directly from your daily interactive usage (chat, editor completions, API requests).
+
+In your `strata-b580-*.json` server configuration, add:
+```json
+"expert_profile_save": "data/expert-profile-learned.bin"
+```
+* **How it operates**: On Intel Arc (SYCL), the device plan tallies actual expert selections during normal inference.
+* **Saving interval**: The profile is written automatically upon clean server shutdown and every 10 minutes between requests.
+* **Usage**: On the next startup, update `--expert-profile` to point to `data/expert-profile-learned.bin`.
+
+---
+
+### Step 11.5: Applying the New Profile
+
+Once generated, point your server configuration (`strata-b580-iq2xs.json` or `strata-b580-iq3s.json`) to the newly created profile:
+
+```json
+    "--expert-profile", "data/expert-profile-code.bin",
+```
+Or specify it directly in the CLI:
+```bash
+./build_sycl/strata ... --expert-profile data/expert-profile-code.bin ...
+```
+
+When the engine starts up, the banner reports `N experts loaded into VRAM` according to your custom ranking, giving immediate high cache hit rates for your chosen workload.
