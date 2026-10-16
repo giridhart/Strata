@@ -845,7 +845,7 @@ export ZES_ENABLE_SYSMAN=1
 python3 tools/collect_profile_traces.py strata-b580-iq3s.json ./traces_code \
   --corpus bench/profile_corpus.json \
   --only 0,1,2,3,4,5,6,7,8,9,10,11 \
-  --mode usage
+  --mode routing
 
 # 3. Aggregate the traces into a normalized profile
 python3 tools/make_profile_mix.py ./traces_code/c*.trace --out data/expert-profile-code.bin
@@ -874,7 +874,7 @@ The format is an array of objects with description `"d"` and prompt `"p"`:
 ```bash
 python3 tools/collect_profile_traces.py strata-b580-iq3s.json ./traces_custom \
   --corpus bench/custom_code_corpus.json \
-  --mode usage
+  --mode routing
 ```
 
 #### 3. Merge Traces into a Profile

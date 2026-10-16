@@ -78,12 +78,16 @@ def main():
         env = dict(env0)
         if a.mode == "usage":
             env["STRATA_USAGE_DUMP"] = str(trace)
+            cmd += ["--dump-routing", str(trace)]
         else:
             cmd += ["--dump-routing", str(trace)]
         print(f"[{n + 1}/{len(corpus)}] {c['d']}: {len(ids)} prompt tokens", flush=True)
         r = subprocess.run(cmd, cwd=cfg.get("cwd") or None, env=env, capture_output=True, text=True)
-        if r.returncode != 0 or not trace.exists():
+        if r.returncode != 0:
             print(f"  failed (rc {r.returncode}): {r.stderr[-300:]}", file=sys.stderr)
+            sys.exit(1)
+        if not trace.exists() or trace.stat().st_size == 0:
+            print(f"  failed: process exited with code 0 but trace file {trace} was not created or empty", file=sys.stderr)
             sys.exit(1)
     print(f"traces in {out}")
 
