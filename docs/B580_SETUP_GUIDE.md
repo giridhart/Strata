@@ -209,7 +209,7 @@ You can execute individual microbenchmarks directly to measure specific hardware
 
 ## 6. Using Performance Data to Calibrate Serving Parameters
 
-Empirical results from the `perf/` benchmarks directly map to zero-recompile runtime environment variables in `include/strata/core/sycl_arch.hpp`:
+Empirical results from the `perf/` benchmarks directly map to zero-recompile runtime environment variables read by [`include/strata/core/sycl_arch.hpp`](file:///home/girtam/projects/Strata/include/strata/core/sycl_arch.hpp):
 
 | Benchmark Metric | Measured Result on B580 | Optimal Parameter | Effect in Serving |
 | :--- | :--- | :--- | :--- |
@@ -218,6 +218,86 @@ Empirical results from the `perf/` benchmarks directly map to zero-recompile run
 | **`perf_residual_pipeline`** (Cache hints) | 1.5%–3.3% latency reduction using non-temporal loads | `STRATA_XE2_CACHE_HINT=1` | Streams bulk model weights without evicting active KV cache from L2/L3 |
 | **`perf_moe_accumulate`** (Dual-Column MoE) | Up to 2.94x speedup on grouped gate+up SwiGLU | `STRATA_XE2_DUAL_COLUMN=1` *(opt-in)* | In-register SwiGLU fusion (fast decode path) |
 | **Workload Profile Tracing** | Identifies top 2,500–3,800 active experts | `--expert-profile data/expert-profile.bin` | Directs `--expert-cache auto` to pre-stage the hottest experts in VRAM |
+
+---
+
+### Step 6.1: Hardware Auto-Detection vs. Manual Overrides
+
+Strata's runtime automatically queries the GPU hardware at launch via [`strata::sycl_arch::get_xe2_tuning_profile()`](file:///home/girtam/projects/Strata/include/strata/core/sycl_arch.hpp#L33-L75):
+* **Desktop Arc B580** (20 Xe-cores, $\ge 128$ compute units, dedicated 12 GB GDDR6): Defaults automatically to `split_k_factor = 32`, `slm_pad_elements = 8`, and `enable_streaming_hints = true`.
+* **Integrated Lunar Lake** (8 Xe-cores, 64 compute units, shared system memory): Defaults conservatively to `split_k_factor = 1`, `slm_pad_elements = 0`, and `enable_streaming_hints = false` to prevent cache thrashing on unified memory.
+
+You can calibrate and override any of these parameters without recompiling by setting the corresponding environment variables in your shell or in `strata-b580-iq2xs.json`.
+
+---
+
+### Step 6.2: How to Read Benchmark Tables & Extract Calibration Values
+
+When you run the microbenchmarks (`./build_sycl/perf_*`), Google Benchmark outputs formatted execution logs. Here is how to interpret each benchmark's rows and extract your optimal settings:
+
+#### 1. KV Attention Decode Bandwidth (`perf_kv_decode`)
+Measures memory bandwidth during single-token attention reduction over historical context:
+```bash
+./build_sycl/perf_kv_decode --benchmark_filter="BM_Xe2_KV_Decode_INT8_SplitK"
+```
+* **Raw Benchmark Output Pattern**:
+  ```text
+  BM_Xe2_KV_Decode_INT8_SplitK/16384/4    ... us   ... us    ... Bandwidth_GBps=182.4 Context_T=16.384k Splits=4
+  BM_Xe2_KV_Decode_INT8_SplitK/16384/8    ... us   ... us    ... Bandwidth_GBps=254.1 Context_T=16.384k Splits=8
+  BM_Xe2_KV_Decode_INT8_SplitK/16384/16   ... us   ... us    ... Bandwidth_GBps=321.0 Context_T=16.384k Splits=16
+  BM_Xe2_KV_Decode_INT8_SplitK/16384/32   ... us   ... us    ... Bandwidth_GBps=384.7 Context_T=16.384k Splits=32
+  BM_Xe2_KV_Decode_INT8_SplitK/16384/64   ... us   ... us    ... Bandwidth_GBps=342.1 Context_T=16.384k Splits=64
+  ```
+* **How to Interpret**: At context length $T = 16384$ and $65536$, inspect the `Bandwidth_GBps` column. Note which `Splits` count reaches peak bandwidth before reduction merge overhead degrades performance.
+* **Calibration Setting**: Set `STRATA_XE2_SPLIT_K` to that split count:
+  ```bash
+  export STRATA_XE2_SPLIT_K=32
+  ```
+
+#### 2. Fused GDN Shared Local Memory (SLM) Padding (`perf_fused_gdn`)
+Tests Shared Local Memory (SLM) stride padding to prevent bank conflicts across Xe2 64-byte cache lines during linear attention recurrence:
+```bash
+./build_sycl/perf_fused_gdn --benchmark_filter="BM_Xe2_GDN_Fused_SLM"
+```
+* **Raw Benchmark Output Pattern**:
+  ```text
+  BM_Xe2_GDN_Fused_SLM/16/16               ... ns   ... ns    ... Bandwidth_GBps=31.2 Pad_Elements=0
+  BM_Xe2_GDN_Fused_SLM_Padded<4>/16/16    ... ns   ... ns    ... Bandwidth_GBps=44.8 Pad_Elements=4
+  BM_Xe2_GDN_Fused_SLM_Padded<8>/16/16    ... ns   ... ns    ... Bandwidth_GBps=58.1 Pad_Elements=8
+  BM_Xe2_GDN_Fused_SLM_Padded<16>/16/16   ... ns   ... ns    ... Bandwidth_GBps=52.3 Pad_Elements=16
+  ```
+* **How to Interpret**: Compare latency (`Time`) and `Bandwidth_GBps` across the different `Pad_Elements` entries. On the B580, `Pad_Elements=8` offsets successive matrix rows so that 16-lane SIMD memory accesses map to distinct physical SLM banks without stalling.
+* **Calibration Setting**:
+  ```bash
+  export STRATA_XE2_SLM_PAD=8
+  ```
+
+#### 3. MoE Gate+Up Projection Fusion (`perf_moe_accumulate`)
+Compares separate gate and up projection launches vs. in-register Dual-Column SwiGLU fusion:
+```bash
+./build_sycl/perf_moe_accumulate --benchmark_filter="SwiGLU"
+```
+* **Raw Benchmark Output Pattern**:
+  ```text
+  BM_Xe2_MoE_Separate_Gate_Up_SwiGLU/1    ... us   ... us    ... (two kernel dispatches)
+  BM_Xe2_MoE_DualColumn_SwiGLU/1          ... us   ... us    ... (in-register fused dispatch)
+  ```
+* **How to Interpret**: Check batch size 1 (single-token decode). If `DualColumn_SwiGLU/1` displays lower latency than `Separate_Gate_Up_SwiGLU/1`, enable in-register SwiGLU fusion:
+* **Calibration Setting**:
+  ```bash
+  export STRATA_XE2_DUAL_COLUMN=1
+  ```
+
+#### 4. Streaming Cache-Control Hints (`perf_residual_pipeline`)
+Measures non-temporal streaming load hints (`.nt` / `uncached`) to prevent bulk model weights from evicting active KV-cache entries from L2/L3:
+```bash
+./build_sycl/perf_residual_pipeline
+```
+* **How to Interpret**: If streaming cache hints reduce total pipeline latency or improve KV cache retention across back-to-back layers:
+* **Calibration Setting**:
+  ```bash
+  export STRATA_XE2_CACHE_HINT=1
+  ```
 
 ---
 
