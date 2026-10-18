@@ -32,6 +32,7 @@ void NativeHead::unload() {
         scratch_ = nullptr;
     }
     if (weights_) {
+        strata::kernels::native_q6_k_unpack(weights_);
         try {
             sycl::free((void*)weights_, default_queue());
         } catch (...) {
@@ -96,6 +97,9 @@ bool NativeHead::load(const std::vector<std::string>& shards, int64_t n_in, int6
         n_in_ = (int)n_in;
         n_out_ = (int)n_out;
         type_ = (int)tensor->type;
+        if (type_ == 14 && !strata::kernels::native_q6_k_packed_enabled() &&
+            strata::kernels::native_q6_k_planar_enabled())
+            weights_ = strata::kernels::native_q6_k_planar_adopt(weights_, n_in_, n_out_, "output head");
         return true;
     } catch (const std::exception& error) {
         err = std::string("native head: ") + error.what();

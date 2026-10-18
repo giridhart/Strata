@@ -156,7 +156,10 @@ MtpDrafter::~MtpDrafter() {
     if (state_arena_) sycl::free(state_arena_, default_queue());
     if (arena_) sycl::free(arena_, default_queue());
     if (head_logits_) sycl::free(head_logits_, default_queue());
-    if (dhead_) sycl::free(dhead_, default_queue());
+    if (dhead_) {
+        strata::kernels::native_q6_k_unpack(dhead_);
+        sycl::free(dhead_, default_queue());
+    }
     if (dvocab_) sycl::free(dvocab_, default_queue());
     void* hosts[] = {h_tok_, h_step_, h_pos_, h_row_, h_out_, h_prob_};
     for (void* h : hosts)
@@ -609,11 +612,26 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
                 return false;
             }
             q.memcpy(dvocab_, raw.data(), raw.size()).wait();
-            strata::kernels::gather_rows((const uint8_t*)head->weights(), row_bytes, dvocab_, n_dvocab_, dhead_, &q);
+            bool planar_gathered = false;
+            if (head->type() == 14 && strata::kernels::native_q6_k_is_planar(head->weights())) {
+                void* pd = strata::kernels::native_q6_k_planar_gather(
+                    head->weights(), (int)(row_bytes / 210) * 256, dvocab_, n_dvocab_, "MTP draft head");
+                if (pd != nullptr) {
+                    sycl::free(dhead_, q);
+                    dhead_ = (uint8_t*)pd;
+                    planar_gathered = true;
+                }
+            }
+            if (!planar_gathered)
+                strata::kernels::gather_rows((const uint8_t*)head->weights(), row_bytes, dvocab_, n_dvocab_, dhead_, &q);
             q.wait_and_throw();
             vram_ += (uint64_t)(n_dvocab_ * row_bytes) + raw.size();
             std::fprintf(stderr, "strata mtp: draft head over %lld tokens (%.1f MiB)\n", (long long)n_dvocab_,
                          (double)(n_dvocab_ * row_bytes) / 1048576.0);
+            if (!planar_gathered && head->type() == 14 && !strata::kernels::native_q6_k_packed_enabled() &&
+                strata::kernels::native_q6_k_planar_enabled())
+                dhead_ = (uint8_t*)strata::kernels::native_q6_k_planar_adopt(
+                    dhead_, (int)(row_bytes / 210) * 256, (int)n_dvocab_, "MTP draft head");
         }
     }
     if (coupled_draft_env() && cparams_ == nullptr && !setup_coupled(err)) return false;

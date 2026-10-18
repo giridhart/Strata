@@ -92,4 +92,37 @@ inline void host_free_polled(void* p, sycl::queue& q) {
     sycl::free(p, q);
 }
 
+enum class IntelGpuGen { Unknown, Alchemist, Battlemage };
+inline IntelGpuGen intel_gpu_gen(const sycl::device& d) {
+    if (!d.is_gpu()) return IntelGpuGen::Unknown;
+    try {
+        namespace exp = sycl::ext::oneapi::experimental;
+        const auto a = d.get_info<exp::info::device::architecture>();
+        if (a == exp::architecture::intel_gpu_bmg_g21 || a == exp::architecture::intel_gpu_bmg_g31)
+            return IntelGpuGen::Battlemage;
+        if (a == exp::architecture::intel_gpu_acm_g10 || a == exp::architecture::intel_gpu_acm_g11 ||
+            a == exp::architecture::intel_gpu_acm_g12)
+            return IntelGpuGen::Alchemist;
+    } catch (...) {
+    }
+    std::string n;
+    try { n = d.get_info<sycl::info::device::name>(); } catch (...) { return IntelGpuGen::Unknown; }
+    if (n.find("Intel") == std::string::npos) return IntelGpuGen::Unknown;
+    if (const size_t b = n.find("[0x"); b != std::string::npos) {
+        const unsigned long id = std::strtoul(n.c_str() + b + 1, nullptr, 16);
+        if ((id >= 0xE200 && id <= 0xE2FF) || (id >= 0x6400 && id <= 0x64FF)) return IntelGpuGen::Battlemage;
+        if ((id >= 0x5690 && id <= 0x56BF) || id == 0x56C0 || id == 0x56C1) return IntelGpuGen::Alchemist;
+    }
+    if (n.find("Battlemage") != std::string::npos) return IntelGpuGen::Battlemage;
+    if (n.find("Alchemist") != std::string::npos) return IntelGpuGen::Alchemist;
+    for (size_t i = 0; i + 2 < n.size(); ++i) {
+        if ((i > 0 && n[i - 1] != ' ') || (n[i] != 'A' && n[i] != 'B')) continue;
+        size_t j = i + 1;
+        while (j < n.size() && n[j] >= '0' && n[j] <= '9') ++j;
+        if (j - i - 1 < 2 || j - i - 1 > 3 || (j < n.size() && n[j] != ' ' && n[j] != '(')) continue;
+        return n[i] == 'B' ? IntelGpuGen::Battlemage : IntelGpuGen::Alchemist;
+    }
+    return IntelGpuGen::Unknown;
+}
+
 }  // namespace strata
