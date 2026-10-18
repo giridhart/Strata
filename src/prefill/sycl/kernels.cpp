@@ -1027,7 +1027,7 @@ void to_bf16(const float* x, uint16_t* y, int64_t n, void* stream, uint16_t* ylo
 }
 
 void gr_norm(const float* R, const float* w_norm, float eps, float* xn, uint16_t* xn16, int64_t T, void* stream,
-             uint16_t* xn16_lo) {
+             uint16_t* xn16_lo, bool /*f16img*/) {
     static_cast<sycl::queue*>(stream)->submit([&](sycl::handler& cgh) {
         sycl::local_accessor<float, 1> sh_acc_ct1(sycl::range<1>(32), cgh);
 
@@ -1041,7 +1041,7 @@ void gr_norm(const float* R, const float* w_norm, float eps, float* xn, uint16_t
     check("gr_norm");
 }
 void gr_norm_rs(const float* R, const float* w_norm, float eps, float* rs, uint16_t* xn16, int64_t T, void* stream,
-                uint16_t* xn16_lo, int64_t ldx) {
+                uint16_t* xn16_lo, int64_t ldx, bool /*f16img*/) {
     (void)ldx;
     static_cast<sycl::queue*>(stream)->submit([&](sycl::handler& cgh) {
         sycl::local_accessor<float, 1> sh_acc_ct1(sycl::range<1>(32), cgh);
@@ -1066,7 +1066,7 @@ void gr_mix_r(const float* R, const float* rs, const float* w_norm, const float*
     check("gr_mix_r");
 }
 void gr_write_norm_rs(float* R, const float* bo, const float* inj, int64_t inj_ld, const float* w_norm_next, float eps,
-                      float* rs, uint16_t* xn16, int64_t T, void* stream, uint16_t* xn16_lo, int64_t ldx) {
+                      float* rs, uint16_t* xn16, int64_t T, void* stream, uint16_t* xn16_lo, int64_t ldx, bool /*f16img*/) {
     (void)ldx;
     static_cast<sycl::queue*>(stream)->submit([&](sycl::handler& cgh) {
         sycl::local_accessor<float, 1> sh_acc_ct1(sycl::range<1>(32), cgh);

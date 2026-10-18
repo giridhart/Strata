@@ -69,3 +69,6 @@ bench_results/
 .agents/
 *.bundle
 *.patch
+
+# local Windows HIP packaging output
+dist-hip/
