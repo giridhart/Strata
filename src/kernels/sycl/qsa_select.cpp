@@ -55,14 +55,14 @@ void block_scores_kernel(const float* __restrict__ pooled, const float* __restri
     }
 }
 
-void block_scores_multi_kernel(const float* __restrict__ pooled, const float* __restrict__ dead,
-                               const float* __restrict__ q_idx, const int32_t* __restrict__ steps, int nq,
-                               int64_t max_blocks, float* __restrict__ out, bool early_exit,
-                               float* qs, int64_t* s_nkv, int64_t* s_nbid, sycl::nd_item<1> item) {
-    auto sg = item.get_sub_group();
-    const int lid = item.get_local_id(0);
-    const int lrange = item.get_local_range(0);
-
+template <typename BarrierFn>
+inline void block_scores_multi_body(const float* __restrict__ pooled, const float* __restrict__ dead,
+                                    const float* __restrict__ q_idx, const int32_t* __restrict__ steps, int nq,
+                                    int64_t max_blocks, float* __restrict__ out, bool early_exit,
+                                    const QsaScoreRows& srow,
+                                    float* qs, int64_t* s_nkv, int64_t* s_nbid,
+                                    int group_id, int group_range, int lid, int lrange,
+                                    sycl::sub_group sg, const BarrierFn& group_barrier) {
     if (!early_exit) {
         for (int i = lid; i < nq * IDX_HEADS * IDX_DIM; i += lrange)
             qs[i] = q_idx[i];
@@ -71,25 +71,28 @@ void block_scores_multi_kernel(const float* __restrict__ pooled, const float* __
         s_nkv[lid] = steps[lid * kStepCount + kStepNKv];
         s_nbid[lid] = steps[lid * kStepCount + kStepNBid];
     }
-    item.barrier(sycl::access::fence_space::local_space);
+    group_barrier();
     int64_t top = 0;
     for (int q = 0; q < nq; ++q)
         top = s_nbid[q] > top ? s_nbid[q] : top;
     if (early_exit) {
-        if ((int64_t)item.get_group(0) * SCORE_WARPS > top) return;
+        if ((int64_t)group_id * SCORE_WARPS > top) return;
         for (int i = lid; i < nq * IDX_HEADS * IDX_DIM; i += lrange)
             qs[i] = q_idx[i];
-        item.barrier(sycl::access::fence_space::local_space);
+        group_barrier();
     }
     const int lane = lid & 31;
-    const int64_t wstride = (int64_t)item.get_group_range(0) * SCORE_WARPS;
-    for (int64_t b = (int64_t)item.get_group(0) * SCORE_WARPS + (lid >> 5); b <= top && b < max_blocks; b += wstride) {
-        const sycl::float4 kp = *reinterpret_cast<const sycl::float4*>(pooled + b * IDX_DIM + lane * 4);
-        const sycl::float4 kd = *reinterpret_cast<const sycl::float4*>(dead + lane * 4);
+    const int64_t wstride = (int64_t)group_range * SCORE_WARPS;
+    for (int64_t b = (int64_t)group_id * SCORE_WARPS + (lid >> 5); b <= top && b < max_blocks; b += wstride) {
+        const bool own = srow.n > 0;
+        const sycl::float4 kp = own ? sycl::float4(0.0f, 0.0f, 0.0f, 0.0f) : *reinterpret_cast<const sycl::float4*>(pooled + b * IDX_DIM + lane * 4);
+        const sycl::float4 kd = own ? sycl::float4(0.0f, 0.0f, 0.0f, 0.0f) : *reinterpret_cast<const sycl::float4*>(dead + lane * 4);
         for (int qi = 0; qi < nq; ++qi) {
             const int64_t n_bid = s_nbid[qi];
             if (b > n_bid) continue;
-            const sycl::float4 k4 = (b == n_bid) ? kd : kp;
+            const sycl::float4 k4 = !own ? ((b == n_bid) ? kd : kp)
+                                         : (b == n_bid) ? *reinterpret_cast<const sycl::float4*>(srow.dead[qi] + lane * 4)
+                                                        : *reinterpret_cast<const sycl::float4*>(srow.pooled[qi] + b * IDX_DIM + lane * 4);
             const float* q = qs + qi * IDX_HEADS * IDX_DIM + lane * 4;
             float score = 0.0f;
 #pragma unroll
@@ -106,6 +109,45 @@ void block_scores_multi_kernel(const float* __restrict__ pooled, const float* __
             }
         }
     }
+}
+
+void block_scores_multi_kernel(const float* __restrict__ pooled, const float* __restrict__ dead,
+                               const float* __restrict__ q_idx, const int32_t* __restrict__ steps, int nq,
+                               int64_t max_blocks, float* __restrict__ out, bool early_exit,
+                               float* qs, int64_t* s_nkv, int64_t* s_nbid, sycl::nd_item<1> item,
+                               QsaScoreRows srow = {}) {
+    block_scores_multi_body(pooled, dead, q_idx, steps, nq, max_blocks, out, early_exit, srow,
+                            qs, s_nkv, s_nbid,
+                            (int)item.get_group(0), (int)item.get_group_range(0),
+                            (int)item.get_local_id(0), (int)item.get_local_range(0),
+                            item.get_sub_group(),
+                            [&]() { item.barrier(sycl::access::fence_space::local_space); });
+}
+
+struct ScoreSlotKeys {
+    const float* pooled[MQ];
+    const float* dead[MQ];
+};
+
+void block_scores_slots_kernel(ScoreSlotKeys keys, const float* __restrict__ q_idx,
+                               const int32_t* __restrict__ steps, int64_t max_blocks,
+                               float* __restrict__ out, bool early_exit,
+                               float* qs, int64_t* s_nkv, int64_t* s_nbid,
+                               sycl::nd_item<2> item) {
+    const unsigned z = item.get_group(0);
+    const float* pooled = keys.pooled[0];
+    const float* dead = keys.dead[0];
+#pragma unroll
+    for (unsigned i = 1; i < MQ; ++i)
+        if (z == i) { pooled = keys.pooled[i]; dead = keys.dead[i]; }
+    block_scores_multi_body(pooled, dead, q_idx + (size_t)z * IDX_HEADS * IDX_DIM,
+                            steps + (size_t)z * kStepCount, 1, max_blocks,
+                            out + (size_t)z * max_blocks, early_exit, QsaScoreRows{},
+                            qs, s_nkv, s_nbid,
+                            (int)item.get_group(1), (int)item.get_group_range(1),
+                            (int)item.get_local_id(1), (int)item.get_local_range(1),
+                            item.get_sub_group(),
+                            [&]() { item.barrier(sycl::access::fence_space::local_space); });
 }
 
 template <int NQ>
@@ -567,6 +609,79 @@ bool qsa_block_scores_rows(const float* pooled, const float* dead, const float* 
     else if (n == 2) launch_scores_rows<2>(q_ptr, pooled, dead, q_idx, steps, n, max_blocks, scores);
     else if (n == 3) launch_scores_rows<3>(q_ptr, pooled, dead, q_idx, steps, n, max_blocks, scores);
     else launch_scores_rows<4>(q_ptr, pooled, dead, q_idx, steps, n, max_blocks, scores);
+    return true;
+}
+
+void qsa_block_scores_rows(const QsaScoreRows& rows, const float* q_idx, const int32_t* steps, int64_t nq,
+                           int64_t max_blocks, const QsaShapes& s, float* scores, void* stream) {
+    if (nq <= 0) return;
+    if (s.idx_dim != IDX_DIM || s.idx_n_head != IDX_HEADS || s.idx_block != R || nq > MQ || rows.n != nq) {
+        std::fprintf(stderr, "qsa_block_scores_rows: unsupported geometry\n");
+        std::exit(1);
+    }
+    static const bool early = [] {
+        const char* v = std::getenv("STRATA_QSA_EARLY_EXIT");
+        return v == nullptr || std::atoi(v) != 0;
+    }();
+    const bool early_exit = early;
+    static sycl::queue default_queue{sycl::property::queue::in_order()};
+    sycl::queue* q_ptr = stream ? static_cast<sycl::queue*>(stream) : &default_queue;
+    q_ptr->submit([&](sycl::handler& cgh) {
+        sycl::local_accessor<float, 1> qs_acc(sycl::range<1>(MQ * IDX_HEADS * IDX_DIM), cgh);
+        sycl::local_accessor<int64_t, 1> s_nkv_acc(sycl::range<1>(MQ), cgh);
+        sycl::local_accessor<int64_t, 1> s_nbid_acc(sycl::range<1>(MQ), cgh);
+
+        cgh.parallel_for(sycl::nd_range<1>(256 * SCORE_WARPS * 32, SCORE_WARPS * 32),
+                         [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(32)]] {
+                             block_scores_multi_kernel(
+                                 nullptr, nullptr, q_idx, steps, (int)nq, max_blocks, scores, early_exit,
+                                 qs_acc.get_multi_ptr<sycl::access::decorated::no>().get(),
+                                 s_nkv_acc.get_multi_ptr<sycl::access::decorated::no>().get(),
+                                 s_nbid_acc.get_multi_ptr<sycl::access::decorated::no>().get(), item, rows);
+                         });
+    });
+}
+
+bool qsa_block_scores_slots(const float* const* pooled, const float* const* dead, const float* q_idx,
+                            const int32_t* steps, int64_t nq, int64_t max_blocks, const QsaShapes& s, float* scores,
+                            void* stream) {
+    if (nq <= 0) return true;
+    if (s.idx_dim != IDX_DIM || s.idx_n_head != IDX_HEADS || s.idx_block != R) {
+        std::fprintf(stderr, "qsa_block_scores_slots: unsupported indexer geometry\n");
+        std::exit(1);
+    }
+    static const bool multi = [] {
+        const char* v = std::getenv("STRATA_SCORES_MULTI");
+        return v == nullptr || std::atoi(v) != 0;
+    }();
+    if (nq > MQ || !multi) return false;
+    ScoreSlotKeys keys{};
+    for (int64_t z = 0; z < nq; ++z) {
+        keys.pooled[z] = pooled[z];
+        keys.dead[z] = dead[z];
+    }
+    static const bool early = [] {
+        const char* v = std::getenv("STRATA_QSA_EARLY_EXIT");
+        return v == nullptr || std::atoi(v) != 0;
+    }();
+    const bool early_exit = early;
+    static sycl::queue default_queue{sycl::property::queue::in_order()};
+    sycl::queue* q_ptr = stream ? static_cast<sycl::queue*>(stream) : &default_queue;
+    q_ptr->submit([&](sycl::handler& cgh) {
+        sycl::local_accessor<float, 1> qs_acc(sycl::range<1>(MQ * IDX_HEADS * IDX_DIM), cgh);
+        sycl::local_accessor<int64_t, 1> s_nkv_acc(sycl::range<1>(MQ), cgh);
+        sycl::local_accessor<int64_t, 1> s_nbid_acc(sycl::range<1>(MQ), cgh);
+
+        cgh.parallel_for(sycl::nd_range<2>(sycl::range<2>((size_t)nq, 256 * SCORE_WARPS * 32),
+                                           sycl::range<2>(1, SCORE_WARPS * 32)),
+                         [=](sycl::nd_item<2> item) [[sycl::reqd_sub_group_size(32)]] {
+                             block_scores_slots_kernel(
+                                 keys, q_idx, steps, max_blocks, scores, early_exit,
+                                 qs_acc.get_multi_ptr<sycl::access::decorated::no>().get(),
+                                 s_nkv_acc.get_multi_ptr<sycl::access::decorated::no>().get(),
+                                 s_nbid_acc.get_multi_ptr<sycl::access::decorated::no>().get(), item);
+                         });
+    });
     return true;
 }
 
