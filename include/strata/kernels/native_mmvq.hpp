@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 
 namespace strata::kernels {
 
@@ -30,6 +31,9 @@ std::size_t native_q8_1_bytes(int n_in, int ncols = 1);
 // single-column call. Set before
 // graph capture; captured graphs keep the kernels they captured.
 void native_mmvq_set_multi_exact(bool exact);
+void native_mmvq_set_q6k_wide(bool on);   // SYCL port: the 16-byte-load Q6_K kernel
+void native_q6_k_mmvq_stride224(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, int ncols,
+                                void* stream);   // SYCL port: experiment, Q6_K blocks at a 224-byte stride
 bool native_mmvq_multi_exact();
 // B6 (lab, opt-in STRATA_B6_MMVQ_ROWS=1): the exact multi-column layout with the activation blocks of every column
 // loaded once per weight block and reused across the block's rows (bitwise the same sums as the default exact
@@ -116,6 +120,17 @@ void native_q8_0_packed_unregister(const void* gguf_weights);
 bool native_q6_k_packed_enabled();
 bool native_q6_k_pack(const void* weights, int n_in, int n_out, const char* what);
 void native_q6_k_unpack(const void* weights);
+
+/// STRATA_Q6_PLANAR (SYCL port; =0 turns it off): the Q6_K output heads stored as planes - ql (128 B), qh (64 B), the scales
+/// (16 B, each lane's pair adjacent), d (2 B) of every 210-byte block - so the decode kernel's weight loads are single
+/// aligned 16-byte loads (the GGUF layout is 2-byte aligned: two loads and a shift per run). Same bytes, ~14% faster, outputs
+/// bitwise equal. native_q6_k_planar_adopt converts a GGUF-layout matrix (the old allocation is freed, the returned pointer
+/// replaces it and is what native_q6_k_mmvq is called with; free it like the old one, after native_q6_k_unpack);
+/// native_q6_k_planar_gather takes rows of a planar matrix as a new planar one (nullptr: `planar` is not one).
+bool native_q6_k_planar_enabled();
+bool native_q6_k_is_planar(const void* weights);
+void* native_q6_k_planar_adopt(void* weights, int n_in, int n_out, const char* what);
+void* native_q6_k_planar_gather(const void* planar, int n_in, const int32_t* rows_dev, int64_t n_sel, const char* what);
 
 void native_q8_0_f32(const void* weights, const float* x, void* scratch_q8_1,
                       float* y, int n_in, int n_out, int ncols, void* stream);

@@ -24,15 +24,22 @@
 // SOFTWARE.
 
 #include <sycl/sycl.hpp>
+#include <sycl/ext/intel/experimental/grf_size_properties.hpp>
 #include "strata/kernels/native_mmvq.hpp"
 #include "strata/kernels/dp4a.hpp"
 #include "strata/kernels/iq_kernels.hpp"
+#include "strata/core/sycl_doorbell.hpp"
 
+#include <algorithm>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
+#include <unordered_map>
 
 namespace strata::kernels {
 namespace {
@@ -45,6 +52,39 @@ inline int dp4a(int a, int b, int c) {
     auto va = sycl::vec<int, 1>(a).as<sycl::vec<int8_t, 4>>().convert<int>();
     auto vb = sycl::vec<int, 1>(b).as<sycl::vec<int8_t, 4>>().convert<int>();
     return c + va[0] * vb[0] + va[1] * vb[1] + va[2] * vb[2] + va[3] * vb[3];
+}
+
+// SYCL port: a 4-int vector load from a 4-byte aligned address (a Q8_1 block is 36 bytes, its qs sit at offset 4): one dword-vector
+// message instead of four scalar loads.
+inline sycl::int4 ld_i4_a4(const int* p) {
+    sycl::int4 v;
+    v.load(0, sycl::address_space_cast<sycl::access::address_space::global_space, sycl::access::decorated::no>(p));
+    return v;
+}
+
+// Q6_K: per-byte (v - 32) of four 6-bit values (bytes 0..63): no byte can saturate, so this is the saturating char4 subtract's
+// result exactly, in four integer ops (SWAR: no borrow crosses a byte) instead of the per-byte vector builtin.
+inline int q6_sub32(int x) {
+    const uint32_t u = (uint32_t)x;
+    return (int)(((u | 0x80808080u) - 0x20202020u) ^ (~u & 0x80808080u));
+}
+
+inline sycl::int4 load16_a2(const void* p) {
+    const uintptr_t a = reinterpret_cast<uintptr_t>(p);
+    const sycl::int4* q = reinterpret_cast<const sycl::int4*>(a & ~uintptr_t(15));
+    const int k = int(a >> 2) & 3;
+    const bool half = (a & 2) != 0;
+    const sycl::int4 lo = q[0], hi = (a & 15) ? q[1] : lo;
+    const uint32_t d[8] = {(uint32_t)lo.x(), (uint32_t)lo.y(), (uint32_t)lo.z(), (uint32_t)lo.w(),
+                           (uint32_t)hi.x(), (uint32_t)hi.y(), (uint32_t)hi.z(), (uint32_t)hi.w()};
+    uint32_t w[5];
+#pragma unroll
+    for (int i = 0; i < 5; ++i)
+        w[i] = k == 0 ? d[i] : k == 1 ? d[i + 1] : k == 2 ? d[i + 2] : d[(i + 3) & 7];
+    uint32_t o[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) o[i] = half ? (w[i] >> 16) | (w[i + 1] << 16) : w[i];
+    return sycl::int4((int)o[0], (int)o[1], (int)o[2], (int)o[3]);
 }
 
 inline unsigned int byte_permute(unsigned int a, unsigned int b, unsigned int s) {
@@ -496,15 +536,18 @@ inline sycl::int2 iq4_table_lookup(int q4) {
 // computes integer dot products, applies signed scale in the integer domain,
 // then multiplies the two half scales and integer sum in the original order.
 inline float iq4_xs_q8_dot(const IQ4XSBlock* __restrict__ w, const Q81Block* __restrict__ x, int iqs) {
+    const sycl::int4 q4v = ld_i4_a4(reinterpret_cast<const int*>(w->qs) + iqs);
+    const sycl::int4 u0v = ld_i4_a4(reinterpret_cast<const int*>(x[iqs / 4].qs));
+    const sycl::int4 u1v = ld_i4_a4(reinterpret_cast<const int*>(x[iqs / 4].qs) + 4);
+    const int q4[4] = {q4v.x(), q4v.y(), q4v.z(), q4v.w()};
+    const int u0[4] = {u0v.x(), u0v.y(), u0v.z(), u0v.w()};
+    const int u1[4] = {u1v.x(), u1v.y(), u1v.z(), u1v.w()};
     int sumi = 0;
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
-        const int aux_q4 = reinterpret_cast<const int*>(w->qs)[iqs + j];
-        const sycl::int2 v = iq4_table_lookup(aux_q4);
-        const int u0 = reinterpret_cast<const int*>(x[iqs / 4].qs)[j];
-        const int u1 = reinterpret_cast<const int*>(x[iqs / 4].qs)[j + 4];
-        sumi = dp4a(v.x(), u0, sumi);
-        sumi = dp4a(v.y(), u1, sumi);
+        const sycl::int2 v = iq4_table_lookup(q4[j]);
+        sumi = dp4a(v.x(), u0[j], sumi);
+        sumi = dp4a(v.y(), u1[j], sumi);
     }
     const int ls = ((w->scales_l[iqs / 8] >> (iqs & 0x04)) & 0x0f) | (((w->scales_h >> (iqs / 2)) & 0x03) << 4);
     sumi *= ls - 32;
@@ -680,12 +723,7 @@ inline float q6_q8_dot_impl(int vl, int vh, const int* __restrict__ u, const int
         const int sc = scales[4 * i];
         const int vil = (vl >> (4 * i)) & 0x0f0f0f0f;
         const int vih = ((vh >> (4 * i)) << 4) & 0x30303030;
-        const int vi = vsubss4(vil | vih, 0x20202020);
-        /*
-        DPCT1064:416: Migrated __dp4a call is used in a macro/template
-        definition and may not be valid for all macro/template uses. Adjust the
-        code.
-        */
+        const int vi = q6_sub32(vil | vih);
         sumf += d8[i] * (dp4a(vi, u[i], 0) * sc);
     }
     return d * sumf;
@@ -1083,21 +1121,24 @@ struct IQ4XSTraits {
     };
     static W load(const Block* __restrict__ w, int iqs) {
         W r;
+        const sycl::int4 q4 = ld_i4_a4(reinterpret_cast<const int*>(w->qs) + iqs);
+        const int qv[4] = {q4.x(), q4.y(), q4.z(), q4.w()};
 #pragma unroll
-        for (int j = 0; j < 4; ++j)
-            r.v[j] = iq4_table_lookup(reinterpret_cast<const int*>(w->qs)[iqs + j]);
+        for (int j = 0; j < 4; ++j) r.v[j] = iq4_table_lookup(qv[j]);
         r.ls = ((w->scales_l[iqs / 8] >> (iqs & 0x04)) & 0x0f) | (((w->scales_h >> (iqs / 2)) & 0x03) << 4);
         r.dw = sycl::vec<sycl::half, 1>(w->d).convert<float, sycl::rounding_mode::automatic>()[0];
         return r;
     }
     static float apply(const W& r, const Q81Block* __restrict__ x, int iqs) {
+        const sycl::int4 u0 = ld_i4_a4(reinterpret_cast<const int*>(x[iqs / 4].qs));
+        const sycl::int4 u1 = ld_i4_a4(reinterpret_cast<const int*>(x[iqs / 4].qs) + 4);
+        const int u0v[4] = {u0.x(), u0.y(), u0.z(), u0.w()};
+        const int u1v[4] = {u1.x(), u1.y(), u1.z(), u1.w()};
         int sumi = 0;
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
-            const int u0 = reinterpret_cast<const int*>(x[iqs / 4].qs)[j];
-            const int u1 = reinterpret_cast<const int*>(x[iqs / 4].qs)[j + 4];
-            sumi = dp4a(r.v[j].x(), u0, sumi);
-            sumi = dp4a(r.v[j].y(), u1, sumi);
+            sumi = dp4a(r.v[j].x(), u0v[j], sumi);
+            sumi = dp4a(r.v[j].y(), u1v[j], sumi);
         }
         sumi *= r.ls - 32;
         const float d = r.dw * x[iqs / 4].ds[0];
@@ -1124,6 +1165,11 @@ struct SmallTraits {
 // equal to ncols = 1 only to float rounding (the cross-warp reduction groups partial sums differently).
 bool g_multi_exact =
     true;  // until the upstream layout is timed on an idle GPU (plan rule: default only what is measured)
+// B6 STRATA_B6_MMVQ_ROWS (lab, default 0 = off): see native_mmvq_set_b6_rows
+int g_b6_rows = [] {
+    const char* v = std::getenv("STRATA_B6_MMVQ_ROWS");
+    return v ? std::atoi(v) : 0;
+}();
 
 template <typename F, int NCOLS, int NW, int ROWS>
 /*
@@ -1217,10 +1263,217 @@ bool q8_0_rows1(int n_in, int n_out) {
     }
 }
 
+// ---- B6 STRATA_B6_MMVQ_ROWS (lab, opt-in): the exact multi-column layout with each column's activation fragment
+// loaded ONCE per weight block and reused across ROWS rows of the block.
+template <typename F>
+struct B6X {
+    static constexpr bool ok = false;
+};
+template <>
+struct B6X<Q6KTraits> {
+    static constexpr bool ok = true;
+    struct X {
+        int u[2];
+        float d8[2];
+    };
+    struct W {
+        int vl, vh, sc[2];
+        float d;
+    };
+    static X xload(const Q81Block* x, int iqs) {
+        X r;
+        const int off = 4 * (iqs / 16) + (iqs % 16) / 8;
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            r.u[i] = reinterpret_cast<const int*>(x[off + 2 * i].qs)[iqs % 8];
+            r.d8[i] = x[off + 2 * i].ds[0];
+        }
+        return r;
+    }
+    static W wload(const Q6KBlock* __restrict__ w, int iqs) {
+        const Q6KTraits::W t = Q6KTraits::load(w, iqs);
+        W r;
+        r.vl = t.vl;
+        r.vh = t.vh;
+        r.sc[0] = t.scales[0];
+        r.sc[1] = t.scales[4];
+        r.d = t.d;
+        return r;
+    }
+    static float dot(const W& w, const X& x) {
+        float sumf = 0.0f;
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            const int vil = (w.vl >> (4 * i)) & 0x0f0f0f0f;
+            const int vih = ((w.vh >> (4 * i)) << 4) & 0x30303030;
+            const int vi = q6_sub32(vil | vih);
+            sumf += x.d8[i] * (dp4a(vi, x.u[i], 0) * w.sc[i]);
+        }
+        return w.d * sumf;
+    }
+};
+template <typename T, int KIND>
+struct B6XK {
+    static constexpr bool ok = true;
+    struct X {
+        int u[4];
+        float d8[2];
+    };
+    using W = typename T::W;
+    static X xload(const Q81Block* bq8, int iqs) {
+        X r;
+        const int off = 2 * ((iqs / 2) / 4);
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            const Q81Block* bq8i = bq8 + off + i;
+            r.d8[i] = bq8i->ds[0];
+            const int* q8 = reinterpret_cast<const int*>(bq8i->qs) + ((iqs / 2) % 4);
+            r.u[2 * i] = q8[0];
+            r.u[2 * i + 1] = q8[4];
+        }
+        return r;
+    }
+    static W wload(const typename T::Block* __restrict__ w, int iqs) { return T::load(w, iqs); }
+    static float dot(const W& w, const X& x) {
+        const uint8_t* sc = reinterpret_cast<const uint8_t*>(w.aux);
+        if constexpr (KIND == 4)
+            return q4_q8_dot_impl(w.v, x.u, sc, sc + 2, w.dm, x.d8);
+        else
+            return q5_q8_dot_impl(w.vl, w.vh, x.u, sc, sc + 2, w.dm, x.d8);
+    }
+};
+template <>
+struct B6X<Q4KTraits> : B6XK<Q4KTraits, 4> {};
+template <>
+struct B6X<Q5KTraits> : B6XK<Q5KTraits, 5> {};
+template <>
+struct B6X<IQ4XSTraits> {
+    static constexpr bool ok = true;
+    struct X {
+        int u0[4], u1[4];
+        float dx;
+    };
+    using W = IQ4XSTraits::W;
+    static X xload(const Q81Block* x, int iqs) {
+        X r;
+        const sycl::int4 u0 = ld_i4_a4(reinterpret_cast<const int*>(x[iqs / 4].qs));
+        const sycl::int4 u1 = ld_i4_a4(reinterpret_cast<const int*>(x[iqs / 4].qs) + 4);
+        r.u0[0] = u0.x();
+        r.u0[1] = u0.y();
+        r.u0[2] = u0.z();
+        r.u0[3] = u0.w();
+        r.u1[0] = u1.x();
+        r.u1[1] = u1.y();
+        r.u1[2] = u1.z();
+        r.u1[3] = u1.w();
+        r.dx = x[iqs / 4].ds[0];
+        return r;
+    }
+    static W wload(const IQ4XSBlock* __restrict__ w, int iqs) { return IQ4XSTraits::load(w, iqs); }
+    static float dot(const W& w, const X& x) {
+        int sumi = 0;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            sumi = dp4a(w.v[j].x(), x.u0[j], sumi);
+            sumi = dp4a(w.v[j].y(), x.u1[j], sumi);
+        }
+        sumi *= w.ls - 32;
+        const float d = w.dw * x.dx;
+        return d * sumi;
+    }
+};
+
+template <typename F, int NCOLS, int ROWS>
+void b6_mmvq_rows_kernel(const typename F::Block* __restrict__ w, const Q81Block* __restrict__ x, float* __restrict__ y,
+                         int n_in, int n_out, float partial[WARPS - 1][NCOLS][ROWS][WARP]) {
+    using XB = B6X<F>;
+    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    const int tid = WARP * int(item_ct1.get_local_id(1)) + int(item_ct1.get_local_id(2));
+    const int row0 = ROWS * int(item_ct1.get_group(2));
+    const int blocks_per_row = n_in / F::DIV;
+    const int x_stride = n_in / Q8K;
+    const int kqs = F::kqs(tid);
+    float tmp[NCOLS][ROWS] = {};
+    for (int kbx = tid / F::T; kbx < blocks_per_row; kbx += F::BPI) {
+        const int kby = kbx * F::KBY;
+        typename XB::X xv[NCOLS];
+#pragma unroll
+        for (int j = 0; j < NCOLS; ++j) xv[j] = XB::xload(x + std::size_t(j) * x_stride + kby, kqs);
+#pragma unroll
+        for (int i = 0; i < ROWS; ++i) {
+            if (row0 + i < n_out) {
+                const typename XB::W wv = XB::wload(w + std::size_t(row0 + i) * blocks_per_row + kbx, kqs);
+#pragma unroll
+                for (int j = 0; j < NCOLS; ++j) tmp[j][i] += XB::dot(wv, xv[j]);
+            }
+        }
+    }
+    if (item_ct1.get_local_id(1) > 0) {
+#pragma unroll
+        for (int j = 0; j < NCOLS; ++j)
+#pragma unroll
+            for (int i = 0; i < ROWS; ++i)
+                partial[item_ct1.get_local_id(1) - 1][j][i][item_ct1.get_local_id(2)] = tmp[j][i];
+    }
+    item_ct1.barrier(sycl::access::fence_space::local_space);
+    if (item_ct1.get_local_id(1) > 0) return;
+#pragma unroll
+    for (int j = 0; j < NCOLS; ++j) {
+#pragma unroll
+        for (int i = 0; i < ROWS; ++i) {
+#pragma unroll
+            for (int l = 0; l < WARPS - 1; ++l) tmp[j][i] += partial[l][j][i][item_ct1.get_local_id(2)];
+            tmp[j][i] = warp_sum(tmp[j][i]);
+            if (int(item_ct1.get_local_id(2)) == i && row0 + i < n_out) y[std::size_t(j) * n_out + row0 + i] = tmp[j][i];
+        }
+    }
+}
+
+template <typename F, int NCOLS>
+bool b6_launch(const typename F::Block* w, const Q81Block* x, float* y, int n_in, int n_out, sycl::queue* s) {
+    if constexpr (!B6X<F>::ok) {
+        return false;
+    } else {
+        if (g_b6_rows <= 0 || !g_multi_exact || n_in / F::DIV < 1) return false;
+        const int rows = g_b6_rows == 1 ? 2 : g_b6_rows;
+        const sycl::range<3> threads(1, WARPS, WARP);
+        if (rows == 2) {
+            const unsigned blocks = unsigned((n_out + 1) / 2);
+            s->submit([&](sycl::handler& cgh) {
+                sycl::local_accessor<float[WARPS - 1][NCOLS][2][WARP], 0> partial_acc(cgh);
+                cgh.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, blocks) * threads, threads),
+                                 [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(32)]] {
+                                     b6_mmvq_rows_kernel<F, NCOLS, 2>(w, x, y, n_in, n_out, partial_acc);
+                                 });
+            });
+        } else if (rows == 8) {
+            const unsigned blocks = unsigned((n_out + 7) / 8);
+            s->submit([&](sycl::handler& cgh) {
+                sycl::local_accessor<float[WARPS - 1][NCOLS][8][WARP], 0> partial_acc(cgh);
+                cgh.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, blocks) * threads, threads),
+                                 [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(32)]] {
+                                     b6_mmvq_rows_kernel<F, NCOLS, 8>(w, x, y, n_in, n_out, partial_acc);
+                                 });
+            });
+        } else {
+            const unsigned blocks = unsigned((n_out + 3) / 4);
+            s->submit([&](sycl::handler& cgh) {
+                sycl::local_accessor<float[WARPS - 1][NCOLS][4][WARP], 0> partial_acc(cgh);
+                cgh.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, blocks) * threads, threads),
+                                 [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(32)]] {
+                                     b6_mmvq_rows_kernel<F, NCOLS, 4>(w, x, y, n_in, n_out, partial_acc);
+                                 });
+            });
+        }
+        return true;
+    }
+}
+
 template <typename F, int NCOLS>
 void launch_multi_n(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, sycl::queue* s) {
     const auto* w = static_cast<const typename F::Block*>(weights);
     const auto* x = static_cast<const Q81Block*>(x_q8_1);
+    if (b6_launch<F, NCOLS>(w, x, y, n_in, n_out, s)) return;
     if (!g_multi_exact) {
         constexpr int NW = NCOLS <= 4 ? 4 : 2;
         const unsigned blocks = unsigned((std::size_t(n_out) + 1) / 2);
@@ -1410,10 +1663,529 @@ void small_f32(const void* weights, const float* x, void* scratch_q8_1, float* y
     small_mmvq<Weight, Qi>(weights, scratch_q8_1, y, n_in, n_out, ncols, stream);
 }
 
+inline bool q6k_a2() {
+    static const bool v = std::getenv("STRATA_MMVQ_A2") == nullptr || std::atoi(std::getenv("STRATA_MMVQ_A2")) != 0;
+    return v;
+}
+
+template <int NCOLS, int RPW, int SG = WARP, int BS = (int)sizeof(Q6KBlock), bool A2 = false>
+void native_mmvq_q6k_wide_kernel(const Q6KBlock* __restrict__ w, const Q81Block* __restrict__ x, float* __restrict__ y,
+                                 int n_in, int n_out) {
+    auto item = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    const int lane = int(item.get_local_id(2)), warp = int(item.get_local_id(1));
+    constexpr int NWG = WARPS * WARP / SG;
+    const int row0 = (int(item.get_group(2)) * NWG + warp) * RPW;
+    if (row0 >= n_out) return;
+    const int blocks_per_row = n_in / QK, x_stride = n_in / Q8K;
+    const int g = lane & 7, sub = lane >> 3;
+    const int vh_shift = 2 * ((g & 3) >> 1);
+    const int qh4_idx = 2 * (g >> 2) + (g & 1);
+    const int scale_offset = 8 * (g >> 2) + (g & 3);
+    const int bq8_offset = 4 * (g >> 2) + ((g & 3) >> 1);
+    const int u_int4 = g & 1;
+    float acc[RPW][NCOLS] = {};
+    for (int kbx = sub; kbx < blocks_per_row; kbx += SG / 8) {
+        const int kby = kbx * (QK / Q8K);
+        sycl::int4 ql4[RPW], qh4[RPW];
+        float dsc0[RPW], dsc1[RPW];
+#pragma unroll
+        for (int r = 0; r < RPW; ++r) {
+            const Q6KBlock* b = reinterpret_cast<const Q6KBlock*>(
+                reinterpret_cast<const uint8_t*>(w) +
+                (std::size_t(row0 + (row0 + r < n_out ? r : 0)) * blocks_per_row + kbx) * BS);
+            if constexpr (A2) {
+                ql4[r] = load16_a2(b->ql + 16 * g);
+                qh4[r] = load16_a2(b->qh + 16 * qh4_idx);
+            } else {
+                ql4[r] = reinterpret_cast<const sycl::int4*>(b->ql)[g];
+                qh4[r] = reinterpret_cast<const sycl::int4*>(b->qh)[qh4_idx];
+            }
+            const float d = b->d;
+            dsc0[r] = d * (float)b->scales[scale_offset];
+            dsc1[r] = d * (float)b->scales[scale_offset + 4];
+        }
+        sycl::int4 u0[NCOLS], u1[NCOLS];
+        float ds0[NCOLS], ds1[NCOLS];
+#pragma unroll
+        for (int j = 0; j < NCOLS; ++j) {
+            const Q81Block* xb = x + std::size_t(j) * x_stride + kby + bq8_offset;
+            if constexpr (A2) {
+                u0[j] = ld_i4_a4(reinterpret_cast<const int*>(xb[0].qs) + 4 * u_int4);
+                u1[j] = ld_i4_a4(reinterpret_cast<const int*>(xb[2].qs) + 4 * u_int4);
+            } else {
+                u0[j] = reinterpret_cast<const sycl::int4*>(xb[0].qs)[u_int4];
+                u1[j] = reinterpret_cast<const sycl::int4*>(xb[2].qs)[u_int4];
+            }
+            ds0[j] = xb[0].ds[0];
+            ds1[j] = xb[2].ds[0];
+        }
+#pragma unroll
+        for (int r = 0; r < RPW; ++r) {
+            const int vl[4] = {ql4[r].x(), ql4[r].y(), ql4[r].z(), ql4[r].w()};
+            const int vh[4] = {qh4[r].x() >> vh_shift, qh4[r].y() >> vh_shift, qh4[r].z() >> vh_shift,
+                               qh4[r].w() >> vh_shift};
+            int vi0[4], vi1[4];
+#pragma unroll
+            for (int p = 0; p < 4; ++p) {
+                vi0[p] = q6_sub32((vl[p] & 0x0f0f0f0f) | ((vh[p] << 4) & 0x30303030));
+                vi1[p] = q6_sub32(((vl[p] >> 4) & 0x0f0f0f0f) | (((vh[p] >> 4) << 4) & 0x30303030));
+            }
+#pragma unroll
+            for (int j = 0; j < NCOLS; ++j) {
+                int s0 = 0, s1 = 0;
+                s0 = dp4a(vi0[0], u0[j].x(), s0);
+                s0 = dp4a(vi0[1], u0[j].y(), s0);
+                s0 = dp4a(vi0[2], u0[j].z(), s0);
+                s0 = dp4a(vi0[3], u0[j].w(), s0);
+                s1 = dp4a(vi1[0], u1[j].x(), s1);
+                s1 = dp4a(vi1[1], u1[j].y(), s1);
+                s1 = dp4a(vi1[2], u1[j].z(), s1);
+                s1 = dp4a(vi1[3], u1[j].w(), s1);
+                acc[r][j] += ds0[j] * dsc0[r] * (float)s0 + ds1[j] * dsc1[r] * (float)s1;
+            }
+        }
+    }
+    auto sg = item.get_sub_group();
+#pragma unroll
+    for (int r = 0; r < RPW; ++r)
+#pragma unroll
+        for (int j = 0; j < NCOLS; ++j) {
+            float v = acc[r][j];
+#pragma unroll
+            for (int o = SG / 2; o > 0; o >>= 1) v += sycl::permute_group_by_xor(sg, v, o);
+            if (lane == 0 && row0 + r < n_out) y[std::size_t(j) * n_out + row0 + r] = v;
+        }
+}
+
+inline int q6k_wide_rpw() {
+    static const int v = std::getenv("STRATA_MMVQ_WIDE_RPW") ? std::atoi(std::getenv("STRATA_MMVQ_WIDE_RPW")) : 1;
+    return v;
+}
+
+inline bool mmvq_large_grf(sycl::queue* s) {
+    static const bool v = [s] {
+        const char* e = std::getenv("STRATA_MMVQ_LARGE_GRF");
+        if (e != nullptr) return std::atoi(e) != 0;
+        return strata::intel_gpu_gen(s->get_device()) == strata::IntelGpuGen::Alchemist;
+    }();
+    return v;
+}
+
+template <int NCOLS>
+struct Q6kWideA2Grf256Functor {
+    const Q6KBlock* w;
+    const Q81Block* x;
+    float* y;
+    int n_in, n_out;
+    auto get(sycl::ext::oneapi::experimental::properties_tag) const {
+        return sycl::ext::oneapi::experimental::properties{sycl::ext::intel::experimental::grf_size<256>,
+                                                           sycl::ext::oneapi::experimental::sub_group_size<32>};
+    }
+    void operator()(sycl::nd_item<3>) const {
+        native_mmvq_q6k_wide_kernel<NCOLS, 1, WARP, (int)sizeof(Q6KBlock), true>(w, x, y, n_in, n_out);
+    }
+};
+
+template <int NCOLS>
+void launch_q6k_wide(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, sycl::queue* s) {
+    const auto* w = static_cast<const Q6KBlock*>(weights);
+    const auto* x = static_cast<const Q81Block*>(x_q8_1);
+    const int rpw = q6k_wide_rpw();
+    if (rpw == 1 && q6k_a2()) {
+        const unsigned blocks = unsigned((std::size_t(n_out) + WARPS - 1) / WARPS);
+        if constexpr (NCOLS > 1) {
+            if (mmvq_large_grf(s)) {
+                s->parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, blocks) * sycl::range<3>(1, WARPS, WARP),
+                                                  sycl::range<3>(1, WARPS, WARP)),
+                                Q6kWideA2Grf256Functor<NCOLS>{w, x, y, n_in, n_out});
+                return;
+            }
+        }
+        s->parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, blocks) * sycl::range<3>(1, WARPS, WARP),
+                                          sycl::range<3>(1, WARPS, WARP)),
+                        [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(32)]] {
+                            native_mmvq_q6k_wide_kernel<NCOLS, 1, WARP, (int)sizeof(Q6KBlock), true>(w, x, y, n_in,
+                                                                                                     n_out);
+                        });
+        return;
+    }
+#define STRATA_Q6W(RP)                                                                                             \
+    if (rpw == RP) {                                                                                               \
+        const unsigned blocks = unsigned((std::size_t(n_out) + WARPS * RP - 1) / (WARPS * RP));                    \
+        if (q6k_a2()) {                                                                                            \
+            s->parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, blocks) * sycl::range<3>(1, WARPS, WARP),       \
+                                              sycl::range<3>(1, WARPS, WARP)),                                     \
+                            [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(32)]] {                              \
+                                native_mmvq_q6k_wide_kernel<NCOLS, RP, WARP, (int)sizeof(Q6KBlock), true>(         \
+                                    w, x, y, n_in, n_out);                                                         \
+                            });                                                                                    \
+            return;                                                                                                \
+        }                                                                                                          \
+        s->parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, blocks) * sycl::range<3>(1, WARPS, WARP),           \
+                                          sycl::range<3>(1, WARPS, WARP)),                                         \
+                        [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(32)]] {                                  \
+                            native_mmvq_q6k_wide_kernel<NCOLS, RP>(w, x, y, n_in, n_out);                          \
+                        });                                                                                        \
+        return;                                                                                                    \
+    }
+    STRATA_Q6W(1) STRATA_Q6W(2) STRATA_Q6W(4)
+#undef STRATA_Q6W
+    const unsigned blocks = unsigned((std::size_t(n_out) + WARPS - 1) / WARPS);
+    s->parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, blocks) * sycl::range<3>(1, WARPS, WARP),
+                                      sycl::range<3>(1, WARPS, WARP)),
+                    [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(32)]] {
+                        native_mmvq_q6k_wide_kernel<NCOLS, 1>(w, x, y, n_in, n_out);
+                    });
+}
+
+template <int NCOLS>
+void launch_q6k_wide224(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, sycl::queue* s) {
+    const auto* w = static_cast<const Q6KBlock*>(weights);
+    const auto* x = static_cast<const Q81Block*>(x_q8_1);
+    const unsigned blocks = unsigned((std::size_t(n_out) + WARPS - 1) / WARPS);
+    s->parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, blocks) * sycl::range<3>(1, WARPS, WARP),
+                                      sycl::range<3>(1, WARPS, WARP)),
+                    [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(32)]] {
+                        native_mmvq_q6k_wide_kernel<NCOLS, 1, WARP, 224>(w, x, y, n_in, n_out);
+                    });
+}
+
+bool g_q6k_wide = std::getenv("STRATA_MMVQ_WIDE") != nullptr && std::atoi(std::getenv("STRATA_MMVQ_WIDE")) != 0;
+
+// ============================ STRATA_Q6_PLANAR: the Q6_K heads as 16-byte-aligned planes (SYCL port) ============================
+struct Q6Planar {
+    void* base;
+    const uint8_t* ql;
+    const uint8_t* qh;
+    const uint8_t* sc;
+    const sycl::half* d;
+    int n_in, n_out;
+};
+std::unordered_map<const void*, Q6Planar>& q6_planar_registry() {
+    static std::unordered_map<const void*, Q6Planar> registry;
+    return registry;
+}
+
+template <int NCOLS>
+void native_mmvq_q6k_planar_kernel(const uint8_t* __restrict__ qlp, const uint8_t* __restrict__ qhp,
+                                   const uint8_t* __restrict__ scp, const sycl::half* __restrict__ dp,
+                                   const Q81Block* __restrict__ x, float* __restrict__ y, int n_in, int n_out) {
+    auto item = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    const int lane = int(item.get_local_id(2)), warp = int(item.get_local_id(1));
+    const int row = int(item.get_group(2)) * WARPS + warp;
+    if (row >= n_out) return;
+    const int blocks_per_row = n_in / QK, x_stride = n_in / Q8K;
+    const int g = lane & 7, sub = lane >> 3;
+    const int vh_shift = 2 * ((g & 3) >> 1);
+    const int qh4_idx = 2 * (g >> 2) + (g & 1);
+    const int bq8_offset = 4 * (g >> 2) + ((g & 3) >> 1);
+    const int u_int4 = g & 1;
+    float acc[NCOLS] = {};
+    for (int kbx = sub; kbx < blocks_per_row; kbx += WARP / 8) {
+        const int kby = kbx * (QK / Q8K);
+        const std::size_t bi = std::size_t(row) * blocks_per_row + kbx;
+        const sycl::int4 ql4 = reinterpret_cast<const sycl::int4*>(qlp + bi * 128)[g];
+        const sycl::int4 qh4 = reinterpret_cast<const sycl::int4*>(qhp + bi * 64)[qh4_idx];
+        const uint16_t s2 = reinterpret_cast<const uint16_t*>(scp + bi * 16)[g];
+        const float d = dp[bi];
+        const float dsc0 = d * (float)(int8_t)(s2 & 0xff), dsc1 = d * (float)(int8_t)(s2 >> 8);
+        sycl::int4 u0[NCOLS], u1[NCOLS];
+        float ds0[NCOLS], ds1[NCOLS];
+#pragma unroll
+        for (int j = 0; j < NCOLS; ++j) {
+            const Q81Block* xb = x + std::size_t(j) * x_stride + kby + bq8_offset;
+            u0[j] = ld_i4_a4(reinterpret_cast<const int*>(xb[0].qs) + 4 * u_int4);
+            u1[j] = ld_i4_a4(reinterpret_cast<const int*>(xb[2].qs) + 4 * u_int4);
+            ds0[j] = xb[0].ds[0];
+            ds1[j] = xb[2].ds[0];
+        }
+        const int vl[4] = {ql4.x(), ql4.y(), ql4.z(), ql4.w()};
+        const int vh[4] = {qh4.x() >> vh_shift, qh4.y() >> vh_shift, qh4.z() >> vh_shift, qh4.w() >> vh_shift};
+        int vi0[4], vi1[4];
+#pragma unroll
+        for (int p = 0; p < 4; ++p) {
+            vi0[p] = q6_sub32((vl[p] & 0x0f0f0f0f) | ((vh[p] << 4) & 0x30303030));
+            vi1[p] = q6_sub32(((vl[p] >> 4) & 0x0f0f0f0f) | (((vh[p] >> 4) << 4) & 0x30303030));
+        }
+#pragma unroll
+        for (int j = 0; j < NCOLS; ++j) {
+            int s0 = 0, s1 = 0;
+            s0 = dp4a(vi0[0], u0[j].x(), s0);
+            s0 = dp4a(vi0[1], u0[j].y(), s0);
+            s0 = dp4a(vi0[2], u0[j].z(), s0);
+            s0 = dp4a(vi0[3], u0[j].w(), s0);
+            s1 = dp4a(vi1[0], u1[j].x(), s1);
+            s1 = dp4a(vi1[1], u1[j].y(), s1);
+            s1 = dp4a(vi1[2], u1[j].z(), s1);
+            s1 = dp4a(vi1[3], u1[j].w(), s1);
+            acc[j] += ds0[j] * dsc0 * (float)s0 + ds1[j] * dsc1 * (float)s1;
+        }
+    }
+    auto sg = item.get_sub_group();
+#pragma unroll
+    for (int j = 0; j < NCOLS; ++j) {
+        float v = acc[j];
+#pragma unroll
+        for (int o = WARP / 2; o > 0; o >>= 1) v += sycl::permute_group_by_xor(sg, v, o);
+        if (lane == 0) y[std::size_t(j) * n_out + row] = v;
+    }
+}
+
+template <int NCOLS>
+struct Q6kPlanarGrf256Functor {
+    const uint8_t* ql;
+    const uint8_t* qh;
+    const uint8_t* sc;
+    const sycl::half* d;
+    const Q81Block* x;
+    float* y;
+    int n_in, n_out;
+    auto get(sycl::ext::oneapi::experimental::properties_tag) const {
+        return sycl::ext::oneapi::experimental::properties{sycl::ext::intel::experimental::grf_size<256>,
+                                                           sycl::ext::oneapi::experimental::sub_group_size<32>};
+    }
+    void operator()(sycl::nd_item<3>) const {
+        native_mmvq_q6k_planar_kernel<NCOLS>(ql, qh, sc, d, x, y, n_in, n_out);
+    }
+};
+
+template <int NCOLS>
+void q6_planar_launch(const Q6Planar& w, const Q81Block* x, float* y, sycl::queue* s) {
+    const unsigned blocks = unsigned((std::size_t(w.n_out) + WARPS - 1) / WARPS);
+    const uint8_t *ql = w.ql, *qh = w.qh, *sc = w.sc;
+    const sycl::half* d = w.d;
+    const int n_in = w.n_in, n_out = w.n_out;
+    if constexpr (NCOLS > 1) {
+        if (mmvq_large_grf(s)) {
+            s->parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, blocks) * sycl::range<3>(1, WARPS, WARP),
+                                              sycl::range<3>(1, WARPS, WARP)),
+                            Q6kPlanarGrf256Functor<NCOLS>{ql, qh, sc, d, x, y, n_in, n_out});
+            return;
+        }
+    }
+    s->parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, blocks) * sycl::range<3>(1, WARPS, WARP),
+                                      sycl::range<3>(1, WARPS, WARP)),
+                    [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(32)]] {
+                        native_mmvq_q6k_planar_kernel<NCOLS>(ql, qh, sc, d, x, y, n_in, n_out);
+                    });
+}
+
+bool q6_planar_mmvq(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, int ncols, void* stream) {
+    auto& registry = q6_planar_registry();
+    if (registry.empty() || ncols < 1) return false;
+    const auto found = registry.find(weights);
+    if (found == registry.end() || found->second.n_in != n_in || found->second.n_out != n_out) return false;
+    validate_shape(n_in, std::min(ncols, 8), 256);
+    validate_pointer(x_q8_1);
+    validate_pointer(y);
+    validate_stream(stream);
+    sycl::queue* s = stream ? static_cast<sycl::queue*>(stream) : &default_queue();
+    const std::size_t x_col = std::size_t(n_in / Q8K);
+    for (int c0 = 0; c0 < ncols; c0 += 8) {
+        const int nc = std::min(8, ncols - c0);
+        const auto* x = static_cast<const Q81Block*>(x_q8_1) + std::size_t(c0) * x_col;
+        float* yy = y + std::size_t(c0) * n_out;
+        switch (nc) {
+            case 1:
+                q6_planar_launch<1>(found->second, x, yy, s);
+                break;
+            case 2:
+                q6_planar_launch<2>(found->second, x, yy, s);
+                break;
+            case 3:
+                q6_planar_launch<3>(found->second, x, yy, s);
+                break;
+            case 4:
+                q6_planar_launch<4>(found->second, x, yy, s);
+                break;
+            case 5:
+                q6_planar_launch<5>(found->second, x, yy, s);
+                break;
+            case 6:
+                q6_planar_launch<6>(found->second, x, yy, s);
+                break;
+            case 7:
+                q6_planar_launch<7>(found->second, x, yy, s);
+                break;
+            default:
+                q6_planar_launch<8>(found->second, x, yy, s);
+                break;
+        }
+    }
+    launch_check();
+    return true;
+}
+
+struct Q6PlanarLayout {
+    std::size_t o_qh, o_sc, o_d, total;
+};
+Q6PlanarLayout q6_planar_layout(std::size_t nb) {
+    Q6PlanarLayout l;
+    l.o_qh = (nb * 128 + 255) & ~std::size_t(255);
+    l.o_sc = (l.o_qh + nb * 64 + 255) & ~std::size_t(255);
+    l.o_d = (l.o_sc + nb * 16 + 255) & ~std::size_t(255);
+    l.total = l.o_d + nb * 2;
+    return l;
+}
+Q6Planar q6_planar_make(void* dev, std::size_t nb, int n_in, int n_out) {
+    const Q6PlanarLayout l = q6_planar_layout(nb);
+    auto* base = static_cast<uint8_t*>(dev);
+    return Q6Planar{dev, base, base + l.o_qh, base + l.o_sc, reinterpret_cast<const sycl::half*>(base + l.o_d), n_in,
+                    n_out};
+}
+
 }  // namespace
+
+bool native_q8_0_packed_enabled() { return false; }
+bool native_q8_0_packed_eligible(int n_in, int n_out) {
+    return n_in > 0 && n_in % 32 == 0 && n_in / 32 >= 2 * WARPS * WARP / 8 && n_out >= 2048;
+}
+void native_q8_0_pack_host(const void* gguf_blocks, void* out, int n_in, int n_out) {
+    const auto* blocks = static_cast<const Q80Block*>(gguf_blocks);
+    auto* qs = static_cast<int8_t*>(out);
+    auto* d = reinterpret_cast<sycl::half*>(qs + std::size_t(n_in) * n_out);
+    const std::size_t count = std::size_t(n_in / 32) * n_out;
+    for (std::size_t b = 0; b < count; ++b) {
+        std::memcpy(qs + b * 32, blocks[b].qs, 32);
+        std::memcpy(d + b, &blocks[b].d, sizeof(sycl::half));
+    }
+}
+void native_q8_0_packed_register(const void*, const void*, int, int) {}
+void native_q8_0_packed_unregister(const void*) {}
+
+bool native_q6_k_packed_enabled() { return false; }
+bool native_q6_k_pack(const void*, int, int, const char*) { return false; }
+
+bool native_q6_k_planar_enabled() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("STRATA_Q6_PLANAR");
+        return !(v && v[0] == '0' && v[1] == '\0');
+    }();
+    return enabled;
+}
+
+bool native_q6_k_is_planar(const void* weights) { return q6_planar_registry().count(weights) != 0; }
+
+void* native_q6_k_planar_adopt(void* weights, int n_in, int n_out, const char* what) try {
+    if (!weights || n_in <= 0 || n_in % 256 || n_out <= 0 || !native_q6_k_planar_enabled()) return weights;
+    if (q6_planar_registry().count(weights)) return weights;
+    auto& q = default_queue();
+    const std::size_t nb = std::size_t(n_in / 256) * std::size_t(n_out);
+    const Q6PlanarLayout l = q6_planar_layout(nb);
+    void* dev = nullptr;
+    try {
+        dev = sycl::malloc_device(l.total, q);
+    } catch (...) {
+        dev = nullptr;
+    }
+    if (dev == nullptr) {
+        std::fprintf(
+            stderr,
+            "strata: STRATA_Q6_PLANAR: no VRAM for the %s's planar copy (+%.1f MiB), keeping the GGUF layout\n", what,
+            l.total / 1048576.0);
+        return weights;
+    }
+    const uint8_t* src = static_cast<const uint8_t*>(weights);
+    uint8_t* base = static_cast<uint8_t*>(dev);
+    const std::size_t o_qh = l.o_qh, o_sc = l.o_sc, o_d = l.o_d;
+    q.parallel_for(sycl::range<1>(nb), [=](sycl::id<1> id) {
+        const std::size_t b = id[0];
+        const uint16_t* s16 = reinterpret_cast<const uint16_t*>(src + b * 210);
+        uint16_t* qlo = reinterpret_cast<uint16_t*>(base + b * 128);
+        for (int i = 0; i < 64; ++i) qlo[i] = s16[i];
+        uint16_t* qho = reinterpret_cast<uint16_t*>(base + o_qh + b * 64);
+        for (int i = 0; i < 32; ++i) qho[i] = s16[64 + i];
+        const int8_t* sc = reinterpret_cast<const int8_t*>(src + b * 210 + 192);
+        uint8_t* sco = base + o_sc + b * 16;
+        for (int g = 0; g < 8; ++g) {
+            const int so = 8 * (g >> 2) + (g & 3);
+            sco[2 * g] = (uint8_t)sc[so];
+            sco[2 * g + 1] = (uint8_t)sc[so + 4];
+        }
+        reinterpret_cast<uint16_t*>(base + o_d)[b] = s16[104];
+    });
+    q.wait();
+    sycl::free(weights, q);
+    q6_planar_registry()[dev] = q6_planar_make(dev, nb, n_in, n_out);
+    std::fprintf(stderr, "strata: STRATA_Q6_PLANAR: the %s (%d x %d) is stored as 16-byte-aligned planes (same bytes)\n",
+                 what, n_out, n_in);
+    return dev;
+} catch (sycl::exception const& exc) {
+    std::fprintf(stderr, "strata: STRATA_Q6_PLANAR conversion failed: %s\n", exc.what());
+    return weights;
+}
+
+void* native_q6_k_planar_gather(const void* planar, int n_in, const int32_t* rows_dev, int64_t n_sel,
+                                const char* what) try {
+    const auto found = q6_planar_registry().find(planar);
+    if (found == q6_planar_registry().end() || found->second.n_in != n_in || n_sel <= 0) return nullptr;
+    auto& q = default_queue();
+    const int nbr = n_in / 256;
+    const std::size_t nb = std::size_t(nbr) * std::size_t(n_sel);
+    const Q6PlanarLayout l = q6_planar_layout(nb);
+    void* dev = nullptr;
+    try {
+        dev = sycl::malloc_device(l.total, q);
+    } catch (...) {
+        dev = nullptr;
+    }
+    if (dev == nullptr) return nullptr;
+    const Q6Planar src = found->second;
+    uint8_t* base = static_cast<uint8_t*>(dev);
+    const std::size_t o_qh = l.o_qh, o_sc = l.o_sc, o_d = l.o_d;
+    q.parallel_for(sycl::range<1>(nb), [=](sycl::id<1> id) {
+        const std::size_t b = id[0];
+        const std::size_t i = b / nbr, j = b - i * nbr;
+        const std::size_t sb = std::size_t(rows_dev[i]) * nbr + j;
+        const sycl::int4* sq = reinterpret_cast<const sycl::int4*>(src.ql + sb * 128);
+        sycl::int4* dq = reinterpret_cast<sycl::int4*>(base + b * 128);
+        for (int k = 0; k < 8; ++k) dq[k] = sq[k];
+        const sycl::int4* sh = reinterpret_cast<const sycl::int4*>(src.qh + sb * 64);
+        sycl::int4* dh = reinterpret_cast<sycl::int4*>(base + o_qh + b * 64);
+        for (int k = 0; k < 4; ++k) dh[k] = sh[k];
+        *reinterpret_cast<sycl::int4*>(base + o_sc + b * 16) = *reinterpret_cast<const sycl::int4*>(src.sc + sb * 16);
+        reinterpret_cast<uint16_t*>(base + o_d)[b] = reinterpret_cast<const uint16_t*>(src.d)[sb];
+    });
+    q.wait();
+    q6_planar_registry()[dev] = q6_planar_make(dev, nb, n_in, (int)n_sel);
+    std::fprintf(stderr, "strata: STRATA_Q6_PLANAR: the %s (%lld x %d) is gathered from the planar head\n", what,
+                 (long long)n_sel, n_in);
+    return dev;
+} catch (sycl::exception const& exc) {
+    std::fprintf(stderr, "strata: STRATA_Q6_PLANAR gather failed: %s\n", exc.what());
+    return nullptr;
+}
+
+void native_q6_k_unpack(const void* weights) {
+    q6_planar_registry().erase(weights);
+}
 
 void native_mmvq_set_multi_exact(bool exact) { g_multi_exact = exact; }
 bool native_mmvq_multi_exact() { return g_multi_exact; }
+void native_mmvq_set_b6_rows(int mode) { g_b6_rows = mode; }
+int native_mmvq_b6_rows() { return g_b6_rows; }
+void native_mmvq_set_q6k_wide(bool on) { g_q6k_wide = on; }
+void native_q6_k_mmvq_stride224(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, int ncols,
+                                void* stream) {
+    sycl::queue* s = stream ? static_cast<sycl::queue*>(stream) : &default_queue();
+    switch (ncols) {
+        case 1:
+            launch_q6k_wide224<1>(weights, x_q8_1, y, n_in, n_out, s);
+            return;
+        case 2:
+            launch_q6k_wide224<2>(weights, x_q8_1, y, n_in, n_out, s);
+            return;
+        case 3:
+            launch_q6k_wide224<3>(weights, x_q8_1, y, n_in, n_out, s);
+            return;
+        case 4:
+            launch_q6k_wide224<4>(weights, x_q8_1, y, n_in, n_out, s);
+            return;
+        default:
+            launch_q6k_wide224<6>(weights, x_q8_1, y, n_in, n_out, s);
+            return;
+    }
+}
 
 std::size_t native_q8_1_bytes(int n_in, int ncols) {
     validate_shape(n_in, ncols);
@@ -1875,6 +2647,46 @@ void native_q4_k_f32(const void* weights, const float* x, void* scratch_q8_1, fl
 }
 
 void native_q6_k_mmvq(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, int ncols, void* stream) {
+    if (q6_planar_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream)) return;
+    static const int wide_min =
+        std::getenv("STRATA_MMVQ_WIDE_MIN") ? std::atoi(std::getenv("STRATA_MMVQ_WIDE_MIN")) : q6k_a2() ? 0 : 4096;
+    static const int wide_maxc =
+        std::getenv("STRATA_MMVQ_WIDE_MAXC") ? std::atoi(std::getenv("STRATA_MMVQ_WIDE_MAXC")) : q6k_a2() ? 8 : 4;
+    if (g_q6k_wide && g_multi_exact && g_b6_rows <= 0 && ncols >= 1 && ncols <= wide_maxc && n_in > 0 &&
+        n_in % 256 == 0 && n_out >= wide_min && n_out > 0) {
+        validate_shape(n_in, ncols, 256);
+        validate_pointer(weights);
+        validate_pointer(x_q8_1);
+        validate_pointer(y);
+        validate_stream(stream);
+        sycl::queue* s = stream ? static_cast<sycl::queue*>(stream) : &default_queue();
+        switch (ncols) {
+            case 1:
+                launch_q6k_wide<1>(weights, x_q8_1, y, n_in, n_out, s);
+                return;
+            case 2:
+                launch_q6k_wide<2>(weights, x_q8_1, y, n_in, n_out, s);
+                return;
+            case 3:
+                launch_q6k_wide<3>(weights, x_q8_1, y, n_in, n_out, s);
+                return;
+            case 4:
+                launch_q6k_wide<4>(weights, x_q8_1, y, n_in, n_out, s);
+                return;
+            case 5:
+                launch_q6k_wide<5>(weights, x_q8_1, y, n_in, n_out, s);
+                return;
+            case 6:
+                launch_q6k_wide<6>(weights, x_q8_1, y, n_in, n_out, s);
+                return;
+            case 7:
+                launch_q6k_wide<7>(weights, x_q8_1, y, n_in, n_out, s);
+                return;
+            default:
+                launch_q6k_wide<8>(weights, x_q8_1, y, n_in, n_out, s);
+                return;
+        }
+    }
     validate_shape(n_in, ncols, 256);
     if (n_out <= 0) throw std::invalid_argument("native MMVQ requires n_out > 0");
     validate_pointer(weights);
@@ -1972,6 +2784,10 @@ void native_q5_0_mmvq(const void* weights, const void* x_q8_1, float* y, int n_i
 void native_q5_0_f32(const void* weights, const float* x, void* scratch_q8_1, float* y, int n_in, int n_out, int ncols,
                      void* stream) {
     small_f32<Q50Block, 4>(weights, x, scratch_q8_1, y, n_in, n_out, ncols, stream);
+}
+
+bool native_mmvq_pair(int, const void*, const void*, const void*, float*, float*, int, int, int, void*) {
+    return false;
 }
 
 void native_q8_0_mmvq(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, int ncols, void* stream) {
@@ -2119,5 +2935,20 @@ void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* 
             throw std::invalid_argument("unsupported native MMVQ GGML type");
     }
 }
+
+std::size_t native_q8_1_il_bytes(int n_in, int ncols) { return native_q8_1_bytes(n_in, ncols) * 2; }
+void native_quantize_q8_1_il(const float*, void*, void*, int, int, void*) {
+    throw std::invalid_argument("native_quantize_q8_1_il is CUDA only");
+}
+void native_q8_1_interleave(const void*, void*, int, int, void*) {
+    throw std::invalid_argument("native_q8_1_interleave is CUDA only");
+}
+bool native_mmvq_il_supported(int, int, int) { return false; }
+int native_mmvq_il_rows_for(int, int, int, int) { return 0; }
+void native_mmvq_il(int ggml_type, const void* weights, const void* x_q8_1, const void*, float* y, int n_in, int n_out,
+                    int ncols, void* stream) {
+    native_mmvq(ggml_type, weights, x_q8_1, y, n_in, n_out, ncols, stream);
+}
+void native_mmvq_il_tune(int) {}
 
 }  // namespace strata::kernels
