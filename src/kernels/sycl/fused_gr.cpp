@@ -49,12 +49,45 @@ inline float dot8(const sycl::uint4 w, const float* x) {
     return acc;
 }
 
+// STRATA_HC_Q8: a weight chunk of 8 values in one uint4 register either way - bf16 (4 words), or Q8 (8 int8 codes in
+// .x/.y and the chunk's 32-value block scale in .z), so the kernels keep their register budget.
+inline float dot8q(const uint32_t a, const uint32_t b, const float* x) {
+    float acc = 0.0f;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) acc = sycl::fma((float)(int8_t)(a >> (8 * i)), x[i], acc);
+#pragma unroll
+    for (int i = 0; i < 4; ++i) acc = sycl::fma((float)(int8_t)(b >> (8 * i)), x[4 + i], acc);
+    return acc;
+}
+/// STRATA_HC_REQ8: the chunk at element `e` (a multiple of 8) of a matrix - bf16 `wb`, or (Q8 and `sq` non-null)
+/// int8 codes with scales `sq`, packed into the same uint4 register as 8 int8 codes in .x/.y and the 32-value block's
+/// scale in .z. Q8 is a template parameter: the BF16 instantiations compile exactly as before.
+template <bool Q8>
+inline sycl::uint4 ldw(const uint16_t* wb, const float* sq, size_t e) {
+    if constexpr (Q8) {
+        if (sq != nullptr) {
+            const auto* v = reinterpret_cast<const sycl::uint2*>(reinterpret_cast<const int8_t*>(wb) + e);
+            const uint32_t scale_u = sycl::bit_cast<uint32_t>(sq[e / 32]);
+            return sycl::uint4(v->x(), v->y(), scale_u, 0u);
+        }
+    }
+    return *reinterpret_cast<const sycl::uint4*>(wb + e);
+}
+template <bool Q8>
+inline float dotw(const bool q8, const sycl::uint4 w, const float* x) {
+    if constexpr (Q8) {
+        if (q8) return sycl::bit_cast<float>(w.z()) * dot8q(w.x(), w.y(), x);
+    }
+    return dot8(w, x);
+}
+
 /*
 DPCT1110:14: The total declared local variable size in device function
 gr_down_kernel exceeds 128 bytes and may cause high register pressure. Consult
 with your hardware vendor to find the total register size available and adjust
 the code, or use smaller sub-group size to avoid high register pressure.
 */
+template <bool Q8 = false>
 void gr_down_kernel(FusedGrArgs a, float* xn, float part[8 /*WARPS*/][4 /*HC*/], float* s_rs) {
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
 
@@ -88,11 +121,6 @@ void gr_down_kernel(FusedGrArgs a, float* xn, float part[8 /*WARPS*/][4 /*HC*/],
         const float v = warp_sum(ss[c]);
         if (lane == 0) part[warp][c] = v;
     }
-    /*
-    DPCT1065:246: Consider replacing sycl::nd_item::barrier() with
-    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
-    performance if there is no access to global memory.
-    */
     item_ct1.barrier();
     if (t < HC) {
         float s = 0.0f;
@@ -101,35 +129,21 @@ void gr_down_kernel(FusedGrArgs a, float* xn, float part[8 /*WARPS*/][4 /*HC*/],
         s_rs[t] = sycl::rsqrt(s / (float)N + a.eps);
         if (item_ct1.get_group(2) == 0) a.rs[t] = s_rs[t];
     }
-    /*
-    DPCT1065:247: Consider replacing sycl::nd_item::barrier() with
-    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
-    performance if there is no access to global memory.
-    */
     item_ct1.barrier();
     for (int i = t; i < D; i += THREADS)
         xn[i] *= s_rs[i / N];
-    /*
-    DPCT1065:248: Consider replacing sycl::nd_item::barrier() with
-    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
-    performance if there is no access to global memory.
-    */
     item_ct1.barrier();
     // 2. one warp per output row: 10240 bf16 = 1280 chunks of 8, 40 per lane.
     const bool inject_block = item_ct1.get_group(2) == DOWN_BLOCKS;
     const int row = inject_block ? warp : item_ct1.get_group(2) * WARPS + warp;
     if (inject_block && (a.w_inject == nullptr || warp >= HC)) return;
-    const uint16_t* wrow = (inject_block ? a.w_inject : a.w_down) + (size_t)row * D;
-    const sycl::uint4* w4 = reinterpret_cast<const sycl::uint4*>(wrow);
+    const uint16_t* wmat = inject_block ? a.w_inject : a.w_down;
+    const float* sq = (Q8 && !inject_block) ? a.s_down : nullptr;   // the inject rows stay bf16
+    const bool q8 = Q8 && !inject_block;
     float acc = 0.0f;
 #pragma unroll 4
-    /*
-    DPCT1098:249: The '*' expression is used instead of the __ldg call. These
-    two expressions do not provide the exact same functionality. Check the
-    generated code for potential precision and/or performance issues.
-    */
     for (int j = lane; j < D / 8; j += 32)
-        acc += dot8(*(w4 + j), xn + j * 8);
+        acc += dotw<Q8>(q8, ldw<Q8>(wmat, sq, (size_t)row * D + (size_t)j * 8), xn + j * 8);
     acc = warp_sum(acc);
     if (lane != 0) return;
     if (inject_block) {
@@ -140,6 +154,7 @@ void gr_down_kernel(FusedGrArgs a, float* xn, float part[8 /*WARPS*/][4 /*HC*/],
     }
 }
 
+template <bool Q8 = false>
 void gr_up_kernel(FusedGrArgs a, float* lo, float g[4 /*HC*/][32 /*UP_COLS*/]) {
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
 
@@ -147,28 +162,14 @@ void gr_up_kernel(FusedGrArgs a, float* lo, float g[4 /*HC*/][32 /*UP_COLS*/]) {
     const int d0 = item_ct1.get_group(2) * UP_COLS;
     for (int k = t; k < LR; k += THREADS)
         lo[k] = a.lo[k];
-    /*
-    DPCT1065:250: Consider replacing sycl::nd_item::barrier() with
-    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
-    performance if there is no access to global memory.
-    */
     item_ct1.barrier();
     // 128 rows (4 streams x 32 columns), 16 per warp: 320 bf16 = 40 chunks of 8.
     for (int r = warp; r < HC * UP_COLS; r += WARPS) {
         const int c = r / UP_COLS, dd = r - c * UP_COLS, i = c * N + d0 + dd;
-        const sycl::uint4* w4 = reinterpret_cast<const sycl::uint4*>(a.w_up + (size_t)i * LR);
-        /*
-        DPCT1098:252: The '*' expression is used instead of the __ldg call.
-        These two expressions do not provide the exact same functionality. Check
-        the generated code for potential precision and/or performance issues.
-        */
-        float acc = dot8(*(w4 + lane), lo + lane * 8);
-        /*
-        DPCT1098:253: The '*' expression is used instead of the __ldg call.
-        These two expressions do not provide the exact same functionality. Check
-        the generated code for potential precision and/or performance issues.
-        */
-        if (lane < LR / 8 - 32) acc += dot8(*(w4 + 32 + lane), lo + (32 + lane) * 8);
+        const bool q8 = Q8;
+        float acc = dotw<Q8>(q8, ldw<Q8>(a.w_up, a.s_up, (size_t)i * LR + (size_t)lane * 8), lo + lane * 8);
+        if (lane < LR / 8 - 32)
+            acc += dotw<Q8>(q8, ldw<Q8>(a.w_up, a.s_up, (size_t)i * LR + (size_t)(32 + lane) * 8), lo + (32 + lane) * 8);
         acc = warp_sum(acc);
         if (lane == 0) {
             float rv = a.R[i];
@@ -287,13 +288,7 @@ void gr_norm_multi_kernel(GrMulti m, float part[8 /*WARPS*/][4 /*HC*/], float* s
 // which fits all eight tokens in one 40 KiB launch and stages 160 chunks of 8 (5 per lane, half the registers held
 // for the weight prefetch); smaller tiles raise how many blocks share an SM (the 41-block grid), e.g. three blocks
 // of four tokens instead of one on sm_75.
-template <int TILEV>
-/*
-DPCT1110:16: The total declared local variable size in device function
-gr_down_multi_kernel exceeds 128 bytes and may cause high register pressure.
-Consult with your hardware vendor to find the total register size available and
-adjust the code, or use smaller sub-group size to avoid high register pressure.
-*/
+template <int TILEV, int MAX_T = kFusedGrMaxT, bool Q8 = false>
 void gr_down_multi_kernel(GrMulti m, uint8_t* smem_raw) {
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
     constexpr int TQ = TILEV / 8 / 32;  // uint4 weight chunks per lane per tile
@@ -303,34 +298,21 @@ void gr_down_multi_kernel(GrMulti m, uint8_t* smem_raw) {
     const bool inject_block = item_ct1.get_group(2) == DOWN_BLOCKS;
     const int row = inject_block ? warp : item_ct1.get_group(2) * WARPS + warp;
     const bool active = !(inject_block && (m.a[0].w_inject == nullptr || warp >= HC));
-    const uint16_t* wrow = (inject_block ? m.a[0].w_inject : m.a[0].w_down) + (size_t)(active ? row : 0) * D;
-    const sycl::uint4* w4 = reinterpret_cast<const sycl::uint4*>(wrow);
-    float acc[kFusedGrMaxT];
+    const uint16_t* wmat = inject_block ? m.a[0].w_inject : m.a[0].w_down;
+    const float* sq = (Q8 && !inject_block) ? m.a[0].s_down : nullptr;   // the inject rows stay bf16
+    const bool q8 = Q8 && !inject_block;
+    const size_t row0 = (size_t)(active ? row : 0) * D;
+    float acc[MAX_T];
 #pragma unroll
-    for (int k = 0; k < kFusedGrMaxT; ++k)
+    for (int k = 0; k < MAX_T; ++k)
         acc[k] = 0.0f;
     for (int base = 0; base < D; base += TILEV) {
         sycl::uint4 wv[TQ];
         if (active) {
 #pragma unroll
-            /*
-            DPCT1098:256: The '*' expression is used instead of the __ldg call.
-            These two expressions do not provide the exact same functionality.
-            Check the generated code for potential precision and/or performance
-            issues.
-            */
             for (int q = 0; q < TQ; ++q)
-                wv[q] = *(w4 + base / 8 + lane + 32 * q);
+                wv[q] = ldw<Q8>(wmat, sq, row0 + (size_t)base + (size_t)(lane + 32 * q) * 8);
         }
-        /*
-        DPCT1118:17: SYCL group functions and algorithms must be encountered in
-        converged control flow. You may need to adjust the code.
-        */
-        /*
-        DPCT1065:257: Consider replacing sycl::nd_item::barrier() with
-        sycl::nd_item::barrier(sycl::access::fence_space::local_space) for
-        better performance if there is no access to global memory.
-        */
         item_ct1.barrier();  // the previous tile is consumed
         const sycl::float4* src4 = reinterpret_cast<const sycl::float4*>(m.xn);
         sycl::float4* tile4 = reinterpret_cast<sycl::float4*>(tile);
@@ -338,33 +320,24 @@ void gr_down_multi_kernel(GrMulti m, uint8_t* smem_raw) {
             const int k = i / (TILEV / 4), off = i - k * (TILEV / 4);
             tile4[i] = src4[((size_t)k * D + base) / 4 + off];
         }
-        /*
-        DPCT1118:18: SYCL group functions and algorithms must be encountered in
-        converged control flow. You may need to adjust the code.
-        */
-        /*
-        DPCT1065:258: Consider replacing sycl::nd_item::barrier() with
-        sycl::nd_item::barrier(sycl::access::fence_space::local_space) for
-        better performance if there is no access to global memory.
-        */
         item_ct1.barrier();
         if (!active) continue;
 #pragma unroll
         for (int q = 0; q < TQ; ++q) {
             const int j = lane + 32 * q;
 #pragma unroll
-            for (int k = 0; k < kFusedGrMaxT; ++k)
-                if (k < T) acc[k] += dot8(wv[q], tile + k * TILEV + j * 8);
+            for (int k = 0; k < MAX_T; ++k)
+                if (k < T) acc[k] += dotw<Q8>(q8, wv[q], tile + k * TILEV + j * 8);
         }
     }
     if (!active) return;
-    float s[kFusedGrMaxT];
+    float s[MAX_T];
 #pragma unroll
-    for (int k = 0; k < kFusedGrMaxT; ++k)
+    for (int k = 0; k < MAX_T; ++k)
         s[k] = k < T ? warp_sum(acc[k]) : 0.0f;
     // lane k writes token k (every lane holds every sum after the xor reduction)
 #pragma unroll
-    for (int k = 0; k < kFusedGrMaxT; ++k) {
+    for (int k = 0; k < MAX_T; ++k) {
         if (k >= T || lane != k) continue;
         if (inject_block) {
             GR_PICK(m, k, inject_out)[row] = s[k];
@@ -380,27 +353,29 @@ constexpr int UPM_BLOCKS = N / UPM_COLS;  // 160
 
 // `gr_up_kernel` for T tokens: each row of w_up read once; the T dots reduced by xor so every lane holds every
 // sum, and lane k runs token k's epilogue - the T epilogues in parallel instead of one after another.
-/*
-DPCT1110:19: The total declared local variable size in device function
-gr_up_multi_kernel exceeds 128 bytes and may cause high register pressure.
-Consult with your hardware vendor to find the total register size available and
-adjust the code, or use smaller sub-group size to avoid high register pressure.
-*/
+template <int MAX_T = kFusedGrMaxT, bool EXACT_T = false, bool Q8 = false>
 void gr_up_multi_kernel(GrMulti m, float lo[8 /*kFusedGrMaxT*/][320 /*LR*/],
                         float g[8 /*kFusedGrMaxT*/][4 /*HC*/][16 /*UPM_COLS*/]) {
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
 
     const int t = item_ct1.get_local_id(2), lane = t & 31, warp = t >> 5;
-    const int T = m.T;
+    const int T = EXACT_T ? MAX_T : m.T;
     const int d0 = item_ct1.get_group(2) * UPM_COLS;
     for (int i = t; i < T * LR; i += THREADS)
         lo[i / LR][i % LR] = GR_PICK(m, i / LR, lo)[i % LR];
     item_ct1.barrier();
     for (int r = warp; r < HC * UPM_COLS; r += WARPS) {
         const int c = r / UPM_COLS, dd = r - c * UPM_COLS, i = c * N + d0 + dd;
-        const sycl::uint4* w4 = reinterpret_cast<const sycl::uint4*>(m.a[0].w_up + (size_t)i * LR);
-        const sycl::uint4 wa = *(w4 + lane);
-        const sycl::uint4 wb = lane < LR / 8 - 32 ? *(w4 + 32 + lane) : sycl::uint4(0, 0, 0, 0);
+        sycl::uint4 qa(0, 0, 0, 0), qb(0, 0, 0, 0);
+        if constexpr (Q8) {
+            qa = ldw<true>(m.a[0].w_up, m.a[0].s_up, (size_t)i * LR + (size_t)lane * 8);
+            if (lane < LR / 8 - 32)
+                qb = ldw<true>(m.a[0].w_up, m.a[0].s_up, (size_t)i * LR + (size_t)(32 + lane) * 8);
+        } else {
+            const sycl::uint4* w4 = reinterpret_cast<const sycl::uint4*>(m.a[0].w_up + (size_t)i * LR);
+            qa = *(w4 + lane);
+            qb = lane < LR / 8 - 32 ? *(w4 + 32 + lane) : sycl::uint4(0, 0, 0, 0);
+        }
         // the epilogue inputs of this lane's token, fetched while the dots run
         float rv = 0.0f, wn = 0.0f, rsc = 0.0f, bo = 0.0f, ip = 0.0f;
         bool apply = false;
@@ -416,10 +391,16 @@ void gr_up_multi_kernel(GrMulti m, float lo[8 /*kFusedGrMaxT*/][320 /*LR*/],
         }
         float mine = 0.0f;
 #pragma unroll
-        for (int k = 0; k < kFusedGrMaxT; ++k) {
-            if (k >= T) break;
-            float acc = dot8(wa, lo[k] + lane * 8);
-            if (lane < LR / 8 - 32) acc += dot8(wb, lo[k] + (32 + lane) * 8);
+        for (int k = 0; k < MAX_T; ++k) {
+            if (!EXACT_T && k >= T) break;
+            float acc;
+            if constexpr (Q8) {
+                acc = dotw<true>(true, qa, lo[k] + lane * 8);
+                if (lane < LR / 8 - 32) acc += dotw<true>(true, qb, lo[k] + (32 + lane) * 8);
+            } else {
+                acc = dot8(qa, lo[k] + lane * 8);
+                if (lane < LR / 8 - 32) acc += dot8(qb, lo[k] + (32 + lane) * 8);
+            }
             acc = warp_sum(acc);
             if (lane == k) mine = acc;
         }
@@ -1018,13 +999,9 @@ int down_chunk(bool staged, int* tile_out) {
 // takes first).
 void launch_multi(const GrMulti& m, int variant, sycl::queue* st, unsigned long long* stamp_buf, int stamp_i0) {
     const int n_tok = m.T;
+    const bool q8w = m.a[0].s_down != nullptr;   // STRATA_HC_REQ8: w_down / w_up hold int8 codes
     if (variant >= kHcSplit)
         st->submit([&](sycl::handler& cgh) {
-            /*
-            DPCT1101:867: 'WARPS' expression was replaced with a value. Modify
-            the code to use the original expression, provided in comments, if it
-            is correct.
-            */
             sycl::local_accessor<float, 1> part_acc_ct1(sycl::range<1>(8 /*WARPS*/), cgh);
             sycl::local_accessor<float, 0> s_rs_acc_ct1(cgh);
 
@@ -1045,22 +1022,7 @@ void launch_multi(const GrMulti& m, int variant, sycl::queue* st, unsigned long 
         });
     else
         st->submit([&](sycl::handler& cgh) {
-            /*
-            DPCT1101:868: 'WARPS' expression was replaced with a value. Modify
-            the code to use the original expression, provided in comments, if it
-            is correct.
-            */
-            /*
-            DPCT1101:869: 'HC' expression was replaced with a value. Modify the
-            code to use the original expression, provided in comments, if it is
-            correct.
-            */
             sycl::local_accessor<float[8 /*WARPS*/][4 /*HC*/], 0> part_acc_ct1(cgh);
-            /*
-            DPCT1101:870: 'HC' expression was replaced with a value. Modify the
-            code to use the original expression, provided in comments, if it is
-            correct.
-            */
             sycl::local_accessor<float, 1> s_rs_acc_ct1(sycl::range<1>(4 /*HC*/), cgh);
 
             cgh.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, n_tok) * sycl::range<3>(1, 1, THREADS),
@@ -1071,14 +1033,9 @@ void launch_multi(const GrMulti& m, int variant, sycl::queue* st, unsigned long 
                              });
         });
     if (stamp_buf) gpu_stamp(stamp_buf, stamp_i0, (void*)st);
-    const bool staged = variant >= kHcStaged;
+    const bool staged = variant >= kHcStaged && m.a[0].s_down == nullptr;
     int tv = 2560;
     const int chunk_tok = down_chunk(staged, &tv);
-    /*
-    DPCT1083:30: The size of local memory in the migrated code may be different
-    from the original code. Check that the allocated memory size in the migrated
-    code is correct.
-    */
     const size_t per_tok = (staged ? (size_t)2 * H_TILE : (size_t)tv) * sizeof(float);
     for (int c0 = 0; c0 < n_tok; c0 += chunk_tok) {
         const int ct = n_tok - c0 < chunk_tok ? n_tok - c0 : chunk_tok;
@@ -1111,7 +1068,10 @@ void launch_multi(const GrMulti& m, int variant, sycl::queue* st, unsigned long 
                     sycl::nd_range<3>(sycl::range<3>(1, 1, DOWN_BLOCKS + 1) * sycl::range<3>(1, 1, THREADS),
                                       sycl::range<3>(1, 1, THREADS)),
                     [=](sycl::nd_item<3> /*item_ct1*/) [[sycl::reqd_sub_group_size(32)]] {
-                        gr_down_multi_kernel<1280>(c, smem_acc.get_multi_ptr<sycl::access::decorated::no>().get());
+                        if (q8w)
+                            gr_down_multi_kernel<1280, kFusedGrMaxT, true>(c, smem_acc.get_multi_ptr<sycl::access::decorated::no>().get());
+                        else
+                            gr_down_multi_kernel<1280, kFusedGrMaxT, false>(c, smem_acc.get_multi_ptr<sycl::access::decorated::no>().get());
                     });
             });
         else
@@ -1122,42 +1082,27 @@ void launch_multi(const GrMulti& m, int variant, sycl::queue* st, unsigned long 
                     sycl::nd_range<3>(sycl::range<3>(1, 1, DOWN_BLOCKS + 1) * sycl::range<3>(1, 1, THREADS),
                                       sycl::range<3>(1, 1, THREADS)),
                     [=](sycl::nd_item<3> /*item_ct1*/) [[sycl::reqd_sub_group_size(32)]] {
-                        gr_down_multi_kernel<2560>(c, smem_acc.get_multi_ptr<sycl::access::decorated::no>().get());
+                        if (q8w)
+                            gr_down_multi_kernel<2560, kFusedGrMaxT, true>(c, smem_acc.get_multi_ptr<sycl::access::decorated::no>().get());
+                        else
+                            gr_down_multi_kernel<2560, kFusedGrMaxT, false>(c, smem_acc.get_multi_ptr<sycl::access::decorated::no>().get());
                     });
             });
     }
     if (stamp_buf) gpu_stamp(stamp_buf, stamp_i0 + 1, (void*)st);
     st->submit([&](sycl::handler& cgh) {
-        /*
-        DPCT1101:871: 'kFusedGrMaxT' expression was replaced with a value.
-        Modify the code to use the original expression, provided in comments, if
-        it is correct.
-        */
-        /*
-        DPCT1101:872: 'LR' expression was replaced with a value. Modify the code
-        to use the original expression, provided in comments, if it is correct.
-        */
         sycl::local_accessor<float[8 /*kFusedGrMaxT*/][320 /*LR*/], 0> lo_acc_ct1(cgh);
-        /*
-        DPCT1101:873: 'kFusedGrMaxT' expression was replaced with a value.
-        Modify the code to use the original expression, provided in comments, if
-        it is correct.
-        */
-        /*
-        DPCT1101:874: 'HC' expression was replaced with a value. Modify the code
-        to use the original expression, provided in comments, if it is correct.
-        */
-        /*
-        DPCT1101:875: 'UPM_COLS' expression was replaced with a value. Modify
-        the code to use the original expression, provided in comments, if it is
-        correct.
-        */
         sycl::local_accessor<float[8 /*kFusedGrMaxT*/][4 /*HC*/][16 /*UPM_COLS*/], 0> g_acc_ct1(cgh);
 
         cgh.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, UPM_BLOCKS) * sycl::range<3>(1, 1, THREADS),
                                            sycl::range<3>(1, 1, THREADS)),
                          [=](sycl::nd_item<3> /*item_ct1*/)
-                             [[sycl::reqd_sub_group_size(32)]] { gr_up_multi_kernel(m, lo_acc_ct1, g_acc_ct1); });
+                             [[sycl::reqd_sub_group_size(32)]] {
+                             if (q8w)
+                                 gr_up_multi_kernel<kFusedGrMaxT, false, true>(m, lo_acc_ct1, g_acc_ct1);
+                             else
+                                 gr_up_multi_kernel<kFusedGrMaxT, false, false>(m, lo_acc_ct1, g_acc_ct1);
+                         });
     });
 }
 
@@ -1187,7 +1132,7 @@ bool fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
         const FusedGrArgs& x = a[t];
         if (!x.R || !x.w_norm || !x.w_down || !x.w_up || !x.lo || !x.rs || !x.mixed || (x.w_inject && !x.inject_out) ||
             (x.apply && (!x.bo_prev || !x.inj_prev || !x.R_out)) || x.w_down != a[0].w_down || x.w_up != a[0].w_up ||
-            x.w_inject != a[0].w_inject || x.w_norm != a[0].w_norm) {
+            x.w_inject != a[0].w_inject || x.w_norm != a[0].w_norm || x.s_down != a[0].s_down || x.s_up != a[0].s_up) {
             std::fprintf(stderr, "fused_gr_read_multi: invalid arguments for token %d\n", t);
             std::exit(1);
         }
@@ -1206,21 +1151,11 @@ bool fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
         dev3 = 0;
         if (dev3 >= 0 && dev3 < 64 && split3[dev3] == 0) {
             int optin = 0;
-            /*
-            DPCT1019:281: local_mem_size in SYCL is not a complete equivalent of
-            cudaDevAttrMaxSharedMemoryPerBlockOptin in CUDA. You may need to
-            adjust the code.
-            */
             optin = (int)default_queue().get_device().get_info<sycl::info::device::local_mem_size>();
             const int limit = optin > 0 ? optin : 48 * 1024;
             const int need1 = (int)(kFusedGrMaxT * N * sizeof(float)), need2 = need1 / 2;
             int split = -1;
-            if (need1 <= limit &&
-                /*
-                DPCT1027:283: The call to cudaFuncSetAttribute was replaced with
-                0 because SYCL currently does not support corresponding setting.
-                */
-                0 == 0)
+            if (need1 <= limit)
                 split = 1;
             else if (need2 <= limit)
                 // #375 (kenh0u): the S = 2 split (a 64 KB opt-in card: Turing) disagrees with itself in gr_parity
@@ -1228,15 +1163,10 @@ bool fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
                 std::fprintf(stderr,
                              "strata: STRATA_GR_V3=1 needs the two-half split on this card, which fails its "
                              "checks (#375): the default read is used\n");
-            /*
-            DPCT1026:282: The call to cudaGetLastError was removed because this
-            functionality is redundant in SYCL.
-            */
-            ;  // drop any error the attempts left behind
             split3[dev3] = split;
         }
     }
-    const int split = v3 && dev3 >= 0 && dev3 < 64 ? split3[dev3] : -1;
+    const int split = v3 && dev3 >= 0 && dev3 < 64 && a[0].s_down == nullptr && a[0].s_up == nullptr ? split3[dev3] : -1;
     if (split > 0) {  // 2 kernels; scratch = partials + sums of squares
         float* part = xn_scratch;
         float* ssg = xn_scratch + (size_t)n_tok * HC * 2 * PR;  // room for S = 2
@@ -1384,58 +1314,75 @@ void fused_gr_read(const FusedGrArgs& a, void* stream) {
         std::exit(1);
     }
     sycl::queue* st = stream ? (sycl::queue*)stream : &default_queue();
-    st->submit([&](sycl::handler& cgh) {
-        /*
-        DPCT1101:894: 'D' expression was replaced with a value. Modify the code
-        to use the original expression, provided in comments, if it is correct.
-        */
-        sycl::local_accessor<float, 1> xn_acc_ct1(sycl::range<1>(10240 /*D*/), cgh);
-        /*
-        DPCT1101:895: 'WARPS' expression was replaced with a value. Modify the
-        code to use the original expression, provided in comments, if it is
-        correct.
-        */
-        /*
-        DPCT1101:896: 'HC' expression was replaced with a value. Modify the code
-        to use the original expression, provided in comments, if it is correct.
-        */
-        sycl::local_accessor<float[8 /*WARPS*/][4 /*HC*/], 0> part_acc_ct1(cgh);
-        /*
-        DPCT1101:897: 'HC' expression was replaced with a value. Modify the code
-        to use the original expression, provided in comments, if it is correct.
-        */
-        sycl::local_accessor<float, 1> s_rs_acc_ct1(sycl::range<1>(4 /*HC*/), cgh);
+    if (a.s_down != nullptr) {   // STRATA_HC_REQ8
+        st->submit([&](sycl::handler& cgh) {
+            sycl::local_accessor<float, 1> xn_acc_ct1(sycl::range<1>(10240 /*D*/), cgh);
+            sycl::local_accessor<float[8 /*WARPS*/][4 /*HC*/], 0> part_acc_ct1(cgh);
+            sycl::local_accessor<float, 1> s_rs_acc_ct1(sycl::range<1>(4 /*HC*/), cgh);
 
-        cgh.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, DOWN_BLOCKS + 1) * sycl::range<3>(1, 1, THREADS),
-                                           sycl::range<3>(1, 1, THREADS)),
-                         [=](sycl::nd_item<3> /*item_ct1*/) [[sycl::reqd_sub_group_size(32)]] {
-                             gr_down_kernel(a, xn_acc_ct1.get_multi_ptr<sycl::access::decorated::no>().get(),
-                                            part_acc_ct1,
-                                            s_rs_acc_ct1.get_multi_ptr<sycl::access::decorated::no>().get());
-                         });
-    });
-    st->submit([&](sycl::handler& cgh) {
-        /*
-        DPCT1101:898: 'LR' expression was replaced with a value. Modify the code
-        to use the original expression, provided in comments, if it is correct.
-        */
-        sycl::local_accessor<float, 1> lo_acc_ct1(sycl::range<1>(320 /*LR*/), cgh);
-        /*
-        DPCT1101:899: 'HC' expression was replaced with a value. Modify the code
-        to use the original expression, provided in comments, if it is correct.
-        */
-        /*
-        DPCT1101:900: 'UP_COLS' expression was replaced with a value. Modify the
-        code to use the original expression, provided in comments, if it is
-        correct.
-        */
-        sycl::local_accessor<float[4 /*HC*/][32 /*UP_COLS*/], 0> g_acc_ct1(cgh);
+            cgh.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, DOWN_BLOCKS + 1) * sycl::range<3>(1, 1, THREADS),
+                                               sycl::range<3>(1, 1, THREADS)),
+                             [=](sycl::nd_item<3> /*item_ct1*/) [[sycl::reqd_sub_group_size(32)]] {
+                                 gr_down_kernel<true>(a, xn_acc_ct1.get_multi_ptr<sycl::access::decorated::no>().get(),
+                                                      part_acc_ct1,
+                                                      s_rs_acc_ct1.get_multi_ptr<sycl::access::decorated::no>().get());
+                             });
+        });
+        st->submit([&](sycl::handler& cgh) {
+            sycl::local_accessor<float, 1> lo_acc_ct1(sycl::range<1>(320 /*LR*/), cgh);
+            sycl::local_accessor<float[4 /*HC*/][32 /*UP_COLS*/], 0> g_acc_ct1(cgh);
 
-        cgh.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, UP_BLOCKS) * sycl::range<3>(1, 1, THREADS),
-                                           sycl::range<3>(1, 1, THREADS)),
-                         [=](sycl::nd_item<3> /*item_ct1*/) [[sycl::reqd_sub_group_size(32)]] {
-                             gr_up_kernel(a, lo_acc_ct1.get_multi_ptr<sycl::access::decorated::no>().get(), g_acc_ct1);
-                         });
+            cgh.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, UP_BLOCKS) * sycl::range<3>(1, 1, THREADS),
+                                               sycl::range<3>(1, 1, THREADS)),
+                             [=](sycl::nd_item<3> /*item_ct1*/) [[sycl::reqd_sub_group_size(32)]] {
+                                 gr_up_kernel<true>(a, lo_acc_ct1.get_multi_ptr<sycl::access::decorated::no>().get(), g_acc_ct1);
+                             });
+        });
+    } else {
+        st->submit([&](sycl::handler& cgh) {
+            sycl::local_accessor<float, 1> xn_acc_ct1(sycl::range<1>(10240 /*D*/), cgh);
+            sycl::local_accessor<float[8 /*WARPS*/][4 /*HC*/], 0> part_acc_ct1(cgh);
+            sycl::local_accessor<float, 1> s_rs_acc_ct1(sycl::range<1>(4 /*HC*/), cgh);
+
+            cgh.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, DOWN_BLOCKS + 1) * sycl::range<3>(1, 1, THREADS),
+                                               sycl::range<3>(1, 1, THREADS)),
+                             [=](sycl::nd_item<3> /*item_ct1*/) [[sycl::reqd_sub_group_size(32)]] {
+                                 gr_down_kernel<false>(a, xn_acc_ct1.get_multi_ptr<sycl::access::decorated::no>().get(),
+                                                       part_acc_ct1,
+                                                       s_rs_acc_ct1.get_multi_ptr<sycl::access::decorated::no>().get());
+                             });
+        });
+        st->submit([&](sycl::handler& cgh) {
+            sycl::local_accessor<float, 1> lo_acc_ct1(sycl::range<1>(320 /*LR*/), cgh);
+            sycl::local_accessor<float[4 /*HC*/][32 /*UP_COLS*/], 0> g_acc_ct1(cgh);
+
+            cgh.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, UP_BLOCKS) * sycl::range<3>(1, 1, THREADS),
+                                               sycl::range<3>(1, 1, THREADS)),
+                             [=](sycl::nd_item<3> /*item_ct1*/) [[sycl::reqd_sub_group_size(32)]] {
+                                 gr_up_kernel<false>(a, lo_acc_ct1.get_multi_ptr<sycl::access::decorated::no>().get(), g_acc_ct1);
+                             });
+        });
+    }
+}
+
+namespace {
+void hc_q8_bf16_kernel(const int8_t* q, const float* sc, uint16_t* out, long long n, sycl::nd_item<1> item) {
+    const long long i = (long long)item.get_global_id(0);
+    if (i >= n) return;
+    const float v = sc[i / 32] * (float)q[i];
+    uint32_t b = sycl::bit_cast<uint32_t>(v);
+    b += 0x7fffu + ((b >> 16) & 1u);                  // round to nearest even (the values are finite)
+    out[i] = (uint16_t)(b >> 16);
+}
+}  // namespace
+
+void hc_q8_to_bf16(const void* codes, const float* scales, uint16_t* out, long long n, void* stream) {
+    if (n <= 0) return;
+    sycl::queue* st = stream ? (sycl::queue*)stream : &default_queue();
+    const size_t threads = 256;
+    const size_t grid = ((size_t)n + threads - 1) / threads * threads;
+    st->parallel_for(sycl::nd_range<1>(grid, threads), [=](sycl::nd_item<1> item) {
+        hc_q8_bf16_kernel((const int8_t*)codes, scales, out, n, item);
     });
 }
 

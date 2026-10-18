@@ -550,4 +550,96 @@ const WeightRef* WeightTable::find(const std::string& name) const {
     return it == table_.end() ? nullptr : &it->second;
 }
 
+void WeightTable::hc_q8_names(int64_t n_layers, std::set<std::string>& out) {
+    for (int64_t l = 0; l < n_layers; ++l)
+        for (const char* h : {"hc_attn_", "hc_ffn_"})
+            for (const char* m : {"down", "up"})
+                out.insert("blk." + std::to_string(l) + "." + h + m + ".weight");
+}
+
+bool WeightTable::load_hc_q8(const std::string& pack_dir, uint64_t& bytes, std::string& err) {
+    bytes = 0;
+    std::vector<WeightRef*> todo;
+    for (auto& [name, w] : table_) {
+        const bool hc = name.find(".hc_attn_down.") != std::string::npos || name.find(".hc_attn_up.") != std::string::npos ||
+                        name.find(".hc_ffn_down.") != std::string::npos || name.find(".hc_ffn_up.") != std::string::npos;
+        if (!hc || w.resident) continue;
+        if (w.kind != WeightKind::Bf16InF32 || w.ne0 % 32 != 0 ||
+            (w.src_bytes != (uint64_t)w.elements * 4 && w.src_bytes != (uint64_t)w.elements * 2)) {
+            err = "STRATA_HC_REQ8: " + name + " is not a BF16 tensor of whole 32-value blocks";
+            return false;
+        }
+        todo.push_back(&w);
+    }
+    if (todo.empty()) return true;
+    auto al = [](uint64_t b) { return (b + 255) & ~(uint64_t)255; };
+    uint64_t total = 0;
+    for (const WeightRef* w : todo) total += al((uint64_t)w->elements) + al((uint64_t)w->elements / 32 * 4);
+    sycl::queue q{sycl::property::queue::in_order()};
+    uint8_t* dev = nullptr;
+    try {
+        dev = static_cast<uint8_t*>(sycl::malloc_device(total, q));
+    } catch (...) {
+        dev = nullptr;
+    }
+    if (!dev) { err = "STRATA_HC_REQ8: sycl::malloc_device failed"; return false; }
+    std::vector<float> src;
+    std::vector<int8_t> qcodes;
+    std::vector<float> sc;
+    uint64_t at = 0;
+    for (WeightRef* w : todo) {
+        const char* fn = file_name(w->file_id);
+        const std::string path = pack_dir + "/" + (fn ? fn : "?");
+        std::FILE* f = std::fopen(path.c_str(), "rb");
+        if (!f) { err = "STRATA_HC_REQ8: cannot open " + path; sycl::free(dev, q); return false; }
+        src.resize((size_t)w->elements);
+        const bool raw16 = w->src_bytes == (uint64_t)w->elements * 2;
+#if defined(_WIN32)
+        bool ok = _fseeki64(f, (long long)w->src_off, SEEK_SET) == 0;
+#else
+        bool ok = fseeko(f, (off_t)w->src_off, SEEK_SET) == 0;
+#endif
+        if (ok && raw16) {
+            std::vector<uint16_t> h(src.size());
+            ok = std::fread(h.data(), 2, h.size(), f) == h.size();
+            for (size_t i = 0; ok && i < h.size(); ++i) {
+                const uint32_t b = (uint32_t)h[i] << 16;
+                std::memcpy(&src[i], &b, 4);
+            }
+        } else if (ok) {
+            ok = std::fread(src.data(), 4, src.size(), f) == src.size();
+        }
+        std::fclose(f);
+        if (!ok) { err = "STRATA_HC_REQ8: cannot read the source bytes"; sycl::free(dev, q); return false; }
+        const size_t nb = src.size() / 32;
+        qcodes.resize(src.size());
+        sc.resize(nb);
+        for (size_t b = 0; b < nb; ++b) {
+            float amax = 0.f;
+            for (int j = 0; j < 32; ++j) amax = std::max(amax, std::fabs(src[b * 32 + j]));
+            const float d = amax / 127.f, id = d > 0.f ? 1.f / d : 0.f;
+            sc[b] = d;
+            for (int j = 0; j < 32; ++j) qcodes[b * 32 + j] = (int8_t)std::nearbyint(src[b * 32 + j] * id);
+        }
+        uint8_t* codes = dev + at;
+        at += al(qcodes.size());
+        float* scales = reinterpret_cast<float*>(dev + at);
+        at += al(sc.size() * 4);
+        try {
+            q.memcpy(codes, qcodes.data(), qcodes.size()).wait();
+            q.memcpy(scales, sc.data(), sc.size() * 4).wait();
+        } catch (const sycl::exception& e) {
+            err = std::string("STRATA_HC_REQ8: upload failed: ") + e.what();
+            sycl::free(dev, q);
+            return false;
+        }
+        w->data = codes;
+        w->q8_scale = scales;
+        w->resident = true;
+        w->bytes = qcodes.size() + sc.size() * 4;
+    }
+    bytes = total;
+    return true;
+}
+
 }  // namespace strata::core
