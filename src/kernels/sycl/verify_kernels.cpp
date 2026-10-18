@@ -540,6 +540,17 @@ void fetch_blobs(const unsigned long long* src, const int32_t* n, uint8_t* dst, 
     });
 }
 
+void res_patch(int32_t* table, const int32_t* pairs, int n, void* stream) {
+    if (n <= 0) return;
+    sycl::queue* q = stream ? static_cast<sycl::queue*>(stream) : &default_queue();
+    const size_t blocks = std::min((size_t)64, ((size_t)n + 255) / 256);
+    q->parallel_for(sycl::nd_range<1>(sycl::range<1>(blocks * 256), sycl::range<1>(256)), [=](sycl::nd_item<1> item) {
+        for (int k = (int)item.get_global_id(0); k < n; k += (int)item.get_global_range(0)) {
+            table[pairs[2 * k]] = pairs[2 * k + 1];
+        }
+    });
+}
+
 void rebase_ptrs(unsigned long long* ptr, const int32_t* n, uint8_t* base, int64_t blob_bytes, void* stream) {
     sycl::queue* q = stream ? static_cast<sycl::queue*>(stream) : &default_queue();
     q->parallel_for(sycl::nd_range<1>(sycl::range<1>(128), sycl::range<1>(128)), [=](sycl::nd_item<1> item) {
@@ -757,6 +768,107 @@ void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const 
     });
 }
 
+void gdn_step_norm_groups(const GdnGroups& groups, const float* h, int conv_channels, const float* gate, const float* beta,
+                          const float* z, const float* gamma, float eps, float* y, int h_k, int h_v, bool commit,
+                          void* stream) {
+    if (groups.n < 1 || groups.n > 8 || !h || !gate || !beta || !z || !gamma || !y || h_k <= 0 || h_v % h_k) {
+        std::fprintf(stderr, "gdn_step_norm_groups: invalid arguments\n");
+        std::exit(1);
+    }
+    for (int i = 0; i < groups.n; ++i)
+        if (!groups.state[i] || groups.ntok[i] < 1 || groups.ntok[i] > kVerifyMaxT || (commit && !groups.keep[i])) {
+            std::fprintf(stderr, "gdn_step_norm_groups: invalid group %d\n", i);
+            std::exit(1);
+        }
+    sycl::queue* q = stream ? static_cast<sycl::queue*>(stream) : &default_queue();
+    q->submit([&](sycl::handler& cgh) {
+        sycl::local_accessor<float, 1> sk(sycl::range<1>(S), cgh);
+        sycl::local_accessor<float, 1> sq(sycl::range<1>(S), cgh);
+        sycl::local_accessor<float, 2> red(sycl::range<2>(RG, S), cgh);
+        sycl::local_accessor<float, 1> wsum(sycl::range<1>(S * RG / 32), cgh);
+
+        cgh.parallel_for(sycl::nd_range<3>(sycl::range<3>((size_t)groups.n, (size_t)h_v * RG, S),
+                                           sycl::range<3>(1, RG, S)),
+                         [=](sycl::nd_item<3> item) [[sycl::reqd_sub_group_size(32)]] {
+                             const int gi = (int)item.get_group(0);
+                             const int f = groups.first[gi];
+                             float* state = groups.state[gi];
+                             const float* hbuf = h + (size_t)f * conv_channels;
+                             const float* g = gate + (size_t)f * h_v;
+                             const float* b = beta + (size_t)f * h_v;
+                             const float* zv = z + (size_t)f * S * h_v;
+                             float* yv = y + (size_t)f * S * h_v;
+                             const int T = groups.ntok[gi];
+                             const int32_t* n_keep = groups.keep[gi];
+
+                             const int head = (int)item.get_group(1);
+                             const int rg = (int)item.get_local_id(1);
+                             const int col = (int)item.get_local_id(2);
+                             const int tid = rg * S + col;
+                             const int qh = head % h_k;
+                             const int qk = S * h_k;
+                             const int value_dim = S * h_v;
+                             const int n = commit ? (n_keep ? *n_keep : T) : T;
+                             float s[RPG];
+                             float* base = state + ((size_t)(rg * RPG) * h_v + head) * S + col;
+                             const size_t row_stride = (size_t)h_v * S;
+#pragma unroll
+                             for (int r = 0; r < RPG; ++r) s[r] = base[r * row_stride];
+                             for (int t = 0; t < n; ++t) {
+                                 const float* ht = hbuf + (size_t)t * conv_channels;
+                                 item.barrier(sycl::access::fence_space::local_space);
+                                 if (tid < S) {
+                                     sk[tid] = ht[qk + qh * S + tid];
+                                     sq[tid] = ht[qh * S + tid];
+                                 }
+                                 item.barrier(sycl::access::fence_space::local_space);
+                                 const float gval = sycl::native::exp(g[(size_t)t * h_v + head]);
+                                 float kv = 0.0f;
+#pragma unroll
+                                 for (int r = 0; r < RPG; ++r) kv = sycl::fma(s[r], sk[rg * RPG + r], kv);
+                                 red[rg][col] = kv;
+                                 item.barrier(sycl::access::fence_space::local_space);
+                                 const float kv_col = red[0][col] + red[1][col] + red[2][col] + red[3][col];
+                                 const float delta = (ht[2 * qk + head * S + col] - gval * kv_col) * b[(size_t)t * h_v + head];
+                                 if (commit) {
+#pragma unroll
+                                     for (int r = 0; r < RPG; ++r) s[r] = sycl::fma(gval, s[r], sk[rg * RPG + r] * delta);
+                                     continue;
+                                 }
+                                 float o = 0.0f;
+#pragma unroll
+                                 for (int r = 0; r < RPG; ++r) {
+                                     s[r] = sycl::fma(gval, s[r], sk[rg * RPG + r] * delta);
+                                     o = sycl::fma(s[r], sq[rg * RPG + r], o);
+                                 }
+                                 item.barrier(sycl::access::fence_space::local_space);
+                                 red[rg][col] = o;
+                                 item.barrier(sycl::access::fence_space::local_space);
+                                 float oc = 0.0f, sq_part = 0.0f;
+                                 if (rg == 0) {
+                                     oc = (red[0][col] + red[1][col] + red[2][col] + red[3][col]) * sycl::rsqrt((float)S);
+                                     sq_part = oc * oc;
+                                 }
+                                 auto sg = item.get_sub_group();
+                                 sq_part = sycl::reduce_over_group(sg, sq_part, sycl::plus<float>());
+                                 if ((tid & 31) == 0) wsum[tid >> 5] = sq_part;
+                                 item.barrier(sycl::access::fence_space::local_space);
+                                 if (rg == 0) {
+                                     const float ss = wsum[0] + wsum[1] + wsum[2] + wsum[3];
+                                     const float scale = sycl::rsqrt(ss / (float)S + eps);
+                                     const float zz = zv[(size_t)t * value_dim + head * S + col];
+                                     yv[(size_t)t * value_dim + head * S + col] =
+                                         oc * scale * gamma[col] * (1.0f / (1.0f + sycl::native::exp(-zz)));
+                                 }
+                             }
+                             if (commit && n_keep != nullptr && n > 0) {
+#pragma unroll
+                                 for (int r = 0; r < RPG; ++r) base[r * row_stride] = s[r];
+                             }
+                         });
+    });
+}
+
 void resident_plan(const int32_t* ids, int n_entries, int k, const int32_t* res_layer, int n_expert,
                    const uint8_t* cache_base, const unsigned long long* slot_off, long long blob, int32_t* plan,
                    long long capx, uint32_t* skip, uint32_t ring, void* stream, uint32_t* plan_err) {
@@ -816,6 +928,70 @@ void wait_flag_ge(const uint32_t* flag, uint32_t value, void* stream) {
     const uint32_t spin_max = strata::spin_max(*q);
     q->parallel_for(sycl::nd_range<1>(sycl::range<1>(1), sycl::range<1>(1)),
                     [=](sycl::nd_item<1>) { wait_flag_ge_kernel(flag, value, spin_max); });
+}
+
+void wait_flag_ge_stamped(const uint32_t* flag, uint32_t value, unsigned long long* t_in, unsigned long long* t_out,
+                          void* stream) {
+    sycl::queue* q = stream ? static_cast<sycl::queue*>(stream) : &default_queue();
+    const uint32_t spin_max = strata::spin_max(*q);
+    q->parallel_for(sycl::nd_range<1>(sycl::range<1>(1), sycl::range<1>(1)), [=](sycl::nd_item<1>) {
+        if (t_in != nullptr) *t_in = 0;
+        for (uint32_t spin = 0; spin < spin_max && strata::sys_load(flag) < value; ++spin) {
+            strata_spin_pause();
+        }
+        sycl::atomic_fence(sycl::memory_order::acq_rel, sycl::memory_scope::system);
+        if (t_out != nullptr) *t_out = 0;
+    });
+}
+
+void wait_handoff(const uint32_t* flag, uint32_t value, uint32_t* err, unsigned long long timeout_ns, void* stream) {
+    (void)timeout_ns;
+    sycl::queue* q = stream ? static_cast<sycl::queue*>(stream) : &default_queue();
+    const uint32_t spin_max = strata::spin_max(*q);
+    q->parallel_for(sycl::nd_range<1>(sycl::range<1>(1), sycl::range<1>(1)), [=](sycl::nd_item<1>) {
+        uint32_t spin = 0;
+        while (strata::sys_load(flag) < value) {
+            strata_spin_pause();
+            if (++spin >= spin_max) {
+                if (err != nullptr) strata::sys_store(err, 1u);
+                return;
+            }
+        }
+        sycl::atomic_fence(sycl::memory_order::acq_rel, sycl::memory_scope::system);
+    });
+}
+
+void handoff_publish(float* dst, const float* a, int64_t na, const float* b, int64_t nb, const float* c, int64_t nc,
+                     uint32_t* counter, uint32_t* flag, void* stream, const uint32_t* drop) {
+    const int64_t n = na + nb + nc;
+    if (n <= 0 || dst == nullptr || counter == nullptr || flag == nullptr) {
+        std::fprintf(stderr, "handoff_publish: invalid arguments\n");
+        std::exit(1);
+    }
+    const int64_t nb256 = (n + 255) / 256;
+    const int blocks = (int)(nb256 < 64 ? nb256 : 64);
+    sycl::queue* q = stream ? static_cast<sycl::queue*>(stream) : &default_queue();
+    q->submit([&](sycl::handler& cgh) {
+        cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t)blocks * 256), sycl::range<1>(256)),
+                         [=](sycl::nd_item<1> item) {
+                             const size_t total_blocks = item.get_group_range(0);
+                             for (int64_t i = item.get_global_id(0); i < n; i += item.get_global_range(0)) {
+                                 dst[i] = i < na ? a[i] : i < na + nb ? b[i - na] : c[i - na - nb];
+                             }
+                             sycl::atomic_fence(sycl::memory_order::acq_rel, sycl::memory_scope::system);
+                             item.barrier(sycl::access::fence_space::local_space);
+                             if (item.get_local_id(0) == 0) {
+                                 sycl::atomic_ref<uint32_t, sycl::memory_order::acq_rel, sycl::memory_scope::device> cnt(*counter);
+                                 const uint32_t prev = cnt.fetch_add(1u);
+                                 if (prev == total_blocks - 1) {
+                                     strata::sys_store(counter, 0u);
+                                     if (drop == nullptr || *drop == 0u) {
+                                         strata::sys_store(flag, 1u);
+                                     }
+                                 }
+                             }
+                         });
+    });
 }
 
 void embedding_gather_dev(const uint8_t* codes, const float* scales, const float* offsets, const int32_t* tokens,

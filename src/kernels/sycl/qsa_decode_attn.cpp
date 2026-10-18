@@ -532,6 +532,46 @@ void launch_attn_chunk(sycl::queue* st, const float* q, const QsaAttnPools& pool
     });
 }
 
+template <int KV_MODE, bool LANE_CELL = false>
+void launch_attn_chunk_slots(sycl::queue* st, const float* q, const QsaAttnSlotPools& pools, const int32_t* ids,
+                             const int32_t* steps, int n_kv_heads, int page_size, float scale, float* part_acc, float* part_m,
+                             float* part_l, int n_chunks, int cap, long long stride, int n_q) {
+    sycl::range<3> global_range(n_q, n_kv_heads, (size_t)n_chunks * THREADS);
+    sycl::range<3> local_range(1, 1, THREADS);
+    st->submit([&](sycl::handler& cgh) {
+        sycl::local_accessor<float[G][HD], 0> sq_acc(cgh);
+        sycl::local_accessor<float[G][CHUNK], 0> sp_acc(cgh);
+        sycl::local_accessor<long long, 1> srow_acc(sycl::range<1>(CHUNK), cgh);
+
+        cgh.parallel_for(
+            sycl::nd_range<3>(global_range, local_range), [=](sycl::nd_item<3> item) [[sycl::reqd_sub_group_size(32)]] {
+                attn_chunk_kernel<KV_MODE, LANE_CELL>(item, q, pools.p[item.get_group(0)], ids, steps, n_kv_heads, page_size, scale, part_acc, part_m,
+                                           part_l, n_chunks, sq_acc, sp_acc,
+                                           srow_acc.get_multi_ptr<sycl::access::decorated::no>().get(), cap, stride);
+            });
+    });
+}
+
+template <int KV_MODE>
+void launch_attn_chunk_rows(sycl::queue* st, const float* q, const QsaAttnPoolsRows& rows, const int32_t* ids,
+                            const int32_t* steps, int n_kv_heads, int page_size, float scale, float* part_acc, float* part_m,
+                            float* part_l, int n_chunks, int cap, long long stride, int n_q) {
+    sycl::range<3> global_range(n_q, n_kv_heads, (size_t)n_chunks * THREADS);
+    sycl::range<3> local_range(1, 1, THREADS);
+    st->submit([&](sycl::handler& cgh) {
+        sycl::local_accessor<float[G][HD], 0> sq_acc(cgh);
+        sycl::local_accessor<float[G][CHUNK], 0> sp_acc(cgh);
+        sycl::local_accessor<long long, 1> srow_acc(sycl::range<1>(CHUNK), cgh);
+
+        cgh.parallel_for(
+            sycl::nd_range<3>(global_range, local_range), [=](sycl::nd_item<3> item) [[sycl::reqd_sub_group_size(32)]] {
+                attn_chunk_kernel<KV_MODE, false>(item, q, rows.p[item.get_group(0)], ids, steps, n_kv_heads, page_size, scale, part_acc, part_m,
+                                          part_l, n_chunks, sq_acc, sp_acc,
+                                          srow_acc.get_multi_ptr<sycl::access::decorated::no>().get(), cap, stride);
+            });
+    });
+}
+
 template <int KV_MODE>
 void launch_attn_chunk_pre75(sycl::queue* st, const float* q, const QsaAttnPools& pools, const int32_t* ids,
                              const int32_t* steps, int n_kv_heads, int page_size, float scale, float* part_acc,
@@ -660,6 +700,86 @@ void qsa_decode_attn_batch(const float* q, const QsaAttnPools& pools, const int3
     sycl::queue* st = stream ? static_cast<sycl::queue*>(stream) : &get_default_in_order_queue();
     launch_chunks_batch(q, pools, ids, steps, cap, s, scratch, n_q, st, -1);
     launch_merge_batch(steps, cap, s, scratch, attn, n_q, attn_merge_v2(), st);
+    if (!stream) st->wait();
+}
+
+bool qsa_decode_attn_slots(const float* q, const QsaAttnSlotPools& pools, const int32_t* ids, const int32_t* steps,
+                           int64_t cap, const QsaShapes& s, float* scratch, float* attn, int64_t n_q, void* stream) {
+    if (n_q <= 0) return true;
+    if (n_q > kQsaAttnMaxSlots) return false;
+    if (s.head_dim != HD || s.n_head != (int64_t)G * s.n_head_kv || cap <= 0 || !scratch || !ids || !steps) {
+        std::fprintf(stderr, "qsa_decode_attn_slots: unsupported geometry or missing buffers\n");
+        std::exit(1);
+    }
+    const int kv_mode = attn_kv_mode(pools.p[0]);
+    for (int64_t z = 0; z < n_q; ++z) {
+        if (!pools.p[z].page_table) {
+            std::fprintf(stderr, "qsa_decode_attn_slots: missing page table\n");
+            std::exit(1);
+        }
+        if (attn_kv_mode(pools.p[z]) != kv_mode) return false;
+    }
+    const bool lane_cell = lane_cell_attn();
+    const int n_chunks = (int)((cap + CHUNK - 1) / CHUNK);
+    const long long stride = (long long)qsa_decode_attn_scratch_floats(cap, s);
+    float* part_acc = scratch;
+    float* part_m = scratch + (size_t)n_chunks * s.n_head * HD;
+    float* part_l = part_m + (size_t)n_chunks * s.n_head;
+    const float scale = 1.0f / sqrtf((float)HD);
+    sycl::queue* st = stream ? static_cast<sycl::queue*>(stream) : &get_default_in_order_queue();
+
+    if (lane_cell) {
+        if (kv_mode == 3) launch_attn_chunk_slots<3, true>(st, q, pools, ids, steps, (int)s.n_head_kv, (int)s.page_size, scale, part_acc, part_m, part_l, n_chunks, (int)cap, stride, (int)n_q);
+        else if (kv_mode == 2) launch_attn_chunk_slots<2, true>(st, q, pools, ids, steps, (int)s.n_head_kv, (int)s.page_size, scale, part_acc, part_m, part_l, n_chunks, (int)cap, stride, (int)n_q);
+        else if (kv_mode == 1) launch_attn_chunk_slots<1, true>(st, q, pools, ids, steps, (int)s.n_head_kv, (int)s.page_size, scale, part_acc, part_m, part_l, n_chunks, (int)cap, stride, (int)n_q);
+        else launch_attn_chunk_slots<0, true>(st, q, pools, ids, steps, (int)s.n_head_kv, (int)s.page_size, scale, part_acc, part_m, part_l, n_chunks, (int)cap, stride, (int)n_q);
+    } else {
+        if (kv_mode == 3) launch_attn_chunk_slots<3, false>(st, q, pools, ids, steps, (int)s.n_head_kv, (int)s.page_size, scale, part_acc, part_m, part_l, n_chunks, (int)cap, stride, (int)n_q);
+        else if (kv_mode == 2) launch_attn_chunk_slots<2, false>(st, q, pools, ids, steps, (int)s.n_head_kv, (int)s.page_size, scale, part_acc, part_m, part_l, n_chunks, (int)cap, stride, (int)n_q);
+        else if (kv_mode == 1) launch_attn_chunk_slots<1, false>(st, q, pools, ids, steps, (int)s.n_head_kv, (int)s.page_size, scale, part_acc, part_m, part_l, n_chunks, (int)cap, stride, (int)n_q);
+        else launch_attn_chunk_slots<0, false>(st, q, pools, ids, steps, (int)s.n_head_kv, (int)s.page_size, scale, part_acc, part_m, part_l, n_chunks, (int)cap, stride, (int)n_q);
+    }
+    launch_merge(attn_merge_v2(), part_acc, part_m, part_l, n_chunks, steps, attn, stride, (unsigned)s.n_head,
+                 (unsigned)n_q, st);
+    if (!stream) st->wait();
+    return true;
+}
+
+void qsa_decode_attn_batch_rows(const float* q, const QsaAttnPoolsRows& rows, const int32_t* ids, const int32_t* steps,
+                                int64_t cap, const QsaShapes& s, float* scratch, float* attn, int64_t n_q, void* stream) {
+    if (n_q <= 0) return;
+    const QsaAttnPools& pools = rows.p[0];
+    if (rows.n != n_q || n_q > kAttnRowsMax || s.head_dim != HD || s.n_head != (int64_t)G * s.n_head_kv || cap <= 0 ||
+        !scratch || !ids || !steps) {
+        std::fprintf(stderr, "qsa_decode_attn_batch_rows: unsupported geometry or missing buffers\n");
+        std::exit(1);
+    }
+    const int kv_mode = pools.k_q4 != nullptr ? 2 : (pools.k_q != nullptr && pools.v_q4 != nullptr ? 3
+                        : (pools.k_q != nullptr ? 1 : 0));
+    const int n_chunks = (int)((cap + CHUNK - 1) / CHUNK);
+    const long long stride = (long long)qsa_decode_attn_scratch_floats(cap, s);
+    float* part_acc = scratch;
+    float* part_m = scratch + (size_t)n_chunks * s.n_head * HD;
+    float* part_l = part_m + (size_t)n_chunks * s.n_head;
+    const float scale = 1.0f / sqrtf((float)HD);
+    sycl::queue* st = stream ? static_cast<sycl::queue*>(stream) : &get_default_in_order_queue();
+
+    static const bool lane_cell_rows = [] { const char* v = std::getenv("STRATA_ATTN_LANECELL"); return v && v[0] == '1'; }();
+    if (lane_cell_rows) {
+        for (int64_t r = 0; r < n_q; ++r)
+            qsa_decode_attn_batch(q + (size_t)r * s.n_head * HD, rows.p[r], ids + (size_t)r * cap,
+                                  steps + (size_t)r * kStepCount, cap, s, scratch + (size_t)r * stride,
+                                  attn + (size_t)r * s.n_head * HD, 1, stream);
+        return;
+    }
+
+    if (kv_mode == 3) launch_attn_chunk_rows<3>(st, q, rows, ids, steps, (int)s.n_head_kv, (int)s.page_size, scale, part_acc, part_m, part_l, n_chunks, (int)cap, stride, (int)n_q);
+    else if (kv_mode == 2) launch_attn_chunk_rows<2>(st, q, rows, ids, steps, (int)s.n_head_kv, (int)s.page_size, scale, part_acc, part_m, part_l, n_chunks, (int)cap, stride, (int)n_q);
+    else if (kv_mode == 1) launch_attn_chunk_rows<1>(st, q, rows, ids, steps, (int)s.n_head_kv, (int)s.page_size, scale, part_acc, part_m, part_l, n_chunks, (int)cap, stride, (int)n_q);
+    else launch_attn_chunk_rows<0>(st, q, rows, ids, steps, (int)s.n_head_kv, (int)s.page_size, scale, part_acc, part_m, part_l, n_chunks, (int)cap, stride, (int)n_q);
+
+    launch_merge(attn_merge_v2(), part_acc, part_m, part_l, n_chunks, steps, attn, stride, (unsigned)s.n_head,
+                 (unsigned)n_q, st);
     if (!stream) st->wait();
 }
 

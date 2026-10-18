@@ -538,7 +538,7 @@ bool Verifier::record_window(int T, sycl::queue* cs, std::string& err) try {
     static const bool g_no_batch_kv = std::getenv("STRATA_NO_BATCH_KV_STEP") != nullptr;
     static const bool lean_env = [] { const char* v = std::getenv("STRATA_VERIFY_LEAN"); return !(v && v[0] == '0'); }();
     static const bool no_host_env = [] { const char* v = std::getenv("STRATA_VERIFY_NO_HOST"); return v && *v && std::strcmp(v, "0") != 0; }();
-    const bool lean = lean_env && no_host_env && device_plan_;
+    const bool lean = lean_env && no_host_env && device_plan_ && !batch_rec_;
     auto stamp = [&](int64_t l, int i, int grp) {
         if (prof_on_ && grp == 0) gpu_stamp(prof_, (int)(l * kProfPer + i), cs);
     };
@@ -743,7 +743,11 @@ bool Verifier::record_window(int T, sycl::queue* cs, std::string& err) try {
                 float* idx_raw = idx_raw_L_ + (size_t)qi * MT * ID;
                 // the per-token GEMVs / norms / RoPEs / copies of this layer as one launch over the
                 // window's rows each - row-wise identical arithmetic (STRATA_DEC_BATCH=0: token by token)
-                const bool qb = dec_batch && n > 1 && native_qsa_enabled() && native_rope_enabled() && !st.kv_q4;
+                static const bool qb_q4 = [] {
+                    const char* e = std::getenv("STRATA_DF_QB_Q4");
+                    return e == nullptr || std::atoi(e) != 0;
+                }();
+                const bool qb = dec_batch && n > 1 && native_qsa_enabled() && native_rope_enabled() && (!st.kv_q4 || qb_q4);
                 native_quantize_q8_1(xm, xq_, (int)N, n, cs);
                 if (qb)
                     bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*)wik->data, idx_raw + tb * ID, ID, N,
