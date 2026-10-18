@@ -45,7 +45,8 @@ void block_scores_kernel(const float* __restrict__ pooled, const float* __restri
     for (int h = 0; h < IDX_HEADS; ++h) {
         const sycl::float4 q4 = *reinterpret_cast<const sycl::float4*>(q + h * IDX_DIM);
         float d = k4.x() * q4.x() + k4.y() * q4.y() + k4.z() * q4.z() + k4.w() * q4.w();
-        d = sycl::reduce_over_group(sg, d, sycl::plus<float>());
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) d += sycl::permute_group_by_xor(sg, d, o);
         score += d > 0.0f ? d : 0.0f;
     }
     if (lane == 0) {
@@ -56,14 +57,16 @@ void block_scores_kernel(const float* __restrict__ pooled, const float* __restri
 
 void block_scores_multi_kernel(const float* __restrict__ pooled, const float* __restrict__ dead,
                                const float* __restrict__ q_idx, const int32_t* __restrict__ steps, int nq,
-                               int64_t max_blocks, float* __restrict__ out, float* qs, int64_t* s_nkv, int64_t* s_nbid,
-                               sycl::nd_item<1> item) {
+                               int64_t max_blocks, float* __restrict__ out, bool early_exit,
+                               float* qs, int64_t* s_nkv, int64_t* s_nbid, sycl::nd_item<1> item) {
     auto sg = item.get_sub_group();
     const int lid = item.get_local_id(0);
     const int lrange = item.get_local_range(0);
 
-    for (int i = lid; i < nq * IDX_HEADS * IDX_DIM; i += lrange)
-        qs[i] = q_idx[i];
+    if (!early_exit) {
+        for (int i = lid; i < nq * IDX_HEADS * IDX_DIM; i += lrange)
+            qs[i] = q_idx[i];
+    }
     if (lid < nq) {
         s_nkv[lid] = steps[lid * kStepCount + kStepNKv];
         s_nbid[lid] = steps[lid * kStepCount + kStepNBid];
@@ -72,6 +75,12 @@ void block_scores_multi_kernel(const float* __restrict__ pooled, const float* __
     int64_t top = 0;
     for (int q = 0; q < nq; ++q)
         top = s_nbid[q] > top ? s_nbid[q] : top;
+    if (early_exit) {
+        if ((int64_t)item.get_group(0) * SCORE_WARPS > top) return;
+        for (int i = lid; i < nq * IDX_HEADS * IDX_DIM; i += lrange)
+            qs[i] = q_idx[i];
+        item.barrier(sycl::access::fence_space::local_space);
+    }
     const int lane = lid & 31;
     const int64_t wstride = (int64_t)item.get_group_range(0) * SCORE_WARPS;
     for (int64_t b = (int64_t)item.get_group(0) * SCORE_WARPS + (lid >> 5); b <= top && b < max_blocks; b += wstride) {
@@ -87,10 +96,75 @@ void block_scores_multi_kernel(const float* __restrict__ pooled, const float* __
             for (int h = 0; h < IDX_HEADS; ++h) {
                 const sycl::float4 q4 = *reinterpret_cast<const sycl::float4*>(q + h * IDX_DIM);
                 float d = k4.x() * q4.x() + k4.y() * q4.y() + k4.z() * q4.z() + k4.w() * q4.w();
-                d = sycl::reduce_over_group(sg, d, sycl::plus<float>());
+#pragma unroll
+                for (int o = 16; o > 0; o >>= 1) d += sycl::permute_group_by_xor(sg, d, o);
                 score += d > 0.0f ? d : 0.0f;
             }
             if (lane == 0) {
+                if (b == n_bid && s_nkv[qi] % R != 0) score += 1e9f;
+                out[qi * max_blocks + b] = score;
+            }
+        }
+    }
+}
+
+template <int NQ>
+void block_scores_rows_kernel(const float* __restrict__ pooled, const float* __restrict__ dead,
+                              const float* __restrict__ q_idx, const int32_t* __restrict__ steps, int nq,
+                              int64_t max_blocks, float* __restrict__ out,
+                              int64_t* s_nkv, int64_t* s_nbid, sycl::nd_item<1> item) {
+    auto sg = item.get_sub_group();
+    const int lid = item.get_local_id(0);
+    if (lid < nq) {
+        s_nkv[lid] = steps[lid * kStepCount + kStepNKv];
+        s_nbid[lid] = steps[lid * kStepCount + kStepNBid];
+    }
+    item.barrier(sycl::access::fence_space::local_space);
+    int64_t top = 0;
+    for (int q = 0; q < nq; ++q) top = s_nbid[q] > top ? s_nbid[q] : top;
+    if ((int64_t)item.get_group(0) * SCORE_WARPS > top) return;
+    const int lane = lid & 31;
+    sycl::float4 qr[NQ][IDX_HEADS];
+#pragma unroll
+    for (int qi = 0; qi < NQ; ++qi)
+#pragma unroll
+        for (int h = 0; h < IDX_HEADS; ++h)
+            qr[qi][h] = qi < nq ? *reinterpret_cast<const sycl::float4*>(q_idx + qi * IDX_HEADS * IDX_DIM + h * IDX_DIM + lane * 4)
+                                : sycl::float4(0.0f, 0.0f, 0.0f, 0.0f);
+    const sycl::float4 kd = *reinterpret_cast<const sycl::float4*>(dead + lane * 4);
+    const bool hi16 = (lane & 16) != 0, hi8 = (lane & 8) != 0;
+    const int64_t wstride = (int64_t)item.get_group_range(0) * SCORE_WARPS;
+    for (int64_t b = (int64_t)item.get_group(0) * SCORE_WARPS + (lid >> 5); b <= top && b < max_blocks; b += wstride) {
+        const sycl::float4 kp = *reinterpret_cast<const sycl::float4*>(pooled + b * IDX_DIM + lane * 4);
+#pragma unroll
+        for (int qi = 0; qi < NQ; ++qi) {
+            if (qi >= nq) break;
+            const int64_t n_bid = s_nbid[qi];
+            if (b > n_bid) continue;
+            const sycl::float4 k4 = (b == n_bid) ? kd : kp;
+            float d[IDX_HEADS];
+#pragma unroll
+            for (int h = 0; h < IDX_HEADS; ++h) {
+                const sycl::float4 q4 = qr[qi][h];
+                d[h] = k4.x() * q4.x() + k4.y() * q4.y() + k4.z() * q4.z() + k4.w() * q4.w();
+            }
+            float r2[2];
+#pragma unroll
+            for (int i = 0; i < 2; ++i)
+                r2[i] = (hi16 ? d[i + 2] : d[i]) + sycl::permute_group_by_xor(sg, hi16 ? d[i] : d[i + 2], 16);
+            float r = (hi8 ? r2[1] : r2[0]) + sycl::permute_group_by_xor(sg, hi8 ? r2[0] : r2[1], 8);
+            r += sycl::permute_group_by_xor(sg, r, 4);
+            r += sycl::permute_group_by_xor(sg, r, 2);
+            r += sycl::permute_group_by_xor(sg, r, 1);
+            const float s1 = sycl::select_from_group(sg, r, 8);
+            const float s2 = sycl::select_from_group(sg, r, 16);
+            const float s3 = sycl::select_from_group(sg, r, 24);
+            if (lane == 0) {
+                float score = 0.0f;
+                score += r > 0.0f ? r : 0.0f;
+                score += s1 > 0.0f ? s1 : 0.0f;
+                score += s2 > 0.0f ? s2 : 0.0f;
+                score += s3 > 0.0f ? s3 : 0.0f;
                 if (b == n_bid && s_nkv[qi] % R != 0) score += 1e9f;
                 out[qi * max_blocks + b] = score;
             }
@@ -241,6 +315,7 @@ template <int PER>
 void block_topk_reg_kernel(const float* __restrict__ scores, const int32_t* __restrict__ steps, int64_t max_blocks,
                            int64_t cap, int32_t* __restrict__ ids, int hist[32][256], int* s_warp, int& s_digit,
                            int& s_above, sycl::nd_item<1> item) {
+    auto sg = item.get_sub_group();
     const int64_t qi = item.get_group(0);
     const int32_t* st = steps + qi * kStepCount;
     const int64_t n_kv = st[kStepNKv], n_bid = st[kStepNBid], width = st[kStepWidth];
@@ -288,14 +363,26 @@ void block_topk_reg_kernel(const float* __restrict__ scores, const int32_t* __re
             hist[0][t] = s;
         }
         item.barrier(sycl::access::fence_space::local_space);
-        if (t == 0) {
-            int cum = above, d = 255;
-            for (; d > 0; --d) {
-                if (cum + hist[0][d] >= width) break;
-                cum += hist[0][d];
+        int v = 0, x = 0;
+        if (t < 256) {
+            v = hist[0][255 - t];
+            x = v;
+#pragma unroll
+            for (int o = 1; o < 32; o <<= 1) {
+                const int y = sycl::shift_group_right(sg, x, o);
+                if (lane >= o) x += y;
             }
-            s_digit = d;
-            s_above = cum;
+            if (lane == 31) s_warp[warp] = x;
+        }
+        item.barrier(sycl::access::fence_space::local_space);
+        if (t < 256) {
+            int inc = x;
+            for (int w2 = 0; w2 < warp; ++w2) inc += s_warp[w2];
+            const int before = above + inc - v;
+            if (before < width && (above + inc >= width || t == 255)) {
+                s_digit = 255 - t;
+                s_above = before;
+            }
         }
         item.barrier(sycl::access::fence_space::local_space);
         prefix |= (uint32_t)s_digit << shift;
@@ -451,7 +538,37 @@ void block_topk_wide_kernel(const float* __restrict__ scores, const int32_t* __r
     }
 }
 
+template <int NQ>
+void launch_scores_rows(sycl::queue* q_ptr, const float* pooled, const float* dead, const float* q_idx,
+                        const int32_t* steps, int nq, int64_t max_blocks, float* scores) {
+    q_ptr->submit([&](sycl::handler& cgh) {
+        sycl::local_accessor<int64_t, 1> s_nkv_acc(sycl::range<1>(NQ), cgh);
+        sycl::local_accessor<int64_t, 1> s_nbid_acc(sycl::range<1>(NQ), cgh);
+        cgh.parallel_for(sycl::nd_range<1>(256 * SCORE_WARPS * 32, SCORE_WARPS * 32),
+                         [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(32)]] {
+                             block_scores_rows_kernel<NQ>(
+                                 pooled, dead, q_idx, steps, nq, max_blocks, scores,
+                                 s_nkv_acc.get_multi_ptr<sycl::access::decorated::no>().get(),
+                                 s_nbid_acc.get_multi_ptr<sycl::access::decorated::no>().get(), item);
+                         });
+    });
+}
+
 }  // namespace
+
+bool qsa_block_scores_rows(const float* pooled, const float* dead, const float* q_idx, const int32_t* steps, int64_t nq,
+                           int64_t max_blocks, const QsaShapes& s, float* scores, void* stream) {
+    if (nq <= 0) return true;
+    if (nq > 4 || s.idx_dim != IDX_DIM || s.idx_n_head != IDX_HEADS || s.idx_block != R) return false;
+    static sycl::queue default_queue{sycl::property::queue::in_order()};
+    sycl::queue* q_ptr = stream ? static_cast<sycl::queue*>(stream) : &default_queue;
+    const int n = (int)nq;
+    if (n == 1) launch_scores_rows<1>(q_ptr, pooled, dead, q_idx, steps, n, max_blocks, scores);
+    else if (n == 2) launch_scores_rows<2>(q_ptr, pooled, dead, q_idx, steps, n, max_blocks, scores);
+    else if (n == 3) launch_scores_rows<3>(q_ptr, pooled, dead, q_idx, steps, n, max_blocks, scores);
+    else launch_scores_rows<4>(q_ptr, pooled, dead, q_idx, steps, n, max_blocks, scores);
+    return true;
+}
 
 void qsa_block_scores(const float* pooled, const float* dead, const float* q_idx, const int32_t* steps, int64_t nq,
                       int64_t max_blocks, const QsaShapes& s, float* scores, void* stream, int64_t active_blocks) {
@@ -467,7 +584,17 @@ void qsa_block_scores(const float* pooled, const float* dead, const float* q_idx
         const char* v = std::getenv("STRATA_SCORES_MULTI");
         return v == nullptr || std::atoi(v) != 0;
     }();
+    static const bool early = [] {
+        const char* v = std::getenv("STRATA_QSA_EARLY_EXIT");
+        return v == nullptr || std::atoi(v) != 0;
+    }();
+    const bool early_exit = early;
     if (multi && nq <= MQ && active_blocks <= 0) {
+        static const bool rows_env = [] {
+            const char* v = std::getenv("STRATA_QSA_ROWS");
+            return v != nullptr && v[0] == '1' && v[1] == '\0';
+        }();
+        if (rows_env && qsa_block_scores_rows(pooled, dead, q_idx, steps, nq, max_blocks, s, scores, stream)) return;
         q_ptr->submit([&](sycl::handler& cgh) {
             sycl::local_accessor<float, 1> qs_acc(sycl::range<1>(MQ * IDX_HEADS * IDX_DIM), cgh);
             sycl::local_accessor<int64_t, 1> s_nkv_acc(sycl::range<1>(MQ), cgh);
@@ -476,7 +603,7 @@ void qsa_block_scores(const float* pooled, const float* dead, const float* q_idx
             cgh.parallel_for(sycl::nd_range<1>(256 * SCORE_WARPS * 32, SCORE_WARPS * 32),
                              [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(32)]] {
                                  block_scores_multi_kernel(
-                                     pooled, dead, q_idx, steps, (int)nq, max_blocks, scores,
+                                     pooled, dead, q_idx, steps, (int)nq, max_blocks, scores, early_exit,
                                      qs_acc.get_multi_ptr<sycl::access::decorated::no>().get(),
                                      s_nkv_acc.get_multi_ptr<sycl::access::decorated::no>().get(),
                                      s_nbid_acc.get_multi_ptr<sycl::access::decorated::no>().get(), item);

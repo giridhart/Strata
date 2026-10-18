@@ -715,7 +715,28 @@ bool launch_wmma(const float* q, const QsaAttnPools& pools, const int32_t* ids, 
 }
 #endif
 
+int g_pa_imma = -1;
+
 }  // namespace
+
+bool qsa_decode_attn_split(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps,
+                           int64_t cap, const QsaShapes& s, float* scratch, uint64_t scratch_floats, float* attn,
+                           int64_t n_q, void* stream) {
+    (void)q;
+    (void)pools;
+    (void)ids;
+    (void)steps;
+    (void)cap;
+    (void)s;
+    (void)scratch;
+    (void)scratch_floats;
+    (void)attn;
+    (void)n_q;
+    (void)stream;
+    return false;
+}
+
+void qsa_prompt_attn_set_imma(int on) { g_pa_imma = on < 0 ? -1 : (on ? 1 : 0); }
 
 bool qsa_prompt_attn_batch(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps,
                            int64_t cap, const QsaShapes& s, float* attn, int64_t n_q, void* stream) {
