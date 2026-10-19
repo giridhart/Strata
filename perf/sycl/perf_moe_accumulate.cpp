@@ -686,6 +686,109 @@ static void BM_Xe2_MoE_DualColumn_SwiGLU(benchmark::State& state) {
 }
 
 // ============================================================================
+// STRATA_EXPDEC Shared-Memory MoE Gate/Up SwiGLU Benchmark
+// Evaluates STRATA_EXPDEC=1 (shared memory MoE gate/up SwiGLU) vs STRATA_EXPDEC=0
+// ============================================================================
+
+template <int GU_TYPE = 12, int D_TYPE = 8>
+static void BM_Xe2_MoE_ExpDec_SharedMem(benchmark::State& state) {
+    const int NT = static_cast<int>(state.range(0));
+    const bool use_expdec = state.range(1) != 0;
+    sycl::queue q{sycl::default_selector_v, {sycl::property::queue::enable_profiling()}};
+
+    const int gu_type = GU_TYPE, d_type = D_TYPE;
+    strata::kernels::NativeExpertLayout L = strata::kernels::native_expert_layout(gu_type, d_type, N_EMBD, 640);
+    const size_t scratch_bytes = strata::kernels::native_expert_scratch_bytes(NT, 640);
+
+    uint8_t* d_blob = sycl::malloc_device<uint8_t>(L.bytes, q);
+    uint8_t* d_scratch = sycl::malloc_device<uint8_t>(scratch_bytes, q);
+    float* d_out = sycl::malloc_device<float>(static_cast<size_t>(NT) * N_EMBD, q);
+    const size_t q8_1_bytes = static_cast<size_t>(NT) * (N_EMBD / 32) * 36;
+    void* d_xq = sycl::malloc_device<uint8_t>(q8_1_bytes, q);
+
+    unsigned long long* d_grp_ptr = sycl::malloc_device<unsigned long long>(1, q);
+    int32_t* d_grp_start = sycl::malloc_device<int32_t>(2, q);
+    int32_t* d_ngroups = sycl::malloc_device<int32_t>(1, q);
+    int32_t* d_ent_dst = sycl::malloc_device<int32_t>(NT, q);
+    int32_t* d_ent_tok = sycl::malloc_device<int32_t>(NT, q);
+
+    if (!d_blob || !d_scratch || !d_out || !d_xq || !d_grp_ptr || !d_grp_start || !d_ngroups || !d_ent_dst || !d_ent_tok) {
+        state.SkipWithError("Failed to allocate USM memory for MoE ExpDec benchmark");
+        if (d_blob) sycl::free(d_blob, q);
+        if (d_scratch) sycl::free(d_scratch, q);
+        if (d_out) sycl::free(d_out, q);
+        if (d_xq) sycl::free(d_xq, q);
+        if (d_grp_ptr) sycl::free(d_grp_ptr, q);
+        if (d_grp_start) sycl::free(d_grp_start, q);
+        if (d_ngroups) sycl::free(d_ngroups, q);
+        if (d_ent_dst) sycl::free(d_ent_dst, q);
+        if (d_ent_tok) sycl::free(d_ent_tok, q);
+        return;
+    }
+
+    q.memset(d_blob, 0x11, L.bytes);
+    q.memset(d_scratch, 0, scratch_bytes);
+    q.fill(d_out, 0.0f, static_cast<size_t>(NT) * N_EMBD);
+    q.memset(d_xq, 0x22, q8_1_bytes);
+
+    unsigned long long h_ptr = reinterpret_cast<unsigned long long>(d_blob);
+    int32_t h_start[2] = {0, NT};
+    int32_t h_ngroups = 1;
+    std::vector<int32_t> h_dst(NT), h_tok(NT);
+    for (int i = 0; i < NT; ++i) {
+        h_dst[i] = i;
+        h_tok[i] = i;
+    }
+
+    q.copy(&h_ptr, d_grp_ptr, 1);
+    q.copy(h_start, d_grp_start, 2);
+    q.copy(&h_ngroups, d_ngroups, 1);
+    q.copy(h_dst.data(), d_ent_dst, NT);
+    q.copy(h_tok.data(), d_ent_tok, NT);
+    q.wait_and_throw();
+
+    if (use_expdec) {
+        setenv("STRATA_EXPDEC", "1", 1);
+    } else {
+        setenv("STRATA_EXPDEC", "0", 1);
+    }
+
+    // Warmup
+    for (int i = 0; i < 5; ++i) {
+        strata::kernels::native_expert_grouped(L, d_grp_ptr, d_grp_start, d_ngroups, d_ent_dst, d_ent_tok,
+                                              1, NT, d_xq, d_scratch, d_out, &q);
+        q.wait();
+    }
+
+    for (auto _ : state) {
+        auto t0 = std::chrono::high_resolution_clock::now();
+        strata::kernels::native_expert_grouped(L, d_grp_ptr, d_grp_start, d_ngroups, d_ent_dst, d_ent_tok,
+                                              1, NT, d_xq, d_scratch, d_out, &q);
+        q.wait();
+        auto t1 = std::chrono::high_resolution_clock::now();
+        state.SetIterationTime(std::chrono::duration<double>(t1 - t0).count());
+    }
+
+    unsetenv("STRATA_EXPDEC");
+
+    const double flops = static_cast<double>(NT) * (2.0 * 2560.0 * 640.0 * 2.0 + 2.0 * 640.0 * 2560.0);
+    const double bytes = static_cast<double>(L.bytes) + scratch_bytes + static_cast<double>(NT) * N_EMBD * sizeof(float);
+    state.counters["TFLOPS"] = benchmark::Counter(flops, benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
+    state.counters["Bandwidth_GBps"] = benchmark::Counter(bytes, benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
+    state.counters["ExpDec"] = benchmark::Counter(use_expdec ? 1.0 : 0.0);
+
+    sycl::free(d_blob, q);
+    sycl::free(d_scratch, q);
+    sycl::free(d_out, q);
+    sycl::free(d_xq, q);
+    sycl::free(d_grp_ptr, q);
+    sycl::free(d_grp_start, q);
+    sycl::free(d_ngroups, q);
+    sycl::free(d_ent_dst, q);
+    sycl::free(d_ent_tok, q);
+}
+
+// ============================================================================
 // Registration: MoE Expert Reduction Across Batch Sizes
 // ============================================================================
 
@@ -711,6 +814,7 @@ BENCHMARK(BM_Xe2_MoE_GroupedExpert<2, 2, true>)->Name("BM_Xe2_MoE_GroupedExpert_
 BENCHMARK(BM_Xe2_MoE_GroupedExpert<2, 2, false>)->Name("BM_Xe2_MoE_GroupedExpert_Q4_0_Legacy32")->UseManualTime()->Args({1})->Args({4})->Args({8});
 BENCHMARK(BM_Xe2_MoE_GroupedExpert<40, 40, true>)->Name("BM_Xe2_MoE_GroupedExpert_NVFP4")->UseManualTime()->Args({1})->Args({4})->Args({8});
 BENCHMARK(BM_Xe2_MoE_GroupedExpert<17, 20, true>)->Name("BM_Xe2_MoE_GroupedExpert_IQ2_XS_IQ4NL")->UseManualTime()->Args({1})->Args({4})->Args({8});
+BENCHMARK(BM_Xe2_MoE_GroupedExpert<14, 8, true>)->Name("BM_Xe2_MoE_GroupedExpert_Q6_K_Q8_0")->UseManualTime()->Args({1})->Args({4})->Args({8});
 
 // KqSplit MoE multi-token decode weight reuse across tokens NT in {1, 2, 4, 8}
 BENCHMARK(BM_Xe2_MoE_KqSplit_WeightReuse<12, 8>)->Name("BM_Xe2_MoE_KqSplit_WeightReuse_Q4_K")->UseManualTime()
@@ -720,6 +824,12 @@ BENCHMARK(BM_Xe2_MoE_KqSplit_WeightReuse<12, 8>)->Name("BM_Xe2_MoE_KqSplit_Weigh
     ->Args({8, 0})->Args({8, 1});
 
 BENCHMARK(BM_Xe2_MoE_KqSplit_WeightReuse<8, 8>)->Name("BM_Xe2_MoE_KqSplit_WeightReuse_Q8_0")->UseManualTime()
+    ->Args({1, 0})->Args({1, 1})
+    ->Args({2, 0})->Args({2, 1})
+    ->Args({4, 0})->Args({4, 1})
+    ->Args({8, 0})->Args({8, 1});
+
+BENCHMARK(BM_Xe2_MoE_ExpDec_SharedMem<12, 8>)->Name("BM_Xe2_MoE_ExpDec_SharedMem_Q4_K")->UseManualTime()
     ->Args({1, 0})->Args({1, 1})
     ->Args({2, 0})->Args({2, 1})
     ->Args({4, 0})->Args({4, 1})
