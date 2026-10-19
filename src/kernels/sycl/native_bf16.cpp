@@ -3,6 +3,7 @@
 #include "strata/core/sycl_arch.hpp"
 
 #include <sycl/sycl.hpp>
+#include <cstdlib>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -154,7 +155,180 @@ int mmvf_block_size(int64_t n_in) {
     return best;
 }
 
+// S25 (STRATA_MMVF_ROWS=1): RPB output rows per block. Each block reads the activations once for RPB rows.
+// Per output, thread t walks pairs t, t + BLOCK_SIZE, ... with the same two ordered FMAs and the same warp
+// and block reductions: bit-identical to bf16_f32_mmvf_multi_kernel.
+// S26 STRATA_LFUSE=1 (AUX): one more block computes row 0 of w_aux into y_aux[k * ldy_aux]
+template <int BLOCK_SIZE, int NT, int RPB, bool AUX = false>
+void bf16_f32_mmvf_rows_kernel(sycl::nd_item<1> item, const float* __restrict__ x, int64_t ldx,
+                               const uint16_t* __restrict__ w, float* __restrict__ y, int64_t ldy,
+                               int n_in, int n_out, int n_tok, sycl::local_accessor<float, 3> partials,
+                               const uint16_t* __restrict__ w_aux = nullptr,
+                               float* __restrict__ y_aux = nullptr, int64_t ldy_aux = 0) {
+    const int t = item.get_local_id(0);
+    int o0 = item.get_group(0) * RPB;
+    if constexpr (AUX) {
+        if (item.get_group(0) == item.get_group_range(0) - 1) {
+            w = w_aux;
+            y = y_aux;
+            ldy = ldy_aux;
+            n_out = 1;
+            o0 = 0;
+        }
+    }
+    float acc[RPB][NT];
+#pragma unroll
+    for (int r = 0; r < RPB; ++r) {
+#pragma unroll
+        for (int k = 0; k < NT; ++k)
+            acc[r][k] = 0.0f;
+    }
+    for (int pair = t; pair < n_in / 2; pair += BLOCK_SIZE) {
+        sycl::float2 in[NT];
+#pragma unroll
+        for (int k = 0; k < NT; ++k) {
+            if (k < n_tok) {
+                in[k] = reinterpret_cast<const sycl::float2*>(x + (size_t)k * ldx)[pair];
+            }
+        }
+#pragma unroll
+        for (int r = 0; r < RPB; ++r) {
+            if (o0 + r >= n_out) break;
+            const uint16_t* row = w + (size_t)(o0 + r) * n_in;
+            const uint32_t weight = reinterpret_cast<const uint32_t*>(row)[pair];
+            const float w0 = f32_from_bf16((uint16_t)weight);
+            const float w1 = f32_from_bf16((uint16_t)(weight >> 16));
+#pragma unroll
+            for (int k = 0; k < NT; ++k) {
+                if (k < n_tok) {
+                    acc[r][k] = sycl::fma(w0, in[k].x(), acc[r][k]);
+                    acc[r][k] = sycl::fma(w1, in[k].y(), acc[r][k]);
+                }
+            }
+        }
+    }
+    auto sg = item.get_sub_group();
+    const int lane = sg.get_local_linear_id();
+    const int sg_id = sg.get_group_linear_id();
+#pragma unroll
+    for (int r = 0; r < RPB; ++r) {
+#pragma unroll
+        for (int k = 0; k < NT; ++k)
+            acc[r][k] = sycl::reduce_over_group(sg, acc[r][k], sycl::plus<float>());
+    }
+
+    if constexpr (BLOCK_SIZE > SG_SZ) {
+        if (lane == 0) {
+#pragma unroll
+            for (int r = 0; r < RPB; ++r) {
+#pragma unroll
+                for (int k = 0; k < NT; ++k)
+                    partials[r][k][sg_id] = acc[r][k];
+            }
+        }
+        sycl::group_barrier(item.get_group());
+#pragma unroll
+        for (int r = 0; r < RPB; ++r) {
+#pragma unroll
+            for (int k = 0; k < NT; ++k) {
+                acc[r][k] = 0.0f;
+                constexpr int num_sgs = BLOCK_SIZE / SG_SZ;
+                for (int s = lane; s < num_sgs; s += SG_SZ) {
+                    acc[r][k] += partials[r][k][s];
+                }
+                acc[r][k] = sycl::reduce_over_group(sg, acc[r][k], sycl::plus<float>());
+            }
+        }
+    }
+    if (t == 0) {
+#pragma unroll
+        for (int r = 0; r < RPB; ++r) {
+            if (o0 + r < n_out) {
+#pragma unroll
+                for (int k = 0; k < NT; ++k) {
+                    if (k < n_tok) y[(size_t)k * ldy + o0 + r] = acc[r][k];
+                }
+            }
+        }
+    }
+}
+
+template <int B>
+void launch_rows(sycl::queue* q, const float* x, int64_t ldx, const uint16_t* w, float* y, int64_t ldy,
+                 int n_in, int n_out, int n_tok, const uint16_t* w_aux = nullptr, float* y_aux = nullptr,
+                 int64_t ldy_aux = 0) {
+    constexpr int RPB = 4;
+    const unsigned nb = (unsigned)((n_out + RPB - 1) / RPB);
+    const unsigned total_blocks = w_aux != nullptr ? (nb + 1) : nb;
+    constexpr int num_sgs = (B + SG_SZ - 1) / SG_SZ;
+
+    if (w_aux != nullptr) {
+        if (n_tok <= 4) {
+            q->submit([&](sycl::handler& cgh) {
+                sycl::local_accessor<float, 3> partials(sycl::range<3>(RPB, 4, num_sgs), cgh);
+                cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t)total_blocks * B), sycl::range<1>(B)),
+                                 [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(SG_SZ)]] {
+                                     bf16_f32_mmvf_rows_kernel<B, 4, RPB, true>(
+                                         item, x, ldx, w, y, ldy, n_in, n_out, n_tok, partials, w_aux, y_aux, ldy_aux);
+                                 });
+            });
+        } else {
+            q->submit([&](sycl::handler& cgh) {
+                sycl::local_accessor<float, 3> partials(sycl::range<3>(RPB, 8, num_sgs), cgh);
+                cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t)total_blocks * B), sycl::range<1>(B)),
+                                 [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(SG_SZ)]] {
+                                     bf16_f32_mmvf_rows_kernel<B, 8, RPB, true>(
+                                         item, x, ldx, w, y, ldy, n_in, n_out, n_tok, partials, w_aux, y_aux, ldy_aux);
+                                 });
+            });
+        }
+    } else {
+        if (n_tok <= 4) {
+            q->submit([&](sycl::handler& cgh) {
+                sycl::local_accessor<float, 3> partials(sycl::range<3>(RPB, 4, num_sgs), cgh);
+                cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t)total_blocks * B), sycl::range<1>(B)),
+                                 [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(SG_SZ)]] {
+                                     bf16_f32_mmvf_rows_kernel<B, 4, RPB, false>(
+                                         item, x, ldx, w, y, ldy, n_in, n_out, n_tok, partials);
+                                 });
+            });
+        } else {
+            q->submit([&](sycl::handler& cgh) {
+                sycl::local_accessor<float, 3> partials(sycl::range<3>(RPB, 8, num_sgs), cgh);
+                cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t)total_blocks * B), sycl::range<1>(B)),
+                                 [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(SG_SZ)]] {
+                                     bf16_f32_mmvf_rows_kernel<B, 8, RPB, false>(
+                                         item, x, ldx, w, y, ldy, n_in, n_out, n_tok, partials);
+                                 });
+            });
+        }
+    }
+}
+
 }  // namespace
+
+bool bf16_gemv_fp32_mmvf_multi_aux(const float* x, int64_t ldx, const uint16_t* w, float* y, int64_t ldy,
+                                   int64_t n_in, int64_t n_out, int n_tok, const uint16_t* w_aux, float* y_aux,
+                                   int64_t ldy_aux, void* stream) {
+    static const bool rows = [] { const char* v = std::getenv("STRATA_MMVF_ROWS"); return v && v[0] == '1'; }();
+    if (!rows || n_out < 64 || n_tok < 2 || n_tok > 8 || n_in <= 0 || (n_in & 1) != 0 || (ldx & 1) != 0 ||
+        x == nullptr || w == nullptr || y == nullptr || w_aux == nullptr || y_aux == nullptr ||
+        (reinterpret_cast<uintptr_t>(x) & 7u) != 0)
+        return false;
+    sycl::queue* q = stream ? static_cast<sycl::queue*>(stream) : &default_queue();
+    const int ni = (int)n_in, no = (int)n_out;
+    switch (mmvf_block_size(n_in)) {
+        case 32: launch_rows<32>(q, x, ldx, w, y, ldy, ni, no, n_tok, w_aux, y_aux, ldy_aux); break;
+        case 64: launch_rows<64>(q, x, ldx, w, y, ldy, ni, no, n_tok, w_aux, y_aux, ldy_aux); break;
+        case 96: launch_rows<96>(q, x, ldx, w, y, ldy, ni, no, n_tok, w_aux, y_aux, ldy_aux); break;
+        case 128: launch_rows<128>(q, x, ldx, w, y, ldy, ni, no, n_tok, w_aux, y_aux, ldy_aux); break;
+        case 160: launch_rows<160>(q, x, ldx, w, y, ldy, ni, no, n_tok, w_aux, y_aux, ldy_aux); break;
+        case 192: launch_rows<192>(q, x, ldx, w, y, ldy, ni, no, n_tok, w_aux, y_aux, ldy_aux); break;
+        case 224: launch_rows<224>(q, x, ldx, w, y, ldy, ni, no, n_tok, w_aux, y_aux, ldy_aux); break;
+        default: launch_rows<256>(q, x, ldx, w, y, ldy, ni, no, n_tok, w_aux, y_aux, ldy_aux); break;
+    }
+    return true;
+}
 
 void bf16_gemv_fp32_mmvf_multi(const float* x, int64_t ldx, const uint16_t* w, float* y, int64_t ldy, int64_t n_in,
                                int64_t n_out, int n_tok, void* stream) {
@@ -166,6 +340,22 @@ void bf16_gemv_fp32_mmvf_multi(const float* x, int64_t ldx, const uint16_t* w, f
         w == nullptr || y == nullptr || (reinterpret_cast<uintptr_t>(x) & 7u) != 0)
         throw std::invalid_argument("bf16_gemv_fp32_mmvf_multi: 1..8 rows, even n_in/ldx, aligned pointers");
     sycl::queue* q = stream ? static_cast<sycl::queue*>(stream) : &default_queue();
+
+    static const bool rows = [] { const char* v = std::getenv("STRATA_MMVF_ROWS"); return v && v[0] == '1'; }();
+    if (rows && n_out >= 64) {
+        const int ni = (int)n_in, no = (int)n_out;
+        switch (mmvf_block_size(n_in)) {
+            case 32: launch_rows<32>(q, x, ldx, w, y, ldy, ni, no, n_tok); break;
+            case 64: launch_rows<64>(q, x, ldx, w, y, ldy, ni, no, n_tok); break;
+            case 96: launch_rows<96>(q, x, ldx, w, y, ldy, ni, no, n_tok); break;
+            case 128: launch_rows<128>(q, x, ldx, w, y, ldy, ni, no, n_tok); break;
+            case 160: launch_rows<160>(q, x, ldx, w, y, ldy, ni, no, n_tok); break;
+            case 192: launch_rows<192>(q, x, ldx, w, y, ldy, ni, no, n_tok); break;
+            case 224: launch_rows<224>(q, x, ldx, w, y, ldy, ni, no, n_tok); break;
+            default: launch_rows<256>(q, x, ldx, w, y, ldy, ni, no, n_tok); break;
+        }
+        return;
+    }
 
 #define STRATA_MMVF_M(N)                                                                                         \
     case N:                                                                                                      \
