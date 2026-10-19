@@ -1,9 +1,10 @@
 # Handover Document: Intel Arc B580 / Xe2 SYCL Optimization & Upstream Rebase
 
-**Date & Time**: 2026-10-04 23:45 (Local)  
+**Date & Time**: 2026-10-19 01:15 (Local)  
 **Project**: Strata Engine  
-**Current Branch**: `main` (cleanly rebased on upstream `origin/main` @ commit `41d50fd`, current HEAD @ commit `0e37fc5`)  
-**Backup Branch**: `backup-main-before-rebase` (points to pre-rebase HEAD `6e28497`, preserves full 84-commit history)
+**Current Branch**: `sycl-b580` (cleanly merged with upstream `v0.1.45` @ commit `477ac13c`, current HEAD @ commit `1b90c039`)  
+**Upstream Base**: `https://github.com/Niko1221/Strata` tag `v0.1.45`  
+**Backup Branch**: `backup-sycl-b580-before-v0.1.45` (points to pre-merge HEAD `58c691e1`)
 
 ---
 
@@ -41,6 +42,31 @@ The target model for these optimizations is **Qwen3.8-Flash-Next** (as well as `
      3. [`perf_qsa_attention.cpp`](perf/sycl/perf_qsa_attention.cpp): FlashAttention throughput up to 611k tok/s and Top-K sparse gather bandwidth (22.2 GB/s).
      4. [`perf_moe_accumulate.cpp`](perf/sycl/perf_moe_accumulate.cpp): MoE 10-expert reduction (Subgroup Reduce: **81.3 GB/s**, 3.40x faster than Atomic at $B=32$).
      5. [`perf_dequant_dpas.cpp`](perf/sycl/perf_dequant_dpas.cpp): Direct-to-register 4-bit dequant + DPAS (**423.7 GFLOPS**, **+28.5% faster** than SLM buffering).
+5. **Upstream `v0.1.45` Integration & SYCL Optimization Series (Commits `6a30ef90` .. `1b90c039`)**:
+   - Cleanly merged 190 upstream commits from `upstream/main` (`v0.1.45`, commit `477ac13c`).
+   - Ported all new optimizations to native SYCL 2020 for Intel Arc B580 (Xe2 Battlemage):
+     - **Commit 1 (`6a30ef90`)**: `Merge branch 'upstream/main' into sycl-b580 (v0.1.45)`
+     - **Commit 2 (`5426af45`)**: `perf(sycl): port Q6_K planar layout, SWAR q6_sub32, int4 loads, large-GRF, and B6 multi-row MMVQ`.
+       - Q6_K Planar Layout: Eliminates 2-byte unaligned loads, achieving **3.50x speedup** on `gdn_qkv` (`[2560, 10240, 1]`: 1.136 ms -> **0.324 ms**, 66.4 GB/s) and **3.91x speedup** at 4 tokens (1.575 ms -> **0.403 ms**, 520.0 GFLOPS).
+       - B6 Multi-row MMVQ: Reuses activation loads across verify rows, achieving **23.3% speedup** on `Q4_K` at 4 tokens (986 µs -> **756 µs**).
+     - **Commit 3 (`1a4d363a`)**: `perf(sycl): port STRATA_IQ3S_WIDE dense MMVQ, STRATA_EXPDEC shared-memory MoE gate/up, and Q6_K expert support`.
+       - `STRATA_EXPDEC`: Shared-memory gate/up SwiGLU fusion yields **9.8% speedup** at 2 verify tokens (256.7 µs -> **231.4 µs**).
+       - Supported Unsloth UD-Q6_K_XL MoE experts in SYCL grouped expert kernel with 100% parity.
+     - **Commit 4 (`fbf9f4b6`)**: `perf(sycl): port cooperative-scan QSA top-k, STRATA_QSA_ROWS scorer, and STRATA_ATTN_DAILY decode attention`.
+       - Cooperative scan top-k radix selection and reduce-scattered 4-query scoring.
+       - Chunked decode attention merge kernel (PR #540 Daily decode attention) in native SYCL.
+     - **Commit 5 (`561e01f3`)**: `feat(sycl): port batch-rows/slots QSA & GDN kernels, verify Q4_0 batching, and lean batch doorbells`.
+       - Single-launch multi-row QSA block scores and decode attention.
+       - Lean batch doorbells with atomic tracking avoiding PCIe barriers.
+     - **Commit 6 (`7cf83bf6`)**: `feat(sycl): port STRATA_HC_REQ8 hyper-connection Q8 and expert_cache slot guard`.
+       - Ported Q8 hyper-connection weights, runtime `dot8q` dot products, and expert cache guard slots.
+     - **Commit 7 (`1347363b`)**: `test(sycl): port upstream v0.1.45 parity tests and standalone microbenchmarks to SYCL`.
+       - Ported `expert_cache_slot_guard_test`, `batch_rows_parity`, `qsa_slots_parity`, `qsa_merge_daily_parity`, `mmvf_rows_parity`, and `b6_mmvq_bench`.
+       - Implemented `STRATA_MMVF_ROWS` multi-row and aux fused kernel in `native_bf16.cpp`.
+       - All 7 tests pass with 100% bitwise parity on Intel Arc B580.
+     - **Commit 8 (`1b90c039`)**: `test(sycl): add Google Benchmark perf suites for v0.1.45 SYCL optimizations`.
+       - Added benchmarks to `perf_xe2_gemv.cpp` (Q6_K Planar vs standard GGUF, B6 MMVQ rows), `perf_qsa_attention.cpp` (multi-row scoring & decode attention batch rows), and `perf_moe_accumulate.cpp` (ExpDec shared memory & Q6_K expert grouped).
+   - **Verification**: 131/131 tests passed (127 passed, 4 skipped, 0 failed) with 0 compiler warnings under `-Wall -Wextra`.
 
 ---
 
