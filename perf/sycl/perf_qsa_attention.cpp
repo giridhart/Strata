@@ -15,6 +15,8 @@
 #include "strata/core/sycl_arch.hpp"
 #include "strata/kernels/native_qsa_score.hpp"
 #include "strata/kernels/qsa.hpp"
+#include "strata/kernels/qsa_select.hpp"
+#include "strata/kernels/qsa_decode_attn.hpp"
 
 #include <chrono>
 #include <cmath>
@@ -340,6 +342,189 @@ static void BM_Xe2_QSA_LaneCell_Scoring(benchmark::State& state) {
 }
 
 // ============================================================================
+// Benchmark: BM_Xe2_QSA_Score_Rows (STRATA_QSA_ROWS multi-row evaluation)
+// ============================================================================
+
+static void BM_Xe2_QSA_Score_Rows(benchmark::State& state) {
+    const int T = static_cast<int>(state.range(0));
+    const int n_cells = static_cast<int>(state.range(1));
+    const bool use_rows_opt = state.range(2) != 0;
+
+    const strata::kernels::QsaShapes s = strata::kernels::qsa_real_shapes();
+    const int64_t max_blocks = n_cells / 4 + 1;
+
+    sycl::queue q{sycl::default_selector_v, {sycl::property::queue::enable_profiling()}};
+
+    auto* d_pooled = sycl::malloc_device<float>(static_cast<size_t>(max_blocks) * 128, q);
+    auto* d_dead = sycl::malloc_device<float>(128, q);
+    auto* d_q_idx = sycl::malloc_device<float>(static_cast<size_t>(T) * 4 * 128, q);
+    auto* d_steps = sycl::malloc_device<int32_t>(static_cast<size_t>(T) * strata::kernels::kStepCount, q);
+    auto* d_scores = sycl::malloc_device<float>(static_cast<size_t>(T) * max_blocks, q);
+
+    if (!d_pooled || !d_dead || !d_q_idx || !d_steps || !d_scores) {
+        state.SkipWithError("Failed to allocate USM memory for QSA Score Rows");
+        if (d_pooled) sycl::free(d_pooled, q);
+        if (d_dead) sycl::free(d_dead, q);
+        if (d_q_idx) sycl::free(d_q_idx, q);
+        if (d_steps) sycl::free(d_steps, q);
+        if (d_scores) sycl::free(d_scores, q);
+        return;
+    }
+
+    q.fill(d_pooled, 0.05f, static_cast<size_t>(max_blocks) * 128);
+    q.fill(d_dead, 0.01f, 128);
+    q.fill(d_q_idx, 0.02f, static_cast<size_t>(T) * 4 * 128);
+
+    std::vector<int32_t> h_steps(static_cast<size_t>(T) * strata::kernels::kStepCount);
+    for (int t = 0; t < T; ++t) {
+        h_steps[t * strata::kernels::kStepCount + 0] = n_cells - T + t;
+        h_steps[t * strata::kernels::kStepCount + 1] = n_cells - T + t + 1;
+        h_steps[t * strata::kernels::kStepCount + 2] = (n_cells - T + t) / 4;
+        h_steps[t * strata::kernels::kStepCount + 3] = std::min<int>(2051, n_cells - T + t + 1);
+    }
+    q.memcpy(d_steps, h_steps.data(), h_steps.size() * sizeof(int32_t));
+    q.wait_and_throw();
+
+    if (use_rows_opt) {
+        setenv("STRATA_QSA_ROWS", "1", 1);
+    } else {
+        setenv("STRATA_QSA_ROWS", "0", 1);
+    }
+
+    // Warmup
+    for (int w = 0; w < 3; ++w) {
+        strata::kernels::qsa_block_scores(d_pooled, d_dead, d_q_idx, d_steps, T, max_blocks, s, d_scores, &q);
+    }
+    q.wait();
+
+    for (auto _ : state) {
+        auto t0 = std::chrono::steady_clock::now();
+        strata::kernels::qsa_block_scores(d_pooled, d_dead, d_q_idx, d_steps, T, max_blocks, s, d_scores, &q);
+        q.wait();
+        auto t1 = std::chrono::steady_clock::now();
+        state.SetIterationTime(std::chrono::duration<double>(t1 - t0).count());
+    }
+
+    unsetenv("STRATA_QSA_ROWS");
+
+    const double bytes = static_cast<double>(max_blocks) * 128 * sizeof(float) +
+                         static_cast<double>(T) * 4 * 128 * sizeof(float) +
+                         static_cast<double>(T) * max_blocks * sizeof(float);
+    state.counters["Bandwidth_GBps"] = benchmark::Counter(bytes, benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
+    state.counters["Rows_Opt"] = benchmark::Counter(use_rows_opt ? 1.0 : 0.0);
+    state.counters["T"] = benchmark::Counter(static_cast<double>(T));
+
+    sycl::free(d_pooled, q);
+    sycl::free(d_dead, q);
+    sycl::free(d_q_idx, q);
+    sycl::free(d_steps, q);
+    sycl::free(d_scores, q);
+}
+
+// ============================================================================
+// Benchmark: BM_Xe2_QSA_DecodeAttention_BatchRows
+// ============================================================================
+
+static void BM_Xe2_QSA_DecodeAttention_BatchRows(benchmark::State& state) {
+    const int T = static_cast<int>(state.range(0));
+    const int64_t cap = 2051;
+    const strata::kernels::QsaShapes s = strata::kernels::qsa_real_shapes();
+
+    sycl::queue q{sycl::default_selector_v, {sycl::property::queue::enable_profiling()}};
+
+    const size_t q_elements = static_cast<size_t>(T) * s.n_head * s.head_dim;
+    const size_t ids_elements = static_cast<size_t>(T) * cap;
+    const size_t steps_elements = static_cast<size_t>(T) * strata::kernels::kStepCount;
+    const size_t attn_elements = static_cast<size_t>(T) * s.n_head * s.head_dim;
+    const size_t scratch_floats = static_cast<size_t>(T) * strata::kernels::qsa_decode_attn_scratch_floats(cap, s);
+
+    auto* d_q = sycl::malloc_device<float>(q_elements, q);
+    auto* d_ids = sycl::malloc_device<int32_t>(ids_elements, q);
+    auto* d_steps = sycl::malloc_device<int32_t>(steps_elements, q);
+    auto* d_attn = sycl::malloc_device<float>(attn_elements, q);
+    auto* d_scratch = sycl::malloc_device<float>(scratch_floats, q);
+
+    const int64_t n_pages = 128, page_size = 64;
+    const size_t pool_elements = n_pages * s.n_head_kv * page_size * s.head_dim;
+    auto* d_k_pool = sycl::malloc_device<uint16_t>(pool_elements, q);
+    auto* d_v_pool = sycl::malloc_device<uint16_t>(pool_elements, q);
+    auto* d_page_table = sycl::malloc_device<int32_t>(n_pages, q);
+
+    if (!d_q || !d_ids || !d_steps || !d_attn || !d_scratch || !d_k_pool || !d_v_pool || !d_page_table) {
+        state.SkipWithError("Failed to allocate USM memory for QSA Decode Attention Batch Rows");
+        if (d_q) sycl::free(d_q, q);
+        if (d_ids) sycl::free(d_ids, q);
+        if (d_steps) sycl::free(d_steps, q);
+        if (d_attn) sycl::free(d_attn, q);
+        if (d_scratch) sycl::free(d_scratch, q);
+        if (d_k_pool) sycl::free(d_k_pool, q);
+        if (d_v_pool) sycl::free(d_v_pool, q);
+        if (d_page_table) sycl::free(d_page_table, q);
+        return;
+    }
+
+    q.fill(d_q, 0.05f, q_elements);
+    q.fill(d_k_pool, static_cast<uint16_t>(0x3c00), pool_elements);
+    q.fill(d_v_pool, static_cast<uint16_t>(0x3c00), pool_elements);
+
+    std::vector<int32_t> h_table(n_pages);
+    for (int i = 0; i < n_pages; ++i) h_table[i] = i;
+    q.memcpy(d_page_table, h_table.data(), n_pages * sizeof(int32_t));
+
+    std::vector<int32_t> h_ids(ids_elements);
+    for (size_t i = 0; i < ids_elements; ++i) h_ids[i] = static_cast<int32_t>(i % (n_pages * page_size));
+    q.memcpy(d_ids, h_ids.data(), ids_elements * sizeof(int32_t));
+
+    std::vector<int32_t> h_steps(steps_elements);
+    for (int t = 0; t < T; ++t) {
+        h_steps[t * strata::kernels::kStepCount + 0] = 4000 + t;
+        h_steps[t * strata::kernels::kStepCount + 1] = 4001 + t;
+        h_steps[t * strata::kernels::kStepCount + 2] = 1000;
+        h_steps[t * strata::kernels::kStepCount + 3] = static_cast<int32_t>(cap);
+    }
+    q.memcpy(d_steps, h_steps.data(), steps_elements * sizeof(int32_t));
+    q.wait_and_throw();
+
+    strata::kernels::QsaAttnPools pools;
+    pools.k_pool = d_k_pool;
+    pools.v_pool = d_v_pool;
+    pools.page_table = d_page_table;
+
+    strata::kernels::QsaAttnPoolsRows rows;
+    rows.n = T;
+    for (int t = 0; t < T; ++t) rows.p[t] = pools;
+
+    // Warmup
+    for (int w = 0; w < 3; ++w) {
+        strata::kernels::qsa_decode_attn_batch_rows(d_q, rows, d_ids, d_steps, cap, s, d_scratch, d_attn, T, &q);
+    }
+    q.wait();
+
+    for (auto _ : state) {
+        auto t0 = std::chrono::steady_clock::now();
+        strata::kernels::qsa_decode_attn_batch_rows(d_q, rows, d_ids, d_steps, cap, s, d_scratch, d_attn, T, &q);
+        q.wait();
+        auto t1 = std::chrono::steady_clock::now();
+        state.SetIterationTime(std::chrono::duration<double>(t1 - t0).count());
+    }
+
+    const double bytes = static_cast<double>(q_elements + attn_elements) * sizeof(float) +
+                         static_cast<double>(ids_elements) * sizeof(int32_t) +
+                         static_cast<double>(T) * cap * s.n_head_kv * s.head_dim * 2 * sizeof(uint16_t);
+    state.counters["Bandwidth_GBps"] = benchmark::Counter(bytes, benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
+    state.counters["T"] = benchmark::Counter(static_cast<double>(T));
+
+    sycl::free(d_q, q);
+    sycl::free(d_ids, q);
+    sycl::free(d_steps, q);
+    sycl::free(d_attn, q);
+    sycl::free(d_scratch, q);
+    sycl::free(d_k_pool, q);
+    sycl::free(d_v_pool, q);
+    sycl::free(d_page_table, q);
+}
+
+// ============================================================================
 // Registration: Attention Context Sweeps & Sparse Top-K Gather
 // ============================================================================
 
@@ -361,6 +546,20 @@ BENCHMARK(BM_Xe2_QSA_LaneCell_Scoring)->UseManualTime()->Args({1024});
 BENCHMARK(BM_Xe2_QSA_LaneCell_Scoring)->UseManualTime()->Args({4096});
 BENCHMARK(BM_Xe2_QSA_LaneCell_Scoring)->UseManualTime()->Args({16384});
 BENCHMARK(BM_Xe2_QSA_LaneCell_Scoring)->UseManualTime()->Args({65536});
+
+// 4. STRATA_QSA_ROWS multi-row block scores (T in {1, 2, 4})
+BENCHMARK(BM_Xe2_QSA_Score_Rows)->UseManualTime()->Args({1, 4096, 0});
+BENCHMARK(BM_Xe2_QSA_Score_Rows)->UseManualTime()->Args({1, 4096, 1});
+BENCHMARK(BM_Xe2_QSA_Score_Rows)->UseManualTime()->Args({2, 4096, 0});
+BENCHMARK(BM_Xe2_QSA_Score_Rows)->UseManualTime()->Args({2, 4096, 1});
+BENCHMARK(BM_Xe2_QSA_Score_Rows)->UseManualTime()->Args({4, 4096, 0});
+BENCHMARK(BM_Xe2_QSA_Score_Rows)->UseManualTime()->Args({4, 4096, 1});
+
+// 5. Decode attention batch rows (T in {1, 2, 4, 8})
+BENCHMARK(BM_Xe2_QSA_DecodeAttention_BatchRows)->UseManualTime()->Args({1});
+BENCHMARK(BM_Xe2_QSA_DecodeAttention_BatchRows)->UseManualTime()->Args({2});
+BENCHMARK(BM_Xe2_QSA_DecodeAttention_BatchRows)->UseManualTime()->Args({4});
+BENCHMARK(BM_Xe2_QSA_DecodeAttention_BatchRows)->UseManualTime()->Args({8});
 
 // ============================================================================
 // Main Entry Point

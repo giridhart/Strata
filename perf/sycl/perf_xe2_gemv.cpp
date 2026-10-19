@@ -415,6 +415,131 @@ static void BM_Xe2_Dense_Q8_0_MMVQ(benchmark::State& state) {
     sycl::free(d_y, q);
 }
 
+/// Dense Q6_K GEMV benchmark comparing GGUF standard layout vs planar layout.
+static void BM_Xe2_Dense_Q6_K_Planar_MMVQ(benchmark::State& state) {
+    const int K = state.range(0);
+    const int N = state.range(1);
+    const int ncols = state.range(2);
+    const bool use_planar = state.range(3) != 0;
+
+    sycl::queue q{sycl::default_selector_v, {sycl::property::queue::enable_profiling()}};
+
+    const size_t w_bytes = (size_t)N * (K / 256) * 210;
+    const size_t q8_1_bytes = strata::kernels::native_q8_1_bytes(K, ncols);
+    const size_t out_elements = (size_t)N * ncols;
+
+    auto* d_w = sycl::malloc_device<uint8_t>(w_bytes, q);
+    auto* d_x_q8_1 = sycl::malloc_device<uint8_t>(q8_1_bytes, q);
+    auto* d_y = sycl::malloc_device<float>(out_elements, q);
+
+    q.memset(d_w, 0x55, w_bytes).wait();
+    q.memset(d_x_q8_1, 0xAA, q8_1_bytes).wait();
+    q.fill(d_y, 0.0f, out_elements).wait();
+
+    void* active_w = d_w;
+    if (use_planar) {
+        active_w = strata::kernels::native_q6_k_planar_adopt(d_w, K, N, "perf_q6k_planar");
+    }
+
+    // Warmup
+    for (int w = 0; w < 3; ++w) {
+        strata::kernels::native_q6_k_mmvq(active_w, d_x_q8_1, d_y, K, N, ncols, &q);
+    }
+    q.wait();
+
+    for (auto _ : state) {
+        auto t0 = std::chrono::steady_clock::now();
+        strata::kernels::native_q6_k_mmvq(active_w, d_x_q8_1, d_y, K, N, ncols, &q);
+        q.wait();
+        auto t1 = std::chrono::steady_clock::now();
+        state.SetIterationTime(std::chrono::duration<double>(t1 - t0).count());
+    }
+
+    const double bytes_read = (double)w_bytes + (double)q8_1_bytes;
+    const double bytes_written = (double)out_elements * sizeof(float);
+    state.counters["Bandwidth_GBps"] = benchmark::Counter(
+        bytes_read + bytes_written, benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
+    state.counters["TFLOPS"] = benchmark::Counter(
+        2.0 * (double)K * N * ncols, benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
+    state.counters["tokens_per_sec"] = benchmark::Counter(
+        (double)ncols, benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
+    state.counters["Planar"] = benchmark::Counter(use_planar ? 1.0 : 0.0);
+
+    if (use_planar) {
+        strata::kernels::native_q6_k_unpack(active_w);
+    } else {
+        sycl::free(d_w, q);
+    }
+    sycl::free(d_x_q8_1, q);
+    sycl::free(d_y, q);
+}
+
+/// Dense B6 multi-row MMVQ benchmark evaluating activation reuse across verify rows.
+template <int TYPE = 12>
+static void BM_Xe2_Dense_B6_MMVQ_Rows(benchmark::State& state) {
+    const int K = state.range(0);
+    const int N = state.range(1);
+    const int ncols = state.range(2);
+    const int rows_mode = state.range(3);
+
+    sycl::queue q{sycl::default_selector_v, {sycl::property::queue::enable_profiling()}};
+
+    const size_t block_bytes = (TYPE == 12) ? 144 : (TYPE == 13) ? 176 : 210;
+    const size_t w_bytes = (size_t)N * (K / 256) * block_bytes;
+    const size_t q8_1_bytes = strata::kernels::native_q8_1_bytes(K, ncols);
+    const size_t out_elements = (size_t)N * ncols;
+
+    auto* d_w = sycl::malloc_device<uint8_t>(w_bytes, q);
+    auto* d_x_q8_1 = sycl::malloc_device<uint8_t>(q8_1_bytes, q);
+    auto* d_y = sycl::malloc_device<float>(out_elements, q);
+
+    q.memset(d_w, 0x55, w_bytes).wait();
+    q.memset(d_x_q8_1, 0xAA, q8_1_bytes).wait();
+    q.fill(d_y, 0.0f, out_elements).wait();
+
+    strata::kernels::native_mmvq_set_b6_rows(rows_mode);
+
+    auto launch = [&]() {
+        if constexpr (TYPE == 12) {
+            strata::kernels::native_q4_k_mmvq(d_w, d_x_q8_1, d_y, K, N, ncols, &q);
+        } else if constexpr (TYPE == 13) {
+            strata::kernels::native_q5_k_mmvq(d_w, d_x_q8_1, d_y, K, N, ncols, &q);
+        } else {
+            strata::kernels::native_q6_k_mmvq(d_w, d_x_q8_1, d_y, K, N, ncols, &q);
+        }
+    };
+
+    // Warmup
+    for (int w = 0; w < 3; ++w) {
+        launch();
+    }
+    q.wait();
+
+    for (auto _ : state) {
+        auto t0 = std::chrono::steady_clock::now();
+        launch();
+        q.wait();
+        auto t1 = std::chrono::steady_clock::now();
+        state.SetIterationTime(std::chrono::duration<double>(t1 - t0).count());
+    }
+
+    strata::kernels::native_mmvq_set_b6_rows(0);
+
+    const double bytes_read = (double)w_bytes + (double)q8_1_bytes;
+    const double bytes_written = (double)out_elements * sizeof(float);
+    state.counters["Bandwidth_GBps"] = benchmark::Counter(
+        bytes_read + bytes_written, benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
+    state.counters["TFLOPS"] = benchmark::Counter(
+        2.0 * (double)K * N * ncols, benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
+    state.counters["tokens_per_sec"] = benchmark::Counter(
+        (double)ncols, benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
+    state.counters["B6_Rows_Mode"] = benchmark::Counter((double)rows_mode);
+
+    sycl::free(d_w, q);
+    sycl::free(d_x_q8_1, q);
+    sycl::free(d_y, q);
+}
+
 // ============================================================================
 // Registration: Qwen3.8-Flash-Next Decode & Prefill Projections
 // ============================================================================
@@ -428,6 +553,24 @@ BENCHMARK(BM_Xe2_Dense_Q8_0_MMVQ)->UseManualTime()->Args({2560, 4096, 1});
 BENCHMARK(BM_Xe2_Dense_Q8_0_MMVQ)->UseManualTime()->Args({2560, 10240, 1});
 BENCHMARK(BM_Xe2_Dense_Q8_0_MMVQ)->UseManualTime()->Args({2560, 2560, 4});
 BENCHMARK(BM_Xe2_Dense_Q8_0_MMVQ)->UseManualTime()->Args({2560, 10240, 4});
+
+// Register Q6_K Planar vs standard GGUF MMVQ
+BENCHMARK(BM_Xe2_Dense_Q6_K_Planar_MMVQ)->UseManualTime()->Args({2560, 2560, 1, 0});
+BENCHMARK(BM_Xe2_Dense_Q6_K_Planar_MMVQ)->UseManualTime()->Args({2560, 2560, 1, 1});
+BENCHMARK(BM_Xe2_Dense_Q6_K_Planar_MMVQ)->UseManualTime()->Args({2560, 10240, 1, 0});
+BENCHMARK(BM_Xe2_Dense_Q6_K_Planar_MMVQ)->UseManualTime()->Args({2560, 10240, 1, 1});
+BENCHMARK(BM_Xe2_Dense_Q6_K_Planar_MMVQ)->UseManualTime()->Args({2560, 10240, 4, 0});
+BENCHMARK(BM_Xe2_Dense_Q6_K_Planar_MMVQ)->UseManualTime()->Args({2560, 10240, 4, 1});
+
+// Register B6 MMVQ rows: Q4_K and Q6_K rows 1 vs 2 vs 4
+BENCHMARK(BM_Xe2_Dense_B6_MMVQ_Rows<12>)->Name("BM_Xe2_Dense_B6_MMVQ_Q4_K")->UseManualTime()->Args({2560, 10240, 2, 0});
+BENCHMARK(BM_Xe2_Dense_B6_MMVQ_Rows<12>)->Name("BM_Xe2_Dense_B6_MMVQ_Q4_K")->UseManualTime()->Args({2560, 10240, 2, 1});
+BENCHMARK(BM_Xe2_Dense_B6_MMVQ_Rows<12>)->Name("BM_Xe2_Dense_B6_MMVQ_Q4_K")->UseManualTime()->Args({2560, 10240, 4, 0});
+BENCHMARK(BM_Xe2_Dense_B6_MMVQ_Rows<12>)->Name("BM_Xe2_Dense_B6_MMVQ_Q4_K")->UseManualTime()->Args({2560, 10240, 4, 1});
+BENCHMARK(BM_Xe2_Dense_B6_MMVQ_Rows<14>)->Name("BM_Xe2_Dense_B6_MMVQ_Q6_K")->UseManualTime()->Args({2560, 10240, 2, 0});
+BENCHMARK(BM_Xe2_Dense_B6_MMVQ_Rows<14>)->Name("BM_Xe2_Dense_B6_MMVQ_Q6_K")->UseManualTime()->Args({2560, 10240, 2, 1});
+BENCHMARK(BM_Xe2_Dense_B6_MMVQ_Rows<14>)->Name("BM_Xe2_Dense_B6_MMVQ_Q6_K")->UseManualTime()->Args({2560, 10240, 4, 0});
+BENCHMARK(BM_Xe2_Dense_B6_MMVQ_Rows<14>)->Name("BM_Xe2_Dense_B6_MMVQ_Q6_K")->UseManualTime()->Args({2560, 10240, 4, 1});
 
 // Register all 8 Qwen3.8-Flash-Next decode projections (B=1)
 BENCHMARK(BM_Xe2_GEMV)->UseManualTime()->Args({2560, 48, 1});    // ssm_alpha / ssm_beta [2560, 48]
