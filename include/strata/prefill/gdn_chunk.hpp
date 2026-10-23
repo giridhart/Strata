@@ -51,4 +51,3 @@ bool gdn_chunk_step(float* state, const float* h, const float* gate, const float
                     int64_t ld16 = 0);
 
 }  // namespace strata::prefill
-}  // namespace strata::prefill
