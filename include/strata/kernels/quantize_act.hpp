@@ -37,7 +37,9 @@ void quantize_q8_0_scaled(const float* x, uint8_t* blocks, float* scales, int64_
 // launch and one round trip over the intermediate gone.  `gate_out` may alias `gate`.
 //
 // `swilu_kind` selects the SwiGLU expression this replaces: 0 = the double-precision `ref/moe.py` form
-// (`shared_expert`'s legacy kernel), 1 = the S2 expert path's float native::exp form, 2 = the pinned native form.
+// `swilu_kind` selects the SwiGLU expression this replaces: 0 = the double-precision `ref/moe.py` form
+// (`shared_expert`'s legacy kernel), 1 = the S2 expert path's float exp form, 2 = the pinned CUDA/SYCL
+// native form.  The expressions live in `strata/kernels/swiglu.cuh` (and SYCL equivalents).
 
 // n pairs -> ggml block_q8_0 for the products.
 void swilu_quantize_q8_0(const float* gate, const float* up, float* gate_out, int64_t n, int swilu_kind,
@@ -56,7 +58,7 @@ void swilu_quantize_q8_K(const float* gate, const float* up, float* gate_out, in
 // The layer start wants 2-3 images of the SAME x (ggml block_q8_0, block_q8_K, bf16) and the engine ran one
 // kernel per image - three reads and three launches.  This produces whichever images the caller asks for in
 // one pass; a null pointer skips that image.  The bytes of each image are what its standalone kernel wrote
-// (the per-block math is shared with those standalone kernels).
+// (the per-block math is shared with those kernels).  n must be a multiple of 256 (the Q8_K block).
 void quantize_act_images(const float* x, int64_t n, uint8_t* q8_0_blocks, uint8_t* q8_K_blocks,
                          uint16_t* bf16, void* stream);
 
