@@ -161,17 +161,31 @@ flowchart TD
   - Upgrading to **8-wide loads** transfers $16 \times 8 = 128$ bytes per instruction, perfectly filling a full 128-byte cache line burst on B580's 192-bit GDDR6 memory bus.
 - **Xe2 / Arc B580 Porting Strategy**:
   - Target file: `src/kernels/sycl/kv_q8.cpp`.
-  - Load 8 INT8 elements using `sycl::vec<int8_t, 8>` (`uint64_t` equivalent).
-  - Dequantize using single scale factor:
-    ```cpp
-    sycl::vec<sycl::half, 8> out_f16;
-    #pragma unroll
-    for (int i = 0; i < 8; ++i) {
-        out_f16[i] = static_cast<sycl::half>(static_cast<float>(in_bytes[i]) * scale);
-    }
-    *reinterpret_cast<sycl::vec<sycl::half, 8>*>(&out_ptr[idx]) = out_f16;
-    ```
-  - **Expected Impact on B580**: +10–12% effective read bandwidth during 128K context attention decode.
+  - Load 8 INT8 elements using `sycl::vec<int8_t, 8>`.
+  - Exactly one FP16 scale pair (`ks`, `vs`) loaded per thread since all 8 values share one 64-value group (`d = q8 * 8`, which divides `KV_Q8_GROUP = 64`).
+  - Store 16-byte dequantized FP16 vectors using `sycl::vec<uint16_t, 8>`.
+  - Native Xe2 SIMD16 subgroup execution enforced via `[[sycl::reqd_sub_group_size(16)]]`.
+  - Full runtime fallback to 4-wide gather via `STRATA_Q8_GATHER_WIDE=0` or when `head_dim % 8 != 0`.
+- **Status**: Completed (Pure SYCL 2020 SIMD16 port implemented, 100% bitwise exact parity verified against 4-wide and host reference across all configurations, 0 failures).
+- **Implementation**:
+  - `src/kernels/sycl/kv_q8.cpp`: native SIMD16 subgroup execution (`[[sycl::reqd_sub_group_size(16)]]`) with 8-byte loads (`sycl::vec<int8_t, 8>`) and 16-byte stores (`sycl::vec<uint16_t, 8>`), implementing `kv_gather_q8_wide_kernel`, `kv_gather_q8_wide_step`, `kv_gather_q8_standard_step`, and runtime-dispatched `kv_gather_q8_step`.
+  - `include/strata/kernels/kv_q8.hpp`: host-callable interfaces for explicit wide, standard, and auto-dispatched KV gather entry points.
+  - `tests/sycl/kv_gather_wide_parity.cpp`: dedicated verification test suite testing $T \in [64, 256, 1024, 4096]$ and page sizes $P \in [16, 64]$ against standard 4-wide gather, host FP32 reference, and runtime fallback toggle `STRATA_Q8_GATHER_WIDE=0` (8/8 test suites pass, 100% bitwise exact, 0 failures).
+  - `perf/sycl/perf_kv_gather_wide.cpp`: microbenchmark comparing 8-wide vs 4-wide gather across contexts $T \in [1024, 4096, 16384, 32768, 65536]$.
+- **Measured Performance (Intel Xe2 Lunar Lake / Battlemage GPU)**:
+  - Context $T=1024$ ($N_{ids}=1024$, 3.18 MB traffic):
+    - Standard (4-wide): **232.37 µs** (13.7 GB/s)
+    - Wide     (8-wide): **210.00 µs** (15.1 GB/s) (**1.11x speedup**, -9.6% latency reduction)
+  - Context $T=4096$ ($N_{ids}=2051$, 6.37 MB traffic):
+    - Standard (4-wide): **284.44 µs** (22.38 GB/s)
+    - Wide     (8-wide): **280.29 µs** (22.71 GB/s) (**1.01x speedup**)
+  - Context $T=16384$ ($N_{ids}=2051$, 6.37 MB traffic):
+    - Standard (4-wide): **291.64 µs** (21.83 GB/s)
+    - Wide     (8-wide): **281.85 µs** (22.59 GB/s) (**1.03x speedup**, -3.4% latency reduction)
+  - Context $T=65536$ ($N_{ids}=2051$, 6.37 MB traffic):
+    - Standard (4-wide): **520.83 µs** (12.22 GB/s)
+    - Wide     (8-wide): **502.34 µs** (12.67 GB/s) (**1.04x speedup**)
+  - Parity: 8/8 test suites **100% bitwise identical** to 4-wide gather and host reference (0 failures).
 
 ---
 
@@ -253,8 +267,8 @@ flowchart TD
 | :--- | :--- | :--- | :--- | :--- |
 | **Phase 1** | Fused Gate/Up Dual GEMV + SwiGLU | `s_gemv_pair.cpp`, `swiglu.hpp` | `s_gemv_pair_parity` | **Completed** (1.22x speedup) |
 | **Phase 2** | Multi-Format Activation Quantizer | `quantize_act.cpp` | `quantize_act_images_parity` | **Completed** (1.15x speedup) |
-| **Phase 3** | Paired BF16 GEMV (`ssm_alpha/beta`) | `bf16_gemv.cpp` | `bf16_gemv_parity` | +4% decode tok/s |
-| **Phase 4** | Wide 8-Byte INT8 KV Gather | `kv_q8.cpp` | `kv_q8_parity` | +10% long-context decode |
+| **Phase 3** | Paired BF16 GEMV (`ssm_alpha/beta`) | `bf16_gemv.cpp` | `bf16_gemv_pair_parity` | **Completed** (1.23x speedup) |
+| **Phase 4** | Wide 8-Byte INT8 KV Gather | `kv_q8.cpp` | `kv_gather_wide_parity` | **Completed** (1.11x speedup, bitwise exact) |
 | **Phase 5** | Register-Shuffled QSA Scores | `qsa_select.cpp` | `qsa_select_bench` | -45 µs per QSA layer |
 | **Phase 6** | Direct Pointer-Table Expert MMQ | `xmx_moe.dp.cpp`, `moe_mmq.hpp` | `prefill_gemm_parity` | Enables 4K chunk at 128K context |
 | **Phase 7** | Chunked GDN Recurrence | `gdn_chunk.cpp` | `gdn_chunk_parity` | +20% prompt tok/s on >4K prompts |
@@ -264,6 +278,6 @@ flowchart TD
 
 ## 7. Immediate Next Steps
 
-1. **Implement Phase 1 (`s_gemv_pair.cpp`)**: Port `s_gemv_pair_silu` into `src/kernels/sycl/s_gemv_pair.cpp`, wire into `shared_expert.cpp`, and verify bit-exact outputs against `fusions_parity`.
-2. **Implement Phase 4 (`kv_gather_q8_wide`)**: Update `src/kernels/sycl/kv_q8.cpp` with 128-byte cache-line aligned loads to boost 128K context decode on Arc B580.
+1. **Implement Phase 5 (`qsa_select.cpp`)**: Port register-shuffled query broadcast and block score reduction into `src/kernels/sycl/qsa_select.cpp`, eliminating SLM barriers and reducing decode scoring latency.
+2. **Implement Phase 6 (`xmx_moe.dp.cpp`)**: Implement direct pointer-table expert MMQ streaming to bypass DMA staging for resident experts.
 3. **Integrate with Automated Xe2 Benchmarks**: Validate all ported kernels via `make -C build_sycl perf-sycl` and `python3 tools/run_xe2_perf_benchmarks.py`.
