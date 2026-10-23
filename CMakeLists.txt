@@ -442,6 +442,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP OR STRATA_ENABLE_SYCL)
                           src/kernels/sycl/qsa_select.cpp
                           src/kernels/sycl/verify_kernels.cpp
                           src/kernels/sycl/iq_kernels.cpp
+                          src/kernels/sycl/tq_gemv.cpp
                           src/kernels/ngram.cpp
                           src/ngram/ple_reader.cpp
                           src/platform/direct_file.cpp)
@@ -1658,6 +1659,13 @@ endif()
     add_test(NAME gdn_chunk_parity COMMAND gdn_chunk_parity)
   endif()
 
+  if(STRATA_ENABLE_SYCL AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/sycl/trellis_parity.cpp")
+    add_executable(trellis_parity tests/sycl/trellis_parity.cpp)
+    target_include_directories(trellis_parity PRIVATE ${_strata_gpu_include_directories})
+    target_link_libraries(trellis_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+    add_test(NAME trellis_parity COMMAND trellis_parity)
+  endif()
+
 
 
 
@@ -2594,7 +2602,7 @@ if(STRATA_ENABLE_SYCL)
             sycl_native_gr_norm sycl_xe2_subgroup_gemv sycl_xmx_joint_matrix
             s_gemv_pair_parity quantize_act_images_parity bf16_gemv_pair_parity
             kv_gather_wide_parity qsa_scores_rows_parity prefill_mmq_tab_parity
-            gdn_chunk_parity
+            gdn_chunk_parity trellis_parity
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
     COMMENT "Running Intel SYCL tests via ctest"
     USES_TERMINAL
@@ -2702,6 +2710,7 @@ if(STRATA_BUILD_PERF)
       perf_prefill_gemm
       perf_mmq_direct
       perf_gdn_chunk
+      perf_trellis
       perf_speculative_verify
     )
 
