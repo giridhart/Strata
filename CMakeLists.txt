@@ -609,7 +609,10 @@ endif()
   # QSAROWS (docs/QSAROWS.md): what the T rows of a verification window cost in a QSA layer's decode kernels at a long
   # context (block scores, top-k, attention over each row's selection, indexer append), row by row; GPU, synthetic, no
   # model.  Not in the default build: `cmake --build <dir> --target qsa_rows_bench`.
-  if(STRATA_ENABLE_CUDA)
+  if(STRATA_ENABLE_SYCL)
+    add_executable(qsa_rows_bench EXCLUDE_FROM_ALL src/kernels/sycl/qsa_rows_bench.cpp)
+    target_link_libraries(qsa_rows_bench PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+  elseif(STRATA_ENABLE_CUDA)
     add_executable(qsa_rows_bench EXCLUDE_FROM_ALL src/kernels/qsa_rows_bench.cpp)
     target_include_directories(qsa_rows_bench PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
     target_link_libraries(qsa_rows_bench PRIVATE strata_kernels CUDA::cudart)
