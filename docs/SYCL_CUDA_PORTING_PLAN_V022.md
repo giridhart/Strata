@@ -121,9 +121,31 @@ flowchart TD
   - Fusing them into a dual-matrix GEMV computes both projections in a single workgroup grid.
 - **Xe2 / Arc B580 Porting Strategy**:
   - Target file: `src/kernels/sycl/bf16_gemv.cpp`.
-  - Dispatch dual weight matrix pointers `w_a` and `w_b`.
-  - Subgroups stride along $K=2560$, loading $x[k]$ into registers and performing dual FMA accumulations against weights $A$ and $B$.
-  - **Expected Impact on B580**: 24.2 µs $\rightarrow$ 14.4 µs on narrow projections.
+  - Dispatch dual weight matrix pointers `w1` and `w2`.
+  - Native Xe2 SIMD16 subgroup execution (`[[sycl::reqd_sub_group_size(16)]]`).
+  - Subgroups stride along $K=2560$, loading $x[k]$ ONCE into registers and performing dual FMA accumulations against weights $w1$ and $w2$.
+  - Dual `sycl::reduce_over_group` reductions with optional Intel Xe2 L3 streaming cache hints.
+- **Status**: Completed (Pure SYCL 2020 SIMD16 port implemented, bitwise exact parity verified across all shapes, wired into GDN and QSA).
+- **Implementation**:
+  - `src/kernels/sycl/bf16_gemv.cpp`: native SIMD16 execution (`[[sycl::reqd_sub_group_size(SG_SIZE)]]`) implementing `bf16_gemv_pair_subgroup_kernel` and `bf16_gemv_pair`.
+  - `include/strata/kernels/bf16_gemv.hpp`: host-callable interface for `bf16_gemv_pair`.
+  - `src/core/sycl/layer.cpp` & `src/core/layer.cpp`: wired `project_bf16_pair` to fuse `ssm_alpha` + `ssm_beta` in GDN layers, and `indexer.k_proj` + `indexer.q_proj` in QSA layers.
+  - `tests/sycl/bf16_gemv_pair_parity.cpp`: dedicated verification test suite testing Shapes A, B, C, D, E, F, G, and H against double reference and standalone GEMVs (8/8 test suites pass, 100% bitwise identical on all $N_{out} \ge 64$ shapes, relative L1 error $< 1.1 \times 10^{-7}$ on narrow shapes, 0 failures).
+  - `perf/sycl/perf_bf16_gemv_pair.cpp`: microbenchmark comparing fused `bf16_gemv_pair` vs 2x standalone `bf16_gemv` calls at decode shapes.
+- **Measured Performance (Intel Xe2 Lunar Lake / Battlemage GPU)**:
+  - Shape GDN $[K=2560, N1=48, N2=48]$ (`ssm_alpha` + `ssm_beta`):
+    - Unfused (2x standalone GEMV): **194.27 µs**
+    - Fused   (`bf16_gemv_pair`):     **160.43 µs** (**1.21x speedup**, -17.4% latency reduction)
+    - Throughput: **3.06 GFLOPS, 3.10 GB/s**
+  - Shape QSA $[K=2560, N1=128, N2=512]$ (`indexer.k_proj` + `indexer.q_proj`):
+    - Unfused (2x standalone GEMV): **210.30 µs**
+    - Fused   (`bf16_gemv_pair`):     **171.11 µs** (**1.23x speedup**, -18.6% latency reduction)
+    - Throughput: **19.15 GFLOPS, 19.20 GB/s**
+  - Shape Asymmetric Decode $[K=2560, N1=64, N2=256]$:
+    - Unfused (2x standalone GEMV): **193.76 µs**
+    - Fused   (`bf16_gemv_pair`):     **137.55 µs** (**1.41x speedup**, -29.0% latency reduction)
+    - Throughput: **11.91 GFLOPS, 11.96 GB/s**
+  - Parity: 8/8 test suites **100% bitwise exact / tight FP32 roundoff** (0 failures).
 
 ---
 

@@ -65,6 +65,90 @@ void bf16_gemv_subgroup_kernel(sycl::nd_item<1> item, const uint16_t* __restrict
     if (lane == 0) y[o] = acc;
 }
 
+/// Dual-weight GEMV from one read of x (llama.cpp `*_mul_mat_multi` equivalent).
+/// One subgroup computes row `o` of both matrices simultaneously with dual accumulators over the SAME
+/// lane-strided pass, loading `x[i]` once into registers.
+/// On Xe2 (B580/Lunar Lake), this executes natively in SIMD16 with single-cycle hardware group reduction.
+template <int SUB_SIZE = SG_SIZE, bool STREAMING = false>
+void bf16_gemv_pair_subgroup_kernel(sycl::nd_item<1> item,
+                                    const uint16_t* __restrict__ x,
+                                    const uint16_t* __restrict__ w1, float* __restrict__ y1, long long n_out1,
+                                    const uint16_t* __restrict__ w2, float* __restrict__ y2, long long n_out2,
+                                    long long n_in) {
+    const auto sg = item.get_sub_group();
+    const int sgs_per_block = (int)(item.get_local_range(0) / SUB_SIZE);
+    const long long o = (long long)item.get_group(0) * sgs_per_block + (long long)(item.get_local_id(0) / SUB_SIZE);
+    const long long n_out = n_out1 > n_out2 ? n_out1 : n_out2;
+    if (o >= n_out) return;
+
+    const bool run1 = (w1 != nullptr && y1 != nullptr && o < n_out1);
+    const bool run2 = (w2 != nullptr && y2 != nullptr && o < n_out2);
+    if (!run1 && !run2) return;
+
+    const int lane = sg.get_local_linear_id();
+    const uint16_t* r1 = run1 ? (w1 + o * n_in) : nullptr;
+    const uint16_t* r2 = run2 ? (w2 + o * n_in) : nullptr;
+    float acc1 = 0.0f;
+    float acc2 = 0.0f;
+
+    if constexpr (STREAMING) {
+        auto stream_props = sycl::ext::oneapi::experimental::properties{
+            sycl::ext::intel::experimental::read_hint<
+                sycl::ext::intel::experimental::cache_control<
+                    sycl::ext::intel::experimental::cache_mode::streaming,
+                    sycl::ext::oneapi::experimental::cache_level::L3>>};
+
+        if (run1 && run2) {
+            sycl::ext::oneapi::experimental::annotated_ptr<
+                const uint16_t, decltype(stream_props)> r1_stream(r1, stream_props);
+            sycl::ext::oneapi::experimental::annotated_ptr<
+                const uint16_t, decltype(stream_props)> r2_stream(r2, stream_props);
+            for (long long i = lane; i < n_in; i += SUB_SIZE) {
+                const float xv = f32_from_bf16(x[i]);
+                acc1 += xv * f32_from_bf16(uint16_t(r1_stream[i]));
+                acc2 += xv * f32_from_bf16(uint16_t(r2_stream[i]));
+            }
+        } else if (run1) {
+            sycl::ext::oneapi::experimental::annotated_ptr<
+                const uint16_t, decltype(stream_props)> r1_stream(r1, stream_props);
+            for (long long i = lane; i < n_in; i += SUB_SIZE) {
+                acc1 += f32_from_bf16(x[i]) * f32_from_bf16(uint16_t(r1_stream[i]));
+            }
+        } else if (run2) {
+            sycl::ext::oneapi::experimental::annotated_ptr<
+                const uint16_t, decltype(stream_props)> r2_stream(r2, stream_props);
+            for (long long i = lane; i < n_in; i += SUB_SIZE) {
+                acc2 += f32_from_bf16(x[i]) * f32_from_bf16(uint16_t(r2_stream[i]));
+            }
+        }
+    } else {
+        if (run1 && run2) {
+            for (long long i = lane; i < n_in; i += SUB_SIZE) {
+                const float xv = f32_from_bf16(x[i]);
+                acc1 += xv * f32_from_bf16(r1[i]);
+                acc2 += xv * f32_from_bf16(r2[i]);
+            }
+        } else if (run1) {
+            for (long long i = lane; i < n_in; i += SUB_SIZE) {
+                acc1 += f32_from_bf16(x[i]) * f32_from_bf16(r1[i]);
+            }
+        } else if (run2) {
+            for (long long i = lane; i < n_in; i += SUB_SIZE) {
+                acc2 += f32_from_bf16(x[i]) * f32_from_bf16(r2[i]);
+            }
+        }
+    }
+
+    if (run1) {
+        acc1 = sycl::reduce_over_group(sg, acc1, sycl::plus<float>());
+        if (lane == 0) y1[o] = acc1;
+    }
+    if (run2) {
+        acc2 = sycl::reduce_over_group(sg, acc2, sycl::plus<float>());
+        if (lane == 0) y2[o] = acc2;
+    }
+}
+
 /// TPR lanes cooperate on ONE row's reduction: `threads_per_row` threads each take a strided slice and the
 /// block reduces through shared memory. On Xe2, we first reduce within each SIMD16 subgroup via
 /// single-cycle hardware reduction, then reduce the subgroup sums in local memory.
@@ -137,6 +221,27 @@ void bf16_gemv(const uint16_t* x, const uint16_t* w, float* y, int64_t n_in, int
     // For narrow shapes (n_out < 64, e.g. ssm_alpha [2560, 48]), dispatch the SLM split reduction
     // with 128 threads per row to fully saturate Xe2 Vector Engines (160 engines).
     bf16_gemv_split(x, w, y, n_in, n_out, 128, stream);
+}
+
+void bf16_gemv_pair(const uint16_t* x, const uint16_t* w1, float* y1, int64_t n_out1,
+                    const uint16_t* w2, float* y2, int64_t n_out2, int64_t n_in, void* stream) {
+    sycl::queue* q = stream ? static_cast<sycl::queue*>(stream) : &default_queue();
+    if (n_in <= 0 || (n_out1 <= 0 && n_out2 <= 0)) return;
+    const long long n_out = n_out1 > n_out2 ? n_out1 : n_out2;
+    const int sgs = THREADS / SG_SIZE;
+    const unsigned grid = (unsigned)((n_out + sgs - 1) / sgs);
+    const auto prof = strata::sycl_arch::get_xe2_tuning_profile(q->get_device());
+    if (prof.enable_streaming_hints) {
+        q->parallel_for(sycl::nd_range<1>(sycl::range<1>((grid) * (THREADS)), sycl::range<1>(THREADS)),
+                        [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
+                            bf16_gemv_pair_subgroup_kernel<SG_SIZE, true>(item, x, w1, y1, n_out1, w2, y2, n_out2, n_in);
+                        });
+    } else {
+        q->parallel_for(sycl::nd_range<1>(sycl::range<1>((grid) * (THREADS)), sycl::range<1>(THREADS)),
+                        [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
+                            bf16_gemv_pair_subgroup_kernel<SG_SIZE, false>(item, x, w1, y1, n_out1, w2, y2, n_out2, n_in);
+                        });
+    }
 }
 
 void bf16_gemv_split(const uint16_t* x, const uint16_t* w, float* y, int64_t n_in, int64_t n_out, int threads_per_row,

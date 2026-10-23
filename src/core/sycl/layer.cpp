@@ -159,6 +159,17 @@ void project_bf16(const float* x, const uint16_t* x_bf16, const uint16_t* weight
     else
         bf16_gemv(x_bf16, weights, out, n_in, n_out, stream);
 }
+
+void project_bf16_pair(const float* x, const uint16_t* x_bf16, const uint16_t* w1, float* o1, int64_t n_out1,
+                       const uint16_t* w2, float* o2, int64_t n_out2, int64_t n_in, [[maybe_unused]] bool split, void* stream) {
+    using namespace strata::kernels;
+    if (native_bf16_projections) {
+        bf16_gemv_fp32_mmvf(x, w1, o1, n_in, n_out1, stream);
+        bf16_gemv_fp32_mmvf(x, w2, o2, n_in, n_out2, stream);
+    } else {
+        bf16_gemv_pair(x_bf16, w1, o1, n_out1, w2, o2, n_out2, n_in, stream);
+    }
+}
 ///< threads per row for the row-split GEMVs.
 /// **MEASURED, NOT ASSUMED, AND 64 IS NOT BETTER.**  `dense_pass.exe` drives the same split kernels at
 /// threads_per_row 64 and reports 248.5 GB/s, so matching it looked like free performance.  It is not:
@@ -487,8 +498,8 @@ bool gdn_layer(const WeightTable& tables, const ModelGeometry& g, int64_t layer,
                      (int)g.n_embd, (int)g.ssm_v_heads, stream);
     } else {
         if (!native_bf16_projections) f32_to_bf16_bulk(mixed, b.x_bf16, g.n_embd, stream);
-        project_bf16(mixed, b.x_bf16, (const uint16_t*)w_alpha->data, b.alpha, g.n_embd, g.ssm_v_heads, true, stream);
-        project_bf16(mixed, b.x_bf16, (const uint16_t*)w_beta->data, b.beta, g.n_embd, g.ssm_v_heads, true, stream);
+        project_bf16_pair(mixed, b.x_bf16, (const uint16_t*)w_alpha->data, b.alpha, g.ssm_v_heads,
+                          (const uint16_t*)w_beta->data, b.beta, g.ssm_v_heads, g.n_embd, true, stream);
     }
     if (!fused_pre) try {
             if (native_gdn_enabled()) {
@@ -1379,8 +1390,10 @@ bool qsa_layer(const WeightTable& tables, const ModelGeometry& g, int64_t layer,
             q->memcpy(st.pos_dev, st.host_pos, (size_t)g.n_head * 4);
         }
     }
-    // ---- 3. the indexer's RAW key: appended before any norm, pooled later once per block
-    project_bf16(x, b.x_bf16, (const uint16_t*)w_idxk->data, b.idx_raw, g.n_embd, g.idx_key_dim, false, stream);
+    // ---- 3. the indexer's RAW key and QUERY in ONE paired launch (was two launches):
+    project_bf16_pair(x, b.x_bf16, (const uint16_t*)w_idxk->data, b.idx_raw, g.idx_key_dim,
+                      (const uint16_t*)w_idxq->data, b.q_idx, g.idx_q_heads * g.idx_key_dim, g.n_embd,
+                      false, stream);
     // ---- 4. K and V, in Q8_K, then norm and rotate K only
     SForm f_k, f_v, f_o, f_q;
     if (!sform_of(*w_attnk, f_k, v.name("attn_k.weight"), err)) return false;
@@ -1479,9 +1492,7 @@ bool qsa_layer(const WeightTable& tables, const ModelGeometry& g, int64_t layer,
         });
     }
     if (!normalize_rotate(b.qcur, w_qn, (int)g.n_head, (int)g.head_dim)) return false;
-    // ---- 7. the indexer's query: BF16, then norm and rotate
-    project_bf16(x, b.x_bf16, (const uint16_t*)w_idxq->data, b.q_idx, g.n_embd, g.idx_q_heads * g.idx_key_dim, false,
-                 stream);
+    // ---- 7. the indexer's query: projected at step 3 paired with raw key; norm and rotate it now
     if (!normalize_rotate(b.q_idx, w_iqn, (int)g.idx_q_heads, (int)g.idx_key_dim)) return false;
     // ---- 8. score, select, gather, attend.  `max_blocks` and `cap` are CAPACITIES from the state, not this
     // token's counts: a grid or a shared-memory size that follows the sequence length is baked into a captured
