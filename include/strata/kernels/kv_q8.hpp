@@ -43,4 +43,14 @@ void kv_gather_q8_step(const int8_t* k_q, const int8_t* v_q, const uint16_t* k_s
                        const int32_t* page_table, const int32_t* ids, const int32_t* step, int64_t max_ids,
                        const QsaShapes& s, uint16_t* k_scratch, uint16_t* v_scratch, void* stream);
 
+/// Explicit wide (8-byte loads / 16-byte stores) INT8 KV gather for Intel Xe2 and Pascal/Volta.
+void kv_gather_q8_wide_step(const int8_t* k_q, const int8_t* v_q, const uint16_t* k_scale, const uint16_t* v_scale,
+                            const int32_t* page_table, const int32_t* ids, const int32_t* step, int64_t max_ids,
+                            const QsaShapes& s, uint16_t* k_scratch, uint16_t* v_scratch, void* stream);
+
+/// Standard (4-byte loads / 8-byte stores) INT8 KV gather fallback.
+void kv_gather_q8_standard_step(const int8_t* k_q, const int8_t* v_q, const uint16_t* k_scale, const uint16_t* v_scale,
+                                const int32_t* page_table, const int32_t* ids, const int32_t* step, int64_t max_ids,
+                                const QsaShapes& s, uint16_t* k_scratch, uint16_t* v_scratch, void* stream);
+
 }  // namespace strata::kernels

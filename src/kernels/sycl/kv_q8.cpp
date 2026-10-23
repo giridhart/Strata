@@ -107,6 +107,45 @@ void kv_gather_q8_kernel(const int8_t* __restrict__ k_q, const int8_t* __restric
     reinterpret_cast<sycl::ushort4*>(v_scratch)[dst] = vo;
 }
 
+// One thread = 8 consecutive values of one cell and head: an 8-byte load of codes and a 16-byte
+// store of the dequantized fp16. The 8 values share one 64-value group, so one scale is loaded per thread and
+// the arithmetic stays `(float) code * scale -> f16_from_f32`, i.e. bitwise identical to the 4-wide kernel.
+// On Intel Xe2 (Lunar Lake and Battlemage B580), a SIMD16 subgroup executing 8-wide loads reads 16 * 8 = 128 bytes,
+// perfectly saturating a 128-byte hardware cache-line transaction on B580's GDDR6 memory bus.
+void kv_gather_q8_wide_kernel(const int8_t* __restrict__ k_q, const int8_t* __restrict__ v_q,
+                              const uint16_t* __restrict__ k_scale, const uint16_t* __restrict__ v_scale,
+                              const int32_t* __restrict__ table, const int32_t* __restrict__ ids,
+                              const int32_t* __restrict__ step, int kv_heads, int head_dim, int page_size,
+                              uint16_t* __restrict__ k_scratch, uint16_t* __restrict__ v_scratch,
+                              const sycl::nd_item<1>& item) {
+    const long long n_ids = (long long)*(step + kStepWidth);
+    const int per = head_dim / 8;
+    const long long total = n_ids * kv_heads * per;
+    const long long i = (long long)item.get_group(0) * item.get_local_range(0) + item.get_local_id(0);
+    if (i >= total) return;
+    const long long id = i / (kv_heads * (long long)per);
+    const int rem = (int)(i % (kv_heads * (long long)per));
+    const int h = rem / per, q8 = rem - h * per;
+    const int cell = ids[id];
+    const long long page = (long long)table[cell / page_size];
+    const long long row = (page * kv_heads + h) * page_size + (cell % page_size);
+    const int d = q8 * 8;
+    const int groups = head_dim / KV_Q8_GROUP;
+    const float ks = f32_from_f16(k_scale[row * groups + d / KV_Q8_GROUP]);
+    const float vs = f32_from_f16(v_scale[row * groups + d / KV_Q8_GROUP]);
+    const sycl::vec<int8_t, 8> kc = reinterpret_cast<const sycl::vec<int8_t, 8>*>(k_q + row * head_dim)[q8];
+    const sycl::vec<int8_t, 8> vc = reinterpret_cast<const sycl::vec<int8_t, 8>*>(v_q + row * head_dim)[q8];
+    sycl::vec<uint16_t, 8> ko, vo;
+    #pragma unroll
+    for (int k = 0; k < 8; ++k) {
+        ko[k] = f16_from_f32((float)kc[k] * ks);
+        vo[k] = f16_from_f32((float)vc[k] * vs);
+    }
+    const long long dst = (id * kv_heads + h) * (long long)per + q8;
+    reinterpret_cast<sycl::vec<uint16_t, 8>*>(k_scratch)[dst] = ko;
+    reinterpret_cast<sycl::vec<uint16_t, 8>*>(v_scratch)[dst] = vo;
+}
+
 }  // namespace
 
 void kv_append_q8_step(int8_t* k_q, int8_t* v_q, uint16_t* k_scale, uint16_t* v_scale, const int32_t* page_table,
@@ -154,10 +193,26 @@ void kv_append_q8_steps(int8_t* k_q, int8_t* v_q, uint16_t* k_scale, uint16_t* v
     if (!stream) default_queue.wait();
 }
 
-void kv_gather_q8_step(const int8_t* k_q, const int8_t* v_q, const uint16_t* k_scale, const uint16_t* v_scale,
-                       const int32_t* page_table, const int32_t* ids, const int32_t* step, int64_t max_ids,
-                       const QsaShapes& s, uint16_t* k_scratch, uint16_t* v_scratch, void* stream) {
-    validate(s, "kv_gather_q8");
+void kv_gather_q8_wide_step(const int8_t* k_q, const int8_t* v_q, const uint16_t* k_scale, const uint16_t* v_scale,
+                            const int32_t* page_table, const int32_t* ids, const int32_t* step, int64_t max_ids,
+                            const QsaShapes& s, uint16_t* k_scratch, uint16_t* v_scratch, void* stream) {
+    validate(s, "kv_gather_q8_wide");
+    if (max_ids <= 0) return;
+    const long long total = max_ids * s.n_head_kv * (s.head_dim / 8);
+    const unsigned blocks = (unsigned)((total + 255) / 256);
+    sycl::queue* q = stream ? static_cast<sycl::queue*>(stream) : &default_queue;
+    q->parallel_for(sycl::nd_range<1>(sycl::range<1>(blocks * 256), sycl::range<1>(256)),
+                    [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
+        kv_gather_q8_wide_kernel(k_q, v_q, k_scale, v_scale, page_table, ids, step, (int)s.n_head_kv, (int)s.head_dim,
+                                 (int)s.page_size, k_scratch, v_scratch, item);
+    });
+    if (!stream) default_queue.wait();
+}
+
+void kv_gather_q8_standard_step(const int8_t* k_q, const int8_t* v_q, const uint16_t* k_scale, const uint16_t* v_scale,
+                                const int32_t* page_table, const int32_t* ids, const int32_t* step, int64_t max_ids,
+                                const QsaShapes& s, uint16_t* k_scratch, uint16_t* v_scratch, void* stream) {
+    validate(s, "kv_gather_q8_standard");
     if (max_ids <= 0) return;
     const long long total = max_ids * s.n_head_kv * (s.head_dim / 4);
     const unsigned blocks = (unsigned)((total + 255) / 256);
@@ -167,6 +222,22 @@ void kv_gather_q8_step(const int8_t* k_q, const int8_t* v_q, const uint16_t* k_s
                             (int)s.page_size, k_scratch, v_scratch, item);
     });
     if (!stream) default_queue.wait();
+}
+
+void kv_gather_q8_step(const int8_t* k_q, const int8_t* v_q, const uint16_t* k_scale, const uint16_t* v_scale,
+                       const int32_t* page_table, const int32_t* ids, const int32_t* step, int64_t max_ids,
+                       const QsaShapes& s, uint16_t* k_scratch, uint16_t* v_scratch, void* stream) {
+    validate(s, "kv_gather_q8");
+    if (max_ids <= 0) return;
+
+    const char* env = std::getenv("STRATA_Q8_GATHER_WIDE");
+    const bool wide_enabled = (env == nullptr || env[0] != '0');
+
+    if (wide_enabled && (s.head_dim % 8 == 0)) {
+        kv_gather_q8_wide_step(k_q, v_q, k_scale, v_scale, page_table, ids, step, max_ids, s, k_scratch, v_scratch, stream);
+    } else {
+        kv_gather_q8_standard_step(k_q, v_q, k_scale, v_scale, page_table, ids, step, max_ids, s, k_scratch, v_scratch, stream);
+    }
 }
 
 }  // namespace strata::kernels

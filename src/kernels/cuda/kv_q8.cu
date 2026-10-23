@@ -131,10 +131,10 @@ void kv_append_q8_steps(int8_t* k_q, int8_t* v_q, uint16_t* k_scale, uint16_t* v
     check("kv_append_q8 (steps) launch");
 }
 
-void kv_gather_q8_step(const int8_t* k_q, const int8_t* v_q, const uint16_t* k_scale, const uint16_t* v_scale,
-                       const int32_t* page_table, const int32_t* ids, const int32_t* step, int64_t max_ids,
-                       const QsaShapes& s, uint16_t* k_scratch, uint16_t* v_scratch, void* stream) {
-    validate(s, "kv_gather_q8");
+void kv_gather_q8_standard_step(const int8_t* k_q, const int8_t* v_q, const uint16_t* k_scale, const uint16_t* v_scale,
+                                const int32_t* page_table, const int32_t* ids, const int32_t* step, int64_t max_ids,
+                                const QsaShapes& s, uint16_t* k_scratch, uint16_t* v_scratch, void* stream) {
+    validate(s, "kv_gather_q8_standard");
     if (max_ids <= 0) return;
     const long long total = max_ids * s.n_head_kv * (s.head_dim / 4);
     const unsigned blocks = (unsigned) ((total + 255) / 256);
@@ -142,6 +142,19 @@ void kv_gather_q8_step(const int8_t* k_q, const int8_t* v_q, const uint16_t* k_s
         k_q, v_q, k_scale, v_scale, page_table, ids, step, (int) s.n_head_kv, (int) s.head_dim, (int) s.page_size,
         k_scratch, v_scratch);
     check("kv_gather_q8 launch");
+}
+
+void kv_gather_q8_wide_step(const int8_t* k_q, const int8_t* v_q, const uint16_t* k_scale, const uint16_t* v_scale,
+                            const int32_t* page_table, const int32_t* ids, const int32_t* step, int64_t max_ids,
+                            const QsaShapes& s, uint16_t* k_scratch, uint16_t* v_scratch, void* stream) {
+    // Fallback to standard if wide is not compiled in CUDA baseline
+    kv_gather_q8_standard_step(k_q, v_q, k_scale, v_scale, page_table, ids, step, max_ids, s, k_scratch, v_scratch, stream);
+}
+
+void kv_gather_q8_step(const int8_t* k_q, const int8_t* v_q, const uint16_t* k_scale, const uint16_t* v_scale,
+                       const int32_t* page_table, const int32_t* ids, const int32_t* step, int64_t max_ids,
+                       const QsaShapes& s, uint16_t* k_scratch, uint16_t* v_scratch, void* stream) {
+    kv_gather_q8_standard_step(k_q, v_q, k_scale, v_scale, page_table, ids, step, max_ids, s, k_scratch, v_scratch, stream);
 }
 
 }  // namespace strata::kernels

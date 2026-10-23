@@ -1623,6 +1623,13 @@ endif()
     add_test(NAME bf16_gemv_pair_parity COMMAND bf16_gemv_pair_parity)
   endif()
 
+  if(STRATA_ENABLE_SYCL AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/sycl/kv_gather_wide_parity.cpp")
+    add_executable(kv_gather_wide_parity tests/sycl/kv_gather_wide_parity.cpp)
+    target_include_directories(kv_gather_wide_parity PRIVATE ${_strata_gpu_include_directories})
+    target_link_libraries(kv_gather_wide_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+    add_test(NAME kv_gather_wide_parity COMMAND kv_gather_wide_parity)
+  endif()
+
 
 
 
@@ -2558,6 +2565,7 @@ if(STRATA_ENABLE_SYCL)
             sycl_dequant_bf16 sycl_verify_kernels sycl_graph strata-device
             sycl_native_gr_norm sycl_xe2_subgroup_gemv sycl_xmx_joint_matrix
             s_gemv_pair_parity quantize_act_images_parity bf16_gemv_pair_parity
+            kv_gather_wide_parity
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
     COMMENT "Running Intel SYCL tests via ctest"
     USES_TERMINAL
@@ -2647,6 +2655,13 @@ if(STRATA_BUILD_PERF)
       target_include_directories(perf_bf16_gemv_pair PRIVATE ${_strata_gpu_include_directories})
       target_link_libraries(perf_bf16_gemv_pair PRIVATE strata_core strata_kernels benchmark::benchmark)
       list(APPEND _strata_perf_targets perf_bf16_gemv_pair)
+    endif()
+
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/perf/sycl/perf_kv_gather_wide.cpp")
+      add_executable(perf_kv_gather_wide perf/sycl/perf_kv_gather_wide.cpp)
+      target_include_directories(perf_kv_gather_wide PRIVATE ${_strata_gpu_include_directories})
+      target_link_libraries(perf_kv_gather_wide PRIVATE strata_core strata_kernels benchmark::benchmark)
+      list(APPEND _strata_perf_targets perf_kv_gather_wide)
     endif()
 
     # Tier 2 Performance Benchmarks for Intel Xe2 / Arc B580
