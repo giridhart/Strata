@@ -1582,8 +1582,12 @@ endif()
   # the V100 fusion work: every fused kernel against its unfused pipeline, bitwise, and the before/after
   # CUDA-event timings at decode shapes (`--bench`).  It is a .cu because it carries the unfused reference
   # kernels it compares against.
-  if(STRATA_BUILD_TESTS AND STRATA_ENABLE_CUDA)
-    add_executable(fusions_parity bench/micro/fusions_parity.cu)
+  if(STRATA_BUILD_TESTS AND (STRATA_ENABLE_CUDA OR STRATA_ENABLE_SYCL))
+    if(STRATA_ENABLE_SYCL)
+      add_executable(fusions_parity bench/micro/sycl/fusions_parity.cpp)
+    else()
+      add_executable(fusions_parity bench/micro/fusions_parity.cu)
+    endif()
     target_include_directories(fusions_parity PRIVATE ${_strata_gpu_include_directories})
     target_link_libraries(fusions_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
     add_test(NAME fusions_parity COMMAND fusions_parity)
