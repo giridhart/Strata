@@ -388,6 +388,11 @@ if(STRATA_SYCL_PARITY)
     target_link_libraries(qsa_scores_rows_parity PRIVATE strata_kernels)
     add_test(NAME qsa_scores_rows_parity COMMAND qsa_scores_rows_parity)
   endif()
+  if(EXISTS "${STRATA_ROOT}/tests/sycl/prefill_mmq_tab_parity.cpp")
+    add_executable(prefill_mmq_tab_parity ${STRATA_ROOT}/tests/sycl/prefill_mmq_tab_parity.cpp)
+    target_link_libraries(prefill_mmq_tab_parity PRIVATE strata_prefill strata_kernels)
+    add_test(NAME prefill_mmq_tab_parity COMMAND prefill_mmq_tab_parity)
+  endif()
   # one native expert three ways on real GGUF rows (ggml reference, CPU path, GPU native_expert_grouped):
   #   native_expert_parity <shard1.gguf> [layer ...]
   if(STRATA_NATIVE_EXPERTS)

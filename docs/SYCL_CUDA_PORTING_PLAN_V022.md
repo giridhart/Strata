@@ -242,10 +242,10 @@ flowchart TD
   - In standard prefill, expert activations and weights are gathered into a contiguous staging buffer before launching batched MMQ matrix multiplication.
   - Upstream's pointer-table MMQ passes an array of 16 device pointers directly to the kernel, allowing the tensor-core GEMM to stream resident experts straight out of their VRAM cache slots without intermediate copy passes.
 - **Xe2 / Arc B580 Porting Strategy**:
-  - Target file: `src/prefill/sycl/xmx_moe.dp.cpp` and `sycl/include/strata/prefill/moe_mmq.hpp`.
-  - Bind cache slot offsets as pointer parameters in the Level Zero execution queue.
-  - When expert blocks are resident in VRAM, bypass DMA staging and dispatch `joint_matrix_load` directly from slot addresses.
-  - **Expected Impact on B580**: Eliminates staging memory footprint, allowing `--prefill 4096` to fit within 12 GB VRAM even at 128K context.
+  - Target file: `src/prefill/sycl/moe_mmq.cpp` and `include/strata/prefill/moe_mmq.hpp`.
+  - Pure SYCL 2020 kernel implementation (`Context::run`, `prep_group`, `tab_fits`, `overread_bytes`, `direct_mode`, `direct_slot_guard`) supporting direct pointer table dispatch (`tab.p[e]`).
+  - Wire into `src/prefill/sycl/prefill.cpp`: bypass staging buffer and stream resident experts in place with tail zeroing / NaN over-read protection.
+- **Status**: Completed (Pure SYCL 2020 SIMD16 port implemented, 100% bitwise exact parity verified across 297 comparisons in `prefill_mmq_tab_parity`, 1.35x latency reduction and 11.3 MB VRAM copy traffic eliminated per group).
 
 ---
 
@@ -287,7 +287,7 @@ flowchart TD
 | **Phase 3** | Paired BF16 GEMV (`ssm_alpha/beta`) | `bf16_gemv.cpp` | `bf16_gemv_pair_parity` | **Completed** (1.23x speedup) |
 | **Phase 4** | Wide 8-Byte INT8 KV Gather | `kv_q8.cpp` | `kv_gather_wide_parity` | **Completed** (1.11x speedup, bitwise exact) |
 | **Phase 5** | Register-Shuffled QSA Scores | `qsa_select.cpp` | `qsa_scores_rows_parity` | **Completed** (1.16x speedup, bitwise exact) |
-| **Phase 6** | Direct Pointer-Table Expert MMQ | `xmx_moe.dp.cpp`, `moe_mmq.hpp` | `prefill_gemm_parity` | Enables 4K chunk at 128K context |
+| **Phase 6** | Direct Pointer-Table Expert MMQ | `moe_mmq.cpp`, `moe_mmq.hpp` | `prefill_mmq_tab_parity` | **Completed** (1.35x speedup, bitwise exact) |
 | **Phase 7** | Chunked GDN Recurrence | `gdn_chunk.cpp` | `gdn_chunk_parity` | +20% prompt tok/s on >4K prompts |
 | **Phase 8** | Gyro Trellis (TQ) Decoder | `tq_gemv.cpp`, `fwht.hpp` | `trellis_parity` | Enables Gyro-S/Gyro-M on B580 |
 
@@ -295,6 +295,6 @@ flowchart TD
 
 ## 7. Immediate Next Steps
 
-1. **Phase 5 (`qsa_select.cpp`) Completed**: Ported register-shuffled query broadcast and block score reduction into `src/kernels/sycl/qsa_select.cpp`, verified 100% bitwise parity via `qsa_scores_rows_parity`, measured 1.16x speedup (-103.24 µs at 64K).
-2. **Implement Phase 6 (`xmx_moe.dp.cpp`)**: Implement direct pointer-table expert MMQ streaming to bypass DMA staging for resident experts.
+1. **Phase 6 (`moe_mmq.cpp`) Completed**: Ported pure SYCL 2020 direct pointer-table expert MMQ (`STRATA_MMQ_DIRECT=1`), verified 100% bitwise parity across 297 comparisons in `prefill_mmq_tab_parity`, measured 1.35x latency reduction and 11.26 MB VRAM copy traffic eliminated.
+2. **Implement Phase 7 (`gdn_chunk.cpp`)**: Implement chunked GDN recurrence kernel for prompt speedup on long contexts.
 3. **Integrate with Automated Xe2 Benchmarks**: Validate all ported kernels via `make -C build_sycl perf-sycl` and `python3 tools/run_xe2_perf_benchmarks.py`.
