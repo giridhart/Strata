@@ -29,7 +29,20 @@ struct Runs {
 Runs runs_of(const QsaAttnPools& slots, const KvHostPools& host, int fmt, const QsaShapes& s) {
     const int rows = (int)(s.n_head_kv * s.page_size);
     Runs r{};
-    if (fmt == kKvQ4) {
+    if (fmt == kKvHybrid) {  // K8V4: int8 K codes, their scales, rotated q4_0 V
+        const int codes = rows * (int)s.head_dim, scales = rows * (int)(s.head_dim / KV_Q8_GROUP) * 2;
+        const int v = rows * (int)kv_q4_bytes_per_head((int)s.head_dim);
+        r.src[0] = (const uint8_t*)host.k_q;
+        r.dst[0] = (uint8_t*)slots.k_q;
+        r.len[0] = codes;
+        r.src[1] = (const uint8_t*)host.k_scale;
+        r.dst[1] = (uint8_t*)slots.k_scale;
+        r.len[1] = scales;
+        r.src[2] = (const uint8_t*)host.v_q4;
+        r.dst[2] = (uint8_t*)slots.v_q4;
+        r.len[2] = v;
+        r.n = 3;
+    } else if (fmt == kKvQ4) {
         const int bytes = rows * (int)kv_q4_bytes_per_head((int)s.head_dim);
         r.src[0] = (const uint8_t*)host.k_q4;
         r.dst[0] = (uint8_t*)slots.k_q4;
