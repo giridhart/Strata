@@ -59,7 +59,23 @@ flowchart TD
     float silu_g = g / (1.0f + sycl::native::exp(-g));
     if (sg.leader()) { out[row] = silu_g * u; }
     ```
-  - **Expected Impact on B580**: Cuts decode GEMV latency from ~30.4 µs to ~14.8 µs per pair (saves 1 global write and 1 global read per token per MoE layer).
+- **Status**: Completed (Pure SYCL 2020 SIMD16 port implemented, bitwise parity verified across all shapes/formats, wired into shared_expert).
+- **Implementation**:
+  - `src/kernels/sycl/s_gemv_pair.cpp`: native SIMD16 subgroup-per-output execution (`[[sycl::reqd_sub_group_size(SG_SIZE)]]`), supporting `SideS2`, `SideQ8K`, and `SideQ80`.
+  - `include/strata/kernels/s_gemv.hpp` & `include/strata/kernels/s_gemv_pair.hpp`: host-callable interface `s_gemv_pair_silu`.
+  - `src/kernels/sycl/shared_expert.cpp`: wired to bypass separate gate/up GEMVs and SwiGLU elementwise passes when both projections are S-family.
+  - `tests/sycl/s_gemv_pair_parity.cpp`: bitwise parity verification suite across S4/Q8_0, S4/Q8_K, S8/Q8_K, S2/Q8_0, and mixed formats at $N=640$ and $N=10240$ (0 failures).
+  - `perf/sycl/perf_s_gemv_pair.cpp`: microbenchmark comparing fused vs unfused pipelines at decode shapes.
+- **Measured Performance (Intel Xe2 Lunar Lake / Battlemage GPU)**:
+  - Shape $[K=2560, N=640]$:
+    - Unfused (GEMV+GEMV+SwiGLU): **526.02 µs**
+    - Fused (`s_gemv_pair_silu`): **430.77 µs** (**1.22x speedup**, -18.1% latency reduction)
+    - Throughput: **15.22 GFLOPS, 4.29 GB/s**
+  - Shape $[K=2560, N=6144]$:
+    - Unfused (GEMV+GEMV+SwiGLU): **2336.96 µs**
+    - Fused (`s_gemv_pair_silu`): **2254.38 µs** (**1.04x speedup**, -3.5% latency reduction)
+    - Throughput: **27.92 GFLOPS, 7.86 GB/s**
+  - Parity: 12/12 test suites **100% bitwise identical** (0 failures).
 
 ---
 

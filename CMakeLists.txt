@@ -399,6 +399,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP OR STRATA_ENABLE_SYCL)
   if(STRATA_ENABLE_SYCL)
   add_library(strata_kernels STATIC src/kernels/sycl/dequant_s2.cpp src/kernels/sycl/s2_gemv.cpp
                           src/kernels/sycl/s_gemv.cpp
+                          src/kernels/sycl/s_gemv_pair.cpp
                           src/kernels/sycl/s2_gemv_quads.cpp
                           src/kernels/sycl/s2_gemv_fast.cpp
                           src/kernels/sycl/router_top10.cpp
@@ -1601,6 +1602,13 @@ endif()
     add_test(NAME sycl_xmx_joint_matrix COMMAND sycl_xmx_joint_matrix)
   endif()
 
+  if(STRATA_ENABLE_SYCL AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/sycl/s_gemv_pair_parity.cpp")
+    add_executable(s_gemv_pair_parity tests/sycl/s_gemv_pair_parity.cpp)
+    target_include_directories(s_gemv_pair_parity PRIVATE ${_strata_gpu_include_directories})
+    target_link_libraries(s_gemv_pair_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+    add_test(NAME s_gemv_pair_parity COMMAND s_gemv_pair_parity --selftest)
+  endif()
+
 
 
 
@@ -2535,6 +2543,7 @@ if(STRATA_ENABLE_SYCL)
             sycl_native_flash_attn sycl_native_mmvq sycl_fused_gdn
             sycl_dequant_bf16 sycl_verify_kernels sycl_graph strata-device
             sycl_native_gr_norm sycl_xe2_subgroup_gemv sycl_xmx_joint_matrix
+            s_gemv_pair_parity
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
     COMMENT "Running Intel SYCL tests via ctest"
     USES_TERMINAL
@@ -2602,6 +2611,13 @@ if(STRATA_BUILD_PERF)
       target_include_directories(perf_dequant_dpas PRIVATE ${_strata_gpu_include_directories})
       target_link_libraries(perf_dequant_dpas PRIVATE strata_core strata_kernels benchmark::benchmark)
       list(APPEND _strata_perf_targets perf_dequant_dpas)
+    endif()
+
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/perf/sycl/perf_s_gemv_pair.cpp")
+      add_executable(perf_s_gemv_pair perf/sycl/perf_s_gemv_pair.cpp)
+      target_include_directories(perf_s_gemv_pair PRIVATE ${_strata_gpu_include_directories})
+      target_link_libraries(perf_s_gemv_pair PRIVATE strata_core strata_kernels benchmark::benchmark)
+      list(APPEND _strata_perf_targets perf_s_gemv_pair)
     endif()
 
     # Tier 2 Performance Benchmarks for Intel Xe2 / Arc B580

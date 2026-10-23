@@ -296,17 +296,50 @@ void shared_expert(const uint8_t* x_q8_0, const uint8_t* x_q8k, const uint16_t* 
     const unsigned g_ff = (unsigned)((n_ff + THREADS - 1) / THREADS);
     const unsigned g_embd = (unsigned)((n_embd + THREADS - 1) / THREADS);
 
-    // gate and up projections, then silu(gate) * up in place in `gate`
+    // gate and up projections, then silu(gate) * up in place in `gate`.
+    // When both projections are S-family, we fuse both GEMVs and the SwiGLU into `s_gemv_pair_silu`:
+    // one read of the activation vector x, dual accumulations in registers, and SwiGLU in the epilogue.
+    bool paired = false;
     if (native_gate || native_up) native_quantize_q8_1(x_f32, native->q8_1, (int)n_embd, 1, stream);
-    if (native_gate)
-        native_mmvq(native->gate_type, native->gate_data, native->q8_1, gate, (int)n_embd, (int)n_ff, 1, stream);
-    else
-        gemv(gate_form, gate_codes, gate_scales, gate_off, x_q8_0, x_q8k, gate, n_embd, n_ff);
-    if (native_up)
-        native_mmvq(native->up_type, native->up_data, native->q8_1, up, (int)n_embd, (int)n_ff, 1, stream);
-    else
-        gemv(up_form, up_codes, up_scales, up_off, x_q8_0, x_q8k, up, n_embd, n_ff);
-    if (native_projection && native_down && fused_swiglu_q81_enabled()) {
+    if (!native_gate && !native_up) {
+        paired = s_gemv_pair_silu(x_q8_0, x_q8k, gate_form, gate_codes, gate_scales, gate_off,
+                                  up_form, up_codes, up_scales, up_off, gate, n_embd, n_ff, tpr,
+                                  native_projection ? 2 : 0, stream);
+    }
+    if (!paired) {
+        if (native_gate)
+            native_mmvq(native->gate_type, native->gate_data, native->q8_1, gate, (int)n_embd, (int)n_ff, 1, stream);
+        else
+            gemv(gate_form, gate_codes, gate_scales, gate_off, x_q8_0, x_q8k, gate, n_embd, n_ff);
+        if (native_up)
+            native_mmvq(native->up_type, native->up_data, native->q8_1, up, (int)n_embd, (int)n_ff, 1, stream);
+        else
+            gemv(up_form, up_codes, up_scales, up_off, x_q8_0, x_q8k, up, n_embd, n_ff);
+    }
+
+    if (paired) {
+        // `gate` already holds the SwiGLU products silu(gate)*up from the fused pair kernel.
+        if (native_down) {
+            native_quantize_q8_1(gate, native->q8_1, (int)n_ff, 1, stream);
+            native_mmvq(native->down_type, native->down_data, native->q8_1, out, (int)n_ff, (int)n_embd, 1, stream);
+        } else if (down_form.act_kind == 1) {
+            if (n_ff % 256 != 0) {
+                std::fprintf(stderr,
+                             "shared_expert: the down weight wants Q8_K but n_ff %lld is not a multiple "
+                             "of 256; Q8_K is structurally impossible here\n",
+                             (long long)n_ff);
+                std::exit(1);
+            }
+            quantize_q8_K(gate, h_q8k, n_ff, stream);
+            gemv(down_form, down_codes, down_scales, down_off, h_q8_0, h_q8k, out, n_ff, n_embd);
+        } else if (down_form.code_bits == 2) {
+            quantize_q8_0(gate, h_q8_0, n_ff, stream);
+            gemv(down_form, down_codes, down_scales, down_off, h_q8_0, h_q8k, out, n_ff, n_embd);
+        } else {
+            quantize_q8_0(gate, h_q8_0, n_ff, stream);
+            gemv(down_form, down_codes, down_scales, down_off, h_q8_0, h_q8k, out, n_ff, n_embd);
+        }
+    } else if (native_projection && native_down && fused_swiglu_q81_enabled()) {
         native_swiglu_quantize_q8_1(gate, up, native->q8_1, (int)n_ff, 1, stream);
         native_mmvq(native->down_type, native->down_data, native->q8_1, out, (int)n_ff, (int)n_embd, 1, stream);
     } else {
