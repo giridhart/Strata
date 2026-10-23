@@ -195,8 +195,11 @@ void block_scores_rows_kernel(const float* __restrict__ pooled, const float* __r
             for (int i = 0; i < 2; ++i)
                 r2[i] = (hi16 ? d[i + 2] : d[i]) + sycl::permute_group_by_xor(sg, hi16 ? d[i] : d[i + 2], 16);
             float r = (hi8 ? r2[1] : r2[0]) + sycl::permute_group_by_xor(sg, hi8 ? r2[0] : r2[1], 8);
+            asm volatile("" : "+r"(r));
             r += sycl::permute_group_by_xor(sg, r, 4);
+            asm volatile("" : "+r"(r));
             r += sycl::permute_group_by_xor(sg, r, 2);
+            asm volatile("" : "+r"(r));
             r += sycl::permute_group_by_xor(sg, r, 1);
             const float s1 = sycl::select_from_group(sg, r, 8);
             const float s2 = sycl::select_from_group(sg, r, 16);
@@ -695,20 +698,13 @@ void qsa_block_scores(const float* pooled, const float* dead, const float* q_idx
     static sycl::queue default_queue{sycl::property::queue::in_order()};
     sycl::queue* q_ptr = stream ? static_cast<sycl::queue*>(stream) : &default_queue;
 
-    static const bool multi = [] {
-        const char* v = std::getenv("STRATA_SCORES_MULTI");
-        return v == nullptr || std::atoi(v) != 0;
-    }();
-    static const bool early = [] {
-        const char* v = std::getenv("STRATA_QSA_EARLY_EXIT");
-        return v == nullptr || std::atoi(v) != 0;
-    }();
-    const bool early_exit = early;
+    const char* multi_v = std::getenv("STRATA_SCORES_MULTI");
+    const bool multi = (multi_v == nullptr || std::atoi(multi_v) != 0);
+    const char* early_v = std::getenv("STRATA_QSA_EARLY_EXIT");
+    const bool early_exit = (early_v == nullptr || std::atoi(early_v) != 0);
     if (multi && nq <= MQ && active_blocks <= 0) {
-        static const bool rows_env = [] {
-            const char* v = std::getenv("STRATA_QSA_ROWS");
-            return v != nullptr && v[0] == '1' && v[1] == '\0';
-        }();
+        const char* rows_env_v = std::getenv("STRATA_QSA_ROWS");
+        const bool rows_env = (rows_env_v != nullptr && rows_env_v[0] == '1' && rows_env_v[1] == '\0');
         if (rows_env && qsa_block_scores_rows(pooled, dead, q_idx, steps, nq, max_blocks, s, scores, stream)) return;
         q_ptr->submit([&](sycl::handler& cgh) {
             sycl::local_accessor<float, 1> qs_acc(sycl::range<1>(MQ * IDX_HEADS * IDX_DIM), cgh);
