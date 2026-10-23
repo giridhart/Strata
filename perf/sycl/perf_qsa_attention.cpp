@@ -547,13 +547,27 @@ BENCHMARK(BM_Xe2_QSA_LaneCell_Scoring)->UseManualTime()->Args({4096});
 BENCHMARK(BM_Xe2_QSA_LaneCell_Scoring)->UseManualTime()->Args({16384});
 BENCHMARK(BM_Xe2_QSA_LaneCell_Scoring)->UseManualTime()->Args({65536});
 
-// 4. STRATA_QSA_ROWS multi-row block scores (T in {1, 2, 4})
+// 4. STRATA_QSA_ROWS multi-row block scores (T in {1, 2, 4}, n_cells in {4096, 16384, 65536}, Rows_Opt in {0, 1})
 BENCHMARK(BM_Xe2_QSA_Score_Rows)->UseManualTime()->Args({1, 4096, 0});
 BENCHMARK(BM_Xe2_QSA_Score_Rows)->UseManualTime()->Args({1, 4096, 1});
 BENCHMARK(BM_Xe2_QSA_Score_Rows)->UseManualTime()->Args({2, 4096, 0});
 BENCHMARK(BM_Xe2_QSA_Score_Rows)->UseManualTime()->Args({2, 4096, 1});
 BENCHMARK(BM_Xe2_QSA_Score_Rows)->UseManualTime()->Args({4, 4096, 0});
 BENCHMARK(BM_Xe2_QSA_Score_Rows)->UseManualTime()->Args({4, 4096, 1});
+
+BENCHMARK(BM_Xe2_QSA_Score_Rows)->UseManualTime()->Args({1, 16384, 0});
+BENCHMARK(BM_Xe2_QSA_Score_Rows)->UseManualTime()->Args({1, 16384, 1});
+BENCHMARK(BM_Xe2_QSA_Score_Rows)->UseManualTime()->Args({2, 16384, 0});
+BENCHMARK(BM_Xe2_QSA_Score_Rows)->UseManualTime()->Args({2, 16384, 1});
+BENCHMARK(BM_Xe2_QSA_Score_Rows)->UseManualTime()->Args({4, 16384, 0});
+BENCHMARK(BM_Xe2_QSA_Score_Rows)->UseManualTime()->Args({4, 16384, 1});
+
+BENCHMARK(BM_Xe2_QSA_Score_Rows)->UseManualTime()->Args({1, 65536, 0});
+BENCHMARK(BM_Xe2_QSA_Score_Rows)->UseManualTime()->Args({1, 65536, 1});
+BENCHMARK(BM_Xe2_QSA_Score_Rows)->UseManualTime()->Args({2, 65536, 0});
+BENCHMARK(BM_Xe2_QSA_Score_Rows)->UseManualTime()->Args({2, 65536, 1});
+BENCHMARK(BM_Xe2_QSA_Score_Rows)->UseManualTime()->Args({4, 65536, 0});
+BENCHMARK(BM_Xe2_QSA_Score_Rows)->UseManualTime()->Args({4, 65536, 1});
 
 // 5. Decode attention batch rows (T in {1, 2, 4, 8})
 BENCHMARK(BM_Xe2_QSA_DecodeAttention_BatchRows)->UseManualTime()->Args({1});

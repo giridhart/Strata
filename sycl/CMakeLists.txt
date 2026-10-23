@@ -383,6 +383,11 @@ if(STRATA_SYCL_PARITY)
   target_link_libraries(xmx_gemm_bench PRIVATE strata_kernels strata_prefill)   # -qmkl for the oneMKL reference
   add_executable(xmx_group_parity ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/xmx_group_parity.cpp)   # A770: fused grouped XMX
   target_link_libraries(xmx_group_parity PRIVATE strata_kernels strata_prefill)
+  if(EXISTS "${STRATA_ROOT}/tests/sycl/qsa_scores_rows_parity.cpp")
+    add_executable(qsa_scores_rows_parity ${STRATA_ROOT}/tests/sycl/qsa_scores_rows_parity.cpp)
+    target_link_libraries(qsa_scores_rows_parity PRIVATE strata_kernels)
+    add_test(NAME qsa_scores_rows_parity COMMAND qsa_scores_rows_parity)
+  endif()
   # one native expert three ways on real GGUF rows (ggml reference, CPU path, GPU native_expert_grouped):
   #   native_expert_parity <shard1.gguf> [layer ...]
   if(STRATA_NATIVE_EXPERTS)
