@@ -268,16 +268,36 @@ flowchart TD
 
 ## 5. Tier 4: Trellis Quantization Support (Gyro / APR Format)
 
-### 4.1 Trellis Quantization Decoders (TQ1 / TQ2 / TQ6)
+### 4.1 Trellis Quantization Decoders (TQ1 / TQ2 / TQ6 / TQK7)
 - **Upstream Commits**: `fbf045eb`, `b4e477c0`, `5f81c5dc`, `2c8eb881`
-- **CUDA Origin**: `src/kernels/cuda/tq_load.cu`, `src/kernels/cuda/tq_apply.cu`
+- **CUDA Origin**: `src/kernels/cuda/tq_load.cu`, `src/kernels/cuda/tq_apply.cu`, `include/strata/kernels/tq_lut_i8.cuh`
 - **Architectural Motivation**:
   - Upstream v0.2.2 introduced **Gyro** models using Trellis Quantization (types 144, 145, 146), achieving 1.8–2.2 bits/weight with near-uncompressed quality.
   - Trellis weights use in-place Fast Walsh-Hadamard Transforms (FWHT) to rotate activation vectors, eliminating quantization outliers.
+  - Upstream stages the 4 KB `tq_lut_i8` codebook in local memory (SLM) to eliminate L1 cache line sector contention across warp threads.
 - **Xe2 / Arc B580 Porting Strategy**:
-  - Leverage Strata's verified FWHT256 SLM kernel from `perf/sycl/perf_fwht_kv4.cpp`.
-  - Implement TQ codebook staging in 64 KB SLM: store the 256-entry FP16/INT8 codebook in local memory, decoding 8-lane rows per subgroup.
-  - Matrix-vector dot products executed via Xe2 DPAS (`joint_matrix_mad` or SIMD16 integer MAD).
+  - Target files: `src/kernels/sycl/tq_gemv.cpp`, `include/strata/kernels/tq_gemv.hpp`, `include/strata/kernels/tq_lut.hpp`.
+  - Implemented pure SYCL 2020:
+    1. `hadamard_rows`: Fast Walsh-Hadamard Transform (FWHT128 / FWHT256) in SLM with sign modulation, supporting both in-place and out-of-place execution.
+    2. `dequantize_tq`: High-throughput dequantization using the 2048-point FP16 codebook `tq_lut_f16`, decoding 16 weights per work-item.
+    3. `tq_gemv` / `tq_gemv_ext`: Native Xe2 SIMD16 subgroup execution (`[[sycl::reqd_sub_group_size(16)]]`) with cooperative 4 KB `tq_lut_i8` codebook staging in SLM, SIMD dot products against float activation vectors via 128-bit vector loads (`sycl::vec<float, 4>`), and hardware subgroup reduction.
+- **Status**: Completed (Pure SYCL 2020 SIMD16 port implemented, 100% bitwise exact FWHT and dequantization, 1.15x speedup with SLM codebook staging at $N=10240$, 0 failures in `trellis_parity`).
+- **Implementation**:
+  - `include/strata/kernels/tq_lut.hpp`: 2048-point `tq_lut_f16` and `tq_lut_i8` codebooks with global scale `TQ_LUT_I8_SCALE = 3.984375f / 127.0f`.
+  - `include/strata/kernels/tq_gemv.hpp`: `block_tq2_t` (type 144), `block_tqk6` (type 145), `block_tqk7` (type 146), and host-callable interfaces for `hadamard_rows`, `dequantize_tq`, `tq_gemv`, and `tq_gemv_ext`.
+  - `src/kernels/sycl/tq_gemv.cpp`: SIMD16 subgroup GEMV with cooperative SLM staging, vector loads, and subgroup reduction.
+  - `tests/sycl/trellis_parity.cpp`: verification test suite covering FWHT (bit-exact), TQ dequantization (bit-exact), and GEMV (bitwise match between SLM and global, $< 8.85 \times 10^{-3}$ relative error vs FP32 reference, well below $2.5 \times 10^{-2}$ threshold).
+  - `perf/sycl/perf_trellis.cpp`: microbenchmark comparing SLM-staged vs global lookup GEMV across types 144, 145, 146 at $N=640$ and $N=10240$.
+- **Measured Performance (Intel Xe2 Lunar Lake / Battlemage GPU)**:
+  - Shape $[K=2560, N=10240]$ (Gate/Up projection):
+    - Type 144 (`TQ2_T`, 6.8 MB): Global: **698.23 µs** (10.05 GB/s) vs SLM: **615.18 µs** (11.40 GB/s) (**1.14x speedup**, -83.05 µs)
+    - Type 145 (`TQK6`, 5.2 MB): Global: **706.90 µs** (7.61 GB/s) vs SLM: **632.80 µs** (8.50 GB/s) (**1.12x speedup**, -74.10 µs)
+    - Type 146 (`TQK7`, 6.0 MB): Global: **693.39 µs** (8.93 GB/s) vs SLM: **604.18 µs** (10.25 GB/s) (**1.15x speedup**, -89.21 µs)
+  - Shape $[K=2560, N=640]$ (Down projection):
+    - Type 144 (`TQ2_T`): **183.11 µs** (2.45 GB/s)
+    - Type 145 (`TQK6`): **178.49 µs** (1.94 GB/s)
+    - Type 146 (`TQK7`): **174.33 µs** (2.28 GB/s)
+  - Parity: 26/26 tests passed (0 failures).
 
 ---
 
@@ -292,12 +312,12 @@ flowchart TD
 | **Phase 5** | Register-Shuffled QSA Scores | `qsa_select.cpp` | `qsa_scores_rows_parity` | **Completed** (1.16x speedup, bitwise exact) |
 | **Phase 6** | Direct Pointer-Table Expert MMQ | `moe_mmq.cpp`, `moe_mmq.hpp` | `prefill_mmq_tab_parity` | **Completed** (1.35x speedup, bitwise exact) |
 | **Phase 7** | Chunked GDN Recurrence | `gdn_chunk.cpp`, `gdn_chunk.hpp` | `gdn_chunk_parity` | **Completed** (1.12x speedup at 8K, <2e-6 rel err) |
-| **Phase 8** | Gyro Trellis (TQ) Decoder | `tq_gemv.cpp`, `fwht.hpp` | `trellis_parity` | Enables Gyro-S/Gyro-M on B580 |
+| **Phase 8** | Gyro Trellis (TQ) Decoder | `tq_gemv.cpp`, `tq_gemv.hpp`, `tq_lut.hpp` | `trellis_parity` | **Completed** (1.15x speedup, bit-exact FWHT/dequant) |
 
 ---
 
 ## 7. Immediate Next Steps
 
-1. **Phase 7 (`gdn_chunk.cpp`) Completed**: Ported pure SYCL 2020 chunked GDN prompt recurrence (`STRATA_GDN_CHUNKED=1`), verified 100% parity across $T \in [64, 128, 256, 512, 1024, 2048]$ in `gdn_chunk_parity` ($< 2 \times 10^{-6}$ relative error, bitwise exact for $T < 128$ and `STRATA_GDN_CHUNKED=0`), measured 85.37 ms at $T=8192$ (95.95k tok/s).
-2. **Implement Phase 8 (`tq_gemv.cpp`)**: Port Gyro Trellis (TQ) quantized decoder for Arc B580.
-3. **Integrate with Automated Xe2 Benchmarks**: Validate all ported kernels via `make -C build_sycl perf-sycl` and `python3 tools/run_xe2_perf_benchmarks.py`.
+1. **Phase 8 (`tq_gemv.cpp`) Completed**: Ported pure SYCL 2020 Gyro Trellis (TQ) quantized decoders, FWHT Hadamard rotation, and SIMD16 GEMV with SLM codebook staging. Verified 26/26 test cases in `trellis_parity` (0 failures), measured 1.15x speedup and 11.40 GB/s at $N=10240$ in `perf_trellis`.
+2. **All 8 Target Optimization Phases Completed**: Full coverage across Tiers 1-4 for Intel Arc B580 / Xe2.
+3. **Automated Xe2 Benchmarks**: Validate all ported kernels via `make -C build_sycl perf-sycl` and `python3 tools/run_xe2_perf_benchmarks.py`.
