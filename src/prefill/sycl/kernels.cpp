@@ -2,6 +2,7 @@
 #include <sycl/sycl.hpp>
 #include "strata/prefill/kernels.hpp"
 #include "strata/prefill/gdn_xe.hpp"
+#include "strata/prefill/gdn_chunk.hpp"
 #include "strata/kernels/mrope.hpp"
 #include "strata/kernels/router_top10.hpp"
 
@@ -1256,6 +1257,9 @@ void gdn_recurrence_variant(int variant, float* state, const float* h, const flo
 void gdn_recurrence(float* state, const float* h, const float* gate, const float* beta, const float* z,
                     const float* gamma, float eps, float* y, uint16_t* y16, int64_t T, void* stream,
                     int64_t ldy) {
+    if (gdn_chunk_step(state, h, gate, beta, z, gamma, eps, y, y16, T, stream, ldy)) {
+        return;
+    }
     static const bool serial = std::getenv("STRATA_GDN_REC_HEADS") != nullptr;
     const int v = (!serial && gdn_xe_on(stream)) ? 6 : 0;
     gdn_recurrence_variant(v, state, h, gate, beta, z, gamma, eps, y, y16, T, stream, ldy);

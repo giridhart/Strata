@@ -240,6 +240,7 @@ target_link_libraries(strata_engine PUBLIC strata_core strata_kernels strata_ker
 # cuBLAS -> oneMKL through dpct::blas (needs the MKL SYCL BLAS domain)
 strata_resolve(_prefill src/prefill/gemm.cu src/prefill/kernels.cu src/prefill/prefill.cpp)
 add_library(strata_prefill STATIC ${_prefill}
+            ${STRATA_ROOT}/src/prefill/sycl/gdn_chunk.cpp
             ${CMAKE_CURRENT_SOURCE_DIR}/src/prefill/moe_fused_stub.cpp   # upstream's fused int8 kernels: not built here
             ${CMAKE_CURRENT_SOURCE_DIR}/src/prefill/xmx_moe.dp.cpp)      # A770 port: grouped XMX expert GEMM
 target_compile_options(strata_prefill PUBLIC -qmkl=sequential)
@@ -392,6 +393,11 @@ if(STRATA_SYCL_PARITY)
     add_executable(prefill_mmq_tab_parity ${STRATA_ROOT}/tests/sycl/prefill_mmq_tab_parity.cpp)
     target_link_libraries(prefill_mmq_tab_parity PRIVATE strata_prefill strata_kernels)
     add_test(NAME prefill_mmq_tab_parity COMMAND prefill_mmq_tab_parity)
+  endif()
+  if(EXISTS "${STRATA_ROOT}/tests/sycl/gdn_chunk_parity.cpp")
+    add_executable(gdn_chunk_parity ${STRATA_ROOT}/tests/sycl/gdn_chunk_parity.cpp)
+    target_link_libraries(gdn_chunk_parity PRIVATE strata_prefill strata_kernels)
+    add_test(NAME gdn_chunk_parity COMMAND gdn_chunk_parity)
   endif()
   # one native expert three ways on real GGUF rows (ggml reference, CPU path, GPU native_expert_grouped):
   #   native_expert_parity <shard1.gguf> [layer ...]

@@ -853,7 +853,7 @@ endif()
   # against llama.cpp on the SAME ids and a tokenizer on one side of that comparison is a second variable.
   # plan v0.3 P5: batched prompt processing (tensor-core GEMMs through cuBLAS).
   if(STRATA_ENABLE_SYCL)
-    add_library(strata_prefill STATIC src/prefill/sycl/gemm.cpp src/prefill/sycl/kernels.cpp src/prefill/sycl/moe_mmq.cpp src/prefill/sycl/prefill.cpp)
+    add_library(strata_prefill STATIC src/prefill/sycl/gemm.cpp src/prefill/sycl/kernels.cpp src/prefill/sycl/moe_mmq.cpp src/prefill/sycl/gdn_chunk.cpp src/prefill/sycl/prefill.cpp)
     target_compile_options(strata_prefill PUBLIC "-fsycl")
     target_link_options(strata_prefill PUBLIC "-fsycl")
     target_compile_definitions(strata_prefill PUBLIC STRATA_PREFILL_MMQ=1)
@@ -1649,6 +1649,13 @@ endif()
       "${CMAKE_CURRENT_SOURCE_DIR}/third_party/llama.cpp/ggml/src")
     target_link_libraries(prefill_mmq_tab_parity PRIVATE strata_prefill strata_kernels ${_strata_gpu_runtime_target})
     add_test(NAME prefill_mmq_tab_parity COMMAND prefill_mmq_tab_parity)
+  endif()
+
+  if(STRATA_ENABLE_SYCL AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/sycl/gdn_chunk_parity.cpp")
+    add_executable(gdn_chunk_parity tests/sycl/gdn_chunk_parity.cpp)
+    target_include_directories(gdn_chunk_parity PRIVATE ${_strata_gpu_include_directories})
+    target_link_libraries(gdn_chunk_parity PRIVATE strata_prefill strata_kernels ${_strata_gpu_runtime_target})
+    add_test(NAME gdn_chunk_parity COMMAND gdn_chunk_parity)
   endif()
 
 
@@ -2587,6 +2594,7 @@ if(STRATA_ENABLE_SYCL)
             sycl_native_gr_norm sycl_xe2_subgroup_gemv sycl_xmx_joint_matrix
             s_gemv_pair_parity quantize_act_images_parity bf16_gemv_pair_parity
             kv_gather_wide_parity qsa_scores_rows_parity prefill_mmq_tab_parity
+            gdn_chunk_parity
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
     COMMENT "Running Intel SYCL tests via ctest"
     USES_TERMINAL
@@ -2693,6 +2701,7 @@ if(STRATA_BUILD_PERF)
       perf_kv_decode
       perf_prefill_gemm
       perf_mmq_direct
+      perf_gdn_chunk
       perf_speculative_verify
     )
 
