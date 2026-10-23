@@ -308,13 +308,89 @@ void iota(int32_t* dst, int64_t n, void* stream) {
     ck(0, "iota");
 }
 
-// STRATA_MMQ_DIRECT (include/strata/prefill/moe_mmq.hpp): the pointer-table MMQ is CUDA only, so SYCL keeps the
-// gather - these say so, for a prefill.cpp migrated from a tree that calls them
-bool tab_built() { return false; }
-bool tab_fits(int, int64_t) { return false; }
-size_t overread_bytes(int, int64_t) { return 0; }
-int direct_mode() { return 0; }
-size_t direct_slot_guard() { return 0; }
-void prep_group(const GuardTab&, size_t, void*, void*, size_t, void*) {}
+// STRATA_MMQ_DIRECT (include/strata/prefill/moe_mmq.hpp): pointer-table MMQ support
+bool tab_built() { return true; }
+bool tab_fits(int t, int64_t w_rows) {
+    return tab_built() && (w_rows % 128 == 0) && supported(t) && fits(t, w_rows);
+}
+size_t overread_bytes(int t, int64_t cols) {
+    if (!supported(t)) return 0;
+    int64_t qk = 32;
+    size_t ts = 0;
+    switch (t) {
+        case 8: qk = 32; ts = 34; break;    // Q8_0
+        case 20: qk = 32; ts = 18; break;   // IQ4_NL
+        case 18: qk = 256; ts = 110; break; // IQ3_S
+        case 0: qk = 32; ts = 8; break;     // Q2_0
+        case 16: qk = 256; ts = 66; break;  // IQ2_XXS
+        case 17: qk = 256; ts = 74; break;  // IQ2_XS
+        case 19: qk = 256; ts = 82; break;  // IQ2_S
+        case 21: qk = 256; ts = 98; break;  // IQ3_XXS
+        case 22: qk = 256; ts = 136; break; // IQ4_XS
+        default: qk = 32; ts = 0; break;
+    }
+    const int64_t bpn = cols / qk;
+    auto over = [&](int64_t k_vram) -> int64_t {
+        const int64_t bpi = k_vram / qk;
+        return bpi > 0 ? (bpi - bpn % bpi) % bpi : 0;
+    };
+    int64_t blocks = over(256);
+    return (size_t)blocks * ts;
+}
+bool whole_tiles(int t, int64_t w_rows, int n_experts) {
+    return supported(t) && (w_rows % 128 == 0) && (n_experts > 0);
+}
+int direct_mode() {
+    static const int mode = [] {
+        const char* v = std::getenv("STRATA_MMQ_DIRECT");
+        const int m = v ? std::atoi(v) : 0;
+        if (m != 1 && m != 2) return 0;
+        if (!tab_built()) return 0;
+        return m;
+    }();
+    return mode;
+}
+size_t direct_slot_guard() {
+    return direct_mode() != 0 ? kSlotGuard : 0;
+}
+void prep_group(const GuardTab& g, size_t guard_bytes, void* tail_gu, void* tail_d, size_t tail_bytes, void* stream) {
+    const int n = g.n > 0 ? std::min(g.n, kGatherGroupMax) : 0;
+    const size_t guard = n > 0 ? guard_bytes : 0;
+    const size_t tail = (tail_gu || tail_d) ? tail_bytes : 0;
+    if (guard == 0 && tail == 0) return;
+
+    GuardTab gt = g;
+    gt.n = guard > 0 ? n : 0;
+    const bool tail16 = ((uintptr_t)tail_gu | (uintptr_t)tail_d | tail_bytes) % 16 == 0;
+    const size_t span = std::max(guard, tail);
+    if (span == 0) return;
+
+    sycl::queue* q = stream ? static_cast<sycl::queue*>(stream) : &dpct::get_in_order_queue();
+    const size_t wg_size = 256;
+    const size_t n_blocks = (span + wg_size - 1) / wg_size;
+    const size_t ny = (size_t)(gt.n + 2);
+
+    q->parallel_for(
+        sycl::nd_range<2>(sycl::range<2>(ny, n_blocks * wg_size), sycl::range<2>(1, wg_size)),
+        [=](sycl::nd_item<2> it) {
+            const int y = (int)it.get_group(0);
+            const int64_t i = (int64_t)it.get_global_id(1);
+            if (y < gt.n) {
+                if (i < (int64_t)guard && gt.p[y] != nullptr) {
+                    gt.p[y][i] = 0;
+                }
+                return;
+            }
+            uint8_t* t = (y == gt.n) ? (uint8_t*)tail_gu : (uint8_t*)tail_d;
+            if (t == nullptr) return;
+            if (tail16) {
+                if (i < (int64_t)(tail / 16)) {
+                    reinterpret_cast<sycl::uint4*>(t)[i] = sycl::uint4(0, 0, 0, 0);
+                }
+            } else if (i < (int64_t)tail) {
+                t[i] = 0;
+            }
+        });
+}
 
 }  // namespace strata::prefill::mmq
