@@ -1609,6 +1609,13 @@ endif()
     add_test(NAME s_gemv_pair_parity COMMAND s_gemv_pair_parity --selftest)
   endif()
 
+  if(STRATA_ENABLE_SYCL AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/sycl/quantize_act_images_parity.cpp")
+    add_executable(quantize_act_images_parity tests/sycl/quantize_act_images_parity.cpp)
+    target_include_directories(quantize_act_images_parity PRIVATE ${_strata_gpu_include_directories})
+    target_link_libraries(quantize_act_images_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+    add_test(NAME quantize_act_images_parity COMMAND quantize_act_images_parity)
+  endif()
+
 
 
 
@@ -2543,11 +2550,12 @@ if(STRATA_ENABLE_SYCL)
             sycl_native_flash_attn sycl_native_mmvq sycl_fused_gdn
             sycl_dequant_bf16 sycl_verify_kernels sycl_graph strata-device
             sycl_native_gr_norm sycl_xe2_subgroup_gemv sycl_xmx_joint_matrix
-            s_gemv_pair_parity
+            s_gemv_pair_parity quantize_act_images_parity
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
     COMMENT "Running Intel SYCL tests via ctest"
     USES_TERMINAL
   )
+  add_custom_target(sycl-test DEPENDS check-sycl)
 endif()
 
 # ---- Google Benchmark performance tuning suite ----
@@ -2618,6 +2626,13 @@ if(STRATA_BUILD_PERF)
       target_include_directories(perf_s_gemv_pair PRIVATE ${_strata_gpu_include_directories})
       target_link_libraries(perf_s_gemv_pair PRIVATE strata_core strata_kernels benchmark::benchmark)
       list(APPEND _strata_perf_targets perf_s_gemv_pair)
+    endif()
+
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/perf/sycl/perf_quantize_act.cpp")
+      add_executable(perf_quantize_act perf/sycl/perf_quantize_act.cpp)
+      target_include_directories(perf_quantize_act PRIVATE ${_strata_gpu_include_directories})
+      target_link_libraries(perf_quantize_act PRIVATE strata_core strata_kernels benchmark::benchmark)
+      list(APPEND _strata_perf_targets perf_quantize_act)
     endif()
 
     # Tier 2 Performance Benchmarks for Intel Xe2 / Arc B580

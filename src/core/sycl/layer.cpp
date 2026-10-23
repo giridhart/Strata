@@ -415,8 +415,7 @@ bool gdn_layer(const WeightTable& tables, const ModelGeometry& g, int64_t layer,
     st_begin(layer, 8, stream);
     // Plan v0.3 P3: the canonical activation images only when a canonical projection reads them.
     if (!w_qkv->native_data || !w_gate->native_data) {
-        quantize_q8_K(mixed, b.x_q8k, g.n_embd, stream);
-        quantize_q8_0(mixed, b.x_q8_0, g.n_embd, stream);
+        quantize_act_images(mixed, g.n_embd, b.x_q8_0, b.x_q8k, nullptr, stream);
     }
     st_end(layer, 8, stream);
     // ---- 2. qkv = wqkv @ x, with the activation THIS layer's `attn_qkv` asks for
@@ -543,8 +542,7 @@ bool gdn_layer(const WeightTable& tables, const ModelGeometry& g, int64_t layer,
     // ---- 8. out = ssm_out @ y, whose activation is whatever THIS layer's `ssm_out` asks for
     st_begin(layer, 15, stream);
     if (!w_out->native_data) {
-        quantize_q8_K(b.y, b.y_q8k, g.ssm_value_dim, stream);
-        quantize_q8_0(b.y, b.y_q8_0, g.ssm_value_dim, stream);
+        quantize_act_images(b.y, g.ssm_value_dim, b.y_q8_0, b.y_q8k, nullptr, stream);
     }
     if (!gemv_quantized(*w_out, p_out, f_out, b.y_q8_0, b.y_q8k, out, g.ssm_value_dim, g.n_embd,
                         v.name("ssm_out.weight"), stream, err, b.y))
@@ -713,11 +711,8 @@ bool moe_shared(const WeightTable& tables, const ModelGeometry& g, int64_t layer
     // the rest, `ffn_up_shexp` Q2_0 on 13, and `ffn_down_shexp` is LEGACY in every layer (IQ4_NL/Q4_0/Q5_0/
     // Q8_0/Q2_0, `n_in` 640 so Q8_K is impossible).  So BOTH quantized images of the activation are produced
     // and each projection takes the one its own form asks for.
-    f32_to_bf16_bulk(x, b.x_bf16, g.n_embd, stream);
-    if (!w_sgate->native_data || !w_sup->native_data) {
-        quantize_q8_K(x, b.x_q8k, g.n_embd, stream);
-        quantize_q8_0(x, b.x_q8_0, g.n_embd, stream);
-    }
+    const bool need_q8 = (!w_sgate->native_data || !w_sup->native_data);
+    quantize_act_images(x, g.n_embd, need_q8 ? b.x_q8_0 : nullptr, need_q8 ? b.x_q8k : nullptr, b.x_bf16, stream);
     NativeSharedWeights native;
     native.gate_type = w_sgate->native_type;
     native.gate_data = w_sgate->native_data;
@@ -1357,11 +1352,13 @@ bool qsa_layer(const WeightTable& tables, const ModelGeometry& g, int64_t layer,
         return false;
     }
     // ---- 1. the three activation formats, once each
-    if (!w_attnk->native_data || !w_attnv->native_data || !w_attnq->native_data) {
-        quantize_q8_K(x, b.x_q8k, g.n_embd, stream);
-        quantize_q8_0(x, b.x_q8_0, g.n_embd, stream);
+    const bool need_q8 = (!w_attnk->native_data || !w_attnv->native_data || !w_attnq->native_data);
+    const bool need_bf16 = !native_bf16_projections;
+    if (need_q8) {
+        quantize_act_images(x, g.n_embd, b.x_q8_0, b.x_q8k, need_bf16 ? b.x_bf16 : nullptr, stream);
+    } else if (need_bf16) {
+        f32_to_bf16_bulk(x, b.x_bf16, g.n_embd, stream);
     }
-    if (!native_bf16_projections) f32_to_bf16_bulk(x, b.x_bf16, g.n_embd, stream);
     // ---- 2. the step state: ONE H2D carries every per-token count the kernels need.  Nothing below passes a
     // per-token scalar as an argument, which is what keeps this layer capturable.
     //
