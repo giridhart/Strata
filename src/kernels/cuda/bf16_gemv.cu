@@ -151,6 +151,9 @@ void bf16_gemv(const uint16_t* x, const uint16_t* w, float* y, int64_t n_in, int
 void bf16_gemv_pair(const uint16_t* x, const uint16_t* w1, float* y1, int64_t n_out1, const uint16_t* w2,
                     float* y2, int64_t n_out2, int64_t n_in, void* stream) {
     if (n_in <= 0 || (n_out1 <= 0 && n_out2 <= 0)) return;
+    // THE PAIR KERNEL IS THE WARP-PER-ROW ACCUMULATION on both sides, so it is bitwise what
+    // `bf16_gemv` (n_out >= 64) and `bf16_gemv_split` at tpr 32 produced.  Callers whose standalone path
+    // was the NAIVE kernel (a small `n_out` with the plain entry) must not use this.
     const int warps = THREADS / 32;
     const long long n_out = n_out1 > n_out2 ? n_out1 : n_out2;
     const unsigned grid = (unsigned) ((n_out + warps - 1) / warps);
