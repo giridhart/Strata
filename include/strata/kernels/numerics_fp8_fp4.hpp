@@ -13,10 +13,14 @@
 
 #include <sycl/sycl.hpp>
 #include "strata/core/sycl_arch.hpp"
+#include "strata/kernels/qsa.hpp"
+#include "strata/kernels/kv_stream.hpp"
 
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <type_traits>
 
 namespace strata::kernels {
@@ -440,6 +444,489 @@ inline sycl::event dequantize_fp4_e2m1(const uint8_t* in_packed, OutT* out,
     const uint8_t* in_codes = in_packed;
     const uint8_t* in_scales = in_packed + (num_elements + 1) / 2;
     return dequantize_fp4_e2m1<BlockSize, OutT, BlocksPerSg>(in_codes, in_scales, out, num_elements, q);
+}
+
+// ============================================================================
+// Runtime Configuration Helpers (Item D)
+// ============================================================================
+
+namespace detail {
+inline sycl::queue& default_numerics_queue() {
+    static sycl::queue q{sycl::default_selector_v, sycl::property::queue::in_order()};
+    return q;
+}
+
+inline std::atomic<int>& lowbit_kv_override() {
+    static std::atomic<int> s_override{-1};
+    return s_override;
+}
+}  // namespace detail
+
+/// Returns active low-bit KV storage format:
+///   0 = default (FP16 / INT8 / Q4_0),
+///   1 = FP8 E4M3 (1.031 bytes/element),
+///   2 = FP4 E2M1 (0.531 bytes/element).
+/// Programmatic override via set_lowbit_kv_format takes precedence,
+/// followed by STRATA_KV_FP4 and STRATA_KV_FP8 environment variables.
+inline int lowbit_kv_format() {
+    int val = detail::lowbit_kv_override().load(std::memory_order_relaxed);
+    if (val != -1) return val;
+    const char* e_fp4 = std::getenv("STRATA_KV_FP4");
+    if (e_fp4 != nullptr && std::atoi(e_fp4) != 0) return 2;
+    const char* e_fp8 = std::getenv("STRATA_KV_FP8");
+    if (e_fp8 != nullptr && std::atoi(e_fp8) != 0) return 1;
+    return 0;
+}
+
+/// Checks whether low-bit KV cache compression is currently active (format != 0).
+inline bool lowbit_kv_enabled() {
+    return lowbit_kv_format() != 0;
+}
+
+/// Programmatic override for low-bit KV cache format.
+/// Pass 1 for FP8 E4M3, 2 for FP4 E2M1, 0 to disable, or -1 to revert to environment variables.
+inline void set_lowbit_kv_format(int fmt) {
+    detail::lowbit_kv_override().store(fmt, std::memory_order_relaxed);
+}
+
+// ============================================================================
+// Engine Paged KV Cache Appending Kernels (Intel Xe2 SIMD16)
+// ============================================================================
+
+inline void kv_append_fp8_kernel(
+    uint8_t* __restrict__ k_fp8, uint8_t* __restrict__ v_fp8,
+    const int32_t* __restrict__ table, const int32_t* __restrict__ step,
+    const float* __restrict__ kcur, const float* __restrict__ vcur,
+    int kv_heads, int head_dim, int page_size,
+    KvHostPools host, int planes,
+    sycl::nd_item<1> item) {
+    auto sg = item.get_sub_group();
+    constexpr int SG_SIZE = 16;
+    constexpr int BLK_SIZE = 32;
+    const int blocks_per_head = (head_dim + BLK_SIZE - 1) / BLK_SIZE;
+    const int total_blocks = planes * kv_heads * blocks_per_head;
+
+    const size_t blk_idx = item.get_global_id(0) / SG_SIZE;
+    if (blk_idx >= (size_t)total_blocks) return;
+
+    const unsigned lane = sg.get_local_linear_id();
+
+    const int plane = (int)(blk_idx / (kv_heads * blocks_per_head));
+    const int rem = (int)(blk_idx % (kv_heads * blocks_per_head));
+    const int h = rem / blocks_per_head;
+    const int b = rem % blocks_per_head;
+    const bool is_v = (plane == 1);
+
+    const float* in_vec = (is_v ? vcur : kcur) + (size_t)h * head_dim;
+    uint8_t* out_pool = is_v ? v_fp8 : k_fp8;
+
+    long long row = -1;
+    if (table != nullptr && step != nullptr) {
+        const long long pos = (long long)*(step + kStepPos);
+        const long long page = (long long)table[pos / page_size];
+        if (page >= 0) {
+            row = (page * kv_heads + h) * page_size + (pos % page_size);
+        }
+    } else {
+        row = h;
+    }
+
+    const size_t base_elem = (size_t)b * BLK_SIZE + 2 * lane;
+    float v0 = 0.0f;
+    float v1 = 0.0f;
+    if (base_elem + 1 < (size_t)head_dim) {
+        v0 = in_vec[base_elem];
+        v1 = in_vec[base_elem + 1];
+    } else if (base_elem < (size_t)head_dim) {
+        v0 = in_vec[base_elem];
+    }
+
+    const float local_max = sycl::fmax(sycl::fabs(v0), sycl::fabs(v1));
+    const float block_max = sycl::reduce_over_group(sg, local_max, sycl::maximum<float>());
+
+    const float s = pow2_ceil(sycl::fmax(block_max, 1e-4f) * (1.0f / 448.0f));
+    const float inv_s = 1.0f / s;
+
+    const float q0 = fp8_rt(sycl::clamp(v0 * inv_s, -448.0f, 448.0f));
+    const float q1 = fp8_rt(sycl::clamp(v1 * inv_s, -448.0f, 448.0f));
+    const uint8_t c0 = static_cast<uint8_t>(e4m3_code(q0));
+    const uint8_t c1 = static_cast<uint8_t>(e4m3_code(q1));
+    const uint8_t sc_byte = ue8m0_scale_byte(s);
+
+    const size_t row_bytes = fp8_packed_bytes(head_dim, BLK_SIZE);
+
+    if (row >= 0 && out_pool != nullptr) {
+        uint8_t* row_base = out_pool + row * row_bytes;
+        if (base_elem + 1 < (size_t)head_dim) {
+            row_base[base_elem] = c0;
+            row_base[base_elem + 1] = c1;
+        } else if (base_elem < (size_t)head_dim) {
+            row_base[base_elem] = c0;
+        }
+        if (lane == 0) {
+            row_base[head_dim + b] = sc_byte;
+        }
+    }
+
+    if (host.present() && step != nullptr) {
+        uint8_t* host_pool = reinterpret_cast<uint8_t*>(is_v ? (host.v_pool ? (void*)host.v_pool : (void*)host.v_q4)
+                                                              : (host.k_pool ? (void*)host.k_pool : (void*)host.k_q4));
+        if (host_pool != nullptr) {
+            const long long pos = (long long)*(step + kStepPos);
+            const long long host_row = ((pos / page_size) * kv_heads + h) * page_size + (pos % page_size);
+            uint8_t* host_base = host_pool + host_row * row_bytes;
+            if (base_elem + 1 < (size_t)head_dim) {
+                host_base[base_elem] = c0;
+                host_base[base_elem + 1] = c1;
+            } else if (base_elem < (size_t)head_dim) {
+                host_base[base_elem] = c0;
+            }
+            if (lane == 0) {
+                host_base[head_dim + b] = sc_byte;
+            }
+        }
+    }
+}
+
+inline void kv_append_fp4_kernel(
+    uint8_t* __restrict__ k_fp4, uint8_t* __restrict__ v_fp4,
+    const int32_t* __restrict__ table, const int32_t* __restrict__ step,
+    const float* __restrict__ kcur, const float* __restrict__ vcur,
+    int kv_heads, int head_dim, int page_size,
+    KvHostPools host, int planes,
+    sycl::nd_item<1> item) {
+    auto sg = item.get_sub_group();
+    constexpr int SG_SIZE = 16;
+    constexpr int BLK_SIZE = 32;
+    const int blocks_per_head = (head_dim + BLK_SIZE - 1) / BLK_SIZE;
+    const int total_blocks = planes * kv_heads * blocks_per_head;
+
+    const size_t blk_idx = item.get_global_id(0) / SG_SIZE;
+    if (blk_idx >= (size_t)total_blocks) return;
+
+    const unsigned lane = sg.get_local_linear_id();
+
+    const int plane = (int)(blk_idx / (kv_heads * blocks_per_head));
+    const int rem = (int)(blk_idx % (kv_heads * blocks_per_head));
+    const int h = rem / blocks_per_head;
+    const int b = rem % blocks_per_head;
+    const bool is_v = (plane == 1);
+
+    const float* in_vec = (is_v ? vcur : kcur) + (size_t)h * head_dim;
+    uint8_t* out_pool = is_v ? v_fp4 : k_fp4;
+
+    long long row = -1;
+    if (table != nullptr && step != nullptr) {
+        const long long pos = (long long)*(step + kStepPos);
+        const long long page = (long long)table[pos / page_size];
+        if (page >= 0) {
+            row = (page * kv_heads + h) * page_size + (pos % page_size);
+        }
+    } else {
+        row = h;
+    }
+
+    const size_t base_elem = (size_t)b * BLK_SIZE + 2 * lane;
+    float v0 = 0.0f;
+    float v1 = 0.0f;
+    if (base_elem + 1 < (size_t)head_dim) {
+        v0 = in_vec[base_elem];
+        v1 = in_vec[base_elem + 1];
+    } else if (base_elem < (size_t)head_dim) {
+        v0 = in_vec[base_elem];
+    }
+
+    const float local_max = sycl::fmax(sycl::fabs(v0), sycl::fabs(v1));
+    const float block_max = sycl::reduce_over_group(sg, local_max, sycl::maximum<float>());
+
+    const float s = pow2_ceil(sycl::fmax(block_max, 6.0f * 1.1754943508222875e-38f) * (1.0f / 6.0f));
+    const float inv_s = 1.0f / s;
+
+    const float q0 = e2m1_rt(sycl::clamp(v0 * inv_s, -6.0f, 6.0f));
+    const float q1 = e2m1_rt(sycl::clamp(v1 * inv_s, -6.0f, 6.0f));
+    const uint32_t c0 = e2m1_code(q0);
+    const uint32_t c1 = e2m1_code(q1);
+    const uint8_t packed_byte = static_cast<uint8_t>(c0 | (c1 << 4));
+    const uint8_t sc_byte = ue8m0_scale_byte(s);
+
+    const size_t row_bytes = fp4_packed_bytes(head_dim, BLK_SIZE);
+    const size_t code_bytes = (head_dim + 1) / 2;
+
+    if (row >= 0 && out_pool != nullptr) {
+        uint8_t* row_base = out_pool + row * row_bytes;
+        const size_t byte_idx = (size_t)b * 16 + lane;
+        if (byte_idx < code_bytes) {
+            row_base[byte_idx] = packed_byte;
+        }
+        if (lane == 0) {
+            row_base[code_bytes + b] = sc_byte;
+        }
+    }
+
+    if (host.present() && step != nullptr) {
+        uint8_t* host_pool = reinterpret_cast<uint8_t*>(is_v ? (host.v_pool ? (void*)host.v_pool : (void*)host.v_q4)
+                                                              : (host.k_pool ? (void*)host.k_pool : (void*)host.k_q4));
+        if (host_pool != nullptr) {
+            const long long pos = (long long)*(step + kStepPos);
+            const long long host_row = ((pos / page_size) * kv_heads + h) * page_size + (pos % page_size);
+            uint8_t* host_base = host_pool + host_row * row_bytes;
+            const size_t byte_idx = (size_t)b * 16 + lane;
+            if (byte_idx < code_bytes) {
+                host_base[byte_idx] = packed_byte;
+            }
+            if (lane == 0) {
+                host_base[code_bytes + b] = sc_byte;
+            }
+        }
+    }
+}
+
+// ============================================================================
+// Engine APIs: kv_append_fp8_step & kv_append_fp4_step
+// ============================================================================
+
+/// Appends K and V activation rows into paged FP8 E4M3 KV cache (1.031 bytes/element).
+inline void kv_append_fp8_step(
+    uint8_t* k_fp8, uint8_t* v_fp8,
+    const int32_t* page_table, const int32_t* step,
+    const float* kcur, const float* vcur,
+    const QsaShapes& s,
+    sycl::queue& q,
+    const KvHostPools* host = nullptr) {
+    if (s.head_dim <= 0 || s.n_head_kv <= 0) return;
+    const int planes = (v_fp8 == nullptr || vcur == nullptr) ? 1 : 2;
+    constexpr int SG_SIZE = 16;
+    constexpr int WG_SIZE = 128;
+    constexpr int SGS_PER_WG = WG_SIZE / SG_SIZE;
+    const int blocks_per_head = ((int)s.head_dim + 31) / 32;
+    const int total_blocks = planes * (int)s.n_head_kv * blocks_per_head;
+    const int num_wgs = (total_blocks + SGS_PER_WG - 1) / SGS_PER_WG;
+
+    KvHostPools host_pools = host ? *host : KvHostPools{};
+    q.submit([&](sycl::handler& cgh) {
+        cgh.parallel_for(
+            sycl::nd_range<1>(num_wgs * WG_SIZE, WG_SIZE),
+            [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
+                kv_append_fp8_kernel(k_fp8, v_fp8, page_table, step, kcur, vcur,
+                                     (int)s.n_head_kv, (int)s.head_dim, (int)s.page_size,
+                                     host_pools, planes, item);
+            });
+    });
+}
+
+inline void kv_append_fp8_step(
+    uint8_t* k_fp8, uint8_t* v_fp8,
+    const int32_t* page_table, const int32_t* step,
+    const float* kcur, const float* vcur,
+    const QsaShapes& s,
+    void* stream = nullptr,
+    const KvHostPools* host = nullptr) {
+    sycl::queue& q = stream ? *static_cast<sycl::queue*>(stream) : detail::default_numerics_queue();
+    kv_append_fp8_step(k_fp8, v_fp8, page_table, step, kcur, vcur, s, q, host);
+}
+
+inline void kv_append_fp8_step(
+    uint8_t* k_fp8, uint8_t* v_fp8,
+    const int32_t* page_table, const int32_t* step,
+    const float* kcur, const float* vcur,
+    const QsaShapes& s,
+    sycl::queue* stream,
+    const KvHostPools* host = nullptr) {
+    kv_append_fp8_step(k_fp8, v_fp8, page_table, step, kcur, vcur, s, static_cast<void*>(stream), host);
+}
+
+template <typename KPtr, typename VPtr,
+          std::enable_if_t<!std::is_same_v<KPtr, const float*>, int> = 0>
+inline void kv_append_fp8_step(
+    KPtr k_fp8, VPtr v_fp8,
+    const int32_t* page_table, const int32_t* step,
+    const float* kcur, const float* vcur,
+    const QsaShapes& s,
+    void* stream = nullptr,
+    const KvHostPools* host = nullptr) {
+    kv_append_fp8_step(reinterpret_cast<uint8_t*>(k_fp8), reinterpret_cast<uint8_t*>(v_fp8),
+                       page_table, step, kcur, vcur, s, stream, host);
+}
+
+template <typename KPtr, typename VPtr,
+          std::enable_if_t<!std::is_same_v<KPtr, const float*>, int> = 0>
+inline void kv_append_fp8_step(
+    KPtr k_fp8, VPtr v_fp8,
+    const int32_t* page_table, const int32_t* step,
+    const float* kcur, const float* vcur,
+    const QsaShapes& s,
+    sycl::queue& q,
+    const KvHostPools* host = nullptr) {
+    kv_append_fp8_step(reinterpret_cast<uint8_t*>(k_fp8), reinterpret_cast<uint8_t*>(v_fp8),
+                       page_table, step, kcur, vcur, s, q, host);
+}
+
+template <typename KPtr, typename VPtr,
+          std::enable_if_t<!std::is_same_v<KPtr, const float*>, int> = 0>
+inline void kv_append_fp8_step(
+    KPtr k_fp8, VPtr v_fp8,
+    const int32_t* page_table, const int32_t* step,
+    const float* kcur, const float* vcur,
+    const QsaShapes& s,
+    sycl::queue* stream,
+    const KvHostPools* host = nullptr) {
+    kv_append_fp8_step(reinterpret_cast<uint8_t*>(k_fp8), reinterpret_cast<uint8_t*>(v_fp8),
+                       page_table, step, kcur, vcur, s, static_cast<void*>(stream), host);
+}
+
+/// Direct activation row compression helper into FP8 E4M3 packed buffer.
+inline sycl::event kv_append_fp8_step(
+    const float* kcur, const float* vcur,
+    uint8_t* k_out, uint8_t* v_out,
+    size_t num_elements,
+    sycl::queue& q) {
+    sycl::event e1, e2;
+    if (kcur && k_out && num_elements > 0) {
+        e1 = quantize_fp8_e4m3(kcur, k_out, num_elements, q);
+    }
+    if (vcur && v_out && num_elements > 0) {
+        e2 = quantize_fp8_e4m3(vcur, v_out, num_elements, q);
+    }
+    return (vcur && v_out) ? e2 : e1;
+}
+
+inline void kv_append_fp8_step(
+    const float* kcur, const float* vcur,
+    uint8_t* k_out, uint8_t* v_out,
+    size_t num_elements,
+    void* stream = nullptr) {
+    sycl::queue& q = stream ? *static_cast<sycl::queue*>(stream) : detail::default_numerics_queue();
+    kv_append_fp8_step(kcur, vcur, k_out, v_out, num_elements, q);
+}
+
+inline void kv_append_fp8_step(
+    const float* kcur, const float* vcur,
+    uint8_t* k_out, uint8_t* v_out,
+    size_t num_elements,
+    sycl::queue* stream) {
+    kv_append_fp8_step(kcur, vcur, k_out, v_out, num_elements, static_cast<void*>(stream));
+}
+
+/// Appends K and V activation rows into paged FP4 E2M1 KV cache (0.531 bytes/element).
+inline void kv_append_fp4_step(
+    uint8_t* k_fp4, uint8_t* v_fp4,
+    const int32_t* page_table, const int32_t* step,
+    const float* kcur, const float* vcur,
+    const QsaShapes& s,
+    sycl::queue& q,
+    const KvHostPools* host = nullptr) {
+    if (s.head_dim <= 0 || s.n_head_kv <= 0) return;
+    const int planes = (v_fp4 == nullptr || vcur == nullptr) ? 1 : 2;
+    constexpr int SG_SIZE = 16;
+    constexpr int WG_SIZE = 128;
+    constexpr int SGS_PER_WG = WG_SIZE / SG_SIZE;
+    const int blocks_per_head = ((int)s.head_dim + 31) / 32;
+    const int total_blocks = planes * (int)s.n_head_kv * blocks_per_head;
+    const int num_wgs = (total_blocks + SGS_PER_WG - 1) / SGS_PER_WG;
+
+    KvHostPools host_pools = host ? *host : KvHostPools{};
+    q.submit([&](sycl::handler& cgh) {
+        cgh.parallel_for(
+            sycl::nd_range<1>(num_wgs * WG_SIZE, WG_SIZE),
+            [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
+                kv_append_fp4_kernel(k_fp4, v_fp4, page_table, step, kcur, vcur,
+                                     (int)s.n_head_kv, (int)s.head_dim, (int)s.page_size,
+                                     host_pools, planes, item);
+            });
+    });
+}
+
+inline void kv_append_fp4_step(
+    uint8_t* k_fp4, uint8_t* v_fp4,
+    const int32_t* page_table, const int32_t* step,
+    const float* kcur, const float* vcur,
+    const QsaShapes& s,
+    void* stream = nullptr,
+    const KvHostPools* host = nullptr) {
+    sycl::queue& q = stream ? *static_cast<sycl::queue*>(stream) : detail::default_numerics_queue();
+    kv_append_fp4_step(k_fp4, v_fp4, page_table, step, kcur, vcur, s, q, host);
+}
+
+inline void kv_append_fp4_step(
+    uint8_t* k_fp4, uint8_t* v_fp4,
+    const int32_t* page_table, const int32_t* step,
+    const float* kcur, const float* vcur,
+    const QsaShapes& s,
+    sycl::queue* stream,
+    const KvHostPools* host = nullptr) {
+    kv_append_fp4_step(k_fp4, v_fp4, page_table, step, kcur, vcur, s, static_cast<void*>(stream), host);
+}
+
+template <typename KPtr, typename VPtr,
+          std::enable_if_t<!std::is_same_v<KPtr, const float*>, int> = 0>
+inline void kv_append_fp4_step(
+    KPtr k_fp4, VPtr v_fp4,
+    const int32_t* page_table, const int32_t* step,
+    const float* kcur, const float* vcur,
+    const QsaShapes& s,
+    void* stream = nullptr,
+    const KvHostPools* host = nullptr) {
+    kv_append_fp4_step(reinterpret_cast<uint8_t*>(k_fp4), reinterpret_cast<uint8_t*>(v_fp4),
+                       page_table, step, kcur, vcur, s, stream, host);
+}
+
+template <typename KPtr, typename VPtr,
+          std::enable_if_t<!std::is_same_v<KPtr, const float*>, int> = 0>
+inline void kv_append_fp4_step(
+    KPtr k_fp4, VPtr v_fp4,
+    const int32_t* page_table, const int32_t* step,
+    const float* kcur, const float* vcur,
+    const QsaShapes& s,
+    sycl::queue& q,
+    const KvHostPools* host = nullptr) {
+    kv_append_fp4_step(reinterpret_cast<uint8_t*>(k_fp4), reinterpret_cast<uint8_t*>(v_fp4),
+                       page_table, step, kcur, vcur, s, q, host);
+}
+
+template <typename KPtr, typename VPtr,
+          std::enable_if_t<!std::is_same_v<KPtr, const float*>, int> = 0>
+inline void kv_append_fp4_step(
+    KPtr k_fp4, VPtr v_fp4,
+    const int32_t* page_table, const int32_t* step,
+    const float* kcur, const float* vcur,
+    const QsaShapes& s,
+    sycl::queue* stream,
+    const KvHostPools* host = nullptr) {
+    kv_append_fp4_step(reinterpret_cast<uint8_t*>(k_fp4), reinterpret_cast<uint8_t*>(v_fp4),
+                       page_table, step, kcur, vcur, s, static_cast<void*>(stream), host);
+}
+
+/// Direct activation row compression helper into FP4 E2M1 packed buffer.
+inline sycl::event kv_append_fp4_step(
+    const float* kcur, const float* vcur,
+    uint8_t* k_out, uint8_t* v_out,
+    size_t num_elements,
+    sycl::queue& q) {
+    sycl::event e1, e2;
+    if (kcur && k_out && num_elements > 0) {
+        e1 = quantize_fp4_e2m1<32>(kcur, k_out, num_elements, q);
+    }
+    if (vcur && v_out && num_elements > 0) {
+        e2 = quantize_fp4_e2m1<32>(vcur, v_out, num_elements, q);
+    }
+    return (vcur && v_out) ? e2 : e1;
+}
+
+inline void kv_append_fp4_step(
+    const float* kcur, const float* vcur,
+    uint8_t* k_out, uint8_t* v_out,
+    size_t num_elements,
+    void* stream = nullptr) {
+    sycl::queue& q = stream ? *static_cast<sycl::queue*>(stream) : detail::default_numerics_queue();
+    kv_append_fp4_step(kcur, vcur, k_out, v_out, num_elements, q);
+}
+
+inline void kv_append_fp4_step(
+    const float* kcur, const float* vcur,
+    uint8_t* k_out, uint8_t* v_out,
+    size_t num_elements,
+    sycl::queue* stream) {
+    kv_append_fp4_step(kcur, vcur, k_out, v_out, num_elements, static_cast<void*>(stream));
 }
 
 } // namespace strata::kernels

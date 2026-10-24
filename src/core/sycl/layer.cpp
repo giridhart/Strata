@@ -42,6 +42,7 @@ inline sycl::queue& get_default_queue() {
 #include "strata/kernels/fused_gdn.hpp"
 #include "strata/kernels/finish.hpp"
 #include "strata/kernels/gemv_f16_rows.hpp"
+#include "strata/kernels/numerics_fp8_fp4.hpp"
 #include "strata/kernels/qsa_select.hpp"
 #include <algorithm>
 #include <cstdlib>
@@ -1454,7 +1455,15 @@ bool qsa_layer(const WeightTable& tables, const ModelGeometry& g, int64_t layer,
             strata::kernels::fwht256_inplace_cuda(b.kcur, g.n_head_kv, stream);
             strata::kernels::fwht256_inplace_cuda(b.vcur, g.n_head_kv, stream);
         }
-        if (st.kv_q4) {
+        if (strata::kernels::lowbit_kv_enabled()) {
+            if (strata::kernels::lowbit_kv_format() == 1) {
+                strata::kernels::kv_append_fp8_step(st.k_pool, st.v_pool, st.page_table, st.step, b.kcur, b.vcur, s, stream,
+                                                    &st.host);
+            } else if (strata::kernels::lowbit_kv_format() == 2) {
+                strata::kernels::kv_append_fp4_step(st.k_pool, st.v_pool, st.page_table, st.step, b.kcur, b.vcur, s, stream,
+                                                    &st.host);
+            }
+        } else if (st.kv_q4) {
             strata::kernels::kv_append_q4_step(st.k_q4, st.v_q4, st.page_table, st.step, b.kcur, b.vcur, s, stream,
                                                &st.host);
         } else if (st.kv_int8)
