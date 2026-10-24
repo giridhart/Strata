@@ -41,6 +41,7 @@ inline sycl::queue& get_default_queue() {
 #include "strata/kernels/qsa_decode_attn.hpp"
 #include "strata/kernels/fused_gdn.hpp"
 #include "strata/kernels/finish.hpp"
+#include "strata/kernels/gemv_f16_rows.hpp"
 #include "strata/kernels/qsa_select.hpp"
 #include <algorithm>
 #include <cstdlib>
@@ -169,6 +170,18 @@ void project_bf16_pair(const float* x, const uint16_t* x_bf16, const uint16_t* w
         bf16_gemv_fp32_mmvf(x, w2, o2, n_in, n_out2, stream);
     } else {
         bf16_gemv_pair(x_bf16, w1, o1, n_out1, w2, o2, n_out2, n_in, stream);
+    }
+}
+
+void project_bf16_multi(const float* x, size_t ldx, const uint16_t* weights, float* out, size_t ldy,
+                        int64_t n_in, int64_t n_out, int T, void* stream) {
+    using namespace strata::kernels;
+    if (T > 1 && multi_row_gemv_enabled()) {
+        gemv_f16_dispatch(weights, x, ldx, (int)n_out, (int)n_in, T, 1.0f, out, ldy, stream);
+    } else {
+        for (int t = 0; t < T; ++t) {
+            project_bf16(x + t * ldx, nullptr, weights, out + t * ldy, n_in, n_out, true, stream);
+        }
     }
 }
 ///< threads per row for the row-split GEMVs.
