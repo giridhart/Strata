@@ -1931,6 +1931,14 @@ endif()
     set_tests_properties(gemv_rows_test PROPERTIES RESOURCE_LOCK gpu TIMEOUT 60)
   endif()
 
+  if(STRATA_ENABLE_SYCL AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/core/sycl/numerics_test.cpp")
+    add_executable(numerics_test tests/core/sycl/numerics_test.cpp)
+    target_include_directories(numerics_test PRIVATE ${_strata_gpu_include_directories})
+    target_link_libraries(numerics_test PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+    add_test(NAME numerics_test COMMAND numerics_test)
+    set_tests_properties(numerics_test PROPERTIES RESOURCE_LOCK gpu TIMEOUT 60)
+  endif()
+
 
 
 
@@ -3016,7 +3024,7 @@ if(STRATA_ENABLE_SYCL)
             sycl_native_gr_norm sycl_xe2_subgroup_gemv sycl_xmx_joint_matrix
             s_gemv_pair_parity quantize_act_images_parity bf16_gemv_pair_parity
             kv_gather_wide_parity qsa_scores_rows_parity prefill_mmq_tab_parity
-            gdn_chunk_parity trellis_parity finish_test gemv_rows_test
+            gdn_chunk_parity trellis_parity finish_test gemv_rows_test numerics_test
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
     COMMENT "Running Intel SYCL tests via ctest"
     USES_TERMINAL

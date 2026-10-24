@@ -11,6 +11,7 @@
 #include "strata/core/sycl_arch.hpp"
 #include "strata/kernels/bf16_bits.hpp"
 #include "strata/kernels/f16_bits.hpp"
+#include "strata/kernels/numerics_fp8_fp4.hpp"
 
 #include <atomic>
 #include <cmath>
@@ -30,50 +31,6 @@ constexpr int kKvFp8 = 1;
 inline constexpr size_t finish_kv_row_bytes(int fmt, int d) {
     return fmt == kKvBf16 ? (size_t)d * 2
                           : ((size_t)d + (size_t)d / 32 + 15) / 16 * 16;
-}
-
-// 2^ceil(log2(x)) for positive normal x (reference fast_round_scale)
-inline float pow2_ceil(float x) {
-    const uint32_t b = sycl::bit_cast<uint32_t>(x);
-    const int e = (int)((b >> 23) & 0xffu) - 127 + ((b & 0x7fffffu) != 0u ? 1 : 0);
-    return sycl::bit_cast<float>((uint32_t)(e + 127) << 23);
-}
-
-// v rounded to the nearest E4M3 value (ties to even), saturated at +-448
-inline float e4m3_round(float v) {
-    const float a = sycl::fabs(v);
-    if (!(a == a)) return v;
-    float r;
-    if (a >= 448.0f) {
-        r = 448.0f;
-    } else {
-        const int e = (int)((sycl::bit_cast<uint32_t>(a) >> 23) & 0xffu) - 127;
-        const float step = e < -6 ? 0.001953125f : sycl::bit_cast<float>((uint32_t)(e - 3 + 127) << 23);
-        r = (a == 0.0f) ? 0.0f : sycl::rint(a / step) * step;
-        r = sycl::fmin(r, 448.0f);
-    }
-    return v < 0.0f ? -r : r;
-}
-
-inline float fp8_rt(float v) { return e4m3_round(v); }
-
-// E4M3 code of v / 2^k for a quotient that is an E4M3 value
-inline uint32_t e4m3_code(float v, int k = 0) {
-    const uint32_t b = sycl::bit_cast<uint32_t>(v), sg = (b >> 24) & 0x80u, a = b & 0x7fffffffu;
-    if (a == 0u) return sg;
-    const int e = (int)(a >> 23) - 127 - k;
-    if (e >= -6) return sg | ((uint32_t)(e + 7) << 3) | ((a >> 20) & 7u);
-    return sg | (((a & 0x7fffffu) | 0x800000u) >> (14 - e));
-}
-
-// E4M3 code value decoded to F32
-inline float e4m3_value(uint8_t q) {
-    const uint32_t e = (q >> 3) & 15u, m = q & 7u;
-    float v;
-    if (e == 15u && m == 7u) v = sycl::bit_cast<float>(0x7fc00000u);
-    else if (e == 0u) v = (float)m * 0.001953125f;
-    else v = sycl::bit_cast<float>(((e + 120u) << 23) | (m << 20));
-    return (q & 0x80u) ? -v : v;
 }
 
 struct FinishArgs {
