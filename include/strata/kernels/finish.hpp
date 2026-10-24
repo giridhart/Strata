@@ -12,9 +12,11 @@
 #include "strata/kernels/bf16_bits.hpp"
 #include "strata/kernels/f16_bits.hpp"
 
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 
 namespace strata::kernels {
 
@@ -83,7 +85,10 @@ struct FinishArgs {
     int vpp = 1;
     int pos_step = 1;
     const float* freqs = nullptr; // rd / 2 values
+    float theta = 10000.0f;       // Base frequency if freqs == nullptr
     int quant = 0;                // 0: none/BF16, 1: FP8 E4M3
+    float* out = nullptr;         // F32 destination (if null, in-place on x)
+    long long out_stride = 0;     // F32 destination stride (if 0, uses stride)
     uint16_t* dst = nullptr;      // BF16 destination
     long long dst_stride = 0;
     uint8_t* pdst = nullptr;      // Packed FP8 destination
@@ -112,7 +117,9 @@ inline void launch_finish_kernel(const float* x, int n_vec, int len, long long s
             [=](sycl::nd_item<1> item) {
                 const int v = item.get_group(0);
                 const float* in_vec = x + (long long)v * stride;
-                float* out_vec = const_cast<float*>(in_vec);
+                float* out_vec = (f.out != nullptr)
+                    ? (f.out + (long long)v * (f.out_stride != 0 ? f.out_stride : stride))
+                    : const_cast<float*>(in_vec);
 
                 auto sg = item.get_sub_group();
                 const int tid = item.get_local_id(0);
@@ -172,7 +179,10 @@ inline void launch_finish_kernel(const float* x, int n_vec, int len, long long s
                         const float other = sycl::permute_group_by_xor(sg, r[j], 1);
                         if (e >= r0 && e < len) {
                             const int i = (e - r0) >> 1;
-                            const float ang = (float)pos * f.freqs[i];
+                            const float freq = (f.freqs != nullptr)
+                                ? f.freqs[i]
+                                : sycl::pow(f.theta, -2.0f * (float)i / (float)f.rd);
+                            const float ang = (float)pos * freq;
                             const float c = sycl::cos(ang);
                             const float sn = f.inverse ? -sycl::sin(ang) : sycl::sin(ang);
                             if (((e - r0) & 1) == 0) {
@@ -264,15 +274,232 @@ inline void launch_finish_kernel(const float* x, int n_vec, int len, long long s
 }
 
 inline void finish(const float* x, int n_vec, int len, long long stride,
-                   const FinishArgs& f, sycl::queue* stream = nullptr) {
+                   const FinishArgs& f, void* stream = nullptr) {
     static sycl::queue default_queue{sycl::default_selector_v, sycl::property::queue::in_order()};
-    sycl::queue& q = stream ? *stream : default_queue;
+    sycl::queue& q = stream ? *static_cast<sycl::queue*>(stream) : default_queue;
 
     if (f.pdst != nullptr) {
         launch_finish_kernel<true>(x, n_vec, len, stride, f, q);
     } else {
         launch_finish_kernel<false>(x, n_vec, len, stride, f, q);
     }
+}
+
+inline void finish(const float* x, int n_vec, int len, long long stride,
+                   const FinishArgs& f, sycl::queue* stream) {
+    finish(x, n_vec, len, stride, f, static_cast<void*>(stream));
+}
+
+inline void finish(const float* x, int n_vec, int len, long long stride,
+                   const FinishArgs& f, sycl::queue& q) {
+    finish(x, n_vec, len, stride, f, static_cast<void*>(&q));
+}
+
+namespace detail {
+inline std::atomic<int>& fused_finish_override() {
+    static std::atomic<int> s_override{-1};
+    return s_override;
+}
+}  // namespace detail
+
+inline bool fused_finish_enabled() {
+    int val = detail::fused_finish_override().load(std::memory_order_relaxed);
+    if (val != -1) return val != 0;
+    static const bool env = [] {
+        const char* e = std::getenv("STRATA_FUSED_FINISH");
+        return (e != nullptr && std::atoi(e) != 0);
+    }();
+    return env;
+}
+
+inline void set_fused_finish_enabled(bool enabled) {
+    detail::fused_finish_override().store(enabled ? 1 : 0, std::memory_order_relaxed);
+}
+
+inline bool fused_finish_usable(int len) {
+    return len > 0 && len <= (kFinMax * kFinThreads);
+}
+
+// ----------------------------------------------------------------------------
+// Engine API: finish_norm_rope & finish_norm_rope_quant
+// ----------------------------------------------------------------------------
+
+// Fuses RMSNorm and RoPE in-place (out == nullptr or out == x) or into output buffer out.
+inline void finish_norm_rope(
+    const float* x,
+    float* out,
+    int n_vec,
+    int len,
+    long long stride,
+    const float* w = nullptr,
+    float eps = 1e-6f,
+    int rd = 0,
+    const float* freqs = nullptr,
+    int pos = 0,
+    int inverse = 0,
+    int vpp = 1,
+    int pos_step = 1,
+    long long out_stride = 0,
+    void* stream = nullptr) {
+    FinishArgs args;
+    args.w = w;
+    args.eps = eps;
+    args.rd = rd;
+    args.pos = pos;
+    args.inverse = inverse;
+    args.vpp = vpp;
+    args.pos_step = pos_step;
+    args.freqs = freqs;
+    args.quant = 0;
+    args.out = out;
+    args.out_stride = out_stride != 0 ? out_stride : stride;
+    args.dst = nullptr;
+    args.pdst = nullptr;
+    finish(x, n_vec, len, stride, args, stream);
+}
+
+inline void finish_norm_rope(
+    const float* x,
+    float* out,
+    int n_vec,
+    int len,
+    long long stride,
+    const float* w,
+    float eps,
+    int rd,
+    const float* freqs,
+    int pos,
+    int inverse,
+    int vpp,
+    int pos_step,
+    long long out_stride,
+    sycl::queue& q) {
+    finish_norm_rope(x, out, n_vec, len, stride, w, eps, rd, freqs, pos, inverse, vpp, pos_step, out_stride, static_cast<void*>(&q));
+}
+
+// Fuses RMSNorm and RoPE with direct BF16 destination writeback from registers.
+inline void finish_norm_rope(
+    const float* x,
+    uint16_t* dst,
+    int n_vec,
+    int len,
+    long long stride,
+    long long dst_stride,
+    const float* w = nullptr,
+    float eps = 1e-6f,
+    int rd = 0,
+    const float* freqs = nullptr,
+    int pos = 0,
+    int inverse = 0,
+    int vpp = 1,
+    int pos_step = 1,
+    void* stream = nullptr) {
+    FinishArgs args;
+    args.w = w;
+    args.eps = eps;
+    args.rd = rd;
+    args.pos = pos;
+    args.inverse = inverse;
+    args.vpp = vpp;
+    args.pos_step = pos_step;
+    args.freqs = freqs;
+    args.quant = 0;
+    args.out = nullptr;
+    args.dst = dst;
+    args.dst_stride = dst_stride;
+    args.pdst = nullptr;
+    finish(x, n_vec, len, stride, args, stream);
+}
+
+inline void finish_norm_rope(
+    const float* x,
+    uint16_t* dst,
+    int n_vec,
+    int len,
+    long long stride,
+    long long dst_stride,
+    const float* w,
+    float eps,
+    int rd,
+    const float* freqs,
+    int pos,
+    int inverse,
+    int vpp,
+    int pos_step,
+    sycl::queue& q) {
+    finish_norm_rope(x, dst, n_vec, len, stride, dst_stride, w, eps, rd, freqs, pos, inverse, vpp, pos_step, static_cast<void*>(&q));
+}
+
+inline void finish_norm_rope_bf16(
+    const float* x,
+    uint16_t* dst,
+    int n_vec,
+    int len,
+    long long stride,
+    long long dst_stride,
+    const float* w = nullptr,
+    float eps = 1e-6f,
+    int rd = 0,
+    const float* freqs = nullptr,
+    int pos = 0,
+    int inverse = 0,
+    int vpp = 1,
+    int pos_step = 1,
+    void* stream = nullptr) {
+    finish_norm_rope(x, dst, n_vec, len, stride, dst_stride, w, eps, rd, freqs, pos, inverse, vpp, pos_step, stream);
+}
+
+// Fuses RMSNorm, RoPE, and FP8 E4M3 packed quantization (codes + group scales) into pdst.
+inline void finish_norm_rope_quant(
+    const float* x,
+    uint8_t* pdst,
+    int n_vec,
+    int len,
+    long long stride,
+    long long pdst_stride,
+    const float* w = nullptr,
+    float eps = 1e-6f,
+    int rd = 0,
+    const float* freqs = nullptr,
+    int pos = 0,
+    int inverse = 0,
+    int vpp = 1,
+    int pos_step = 1,
+    void* stream = nullptr) {
+    FinishArgs args;
+    args.w = w;
+    args.eps = eps;
+    args.rd = rd;
+    args.pos = pos;
+    args.inverse = inverse;
+    args.vpp = vpp;
+    args.pos_step = pos_step;
+    args.freqs = freqs;
+    args.quant = 1;
+    args.out = nullptr;
+    args.dst = nullptr;
+    args.pdst = pdst;
+    args.pdst_stride = pdst_stride;
+    finish(x, n_vec, len, stride, args, stream);
+}
+
+inline void finish_norm_rope_quant(
+    const float* x,
+    uint8_t* pdst,
+    int n_vec,
+    int len,
+    long long stride,
+    long long pdst_stride,
+    const float* w,
+    float eps,
+    int rd,
+    const float* freqs,
+    int pos,
+    int inverse,
+    int vpp,
+    int pos_step,
+    sycl::queue& q) {
+    finish_norm_rope_quant(x, pdst, n_vec, len, stride, pdst_stride, w, eps, rd, freqs, pos, inverse, vpp, pos_step, static_cast<void*>(&q));
 }
 
 }  // namespace strata::kernels

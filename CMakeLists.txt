@@ -1915,6 +1915,14 @@ endif()
     add_test(NAME trellis_parity COMMAND trellis_parity)
   endif()
 
+  if(STRATA_ENABLE_SYCL AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/core/sycl/finish_test.cpp")
+    add_executable(finish_test tests/core/sycl/finish_test.cpp)
+    target_include_directories(finish_test PRIVATE ${_strata_gpu_include_directories})
+    target_link_libraries(finish_test PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+    add_test(NAME finish_test COMMAND finish_test)
+    set_tests_properties(finish_test PROPERTIES RESOURCE_LOCK gpu TIMEOUT 60)
+  endif()
+
 
 
 
@@ -3000,7 +3008,7 @@ if(STRATA_ENABLE_SYCL)
             sycl_native_gr_norm sycl_xe2_subgroup_gemv sycl_xmx_joint_matrix
             s_gemv_pair_parity quantize_act_images_parity bf16_gemv_pair_parity
             kv_gather_wide_parity qsa_scores_rows_parity prefill_mmq_tab_parity
-            gdn_chunk_parity trellis_parity
+            gdn_chunk_parity trellis_parity finish_test
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
     COMMENT "Running Intel SYCL tests via ctest"
     USES_TERMINAL
