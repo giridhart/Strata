@@ -3151,6 +3151,7 @@ if(STRATA_BUILD_PERF)
       perf_embed_overlap
       perf_finish
       perf_gemv_rows
+      perf_numerics
     )
 
     foreach(_bm ${_strata_tier4_bms})
