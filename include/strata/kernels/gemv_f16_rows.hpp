@@ -12,8 +12,10 @@
 #include "strata/kernels/f16_bits.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 
 namespace strata::kernels {
 
@@ -158,6 +160,88 @@ inline void gemv_f16(const uint16_t* W, const float* x, int n, int k, int T, flo
     gemv_f16(reinterpret_cast<const sycl::half*>(W), x, n, k, T, alpha, y, q, ldx, ldy);
 }
 
+namespace detail {
+inline sycl::queue& default_gemv_queue() {
+    static sycl::queue q{sycl::default_selector_v, sycl::property::queue::in_order()};
+    return q;
+}
+
+inline std::atomic<int>& multi_row_gemv_override() {
+    static std::atomic<int> s_override{-1};
+    return s_override;
+}
+}  // namespace detail
+
+/// Runtime configuration helper: checks STRATA_MULTI_ROW_GEMV env or defaults to enabled.
+inline bool multi_row_gemv_enabled() {
+    int val = detail::multi_row_gemv_override().load(std::memory_order_relaxed);
+    if (val != -1) return val != 0;
+    static const bool env = [] {
+        const char* e = std::getenv("STRATA_MULTI_ROW_GEMV");
+        if (e != nullptr) return (std::atoi(e) != 0);
+        return true;
+    }();
+    return env;
+}
+
+/// Explicit programmatic toggle for multi-row GEMV execution.
+inline void set_multi_row_gemv_enabled(bool enabled) {
+    detail::multi_row_gemv_override().store(enabled ? 1 : 0, std::memory_order_relaxed);
+}
+
+// Stream interop overloads for gemv_f16
+inline void gemv_f16(const sycl::half* W, const float* x, int n, int k, int T, float alpha,
+                     float* y, void* stream, size_t ldx = 0, size_t ldy = 0) {
+    sycl::queue& q = stream ? *static_cast<sycl::queue*>(stream) : detail::default_gemv_queue();
+    gemv_f16(W, x, n, k, T, alpha, y, q, ldx, ldy);
+}
+
+inline void gemv_f16(const sycl::half* W, const float* x, int n, int k, int T, float alpha,
+                     float* y, sycl::queue* stream, size_t ldx = 0, size_t ldy = 0) {
+    gemv_f16(W, x, n, k, T, alpha, y, static_cast<void*>(stream), ldx, ldy);
+}
+
+inline void gemv_f16(const uint16_t* W, const float* x, int n, int k, int T, float alpha,
+                     float* y, void* stream, size_t ldx = 0, size_t ldy = 0) {
+    gemv_f16(reinterpret_cast<const sycl::half*>(W), x, n, k, T, alpha, y, stream, ldx, ldy);
+}
+
+inline void gemv_f16(const uint16_t* W, const float* x, int n, int k, int T, float alpha,
+                     float* y, sycl::queue* stream, size_t ldx = 0, size_t ldy = 0) {
+    gemv_f16(reinterpret_cast<const sycl::half*>(W), x, n, k, T, alpha, y, static_cast<void*>(stream), ldx, ldy);
+}
+
+inline void gemv_f16(const sycl::half* W, const float* x, size_t ldx, int n, int k, int T,
+                     float alpha, float* y, size_t ldy, sycl::queue& q) {
+    gemv_f16(W, x, n, k, T, alpha, y, q, ldx, ldy);
+}
+
+inline void gemv_f16(const sycl::half* W, const float* x, size_t ldx, int n, int k, int T,
+                     float alpha, float* y, size_t ldy, void* stream) {
+    sycl::queue& q = stream ? *static_cast<sycl::queue*>(stream) : detail::default_gemv_queue();
+    gemv_f16(W, x, n, k, T, alpha, y, q, ldx, ldy);
+}
+
+inline void gemv_f16(const sycl::half* W, const float* x, size_t ldx, int n, int k, int T,
+                     float alpha, float* y, size_t ldy, sycl::queue* stream) {
+    gemv_f16(W, x, ldx, n, k, T, alpha, y, ldy, static_cast<void*>(stream));
+}
+
+inline void gemv_f16(const uint16_t* W, const float* x, size_t ldx, int n, int k, int T,
+                     float alpha, float* y, size_t ldy, sycl::queue& q) {
+    gemv_f16(reinterpret_cast<const sycl::half*>(W), x, ldx, n, k, T, alpha, y, ldy, q);
+}
+
+inline void gemv_f16(const uint16_t* W, const float* x, size_t ldx, int n, int k, int T,
+                     float alpha, float* y, size_t ldy, void* stream) {
+    gemv_f16(reinterpret_cast<const sycl::half*>(W), x, ldx, n, k, T, alpha, y, ldy, stream);
+}
+
+inline void gemv_f16(const uint16_t* W, const float* x, size_t ldx, int n, int k, int T,
+                     float alpha, float* y, size_t ldy, sycl::queue* stream) {
+    gemv_f16(reinterpret_cast<const sycl::half*>(W), x, ldx, n, k, T, alpha, y, ldy, static_cast<void*>(stream));
+}
+
 /// Multi-row GEMV: evaluates T tokens tiled over ROWS_T (default 4 on Xe2).
 /// Each sub-group evaluates a row of weights across ROWS_T activation vectors simultaneously.
 template <int ROWS_T = 4>
@@ -188,6 +272,102 @@ template <int ROWS_T = 4>
 inline void gemv_f16_rows(const uint16_t* W, const float* x, size_t ldx, int n, int k, int T,
                           float alpha, float* y, size_t ldy, sycl::queue& q) {
     gemv_f16_rows<ROWS_T>(reinterpret_cast<const sycl::half*>(W), x, ldx, n, k, T, alpha, y, ldy, q);
+}
+
+template <int ROWS_T = 4>
+inline void gemv_f16_rows(const sycl::half* W, const float* x, size_t ldx, int n, int k, int T,
+                          float alpha, float* y, size_t ldy, void* stream) {
+    sycl::queue& q = stream ? *static_cast<sycl::queue*>(stream) : detail::default_gemv_queue();
+    gemv_f16_rows<ROWS_T>(W, x, ldx, n, k, T, alpha, y, ldy, q);
+}
+
+template <int ROWS_T = 4>
+inline void gemv_f16_rows(const sycl::half* W, const float* x, size_t ldx, int n, int k, int T,
+                          float alpha, float* y, size_t ldy, sycl::queue* stream) {
+    gemv_f16_rows<ROWS_T>(W, x, ldx, n, k, T, alpha, y, ldy, static_cast<void*>(stream));
+}
+
+template <int ROWS_T = 4>
+inline void gemv_f16_rows(const uint16_t* W, const float* x, size_t ldx, int n, int k, int T,
+                          float alpha, float* y, size_t ldy, void* stream) {
+    gemv_f16_rows<ROWS_T>(reinterpret_cast<const sycl::half*>(W), x, ldx, n, k, T, alpha, y, ldy, stream);
+}
+
+template <int ROWS_T = 4>
+inline void gemv_f16_rows(const uint16_t* W, const float* x, size_t ldx, int n, int k, int T,
+                          float alpha, float* y, size_t ldy, sycl::queue* stream) {
+    gemv_f16_rows<ROWS_T>(reinterpret_cast<const sycl::half*>(W), x, ldx, n, k, T, alpha, y, ldy, static_cast<void*>(stream));
+}
+
+// ----------------------------------------------------------------------------
+// Engine API: gemv_f16_dispatch
+// Automatically calls gemv_f16_rows<4> when T > 1 and multi_row_gemv_enabled(),
+// falling back to single-row GEMV when T == 1 or when disabled.
+// ----------------------------------------------------------------------------
+
+inline void gemv_f16_dispatch(const sycl::half* W, const float* x, size_t ldx, int n, int k, int T,
+                              float alpha, float* y, size_t ldy, sycl::queue& q) {
+    if (T > 1 && multi_row_gemv_enabled()) {
+        gemv_f16_rows<4>(W, x, ldx, n, k, T, alpha, y, ldy, q);
+    } else {
+        gemv_f16(W, x, ldx, n, k, T, alpha, y, ldy, q);
+    }
+}
+
+inline void gemv_f16_dispatch(const sycl::half* W, const float* x, size_t ldx, int n, int k, int T,
+                              float alpha, float* y, size_t ldy, void* stream = nullptr) {
+    sycl::queue& q = stream ? *static_cast<sycl::queue*>(stream) : detail::default_gemv_queue();
+    gemv_f16_dispatch(W, x, ldx, n, k, T, alpha, y, ldy, q);
+}
+
+inline void gemv_f16_dispatch(const sycl::half* W, const float* x, size_t ldx, int n, int k, int T,
+                              float alpha, float* y, size_t ldy, sycl::queue* stream) {
+    gemv_f16_dispatch(W, x, ldx, n, k, T, alpha, y, ldy, static_cast<void*>(stream));
+}
+
+inline void gemv_f16_dispatch(const uint16_t* W, const float* x, size_t ldx, int n, int k, int T,
+                              float alpha, float* y, size_t ldy, sycl::queue& q) {
+    gemv_f16_dispatch(reinterpret_cast<const sycl::half*>(W), x, ldx, n, k, T, alpha, y, ldy, q);
+}
+
+inline void gemv_f16_dispatch(const uint16_t* W, const float* x, size_t ldx, int n, int k, int T,
+                              float alpha, float* y, size_t ldy, void* stream = nullptr) {
+    gemv_f16_dispatch(reinterpret_cast<const sycl::half*>(W), x, ldx, n, k, T, alpha, y, ldy, stream);
+}
+
+inline void gemv_f16_dispatch(const uint16_t* W, const float* x, size_t ldx, int n, int k, int T,
+                              float alpha, float* y, size_t ldy, sycl::queue* stream) {
+    gemv_f16_dispatch(reinterpret_cast<const sycl::half*>(W), x, ldx, n, k, T, alpha, y, ldy, static_cast<void*>(stream));
+}
+
+inline void gemv_f16_dispatch(const sycl::half* W, const float* x, int n, int k, int T,
+                              float alpha, float* y, void* stream = nullptr) {
+    gemv_f16_dispatch(W, x, static_cast<size_t>(k), n, k, T, alpha, y, static_cast<size_t>(n), stream);
+}
+
+inline void gemv_f16_dispatch(const sycl::half* W, const float* x, int n, int k, int T,
+                              float alpha, float* y, sycl::queue* stream) {
+    gemv_f16_dispatch(W, x, static_cast<size_t>(k), n, k, T, alpha, y, static_cast<size_t>(n), stream);
+}
+
+inline void gemv_f16_dispatch(const sycl::half* W, const float* x, int n, int k, int T,
+                              float alpha, float* y, sycl::queue& q) {
+    gemv_f16_dispatch(W, x, static_cast<size_t>(k), n, k, T, alpha, y, static_cast<size_t>(n), q);
+}
+
+inline void gemv_f16_dispatch(const uint16_t* W, const float* x, int n, int k, int T,
+                              float alpha, float* y, void* stream = nullptr) {
+    gemv_f16_dispatch(reinterpret_cast<const sycl::half*>(W), x, static_cast<size_t>(k), n, k, T, alpha, y, static_cast<size_t>(n), stream);
+}
+
+inline void gemv_f16_dispatch(const uint16_t* W, const float* x, int n, int k, int T,
+                              float alpha, float* y, sycl::queue* stream) {
+    gemv_f16_dispatch(reinterpret_cast<const sycl::half*>(W), x, static_cast<size_t>(k), n, k, T, alpha, y, static_cast<size_t>(n), stream);
+}
+
+inline void gemv_f16_dispatch(const uint16_t* W, const float* x, int n, int k, int T,
+                              float alpha, float* y, sycl::queue& q) {
+    gemv_f16_dispatch(reinterpret_cast<const sycl::half*>(W), x, static_cast<size_t>(k), n, k, T, alpha, y, static_cast<size_t>(n), q);
 }
 
 }  // namespace strata::kernels

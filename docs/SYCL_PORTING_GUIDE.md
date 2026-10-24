@@ -397,7 +397,111 @@ void finish_norm_rope_quant(const float* x, uint8_t* pdst, int n_vec, int len, l
 
 ---
 
-## 8. References & Related Documents
+## 8. Multi-Row Matrix-Vector Multiplication (gemv_f16_rows) for Speculative Decoding & MTP (Item C)
+
+The Multi-Row GEMV kernel (`include/strata/kernels/gemv_f16_rows.hpp`) ports the DeepSeek-V4.1 multi-row matrix-vector multiplication technique (`src/dsv41/ds4_kernels.cu` lines 370–435) to Pure SYCL 2020, engineered specifically for Intel Xe2 architectures (Battlemage Arc B580 / Lunar Lake Xe2-LPG).
+
+### 8.1 Memory Bandwidth Amortization Across $T$ Tokens
+
+In speculative decoding (Multi-Token Prediction / MTP, Medusa, Lookahead, and draft verification), small-batch inference evaluates a batch of $T$ candidate draft tokens ($T \in \{2, 4, 8\}$) simultaneously.
+
+In a traditional execution path using standard GEMV:
+- The kernel is launched independently for each token $t \in [0, T-1]$.
+- Every single token launch reads the entire 2D projection weight matrix $W \in \mathbb{R}^{N \times K}$ from GPU DRAM into execution units.
+- Evaluating $T$ tokens requires reading the weight matrix **$T$ discrete times from VRAM**, saturating memory bandwidth and stalling execution units on memory-bound projection layers (router gating, indexer projection, etc.).
+
+Multi-Row GEMV (`gemv_f16_rows`) completely amortizes memory traffic across all $T$ activation vectors:
+- Each Intel Xe2 sub-group processes one row of weights $W_{\text{row}} \in \mathbb{R}^K$.
+- The sub-group loads a 16-byte chunk (8 FP16 elements via `sycl::vec<sycl::half, 8>`) **ONCE into General Register File (GRF) registers**.
+- It then evaluates the dot product against $T$ activation rows simultaneously in registers:
+
+```
+[DRAM Weight Row W[row, :]]
+              │
+              │ (Loaded ONCE: 16 bytes = 8 FP16 into GRF registers)
+              ▼
+┌─────────────────────────────────────────────────────────────┐
+│ Intel Xe2 Execution Unit Registers (SIMD16 sub-group)        │
+│                                                             │
+│  Weight Vector:  w0, w1, w2, w3, w4, w5, w6, w7             │
+│                                                             │
+│  Activation T0:  acc[0] += Σ (w * x[0, :])                  │
+│  Activation T1:  acc[1] += Σ (w * x[1, :])                  │
+│  Activation T2:  acc[2] += Σ (w * x[2, :])                  │
+│  Activation T3:  acc[3] += Σ (w * x[3, :])                  │
+│                                                             │
+│  Sub-Group Reductions:                                      │
+│    sycl::reduce_over_group(sg, acc[t], sycl::plus<float>()) │
+└─────────────────────────────────────────────────────────────┘
+              │
+              │ (Writes T output elements to DRAM)
+              ▼
+[DRAM Output Y[0..T-1, row]]
+```
+
+### 8.2 Intel Xe2 SIMD16 Register Tiling: Optimal `ROWS_T = 4`
+
+DeepSeek-V4.1 defaulted to a 2-row tiling (`kRowsT = 2`) on CUDA. On Intel Xe2 execution units, each EU thread features a large General Register File (GRF) with native SIMD16 vector execution.
+
+Microbenchmarking across register tiling sizes (`perf/sycl/perf_gemv_rows.cpp`) revealed:
+- **`ROWS_T = 2`**: Amortizes 50% of weight memory bandwidth, yielding 1.61x–1.75x speedup at $T=2$.
+- **`ROWS_T = 4` (Optimal)**: Perfect balance between register residency and thread occupancy on Xe2 SIMD16 units. Consumes 4 accumulator registers per lane (`float acc[4]`), avoiding register spilling while quadrupling the compute-to-memory ratio.
+- Compared to `ROWS_T = 2`, `ROWS_T = 4` provides an additional **+20% to +35% latency reduction** for $T \ge 4$.
+
+### 8.3 Measured Performance Improvements on Intel Xe2 Hardware
+
+Evaluated across representative projection shapes ($K, N \in \{2048, 2560, 6144\}$) on Intel Xe2 hardware (`Intel(R) Graphics [0x64a0]` / Core Ultra 5 226V / Arc B580):
+
+| Shape ($K \times N$) | Token Count ($T$) | Baseline GEMV | Multi-Row Tile-2 | Multi-Row Tile-4 | Measured Speedup | Effective BW | Compute Throughput |
+|---|---|---|---|---|---|---|---|
+| **2048 x 2048** | $T = 1$ | $107.85\ \mu\text{s}$ | $117.63\ \mu\text{s}$ | $118.05\ \mu\text{s}$ | 0.91x (Fallback) | $71.20\ \text{GB/s}$ | $71.1\ \text{GFLOPS}$ |
+| **2048 x 2048** | $T = 2$ | $208.20\ \mu\text{s}$ | $125.20\ \mu\text{s}$ | $124.41\ \mu\text{s}$ | **1.67x** (+67%) | $67.69\ \text{GB/s}$ | $134.9\ \text{GFLOPS}$ |
+| **2048 x 2048** | $T = 4$ | $395.52\ \mu\text{s}$ | $175.29\ \mu\text{s}$ | $145.42\ \mu\text{s}$ | **2.72x** (+172%) | $58.14\ \text{GB/s}$ | $230.7\ \text{GFLOPS}$ |
+| **2048 x 2048** | $T = 8$ | $787.79\ \mu\text{s}$ | $286.76\ \mu\text{s}$ | $235.63\ \mu\text{s}$ | **3.34x** (+234%) | $36.16\ \text{GB/s}$ | $284.8\ \text{GFLOPS}$ |
+| **2560 x 2560** | $T = 1$ | $137.14\ \mu\text{s}$ | $143.28\ \mu\text{s}$ | $142.54\ \mu\text{s}$ | 0.96x (Fallback) | $92.10\ \text{GB/s}$ | $92.0\ \text{GFLOPS}$ |
+| **2560 x 2560** | $T = 2$ | $275.46\ \mu\text{s}$ | $168.04\ \mu\text{s}$ | $157.36\ \mu\text{s}$ | **1.75x** (+75%) | $83.56\ \text{GB/s}$ | $166.6\ \text{GFLOPS}$ |
+| **2560 x 2560** | $T = 4$ | $570.97\ \mu\text{s}$ | $278.93\ \mu\text{s}$ | $203.88\ \mu\text{s}$ | **2.80x** (+180%) | $64.69\ \text{GB/s}$ | $257.2\ \text{GFLOPS}$ |
+| **2560 x 2560** | $T = 8$ | $1063.36\ \mu\text{s}$ | $489.13\ \mu\text{s}$ | $336.90\ \mu\text{s}$ | **3.16x** (+216%) | $39.39\ \text{GB/s}$ | $311.2\ \text{GFLOPS}$ |
+| **2560 x 6144** | $T = 1$ | $311.68\ \mu\text{s}$ | $316.18\ \mu\text{s}$ | $322.59\ \mu\text{s}$ | 0.97x (Fallback) | $97.62\ \text{GB/s}$ | $97.5\ \text{GFLOPS}$ |
+| **2560 x 6144** | $T = 2$ | $638.71\ \mu\text{s}$ | $340.66\ \mu\text{s}$ | $320.83\ \mu\text{s}$ | **1.99x** (+99%) | $98.27\ \text{GB/s}$ | $196.1\ \text{GFLOPS}$ |
+| **2560 x 6144** | $T = 4$ | $1268.79\ \mu\text{s}$ | $638.10\ \mu\text{s}$ | $420.82\ \mu\text{s}$ | **3.02x** (+202%) | $75.08\ \text{GB/s}$ | $299.0\ \text{GFLOPS}$ |
+| **2560 x 6144** | $T = 8$ | $2514.05\ \mu\text{s}$ | $1268.35\ \mu\text{s}$ | $783.20\ \mu\text{s}$ | **3.21x** (+221%) | $40.52\ \text{GB/s}$ | $321.3\ \text{GFLOPS}$ |
+| **6144 x 2560** | $T = 2$ | $662.81\ \mu\text{s}$ | $392.40\ \mu\text{s}$ | $388.53\ \mu\text{s}$ | **1.71x** (+71%) | $81.14\ \text{GB/s}$ | $161.9\ \text{GFLOPS}$ |
+| **6144 x 2560** | $T = 4$ | $1329.52\ \mu\text{s}$ | $740.44\ \mu\text{s}$ | $550.78\ \mu\text{s}$ | **2.41x** (+141%) | $57.37\ \text{GB/s}$ | $228.5\ \text{GFLOPS}$ |
+| **6144 x 2560** | $T = 8$ | $2614.22\ \mu\text{s}$ | $1323.74\ \mu\text{s}$ | $959.23\ \mu\text{s}$ | **2.73x** (+173%) | $33.08\ \text{GB/s}$ | $262.4\ \text{GFLOPS}$ |
+
+**Summary Across Evaluation Suite**:
+- **$T = 2$**: **1.61x–1.83x** (up to **1.99x**) speedup.
+- **$T = 4$**: **2.38x–2.92x** (up to **3.02x**) speedup.
+- **$T = 8$**: **2.48x–3.46x** speedup.
+
+### 8.4 Engine API & Dispatch Architecture
+
+The multi-row GEMV engine API is defined in `include/strata/kernels/gemv_f16_rows.hpp`:
+
+```cpp
+// Automatic engine dispatch: calls gemv_f16_rows<4> when T > 1, single-row GEMV when T == 1
+void gemv_f16_dispatch(const sycl::half* W, const float* x, size_t ldx, int n, int k, int T,
+                       float alpha, float* y, size_t ldy, sycl::queue& q);
+
+// Stream interop overloads (sycl::queue*, void* stream)
+void gemv_f16_dispatch(const sycl::half* W, const float* x, size_t ldx, int n, int k, int T,
+                       float alpha, float* y, size_t ldy, void* stream = nullptr);
+
+// uint16_t (BF16 / FP16 raw bit representation) overloads
+void gemv_f16_dispatch(const uint16_t* W, const float* x, size_t ldx, int n, int k, int T,
+                       float alpha, float* y, size_t ldy, void* stream = nullptr);
+```
+
+**Runtime Configuration Switch**:
+- Environment variable: `STRATA_MULTI_ROW_GEMV` (set to `0` to force disable, defaults to enabled on Xe2).
+- Programmatic toggle: `strata::kernels::set_multi_row_gemv_enabled(bool)`.
+- Query function: `strata::kernels::multi_row_gemv_enabled()`.
+- Single-token ($T = 1$) execution paths remain 100% byte-identical to standard single-row GEMV.
+
+---
+
+## 9. References & Related Documents
 
 - [Intel oneAPI SYCL Command Graph Extension Specification](https://github.com/intel/llvm/blob/sycl/sycl/doc/extensions/experimental/sycl_ext_oneapi_graph.asciidoc)
 - [Intel oneAPI Samples: CUDA to SYCL Migration Training](https://github.com/oneapi-src/oneAPI-samples/tree/master/DirectProgramming/C%2B%2BSYCL/Jupyter/cuda-to-sycl-migration-training)

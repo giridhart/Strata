@@ -21,6 +21,7 @@
 #include "strata/kernels/native_rope.hpp"
 #include "strata/kernels/native_router.hpp"
 #include "strata/kernels/finish.hpp"
+#include "strata/kernels/gemv_f16_rows.hpp"
 #include "strata/kernels/qsa.hpp"
 #include "strata/kernels/qsa_decode_attn.hpp"
 #include "strata/kernels/quantize_act.hpp"
@@ -826,9 +827,14 @@ bool MtpDrafter::record_forward(int T, int step_row0, sycl::queue* cs, std::stri
             fused_gr_read_multi(fa, T, xn_, cs);
         }
         // ---- MoE: router, the 512 resident experts, the shared expert, the combine, the write
-        for (int t = 0; t < T; ++t) {
-            bf16_gemv_fp32_mmvf(mixed_ + t * N, bf16("mlp.gate.weight"), logits_ + t * g.n_expert, (int)N,
-                                (int)g.n_expert, cs);
+        if (T > 1 && multi_row_gemv_enabled()) {
+            gemv_f16_dispatch(bf16("mlp.gate.weight"), mixed_, (size_t)N, (int)g.n_expert, (int)N, T,
+                              1.0f, logits_, (size_t)g.n_expert, cs);
+        } else {
+            for (int t = 0; t < T; ++t) {
+                bf16_gemv_fp32_mmvf(mixed_ + t * N, bf16("mlp.gate.weight"), logits_ + t * g.n_expert, (int)N,
+                                    (int)g.n_expert, cs);
+            }
         }
         if (native_router_enabled()) {
             if (T == 1)
