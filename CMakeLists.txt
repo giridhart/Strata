@@ -3071,6 +3071,13 @@ if(STRATA_BUILD_PERF)
       list(APPEND _strata_perf_targets perf_dequant_dpas)
     endif()
 
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/perf/sycl/perf_iq1m_lut.cpp")
+      add_executable(perf_iq1m_lut perf/sycl/perf_iq1m_lut.cpp)
+      target_include_directories(perf_iq1m_lut PRIVATE ${_strata_gpu_include_directories} ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ggml)
+      target_link_libraries(perf_iq1m_lut PRIVATE strata_core strata_kernels benchmark::benchmark)
+      list(APPEND _strata_perf_targets perf_iq1m_lut)
+    endif()
+
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/perf/sycl/perf_s_gemv_pair.cpp")
       add_executable(perf_s_gemv_pair perf/sycl/perf_s_gemv_pair.cpp)
       target_include_directories(perf_s_gemv_pair PRIVATE ${_strata_gpu_include_directories})
