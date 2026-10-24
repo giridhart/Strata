@@ -20,6 +20,7 @@
 #include "strata/kernels/native_qsa.hpp"
 #include "strata/kernels/native_rope.hpp"
 #include "strata/kernels/native_router.hpp"
+#include "strata/kernels/finish.hpp"
 #include "strata/kernels/qsa.hpp"
 #include "strata/kernels/qsa_decode_attn.hpp"
 #include "strata/kernels/quantize_act.hpp"
@@ -709,7 +710,13 @@ bool MtpDrafter::record_forward(int T, int step_row0, sycl::queue* cs, std::stri
         // check 6; STRATA_NO_NORM_ROPE=1 keeps the two; off on HIP until its parity check passes). K rows of one token
         // are consecutive in `pos`, tokens are NH apart, so a one-token window is the fusable case.
         const bool fuse_nr = native_rope_enabled() && native_norm_rope_usable((int)HD, (int)s.n_rot);
+        const bool fuse_fin = fused_finish_enabled() && fused_finish_usable((int)HD);
         auto norm_rope = [&](float* data, const float* gamma, int rows, int cols, const int32_t* p) {
+            if (fuse_fin && fused_finish_usable(cols)) {
+                finish_norm_rope(data, data, rows, cols, cols, gamma, EPS,
+                                 (int)s.n_rot, nullptr, (p ? *p : 0), 0, 1, 1, cols, cs);
+                return;
+            }
             if (fuse_nr && native_norm_rope_usable(cols, (int)s.n_rot)) {
                 native_qsa_rms_norm_rope(data, cols, gamma, data, rows, cols, (int)s.n_rot, EPS,
                                          rope_scaling(), p, cs);
@@ -724,7 +731,10 @@ bool MtpDrafter::record_forward(int T, int step_row0, sycl::queue* cs, std::stri
         native_quantize_q8_1(mixed_, xq_, (int)N, T, cs);
         native_mmvq(GGML_Q8_0, q8("self_attn.k_proj.weight"), xq_, kcur_, (int)N, (int)(NKV * HD), T, cs);
         native_mmvq(GGML_Q8_0, q8("self_attn.v_proj.weight"), xq_, vcur_, (int)N, (int)(NKV * HD), T, cs);
-        if (T == 1 && fuse_nr) {
+        if (fuse_fin) {
+            finish_norm_rope(kcur_, kcur_, (int)(T * NKV), (int)HD, (int)HD, f32("self_attn.k_norm.weight"),
+                             EPS, (int)s.n_rot, nullptr, (pos ? *pos : 0), 0, (int)NKV, 1, (int)HD, cs);
+        } else if (T == 1 && fuse_nr) {
             native_qsa_rms_norm_rope(kcur_, (int)HD, f32("self_attn.k_norm.weight"), kcur_, (int)NKV, (int)HD,
                                      (int)s.n_rot, EPS, rope_scaling(), pos, cs);
         } else {
@@ -758,7 +768,11 @@ bool MtpDrafter::record_forward(int T, int step_row0, sycl::queue* cs, std::stri
             }
         if (!full) return true;
         native_mmvq(GGML_Q8_0, q8("self_attn.q_proj.weight"), xq_, qfull_, (int)N, (int)(NH * 2 * HD), T, cs);
-        if (fuse_nr) {
+        if (fuse_fin) {
+            finish_norm_rope(qfull_, qcur_, (int)(T * NH), (int)HD, (int)(2 * HD), f32("self_attn.q_norm.weight"),
+                             EPS, (int)s.n_rot, nullptr, (pos ? *pos : 0), 0, (int)NH, 1, (int)HD, cs);
+            if (st_.kv_rot) fwht256_inplace_cuda(qcur_, (int64_t)T * NH, cs);
+        } else if (fuse_nr) {
             native_qsa_rms_norm_rope(qfull_, (int)(2 * HD), f32("self_attn.q_norm.weight"), qcur_, (int)(T * NH),
                                      (int)HD, (int)s.n_rot, EPS, rope_scaling(), pos, cs);
             if (st_.kv_rot) fwht256_inplace_cuda(qcur_, (int64_t)T * NH, cs);

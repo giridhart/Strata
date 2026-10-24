@@ -40,6 +40,7 @@ inline sycl::queue& get_default_queue() {
 #include "strata/kernels/cvec.hpp"
 #include "strata/kernels/qsa_decode_attn.hpp"
 #include "strata/kernels/fused_gdn.hpp"
+#include "strata/kernels/finish.hpp"
 #include "strata/kernels/qsa_select.hpp"
 #include <algorithm>
 #include <cstdlib>
@@ -1306,6 +1307,11 @@ bool qsa_layer(const WeightTable& tables, const ModelGeometry& g, int64_t layer,
     const int64_t cap = qsa_selection_width(kTopkMaxCells, s);
     const auto normalize_rotate = [&](float* data, const WeightRef* norm, int rows, int cols) {
         try {
+            if (fused_finish_enabled() && fused_finish_usable(cols)) {
+                finish_norm_rope(data, data, rows, cols, cols, (const float*)norm->data, RMS_EPS,
+                                 (int)s.n_rot, nullptr, (int)(pos_base + pos), 0, 1, 1, cols, stream);
+                return true;
+            }
             if (native_qsa_enabled())
                 native_qsa_rms_norm_weighted(data, (const float*)norm->data, data, cols, rows, RMS_EPS, stream);
             else
