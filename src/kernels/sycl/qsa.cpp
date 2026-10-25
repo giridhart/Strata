@@ -437,11 +437,16 @@ void kv_gather_kernel(const uint16_t* __restrict__ k_pool, const uint16_t* __res
     const int rem = (int)(i % (kv_heads * (long long)per));
     const int h = rem / per, q = rem - h * per;
     const int cell = ids[id];
-    const long long page = (long long)table[cell / page_size];
-    const long long src = ((page * kv_heads + h) * page_size + (cell % page_size)) * (long long)per + q;
     const long long dst = (id * kv_heads + h) * (long long)per + q;
-    reinterpret_cast<sycl::uint2*>(k_scratch)[dst] = reinterpret_cast<const sycl::uint2*>(k_pool)[src];
-    reinterpret_cast<sycl::uint2*>(v_scratch)[dst] = reinterpret_cast<const sycl::uint2*>(v_pool)[src];
+    if (cell >= 0) {
+        const long long page = (long long)table[cell / page_size];
+        const long long src = ((page * kv_heads + h) * page_size + (cell % page_size)) * (long long)per + q;
+        reinterpret_cast<sycl::uint2*>(k_scratch)[dst] = reinterpret_cast<const sycl::uint2*>(k_pool)[src];
+        reinterpret_cast<sycl::uint2*>(v_scratch)[dst] = reinterpret_cast<const sycl::uint2*>(v_pool)[src];
+    } else {
+        reinterpret_cast<sycl::uint2*>(k_scratch)[dst] = sycl::uint2{0, 0};
+        reinterpret_cast<sycl::uint2*>(v_scratch)[dst] = sycl::uint2{0, 0};
+    }
 }
 
 // ================= 6. qsa_attend =================

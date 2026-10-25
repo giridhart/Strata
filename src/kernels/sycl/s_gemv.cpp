@@ -487,8 +487,8 @@ void s_gemv_split_kernel(const uint16_t* __restrict__ x, const uint8_t* __restri
         }
         item.barrier(sycl::access::fence_space::local_space);
         const int num_sgs = threads_per_row / SG_SIZE;
-        if (tid < num_sgs) {
-            float p_val = partial[tid];
+        if (item.get_sub_group().get_group_id()[0] == 0) {
+            float p_val = (item.get_local_id(0) < num_sgs) ? partial[item.get_local_id(0)] : 0.0f;
             p_val = sycl::reduce_over_group(sg, p_val, sycl::plus<float>());
             if (tid == 0) y[o] = p_val;
         }

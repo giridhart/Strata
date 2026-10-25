@@ -85,6 +85,12 @@ void kv_gather_q8_kernel(const int8_t* __restrict__ k_q, const int8_t* __restric
     const int rem = (int)(i % (kv_heads * (long long)per));
     const int h = rem / per, q4 = rem - h * per;
     const int cell = ids[id];
+    const long long dst = (id * kv_heads + h) * (long long)per + q4;
+    if (cell < 0) {
+        reinterpret_cast<sycl::ushort4*>(k_scratch)[dst] = sycl::ushort4{0, 0, 0, 0};
+        reinterpret_cast<sycl::ushort4*>(v_scratch)[dst] = sycl::ushort4{0, 0, 0, 0};
+        return;
+    }
     const long long page = (long long)table[cell / page_size];
     const long long row = (page * kv_heads + h) * page_size + (cell % page_size);
     const int d = q4 * 4;
@@ -102,7 +108,6 @@ void kv_gather_q8_kernel(const int8_t* __restrict__ k_q, const int8_t* __restric
     vo.y() = f16_from_f32((float)vc.y() * vs);
     vo.z() = f16_from_f32((float)vc.z() * vs);
     vo.w() = f16_from_f32((float)vc.w() * vs);
-    const long long dst = (id * kv_heads + h) * (long long)per + q4;
     reinterpret_cast<sycl::ushort4*>(k_scratch)[dst] = ko;
     reinterpret_cast<sycl::ushort4*>(v_scratch)[dst] = vo;
 }
@@ -127,6 +132,12 @@ void kv_gather_q8_wide_kernel(const int8_t* __restrict__ k_q, const int8_t* __re
     const int rem = (int)(i % (kv_heads * (long long)per));
     const int h = rem / per, q8 = rem - h * per;
     const int cell = ids[id];
+    const long long dst = (id * kv_heads + h) * (long long)per + q8;
+    if (cell < 0) {
+        reinterpret_cast<sycl::vec<uint16_t, 8>*>(k_scratch)[dst] = sycl::vec<uint16_t, 8>{0, 0, 0, 0, 0, 0, 0, 0};
+        reinterpret_cast<sycl::vec<uint16_t, 8>*>(v_scratch)[dst] = sycl::vec<uint16_t, 8>{0, 0, 0, 0, 0, 0, 0, 0};
+        return;
+    }
     const long long page = (long long)table[cell / page_size];
     const long long row = (page * kv_heads + h) * page_size + (cell % page_size);
     const int d = q8 * 8;
@@ -141,7 +152,6 @@ void kv_gather_q8_wide_kernel(const int8_t* __restrict__ k_q, const int8_t* __re
         ko[k] = f16_from_f32((float)kc[k] * ks);
         vo[k] = f16_from_f32((float)vc[k] * vs);
     }
-    const long long dst = (id * kv_heads + h) * (long long)per + q8;
     reinterpret_cast<sycl::vec<uint16_t, 8>*>(k_scratch)[dst] = ko;
     reinterpret_cast<sycl::vec<uint16_t, 8>*>(v_scratch)[dst] = vo;
 }

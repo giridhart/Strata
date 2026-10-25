@@ -147,8 +147,10 @@ void prompt_attn_xmx_kernel(const float* __restrict__ q, QsaAttnPools p, const i
             long long r = -1;
             if (t < nh) {
                 const int cell = ids[c0 + t];
-                const long long page = static_cast<long long>(p.page_table[cell / page_size]);
-                if (page >= 0) r = (page * n_kv_heads + kvh) * page_size + (cell % page_size);
+                if (cell >= 0) {
+                    const long long page = static_cast<long long>(p.page_table[cell / page_size]);
+                    if (page >= 0) r = (page * n_kv_heads + kvh) * page_size + (cell % page_size);
+                }
             }
             rows[t] = r;
         }
@@ -533,8 +535,10 @@ __global__ void __launch_bounds__(THREADS)
         long long myrow = -1;
         if (c0 + lane < n) {
             const int cell = __ldg(ids + c0 + lane);
-            const long long page = (long long)__ldg(p.page_table + cell / page_size);
-            if (page >= 0) myrow = (page * n_kv_heads + kvh) * page_size + (cell % page_size);
+            if (cell >= 0) {
+                const long long page = (long long)__ldg(p.page_table + cell / page_size);
+                if (page >= 0) myrow = (page * n_kv_heads + kvh) * page_size + (cell % page_size);
+            }
         }
         {
             uint4 v0 = make_uint4(0, 0, 0, 0), v1 = v0, v2 = v0, v3 = v0;

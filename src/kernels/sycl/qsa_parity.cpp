@@ -1530,10 +1530,11 @@ int main(int argc, char** argv) {
             strata::kernels::QsaIndexerBuffers bufsA{tailA.p, deadA.p, pooledA.p, bposA.p};
             strata::kernels::QsaIndexerBuffers bufsB{tailB.p, deadB.p, pooledB.p, bposB.p};
             for (int64_t t = 0; t < NB; ++t) {  // the sequential side: one cell, its device position
-                q_ct1.memcpy(draw.p, &raws[(size_t)t * IDXD], (size_t)IDXD * 4).wait();
+                cs->memcpy(draw.p, &raws[(size_t)t * IDXD], (size_t)IDXD * 4);
                 const int32_t tp = (int32_t)t;
-                q_ct1.memcpy(dpos.p, &tp, 4).wait();
+                cs->memcpy(dpos.p, &tp, 4);
                 strata::kernels::native_qsa_indexer_append(draw.p, dpos.p, BASE, dw_kn.p, EPS, bufsA, S, MC, sc, cs);
+                cs->wait();
             }
             strata::kernels::native_qsa_indexer_append_batch(drawAll.p, NB, 0, BASE, dw_kn.p, EPS, bufsB, S, MC, sc,
                                                              cs);
