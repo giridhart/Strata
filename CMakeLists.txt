@@ -1945,6 +1945,21 @@ endif()
     set_tests_properties(numerics_test PROPERTIES RESOURCE_LOCK gpu TIMEOUT 60)
   endif()
 
+  if(STRATA_ENABLE_SYCL AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/core/sycl/hc_mix_split_test.cpp")
+    add_executable(hc_mix_split_test tests/core/sycl/hc_mix_split_test.cpp)
+    target_include_directories(hc_mix_split_test PRIVATE ${_strata_gpu_include_directories})
+    target_link_libraries(hc_mix_split_test PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+    add_test(NAME hc_mix_split_test COMMAND hc_mix_split_test)
+    set_tests_properties(hc_mix_split_test PROPERTIES RESOURCE_LOCK gpu TIMEOUT 60)
+  endif()
+
+  if(STRATA_ENABLE_SYCL AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/core/sycl/q8_quant_multi_test.cpp")
+    add_executable(q8_quant_multi_test tests/core/sycl/q8_quant_multi_test.cpp)
+    target_include_directories(q8_quant_multi_test PRIVATE ${_strata_gpu_include_directories})
+    target_link_libraries(q8_quant_multi_test PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+    add_test(NAME q8_quant_multi_test COMMAND q8_quant_multi_test)
+    set_tests_properties(q8_quant_multi_test PROPERTIES RESOURCE_LOCK gpu TIMEOUT 60)
+  endif()
 
 
 
@@ -3050,6 +3065,7 @@ if(STRATA_ENABLE_SYCL)
             s_gemv_pair_parity quantize_act_images_parity bf16_gemv_pair_parity
             kv_gather_wide_parity qsa_scores_rows_parity prefill_mmq_tab_parity
             gdn_chunk_parity trellis_parity finish_test gemv_rows_test numerics_test
+            hc_mix_split_test q8_quant_multi_test
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
     COMMENT "Running Intel SYCL tests via ctest"
     USES_TERMINAL
