@@ -1948,6 +1948,7 @@ endif()
 
 
 
+
   # ---- P2.S4: the PLE n-gram hash, the IQ4_NL table read, and the PLE block ----
   # `ngram.cpp` is host-only but lives in `strata_kernels` because `ple.cu` shares its geometry constants, and
   # splitting them across two libraries would only add a layer.
@@ -3200,6 +3201,8 @@ if(STRATA_BUILD_PERF)
       perf_finish
       perf_gemv_rows
       perf_numerics
+      perf_hc_mix_split
+      perf_q8_quant_multi
     )
 
     foreach(_bm ${_strata_tier4_bms})
