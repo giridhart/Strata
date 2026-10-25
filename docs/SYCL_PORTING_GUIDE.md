@@ -651,10 +651,74 @@ Microbenchmarking via `perf/sycl/perf_q8_quant_multi.cpp` on Intel Xe2:
 
 ---
 
-## 12. References & Related Documents
+## 12. On-Device SYCL Kernel Autotuning & Memory Hints Architecture (Item E)
+
+The on-device kernel autotuning and dynamic shape capture subsystem (`include/strata/core/sycl_tuning.hpp`, `tools/sycl/tune_sycl_kernels.cpp`) establishes an automated calibration pipeline for Intel Xe2 architectures (Arc B580 and Lunar Lake).
+
+### 12.1 Background & Motivation
+
+Fixed execution parameters (workgroup sizes, Split-K threads per row, SLM padding, and default cache behavior) cause significant hardware under-utilization on Intel GPUs:
+1. **Narrow Matrix Under-Utilization ($N \le 64$)**: For narrow column projections (e.g. $N=48$ in `ssm_alpha`/`ssm_beta`), default 1-subgroup-per-row dispatch launches only 3 subgroups across the GPU, leaving over 90% of execution units idle.
+2. **Cache Thrashing on Autoregressive Decode**: Streaming one-time large model weights through the default cache evicts hot reusable KV caches and token activations.
+3. **Multi-Pass Redundant Global Memory Reads**: Normalization layers (`native_gr_norm`) re-read input vectors across Pass 1 (sum-of-squares) and Pass 2 (scaling).
+
+### 12.2 Registry & Fingerprint Architecture
+
+* **`SyclTuningRegistry`**: Thread-safe in-memory cache providing sub-10ns $O(1)$ lookup via a 64-bit composite hash key:
+  $$\text{Key} = (\text{KernelType} \ll 56) \mid (K \ll 28) \mid N$$
+  Employs a 3-tier fallback hierarchy: (1) Exact shape $(K, N)$ match $\to$ (2) Workgroup-only fallback $\to$ (3) Safe untuned default.
+* **`DeviceFingerprint`**: Strict hardware validation combining device name, driver version, compute unit count, and native sub-group size to prevent cross-device parameter contamination.
+* **`ShapeCollector`**: Signal-safe (`SIGINT`/`SIGTERM`) dynamic trace hook enabled by `STRATA_SYCL_RECORD_SHAPES=1` or `STRATA_SYCL_TRACE=1`. Automatically accumulates active shapes and flushes atomically to `data/tuning/sycl/workload_<device>.txt`.
+
+### 12.3 Intel Xe2 Memory Hints & Cache Policies
+
+Strata leverages Intel oneAPI experimental cache control properties via `annotated_ptr`:
+* **`CachePolicy::StreamingL3`**: Applied to single-pass model weights (`annotated_ptr<T, cache_control<cache_mode::streaming, cache_level::L3>>`), bypassing the L3 cache to protect active KV cache entries.
+* **`CachePolicy::CachedL1L3`**: Applied to reusable activations in normalization and multi-pass operators to keep inputs pinned in local SRAM/L1 across consecutive passes.
+
+### 12.4 Measured Performance Improvements on Intel Xe2 Hardware
+
+Below are empirical results measured directly on reference Intel Xe2 hardware (`Intel(R) Graphics [0x64a0]`, Lunar Lake Xe2-LPG, 4 Xe-cores / 64 VEs, SIMD16, Intel oneAPI 2026.1):
+
+| Kernel Family | Model Tensor / Role | Shape $[K \times N]$ | Untuned Latency ($\mu\text{s}$) | Tuned Latency ($\mu\text{s}$) | Speedup | Bandwidth (GB/s) | Tuned Dispatch Configuration |
+|---|---|---|---:|---:|:---:|---:|---|
+| `bf16_gemv` | `ssm_alpha / ssm_beta` | `[2560 x 48]` | 24.77 $\mu\text{s}$ | 19.81 $\mu\text{s}$ | **1.25x** | 12.7 GB/s | `LWS=128`, `TPR=128`, Streaming L3 |
+| `bf16_gemv` | Asymmetric decode | `[2560 x 64]` | 33.87 $\mu\text{s}$ | 30.60 $\mu\text{s}$ | **1.11x** | 10.9 GB/s | `LWS=64`, `TPR=64`, Streaming L3 |
+| `bf16_gemv` | `indexer.k_proj` | `[2560 x 128]` | 36.00 $\mu\text{s}$ | 33.50 $\mu\text{s}$ | **1.07x** | 19.7 GB/s | `LWS=32`, `TPR=16`, Streaming L3 |
+| `bf16_gemv` | Asymmetric decode | `[2560 x 256]` | 62.54 $\mu\text{s}$ | 51.19 $\mu\text{s}$ | **1.22x** | 25.7 GB/s | `LWS=256`, `TPR=256`, Streaming L3 |
+| `bf16_gemv` | `indexer.q_proj` | `[2560 x 512]` | 54.70 $\mu\text{s}$ | 51.20 $\mu\text{s}$ | **1.07x** | 51.2 GB/s | `LWS=32`, `TPR=32`, Streaming L3 |
+| `bf16_gemv` | `ffn_gate_inp` | `[2560 x 640]` | 59.16 $\mu\text{s}$ | 58.20 $\mu\text{s}$ | **1.02x** | 56.4 GB/s | `LWS=32`, `TPR=32`, Streaming L3 |
+| `bf16_gemv` | `shared_proj / ple_val` | `[2560 x 2560]` | 151.73 $\mu\text{s}$ | 148.50 $\mu\text{s}$ | **1.02x** | 88.3 GB/s | `LWS=32`, `TPR=16`, Streaming L3 |
+| `bf16_gemv_pair` | Asymmetric paired decode | `[2560, 64+256]` | 208.86 $\mu\text{s}$ | 144.79 $\mu\text{s}$ | **1.44x** | 11.4 GB/s | Fused paired dual GEMV, Streaming L3 |
+| `bf16_gemv_pair` | Paired `ssm_alpha + beta` | `[2560, 48+48]` | 201.95 $\mu\text{s}$ | 159.10 $\mu\text{s}$ | **1.27x** | 3.1 GB/s | Fused paired dual GEMV, Streaming L3 |
+| `bf16_gemv_pair` | Paired `k_proj + q_proj` | `[2560, 128+512]` | 202.24 $\mu\text{s}$ | 171.05 $\mu\text{s}$ | **1.18x** | 19.2 GB/s | Fused paired dual GEMV, Streaming L3 |
+| `s_gemv_q8k` | Expert `gate/up` | `[2560 x 640]` | 59.92 $\mu\text{s}$ | 58.10 $\mu\text{s}$ | **1.03x** | 30.1 GB/s | `LWS=128`, `TPR=64`, SLM_PAD=4, Streaming L3 |
+| `s_gemv_q8k` | `attn_output` (Q4_K) | `[2560 x 2560]` | 99.76 $\mu\text{s}$ | 73.41 $\mu\text{s}$ | **1.36x** | 50.4 GB/s | `LWS=256`, `TPR=128`, Streaming L3 |
+| `s_gemv_q8k` | `ffn_gate_up` (Q4_K) | `[2560 x 6144]` | 153.44 $\mu\text{s}$ | 151.20 $\mu\text{s}$ | **1.01x** | 58.7 GB/s | `LWS=256`, `TPR=128`, Streaming L3 |
+| `s_gemv_q8_0` | Shared expert `down` | `[2560 x 640]` | 212.03 $\mu\text{s}$ | 183.05 $\mu\text{s}$ | **1.16x** | 10.1 GB/s | `LWS=128`, `TPR=64`, SLM_PAD=4, Streaming L3 |
+| `s_gemv_q8_0` | Shared expert `up` | `[640 x 2560]` | 296.24 $\mu\text{s}$ | 282.10 $\mu\text{s}$ | **1.05x** | 6.6 GB/s | `LWS=256`, `TPR=128`, Streaming L3 |
+| `s_gemv_pair_silu`| Gate/Up + SwiGLU | `[2560 x 640]` | 522.78 $\mu\text{s}$ | 446.18 $\mu\text{s}$ | **1.18x** | 4.1 GB/s | Fused dual GEMV + in-flight SwiGLU |
+| `s2_gemv` | Expert `gate/up` (S2) | `[2560 x 640]` | 168.20 $\mu\text{s}$ | 163.91 $\mu\text{s}$ | **1.03x** | 3.2 GB/s | `LWS=128`, `TPR=64`, SLM_PAD=4, Streaming L3 |
+| `s2_gemv` | Expert `down` (S2) | `[640 x 2560]` | 170.32 $\mu\text{s}$ | 160.32 $\mu\text{s}$ | **1.06x** | 3.3 GB/s | `LWS=256`, `TPR=128`, Streaming L3 |
+| `s2_gemv` | `attn_output` (S2) | `[2560 x 2560]` | 188.97 $\mu\text{s}$ | 183.74 $\mu\text{s}$ | **1.03x** | 11.2 GB/s | `LWS=256`, `TPR=128`, Streaming L3 |
+| `gr_norm` | Residual `hc_lr` norm | `[320 x 1]` | 55.43 $\mu\text{s}$ | 33.38 $\mu\text{s}$ | **1.66x** | 0.1 GB/s | `LWS=128`, `CachedL1L3` retention |
+| `gr_norm` | `n_embd` RMSNorm | `[2560 x 1]` | 26.91 $\mu\text{s}$ | 26.80 $\mu\text{s}$ | **1.00x** | 1.1 GB/s | `LWS=256`, `CachedL1L3` retention |
+| `gr_norm` | `hc_attn / hc_ffn` norm | `[10240 x 1]` | 49.44 $\mu\text{s}$ | 48.05 $\mu\text{s}$ | **1.03x** | 2.6 GB/s | `LWS=256`, `CachedL1L3` retention |
+| `native_router` | MoE Top-10 routing | `[512, k=10]` | 65.09 $\mu\text{s}$ | 40.84 $\mu\text{s}$ | **1.59x** | 0.1 GB/s | `LWS=256`, multi-subgroup strided reduction |
+| `native_router` | MoE Top-8 routing | `[256, k=8]` | 38.27 $\mu\text{s}$ | 37.90 $\mu\text{s}$ | **1.01x** | 0.1 GB/s | `LWS=256`, default cache |
+| `quantize_act` | Fused Q8_0 + Q8_K | `[2560]` | 265.50 $\mu\text{s}$ | 216.66 $\mu\text{s}$ | **1.23x** | 0.1 GB/s | Single-pass combined quantizer |
+| `quantize_act` | Fused Q8_0 + Q8_K + BF16 | `[2560]` | 269.89 $\mu\text{s}$ | 224.54 $\mu\text{s}$ | **1.20x** | 0.1 GB/s | Single-pass combined quantizer |
+
+For the complete architectural guide, tuning tool options, and workflow steps, see [docs/SYCL_TUNING.md](SYCL_TUNING.md).
+
+---
+
+## 13. References & Related Documents
 
 - [Intel oneAPI SYCL Command Graph Extension Specification](https://github.com/intel/llvm/blob/sycl/sycl/doc/extensions/experimental/sycl_ext_oneapi_graph.asciidoc)
 - [Intel oneAPI Samples: CUDA to SYCL Migration Training](https://github.com/oneapi-src/oneAPI-samples/tree/master/DirectProgramming/C%2B%2BSYCL/Jupyter/cuda-to-sycl-migration-training)
+- [`docs/SYCL_TUNING.md`](SYCL_TUNING.md): Master SYCL Kernel Autotuning Guide & Reference Tables.
 - [`docs/SYCL_STATUS.md`](SYCL_STATUS.md): Master Status, Parity Test Results & 44-Kernel Registry.
 - [`docs/INTEL_B580_OPTIMIZATION_PLAN.md`](INTEL_B580_OPTIMIZATION_PLAN.md): Intel Arc B580 / Xe2 microarchitecture optimization guide.
+- [`docs/B580_SETUP_GUIDE.md`](B580_SETUP_GUIDE.md): Intel Arc B580 Model Recommendation, Setup, and Calibration Guide.
 - [`HANDOVER.md`](../HANDOVER.md): Engineering handover for Xe2 optimizations & upstream rebase.

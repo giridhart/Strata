@@ -1,0 +1,29 @@
+# STRATA_SYCL_TUNING_V1 autotuned calibration table
+STRATA_SYCL_TUNING_V1 "Intel(R) Graphics [0x64a0]" "1.14.37020+3" 64 16
+# kernel_name n_in n_out code_bits group_elems act_kind lws tpr slm_pad w_cache x_cache out_cache
+bf16_gemv 2560 48 0 0 0 256 256 0 streaming cached default
+bf16_gemv 2560 64 0 0 0 64 64 0 streaming cached default
+bf16_gemv 2560 128 0 0 0 32 16 0 streaming cached default
+bf16_gemv 2560 256 0 0 0 256 256 0 streaming cached default
+bf16_gemv 2560 512 0 0 0 32 32 0 streaming cached default
+bf16_gemv 2560 640 0 0 0 32 32 0 streaming cached default
+bf16_gemv 2560 2560 0 0 0 32 16 0 streaming cached default
+s_gemv_q8k 2560 640 8 64 1 128 64 4 streaming cached default
+s_gemv_q8k 640 2560 8 64 1 256 128 0 streaming cached default
+s_gemv_q8k 2560 2560 4 64 1 256 128 0 streaming cached default
+s_gemv_q8k 2560 6144 4 64 1 256 128 0 streaming cached default
+s_gemv_q8k 2560 10240 4 64 1 256 128 0 streaming cached default
+s_gemv_q8_0 2560 640 8 32 0 128 64 4 streaming cached default
+s_gemv_q8_0 640 2560 8 32 0 256 128 0 streaming cached default
+s2_gemv 2560 640 2 64 0 128 64 4 streaming cached default
+s2_gemv 640 2560 2 64 0 256 128 0 streaming cached default
+s2_gemv 2560 2560 2 64 0 256 128 0 streaming cached default
+s2_expert 2560 640 2 64 0 128 64 4 streaming cached default
+s2_expert 640 2560 2 64 0 256 128 0 streaming cached default
+gr_norm 2560 1 0 0 0 256 0 0 cached cached default
+gr_norm 10240 1 0 0 0 256 0 0 cached cached default
+gr_norm 320 1 0 0 0 128 0 0 cached cached default
+native_router 512 1 0 0 0 256 0 0 default cached default
+native_router 256 1 0 0 0 256 0 0 default cached default
+flash_attn 256 24 16 256 0 128 0 0 default default default
+native_gdn 128 8 32 1 0 64 0 0 default default default

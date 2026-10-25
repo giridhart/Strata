@@ -25,6 +25,7 @@
 #include <cstdint>
 #include <algorithm>
 #include "strata/core/sycl_arch.hpp"
+#include "strata/core/sycl_tuning.hpp"
 #include "strata/kernels/quantize_act.hpp"
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/kernels/bf16_bits.hpp"
@@ -298,8 +299,15 @@ void quantize_q8_0(const float* x, uint8_t* blocks, int64_t n, void* stream) {
         std::fprintf(stderr, "quantize_q8_0: n %lld is not a multiple of %d\n", (long long)n, QK8_0);
         std::exit(1);
     }
+    STRATA_SYCL_RECORD_SHAPE(strata::sycl_tuning::KernelType::S_GEMV_Q8_0, n, 1, 8, 32, 0);
+    auto& reg = strata::sycl_tuning::SyclTuningRegistry::instance();
+    reg.try_auto_load(q->get_device());
+    const uint64_t key = strata::sycl_tuning::make_kernel_key(
+        strata::sycl_tuning::KernelType::S_GEMV_Q8_0, n, 1, 8, 32, 0);
+    const auto tuned = reg.get_or_fallback(key, {128, 0, 0, strata::sycl_tuning::CachePolicy::Default});
+    const int threads = (tuned.lws > 0 && tuned.lws % strata::sycl_arch::SUB_GROUP_SIZE == 0) ? tuned.lws : 128;
+
     const long long nb = n / QK8_0;
-    const int threads = 128;
     const unsigned grid = (unsigned)((nb + threads - 1) / threads);
     q->parallel_for(sycl::nd_range<1>(sycl::range<1>((grid) * (threads)), sycl::range<1>(threads)),
                     [=](sycl::nd_item<1> item) { quantize_q8_0_kernel(item, x, blocks, nb); });
@@ -319,8 +327,18 @@ void quantize_q8_0_scaled(const float* x, uint8_t* blocks, float* scales, int64_
         std::fprintf(stderr, "quantize_q8_0_scaled: scales is null\n");
         std::exit(1);
     }
+    STRATA_SYCL_RECORD_SHAPE(strata::sycl_tuning::KernelType::S_GEMV_Q8_0, n, 1, 8, 32, 1);
+    auto& reg = strata::sycl_tuning::SyclTuningRegistry::instance();
+    reg.try_auto_load(q->get_device());
+    const uint64_t key = strata::sycl_tuning::make_kernel_key(
+        strata::sycl_tuning::KernelType::S_GEMV_Q8_0, n, 1, 8, 32, 1);
+    const uint64_t key_unscaled = strata::sycl_tuning::make_kernel_key(
+        strata::sycl_tuning::KernelType::S_GEMV_Q8_0, n, 1, 8, 32, 0);
+    const auto tuned = reg.get_or_fallback(
+        key, reg.get_or_fallback(key_unscaled, {128, 0, 0, strata::sycl_tuning::CachePolicy::Default}));
+    const int threads = (tuned.lws > 0 && tuned.lws % strata::sycl_arch::SUB_GROUP_SIZE == 0) ? tuned.lws : 128;
+
     const long long nb = n / QK8_0;
-    const int threads = 128;
     const unsigned grid = (unsigned)((nb + threads - 1) / threads);
     q->parallel_for(sycl::nd_range<1>(sycl::range<1>((grid) * (threads)), sycl::range<1>(threads)),
                     [=](sycl::nd_item<1> item) { quantize_q8_0_scaled_kernel(item, x, blocks, scales, nb); });
@@ -349,8 +367,15 @@ void quantize_q8_K(const float* x, uint8_t* blocks, int64_t n, void* stream) {
         std::fprintf(stderr, "quantize_q8_K: n %lld is not a multiple of %d\n", (long long)n, QK_K);
         std::exit(1);
     }
+    STRATA_SYCL_RECORD_SHAPE(strata::sycl_tuning::KernelType::S_GEMV_Q8K, n, 1, 8, 64, 1);
+    auto& reg = strata::sycl_tuning::SyclTuningRegistry::instance();
+    reg.try_auto_load(q->get_device());
+    const uint64_t key = strata::sycl_tuning::make_kernel_key(
+        strata::sycl_tuning::KernelType::S_GEMV_Q8K, n, 1, 8, 64, 1);
+    const auto tuned = reg.get_or_fallback(key, {64, 0, 0, strata::sycl_tuning::CachePolicy::Default});
+    const int threads = (tuned.lws > 0 && tuned.lws % strata::sycl_arch::SUB_GROUP_SIZE == 0) ? tuned.lws : 64;
+
     const long long nb = n / QK_K;
-    const int threads = 64;
     const unsigned grid = (unsigned)((nb + threads - 1) / threads);
     q->parallel_for(sycl::nd_range<1>(sycl::range<1>((grid) * (threads)), sycl::range<1>(threads)),
                     [=](sycl::nd_item<1> item) { quantize_q8_K_kernel(item, x, blocks, nb); });

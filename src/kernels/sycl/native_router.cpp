@@ -21,6 +21,7 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 #include <sycl/sycl.hpp>
+#include "strata/core/sycl_tuning.hpp"
 #include "strata/kernels/native_router.hpp"
 #include <atomic>
 #include <cfloat>
@@ -218,10 +219,34 @@ void native_router_top10(const float* logits, int32_t* ids, float* weights, void
     static sycl::queue default_queue{sycl::property::queue::in_order()};
     sycl::queue* q = stream ? static_cast<sycl::queue*>(stream) : &default_queue;
 
-    q->parallel_for(sycl::nd_range<1>(sycl::range<1>(32), sycl::range<1>(32)),
-                    [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(32)]] {
-                        route_token(logits, ids, weights, 0, (int)item.get_local_id(0), item.get_sub_group());
-                    });
+    const int n_experts = 512;
+    STRATA_SYCL_RECORD_SHAPE(strata::sycl_tuning::KernelType::ROUTER, n_experts, 1, 0, 0, 0);
+    auto& reg = strata::sycl_tuning::SyclTuningRegistry::instance();
+    reg.try_auto_load(q->get_device());
+    const uint64_t key = strata::sycl_tuning::make_kernel_key(
+        strata::sycl_tuning::KernelType::ROUTER, n_experts, 1, 0, 0, 0);
+    const uint64_t key_fallback = strata::sycl_tuning::make_kernel_key(
+        strata::sycl_tuning::KernelType::UNKNOWN, n_experts, 1, 0, 0, 0);
+    const auto tuned = reg.get_or_fallback(
+        key, reg.get_or_fallback(key_fallback, {32, 0, 0, strata::sycl_tuning::CachePolicy::Default}));
+
+    const size_t wg_size = (tuned.lws > 0 && tuned.lws % 32 == 0) ? (size_t)tuned.lws : 32;
+
+    if (wg_size == 32) {
+        q->parallel_for(sycl::nd_range<1>(sycl::range<1>(32), sycl::range<1>(32)),
+                        [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(32)]] {
+                            route_token(logits, ids, weights, 0, (int)item.get_local_id(0), item.get_sub_group());
+                        });
+    } else {
+        q->parallel_for(sycl::nd_range<1>(sycl::range<1>(wg_size), sycl::range<1>(wg_size)),
+                        [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(32)]] {
+                            const size_t global_tid = item.get_global_id(0);
+                            const size_t tok = global_tid / 32;
+                            if (tok >= 1) return;
+                            const int lane = (int)(global_tid % 32);
+                            route_token(logits, ids, weights, tok, lane, item.get_sub_group());
+                        });
+    }
 }
 
 void native_router_top10_multi(const float* logits, int32_t* ids, float* weights, int n_tok, void* stream) {
@@ -232,8 +257,19 @@ void native_router_top10_multi(const float* logits, int32_t* ids, float* weights
     static sycl::queue default_queue{sycl::property::queue::in_order()};
     sycl::queue* q = stream ? static_cast<sycl::queue*>(stream) : &default_queue;
 
-    constexpr size_t warps_per_wg = 8;
-    constexpr size_t wg_size = warps_per_wg * 32;
+    const int n_experts = 512;
+    STRATA_SYCL_RECORD_SHAPE(strata::sycl_tuning::KernelType::ROUTER, n_experts, 1, 0, 0, 0);
+    auto& reg = strata::sycl_tuning::SyclTuningRegistry::instance();
+    reg.try_auto_load(q->get_device());
+    const uint64_t key = strata::sycl_tuning::make_kernel_key(
+        strata::sycl_tuning::KernelType::ROUTER, n_experts, 1, 0, 0, 0);
+    const uint64_t key_fallback = strata::sycl_tuning::make_kernel_key(
+        strata::sycl_tuning::KernelType::UNKNOWN, n_experts, 1, 0, 0, 0);
+    const auto tuned = reg.get_or_fallback(
+        key, reg.get_or_fallback(key_fallback, {256, 0, 0, strata::sycl_tuning::CachePolicy::Default}));
+
+    const size_t wg_size = (tuned.lws > 0 && tuned.lws % 32 == 0) ? (size_t)tuned.lws : 256;
+    const size_t warps_per_wg = wg_size / 32;
     const size_t total_warps = ((size_t)n_tok + warps_per_wg - 1) / warps_per_wg * warps_per_wg;
     const size_t total_threads = total_warps * 32;
 
@@ -265,8 +301,19 @@ void native_router_topk(const float* logits, int32_t* ids, float* weights, int n
     static sycl::queue default_queue{sycl::property::queue::in_order()};
     sycl::queue* q = stream ? static_cast<sycl::queue*>(stream) : &default_queue;
 
-    constexpr size_t warps_per_wg = 8;
-    constexpr size_t wg_size = warps_per_wg * 32;
+    const int n_experts = n_expert;
+    STRATA_SYCL_RECORD_SHAPE(strata::sycl_tuning::KernelType::ROUTER, n_experts, 1, 0, 0, 0);
+    auto& reg = strata::sycl_tuning::SyclTuningRegistry::instance();
+    reg.try_auto_load(q->get_device());
+    const uint64_t key = strata::sycl_tuning::make_kernel_key(
+        strata::sycl_tuning::KernelType::ROUTER, n_experts, 1, 0, 0, 0);
+    const uint64_t key_fallback = strata::sycl_tuning::make_kernel_key(
+        strata::sycl_tuning::KernelType::UNKNOWN, n_experts, 1, 0, 0, 0);
+    const auto tuned = reg.get_or_fallback(
+        key, reg.get_or_fallback(key_fallback, {256, 0, 0, strata::sycl_tuning::CachePolicy::Default}));
+
+    const size_t wg_size = (tuned.lws > 0 && tuned.lws % 32 == 0) ? (size_t)tuned.lws : 256;
+    const size_t warps_per_wg = wg_size / 32;
     const size_t total_warps = ((size_t)n_tok + warps_per_wg - 1) / warps_per_wg * warps_per_wg;
     const size_t total_threads = total_warps * 32;
 

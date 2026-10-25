@@ -15,6 +15,7 @@
 // the same reason.  `bench/micro/moe_hit_parity.cu` is the check.
 #include <sycl/sycl.hpp>
 #include "strata/core/sycl_arch.hpp"
+#include "strata/core/sycl_tuning.hpp"
 #include "strata/kernels/s2_expert_grouped.hpp"
 #include "strata/kernels/dp4a.hpp"
 
@@ -682,6 +683,16 @@ void moe_hit_grouped_s2(const uint8_t* blob_base, const int32_t* slot_index, con
     if (n_hits <= 0) return;
     static sycl::queue default_queue{sycl::property::queue::in_order()};
     sycl::queue* cs = stream ? static_cast<sycl::queue*>(stream) : &default_queue;
+
+    STRATA_SYCL_RECORD_SHAPE(strata::sycl_tuning::KernelType::S2_EXPERT, n_hits, 2560, 2, 64, 0);
+    auto& reg = strata::sycl_tuning::SyclTuningRegistry::instance();
+    reg.try_auto_load(cs->get_device());
+    const uint64_t key = strata::sycl_tuning::make_kernel_key(
+        strata::sycl_tuning::KernelType::S2_EXPERT, n_hits, 2560, 2, 64, 0);
+    const auto tuned = reg.get_or_fallback(
+        key, {256, 0, 0, strata::sycl_tuning::CachePolicy::StreamingL3});
+    (void)tuned;
+
     const bool fast = new_hit(blob_base, blob_bytes, x_q8_0, scratch, n_hits);
 
     const uint64_t gu_bytes = ((uint64_t)n_hits * (uint64_t)(2 * FF) * 4 + 15) & ~15ull;
@@ -826,6 +837,16 @@ void moe_hit_grouped_s2_dev(const uint8_t* blob_base, const int32_t* slot_index,
     if (cap <= 0) return;
     static sycl::queue default_queue{sycl::property::queue::in_order()};
     sycl::queue* cs = stream ? static_cast<sycl::queue*>(stream) : &default_queue;
+
+    STRATA_SYCL_RECORD_SHAPE(strata::sycl_tuning::KernelType::S2_EXPERT, cap, 2560, 2, 64, 0);
+    auto& reg = strata::sycl_tuning::SyclTuningRegistry::instance();
+    reg.try_auto_load(cs->get_device());
+    const uint64_t key = strata::sycl_tuning::make_kernel_key(
+        strata::sycl_tuning::KernelType::S2_EXPERT, cap, 2560, 2, 64, 0);
+    const auto tuned = reg.get_or_fallback(
+        key, {256, 0, 0, strata::sycl_tuning::CachePolicy::StreamingL3});
+    (void)tuned;
+
     const bool fast = new_hit(blob_base, blob_bytes, x_q8_0, scratch, cap);
     const uint64_t gu_bytes = ((uint64_t)cap * (uint64_t)(2 * FF) * 4 + 15) & ~15ull;
     const uint64_t q8_bytes = ((uint64_t)cap * (uint64_t)(FF / 32) * 34 + 15) & ~15ull;
@@ -897,6 +918,16 @@ void moe_hit_grouped_s2_multi(const uint8_t* blob_base, const int32_t* slot_inde
     if (cap <= 0) return;
     static sycl::queue default_queue{sycl::property::queue::in_order()};
     sycl::queue* cs = stream ? static_cast<sycl::queue*>(stream) : &default_queue;
+
+    STRATA_SYCL_RECORD_SHAPE(strata::sycl_tuning::KernelType::S2_EXPERT, cap, 2560, 2, 64, 0);
+    auto& reg = strata::sycl_tuning::SyclTuningRegistry::instance();
+    reg.try_auto_load(cs->get_device());
+    const uint64_t key = strata::sycl_tuning::make_kernel_key(
+        strata::sycl_tuning::KernelType::S2_EXPERT, cap, 2560, 2, 64, 0);
+    const auto tuned = reg.get_or_fallback(
+        key, {256, 0, 0, strata::sycl_tuning::CachePolicy::StreamingL3});
+    (void)tuned;
+
     const bool fast = new_hit(blob_base, blob_bytes, x_q8_0, scratch, cap);
     const uint64_t gu_bytes = ((uint64_t)cap * (uint64_t)(2 * FF) * 4 + 15) & ~15ull;
     const uint64_t q8_bytes = ((uint64_t)cap * (uint64_t)(FF / 32) * 34 + 15) & ~15ull;

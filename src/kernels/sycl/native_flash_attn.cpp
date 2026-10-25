@@ -19,6 +19,7 @@
 // SOFTWARE.
 
 #include "strata/kernels/native_flash_attn.hpp"
+#include "strata/core/sycl_tuning.hpp"
 
 #include <sycl/sycl.hpp>
 #include <cfloat>
@@ -226,6 +227,14 @@ void native_flash_attn_short_step(const float* q, const uint16_t* k, const uint1
     if (!q_ptr->get_device().has(sycl::aspect::fp16)) {
         throw std::runtime_error("native FlashAttention requires FP16 hardware support");
     }
+
+    STRATA_SYCL_RECORD_SHAPE(strata::sycl_tuning::KernelType::FLASH_ATTN, shapes.head_dim, shapes.n_head, 16, max_context, 0);
+    auto& reg = strata::sycl_tuning::SyclTuningRegistry::instance();
+    reg.try_auto_load(q_ptr->get_device());
+    const uint64_t key = strata::sycl_tuning::make_kernel_key(
+        strata::sycl_tuning::KernelType::FLASH_ATTN, shapes.head_dim, shapes.n_head, 16, max_context, 0);
+    const auto tuned = reg.get_or_fallback(key, {128, 0, 0, strata::sycl_tuning::CachePolicy::Default});
+    (void)tuned;
 
     q_ptr->submit([&](sycl::handler& cgh) {
         sycl::local_accessor<float, 1> tile(sycl::range<1>(4 * 4 * 256), cgh);

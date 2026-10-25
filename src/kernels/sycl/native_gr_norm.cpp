@@ -25,6 +25,7 @@
 
 #include <sycl/sycl.hpp>
 #include "strata/core/sycl_arch.hpp"
+#include "strata/core/sycl_tuning.hpp"
 #include "strata/kernels/native_gr_norm.hpp"
 
 #include <cmath>
@@ -32,6 +33,7 @@
 #include <cstdint>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 
 namespace strata::kernels {
 namespace {
@@ -39,11 +41,12 @@ namespace {
 static sycl::queue default_queue{sycl::property::queue::in_order()};
 constexpr int SG_SZ = strata::sycl_arch::SUB_GROUP_SIZE;
 
-template <int BlockSize>
+template <int BlockSize = 0>
 void weighted_rms_norm(sycl::nd_item<1> item, const float* __restrict__ input, const float* __restrict__ gamma,
                        float* __restrict__ output, int n_cols, int n_rows, float epsilon, float* sums) {
     auto sg = item.get_sub_group();
     const int tid = item.get_local_id(0);
+    const int bsz = (BlockSize > 0) ? BlockSize : (int)item.get_local_range(0);
     const std::size_t global_row = item.get_group(0);
     const std::size_t row_in_token = global_row % (size_t)n_rows;
     const std::size_t row_offset = global_row * n_cols;
@@ -51,7 +54,7 @@ void weighted_rms_norm(sycl::nd_item<1> item, const float* __restrict__ input, c
     gamma += row_in_token * n_cols;
     output += row_offset;
     float partial = 0.0f;
-    for (int col = tid; col < n_cols; col += BlockSize) {
+    for (int col = tid; col < n_cols; col += bsz) {
         const float value = input[col];
         partial += value * value;
     }
@@ -64,7 +67,7 @@ void weighted_rms_norm(sycl::nd_item<1> item, const float* __restrict__ input, c
     sycl::group_barrier(item.get_group());
 
     partial = 0.0f;
-    constexpr int num_sgs = BlockSize / SG_SZ;
+    const int num_sgs = bsz / SG_SZ;
     for (int s = lane; s < num_sgs; s += SG_SZ) {
         partial += sums[s];
     }
@@ -72,7 +75,7 @@ void weighted_rms_norm(sycl::nd_item<1> item, const float* __restrict__ input, c
 
     const float mean = partial / n_cols;
     const float scale = sycl::rsqrt(mean + epsilon);
-    for (int col = tid; col < n_cols; col += BlockSize) {
+    for (int col = tid; col < n_cols; col += bsz) {
         output[col] = scale * input[col] * gamma[col];
     }
 }
@@ -97,26 +100,46 @@ void native_gr_rms_norm_weighted_multi(const float* input, const float* gamma, f
     check_pointer(gamma);
     check_pointer(output);
     sycl::queue* q = stream ? static_cast<sycl::queue*>(stream) : &default_queue;
+
+    STRATA_SYCL_RECORD_SHAPE(strata::sycl_tuning::KernelType::GR_NORM, n_cols, 1, 0, 0, 0);
+    auto& reg = strata::sycl_tuning::SyclTuningRegistry::instance();
+    reg.try_auto_load(q->get_device());
+    const uint64_t key = strata::sycl_tuning::make_kernel_key(
+        strata::sycl_tuning::KernelType::GR_NORM, n_cols, 1, 0, 0, 0);
+    const auto tuned = reg.get_or_fallback(
+        key, { (n_cols < 1024 ? 256 : 1024), 0, 0, strata::sycl_tuning::CachePolicy::CachedL1L3 });
+
+    const int fallback_lws = (n_cols < 1024 ? 256 : 1024);
+    const int threads = (tuned.lws > 0 && tuned.lws % SG_SZ == 0) ? tuned.lws : fallback_lws;
     const size_t total_rows = (size_t)n_rows * n_tok;
-    if (n_cols < 1024) {
+
+    auto launch = [&](auto bsz_tag) {
+        constexpr int B = decltype(bsz_tag)::value;
+        const int cur_lws = (B > 0) ? B : threads;
         q->submit([&](sycl::handler& cgh) {
-            sycl::local_accessor<float, 1> sums(sycl::range<1>(256 / SG_SZ), cgh);
-            cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(total_rows * 256), sycl::range<1>(256)),
+            sycl::local_accessor<float, 1> sums(sycl::range<1>(cur_lws / SG_SZ), cgh);
+            cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(total_rows * cur_lws), sycl::range<1>(cur_lws)),
                              [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(SG_SZ)]] {
-                                 weighted_rms_norm<256>(item, input, gamma, output, n_cols, n_rows, epsilon,
-                                                        sums.get_multi_ptr<sycl::access::decorated::no>().get());
+                                 weighted_rms_norm<B>(item, input, gamma, output, n_cols, n_rows, epsilon,
+                                                      sums.get_multi_ptr<sycl::access::decorated::no>().get());
                              });
         });
+    };
+
+    if (threads == 256) {
+        launch(std::integral_constant<int, 256>{});
+    } else if (threads == 1024) {
+        launch(std::integral_constant<int, 1024>{});
+    } else if (threads == 512) {
+        launch(std::integral_constant<int, 512>{});
+    } else if (threads == 128) {
+        launch(std::integral_constant<int, 128>{});
+    } else if (threads == 64) {
+        launch(std::integral_constant<int, 64>{});
     } else {
-        q->submit([&](sycl::handler& cgh) {
-            sycl::local_accessor<float, 1> sums(sycl::range<1>(1024 / SG_SZ), cgh);
-            cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(total_rows * 1024), sycl::range<1>(1024)),
-                             [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(SG_SZ)]] {
-                                 weighted_rms_norm<1024>(item, input, gamma, output, n_cols, n_rows, epsilon,
-                                                         sums.get_multi_ptr<sycl::access::decorated::no>().get());
-                             });
-        });
+        launch(std::integral_constant<int, 0>{});
     }
+
     if (!stream) default_queue.wait();
 }
 

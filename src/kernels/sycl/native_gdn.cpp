@@ -24,6 +24,7 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 #include "strata/core/sycl_arch.hpp"
+#include "strata/core/sycl_tuning.hpp"
 #include "strata/kernels/native_gdn.hpp"
 
 #include <sycl/sycl.hpp>
@@ -117,6 +118,13 @@ void native_gdn_step(float* state, const float* q, const float* k, const float* 
     }
     const float scale = 1.0f / sqrtf(float(S));
     sycl::queue* q_ptr = stream ? static_cast<sycl::queue*>(stream) : &default_queue();
+
+    STRATA_SYCL_RECORD_SHAPE(strata::sycl_tuning::KernelType::GDN, shape.S, shape.h_v, 32, shape.h_k, 0);
+    auto& reg = strata::sycl_tuning::SyclTuningRegistry::instance();
+    reg.try_auto_load(q_ptr->get_device());
+    const uint64_t key = strata::sycl_tuning::make_kernel_key(strata::sycl_tuning::KernelType::GDN, shape.S, shape.h_v, 32, shape.h_k, 0);
+    const auto tuned = reg.get_or_fallback(key, {SG_SIZE * 4, 0, 0, strata::sycl_tuning::CachePolicy::Default});
+    (void)tuned;
     q_ptr->parallel_for(sycl::nd_range<2>(sycl::range<2>(shape.h_v * 4, (S / 4) * SG_SIZE), sycl::range<2>(4, SG_SIZE)),
                         [=](sycl::nd_item<2> item) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
                             step<SG_SIZE>(item, state, q, k, v, gate, beta, output, int(shape.h_k), int(shape.h_v),
