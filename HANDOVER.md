@@ -1,10 +1,10 @@
 # Handover Document: Intel Arc B580 / Xe2 SYCL Optimization & Upstream Rebase
 
-**Date & Time**: 2026-10-19 01:15 (Local)  
+**Date & Time**: 2026-10-25 23:20 (Local)  
 **Project**: Strata Engine  
-**Current Branch**: `sycl-b580` (cleanly merged with upstream `v0.1.45` @ commit `477ac13c`, current HEAD @ commit `1b90c039`)  
-**Upstream Base**: `https://github.com/Niko1221/Strata` tag `v0.1.45`  
-**Backup Branch**: `backup-sycl-b580-before-v0.1.45` (points to pre-merge HEAD `58c691e1`)
+**Current Branch**: `sycl-b580` (cleanly merged with upstream `origin/main` @ `v0.2.6`, engine `0.1.51`)  
+**Upstream Base**: `https://github.com/Niko1221/Strata` tag `v0.2.6`  
+**Test Suite**: 20/20 dedicated SYCL CTests passing (100% via `check-sycl`); 121/121 full test suite passing via `tools/test_sycl.sh`
 
 ---
 
@@ -67,6 +67,18 @@ The target model for these optimizations is **Qwen3.8-Flash-Next** (as well as `
      - **Commit 8 (`1b90c039`)**: `test(sycl): add Google Benchmark perf suites for v0.1.45 SYCL optimizations`.
        - Added benchmarks to `perf_xe2_gemv.cpp` (Q6_K Planar vs standard GGUF, B6 MMVQ rows), `perf_qsa_attention.cpp` (multi-row scoring & decode attention batch rows), and `perf_moe_accumulate.cpp` (ExpDec shared memory & Q6_K expert grouped).
    - **Verification**: 131/131 tests passed (127 passed, 4 skipped, 0 failed) with 0 compiler warnings under `-Wall -Wextra`.
+
+6. **Upstream `v0.2.2` – `v0.2.6` Cumulative Optimization Integration**:
+   - Merged upstream releases up to v0.2.6 (engine 0.1.51).
+   - Ported dual Gate+Up GEMV with in-register SwiGLU (`s_gemv_pair.cpp`), Gyro Trellis TQ quantized decoders (`tq_gemv.cpp`), paired linear BF16 GEMV (`bf16_gemv_pair`), fused multi-format activation quantizer (`quantize_act_images`), wide 8-byte INT8 KV cache gather (`kv_gather_wide_parity`), chunked GDN prompt recurrence (`gdn_chunk.cpp`), and direct pointer-table expert MMQ streaming (`moe_mmq.cpp`).
+   - Bitwise parity verified across all ported kernels with 0 compiler warnings.
+
+7. **On-Device SYCL Kernel Autotuning & Memory Hints Framework** (Commit `3741d6c8`):
+   - Implemented non-invasive tensor shape capture hook (`STRATA_SYCL_RECORD_SHAPES=1` via `ShapeCollector`).
+   - Implemented standalone on-device tuner (`tools/sycl/tune_sycl_kernels.cpp` / `tune_sycl_kernels`) sweeping LWS, Split-K (TPR), SLM padding, and streaming vs. cached L3 memory hints.
+   - Built persistent calibration registry (`data/tuning/sycl/<device>.txt`) with in-memory `SyclTuningRegistry` performing sub-10ns O(1) lookups during kernel launch.
+   - Wired dynamic autotuning and streaming memory hints into `bf16_gemv` and `s_gemv`.
+   - Comprehensive test hardening: 5/5 unit tests in `sycl_tuning_registry_test.cpp`, boundary/fuzz test in `sycl_tuning_fuzz_test.cpp`, and 20/20 SYCL CTests passing.
 
 ---
 

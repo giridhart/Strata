@@ -4,13 +4,15 @@
 > **Host OS**: Linux x86_64 (Kernel 6.14.0-33-generic, WSL2 / Native Ubuntu)  
 > **Toolchain**: Intel oneAPI 2026.1 (`icpx -fsycl -qmkl`)  
 > **Build Directory**: `build_sycl`  
-> **Current Branch**: `main` (cleanly rebased on upstream `origin/main` @ `v0.1.39`)  
+> **Current Branch**: `sycl-b580` (merged with upstream `origin/main` @ `v0.2.6`, engine `0.1.51`)  
 > **Build Status**: Clean build exit 0 | **ZERO compiler warnings** under strict `-Wall -Wextra`  
-> **Production Kernels**: **44/44 Pure SYCL 2020 (100% - Zero DPCT artifacts)**  
-> **Test Status**: **16/16 dedicated SYCL CTests passing (100%)** via `make check-sycl` in ~3.8s  
+> **Production Kernels**: **Pure SYCL 2020 (100% - Zero DPCT artifacts)** across all decode, prefill, and parity targets  
+> **Test Status**: **20/20 dedicated SYCL CTests passing (100%)** via `make check-sycl` (121/121 full test suite passing via `tools/test_sycl.sh`)  
 > **Related Documentation**:
 > - Architectural Guide: [`docs/SYCL_PORTING_GUIDE.md`](SYCL_PORTING_GUIDE.md)
+> - Kernel Autotuning & Memory Hints: [`docs/SYCL_TUNING.md`](SYCL_TUNING.md)
 > - Intel Xe2 / Arc B580 Optimization Plan: [`docs/INTEL_B580_OPTIMIZATION_PLAN.md`](INTEL_B580_OPTIMIZATION_PLAN.md)
+> - Arc B580 Setup & Serving Guide: [`docs/B580_SETUP_GUIDE.md`](B580_SETUP_GUIDE.md)
 > - Session Handover: [`HANDOVER.md`](../HANDOVER.md)
 
 ---
@@ -93,29 +95,35 @@ flowchart TD
 ### Phase 5: Parity Test Modernization - **100% COMPLETE**
 - All 36 parity test drivers in `src/kernels/sycl/` ported to pure SYCL 2020 and passing.
 
-### Phase 6: Intel Xe2 (Lunar Lake & Battlemage B580) Optimization - **IN PROGRESS**
+### Phase 6: Intel Xe2 (Lunar Lake & Battlemage B580) Optimization - **100% COMPLETE**
 - Configured native `SUB_GROUP_SIZE = 16` for Intel Xe2 targets via `include/strata/core/sycl_arch.hpp`.
 - Optimized quantized GEMV kernels (`s2_gemv.cpp`, `s2_gemv_fast.cpp`, `s2_gemv_quads.cpp`, `s_gemv.cpp`) for SIMD16 subgroup execution.
-- Porting QSA prompt attention (`qsa_prompt_attn.cpp`) to hardware XMX systolic matrix engines (`joint_matrix`).
+- Ported QSA prompt attention (`qsa_prompt_attn.cpp`) to hardware XMX systolic matrix engines (`joint_matrix`).
+- Integrated fused operator pipelines: dual Gate+Up GEMV (`s_gemv_pair.cpp`), Gyro Trellis decoders (`tq_gemv.cpp`), chunked GDN (`gdn_chunk.cpp`), and pointer-table MMQ (`moe_mmq.cpp`).
+
+### Phase 7: On-Device Kernel Autotuning & Memory Hints - **100% COMPLETE**
+- Integrated non-invasive workload shape capture (`ShapeCollector`), persistent device-fingerprinted calibration files (`data/tuning/sycl/`), and standalone autotuner (`tune_sycl_kernels`).
+- Integrated in-memory `SyclTuningRegistry` with sub-10ns O(1) hash lookup and Intel L3 streaming vs L1/L3 cached memory hints.
+- Fully documented in [`docs/SYCL_TUNING.md`](SYCL_TUNING.md).
 
 ---
 
-## 3. Pure SYCL 2020 Computational Kernel Registry (44/44)
+## 3. Pure SYCL 2020 Computational Kernel Registry
 
 | # | Kernel File | Primary Parity Target | Parity Status | Xe2 SIMD16 Optimization |
 |---|---|---|---|---|
-| 1 | [`bf16_gemv.cpp`](../src/kernels/sycl/bf16_gemv.cpp) | `bf16_gemv_parity` | **PASS (0 fails)** | SIMD16 + `reduce_over_group` |
+| 1 | [`bf16_gemv.cpp`](../src/kernels/sycl/bf16_gemv.cpp) | `bf16_gemv_parity` | **PASS (0 fails)** | SIMD16 + `reduce_over_group` + dynamic LWS/TPR autotuning |
 | 2 | [`cvec.cpp`](../src/kernels/sycl/cvec.cpp) | `cvec_parity` | **PASS (0 fails)** | Native 1D range |
 | 3 | [`dequant_bf16.cpp`](../src/kernels/sycl/dequant_bf16.cpp) | `dequant_bf16_test` | **PASS (0 fails)** | Constexpr lookup tables |
 | 4 | [`dequant_s2.cpp`](../src/kernels/sycl/dequant_s2.cpp) | `dequant_s2_parity` | **PASS (0 fails)** | Pure SYCL math built-ins |
 | 5 | [`elementwise.cpp`](../src/kernels/sycl/elementwise.cpp) | `elementwise_parity` | **PASS (0 fails)** | 1D auto-tuned range |
-| 6 | [`fused_gdn.cpp`](../src/kernels/sycl/fused_gdn.cpp) | `sycl_fused_gdn` | **PASS (0 fails)** | 2D row-group shuffles |
+| 6 | [`fused_gdn.cpp`](../src/kernels/sycl/fused_gdn.cpp) | `sycl_fused_gdn` | **PASS (0 fails)** | 2D row-group shuffles + SLM padding |
 | 7 | [`fused_gr.cpp`](../src/kernels/sycl/fused_gr.cpp) | `gr_parity` | **PASS (0 fails)** | Subgroup shuffles |
 | 8 | [`gdn.cpp`](../src/kernels/sycl/gdn.cpp) | `gdn_parity` | **PASS (0 fails)** | 2D local accessor, `shift_group_left` |
 | 9 | [`gr.cpp`](../src/kernels/sycl/gr.cpp) | `gr_parity` | **PASS (0 fails)** | 1D ranges, subgroup reduction |
-| 10 | [`iq_kernels.cpp`](../src/kernels/sycl/iq_kernels.cpp) | `iq_parity`, `iq_multi_parity` | **PASS (0 fails)** | Vectorized `dp4a`, byte permute |
+| 10 | [`iq_kernels.cpp`](../src/kernels/sycl/iq_kernels.cpp) | `iq_parity`, `iq_multi_parity` | **PASS (0 fails)** | Vectorized `dp4a`, byte permute, coalesced store runs |
 | 11 | [`kv_q4.cpp`](../src/kernels/sycl/kv_q4.cpp) | `kv_q4_parity` | **PASS (0 fails)** | Native subgroup execution |
-| 12 | [`kv_q8.cpp`](../src/kernels/sycl/kv_q8.cpp) | `kv_q8_parity` | **PASS (0 fails)** | 1D gather, local accessor |
+| 12 | [`kv_q8.cpp`](../src/kernels/sycl/kv_q8.cpp) | `kv_q8_parity`, `kv_gather_wide_parity` | **PASS (0 fails)** | 8-wide INT8 gather, local accessor |
 | 13 | [`kv_stream.cpp`](../src/kernels/sycl/kv_stream.cpp) | `kv_stream_parity` | **PASS (0 fails)** | `sycl::atomic_ref` with memory scopes |
 | 14 | [`native_bf16.cpp`](../src/kernels/sycl/native_bf16.cpp) | `sycl_native_bf16` | **PASS (0 fails)** | SIMD16 + `reduce_over_group` |
 | 15 | [`native_flash_attn.cpp`](../src/kernels/sycl/native_flash_attn.cpp) | `sycl_native_flash_attn` | **PASS (0 fails)** | 2D head/warp-thread grid |
@@ -134,17 +142,21 @@ flowchart TD
 | 28 | [`ple.cpp`](../src/kernels/sycl/ple.cpp) | `ple_parity` | **PASS (0 fails)** | In-order queues, subgroup shuffles |
 | 29 | [`qsa.cpp`](../src/kernels/sycl/qsa.cpp) | `qsa_parity` | **PASS (0 fails)** | `permute_group_by_xor` |
 | 30 | [`qsa_decode_attn.cpp`](../src/kernels/sycl/qsa_decode_attn.cpp) | `qsa_decode_attn_test` | **PASS (0 fails)** | 3D chunk range, KV_MODE templates |
-| 31 | [`qsa_prompt_attn.cpp`](../src/kernels/sycl/qsa_prompt_attn.cpp) | `qsa_prompt_attn_parity` | **In Progress** | Porting to XMX `joint_matrix` |
-| 32 | [`qsa_select.cpp`](../src/kernels/sycl/qsa_select.cpp) | `qsa_parity` | **PASS (0 fails)** | Workgroup atomic radix histogram |
-| 33 | [`quantize_act.cpp`](../src/kernels/sycl/quantize_act.cpp) | `quantize_act_parity` | **PASS (0 fails)** | 1D flattened range |
+| 31 | [`qsa_prompt_attn.cpp`](../src/kernels/sycl/qsa_prompt_attn.cpp) | `qsa_prompt_attn_parity` | **PASS (0 fails)** | Hardware XMX `joint_matrix` systolic acceleration |
+| 32 | [`qsa_select.cpp`](../src/kernels/sycl/qsa_select.cpp) | `qsa_parity`, `qsa_scores_rows_parity` | **PASS (0 fails)** | Workgroup atomic radix histogram + register-shuffled scores |
+| 33 | [`quantize_act.cpp`](../src/kernels/sycl/quantize_act.cpp) | `quantize_act_parity` | **PASS (0 fails)** | Fused multi-format quantizer (`quantize_act_images`) |
 | 34 | [`rope.cpp`](../src/kernels/sycl/rope.cpp) | `rope_parity` | **PASS (0 fails)** | 1D range, pure SYCL math |
 | 35 | [`router_top10.cpp`](../src/kernels/sycl/router_top10.cpp) | `router_top10_parity` | **PASS (0 fails)** | Subgroup `shift_group_left` |
-| 36 | [`s2_expert_grouped.cpp`](../src/kernels/sycl/s2_expert_grouped.cpp) | `s2_expert_grouped_parity` | **PASS (0 fails)** | Vector `dp4a`, bitwise permute |
+| 36 | [`s2_expert_grouped.cpp`](../src/kernels/sycl/s2_expert_grouped.cpp) | `s2_expert_grouped_parity` | **PASS (0 fails)** | Vector `dp4a`, bitwise permute, dual-column fusion |
 | 37 | [`s2_gemv.cpp`](../src/kernels/sycl/s2_gemv.cpp) | `s2_gemv_parity` | **PASS (0 fails)** | SIMD16 subgroup reduction kernel |
 | 38 | [`s2_gemv_fast.cpp`](../src/kernels/sycl/s2_gemv_fast.cpp) | `s2_gemv_parity` | **PASS (0 fails)** | Hierarchical SIMD16 reduction |
 | 39 | [`s2_gemv_q8.cpp`](../src/kernels/sycl/s2_gemv_q8.cpp) | `s2_gemv_q8_parity` | **PASS (0 fails)** | Native 1D indexing |
 | 40 | [`s2_gemv_quads.cpp`](../src/kernels/sycl/s2_gemv_quads.cpp) | `s2_gemv_parity` | **PASS (0 fails)** | Hierarchical SIMD16 reduction |
-| 41 | [`s_gemv.cpp`](../src/kernels/sycl/s_gemv.cpp) | `s_gemv_parity`, `s_gemv_q8k_parity` | **PASS (0 fails)** | SIMD16 stride + `reduce_over_group` |
-| 42 | [`sampler.cpp`](../src/kernels/sycl/sampler.cpp) | `sampler_parity` | **PASS (0 fails)** | Subgroup shuffles, local atomic_ref |
-| 43 | [`shared_expert.cpp`](../src/kernels/sycl/shared_expert.cpp) | `shared_expert_parity` | **PASS (0 fails)** | 2D row-scaling range |
-| 44 | [`verify_kernels.cpp`](../src/kernels/sycl/verify_kernels.cpp) | `sycl_verify_kernels` | **PASS (0 fails)** | 1D/2D ranges, subgroup shuffles |
+| 41 | [`s_gemv.cpp`](../src/kernels/sycl/s_gemv.cpp) | `s_gemv_parity`, `s_gemv_q8k_parity` | **PASS (0 fails)** | SIMD16 stride + `reduce_over_group` + dynamic split autotuning |
+| 42 | [`s_gemv_pair.cpp`](../src/kernels/sycl/s_gemv_pair.cpp) | `s_gemv_pair_parity` | **PASS (0 fails)** | Fused dual Gate+Up GEMV with in-register SwiGLU |
+| 43 | [`sampler.cpp`](../src/kernels/sycl/sampler.cpp) | `sampler_parity` | **PASS (0 fails)** | Subgroup shuffles, local atomic_ref |
+| 44 | [`shared_expert.cpp`](../src/kernels/sycl/shared_expert.cpp) | `shared_expert_parity` | **PASS (0 fails)** | 2D row-scaling range |
+| 45 | [`tq_gemv.cpp`](../src/kernels/sycl/tq_gemv.cpp) | `trellis_parity` | **PASS (0 fails)** | Gyro Trellis quantized decoders with SLM codebook staging |
+| 46 | [`verify_kernels.cpp`](../src/kernels/sycl/verify_kernels.cpp) | `sycl_verify_kernels` | **PASS (0 fails)** | 1D/2D ranges, subgroup shuffles |
+| 47 | [`gdn_chunk.cpp`](../src/prefill/sycl/gdn_chunk.cpp) | `gdn_chunk_parity` | **PASS (0 fails)** | Chunked GDN linear attention recurrence |
+| 48 | [`moe_mmq.cpp`](../src/prefill/sycl/moe_mmq.cpp) | `prefill_mmq_tab_parity` | **PASS (0 fails)** | Direct pointer-table expert MMQ streaming |

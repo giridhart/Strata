@@ -5,21 +5,28 @@ The Strata native SYCL 2020 backend documentation has been consolidated into the
 ## Canonical Documentation Index
 
 1. **[`docs/SYCL_STATUS.md`](docs/SYCL_STATUS.md)**: **Master Status & Kernel Registry**
-   - Current build, toolchain (oneAPI 2026.1), and verification status (16/16 SYCL unit tests passing).
-   - Complete registry of all 44 refactored pure SYCL computational kernels with parity targets.
-   - Upstream rebase status on `v0.1.39` (`origin/main`).
+   - Current build, toolchain (oneAPI 2026.1), and verification status (20/20 SYCL unit tests passing, 121/121 full test suite).
+   - Complete registry of refactored pure SYCL computational kernels with parity targets.
+   - Upstream merge status on `v0.2.6` (`origin/main`, engine `0.1.51`).
 
-2. **[`docs/SYCL_PORTING_GUIDE.md`](docs/SYCL_PORTING_GUIDE.md)**: **Architecture & Engineering Guide**
+2. **[`docs/SYCL_TUNING.md`](docs/SYCL_TUNING.md)**: **Kernel Autotuning & Memory Hints**
+   - On-device autotuning framework (`tune_sycl_kernels`), dynamic shape capture (`ShapeCollector`), persistent tables, and in-memory `SyclTuningRegistry`.
+   - Streaming vs. cached Intel L3 memory hints and microbenchmark reference tables.
+
+3. **[`docs/SYCL_PORTING_GUIDE.md`](docs/SYCL_PORTING_GUIDE.md)**: **Architecture & Engineering Guide**
    - Core 6 translation directives (memory hierarchy, subgroups, atomics, queue synchronizations).
    - SYCL Command Graph extension architecture and transparent CUDA graph capture adapter.
    - Developer and AI refactoring guidelines.
 
-3. **[`docs/INTEL_B580_OPTIMIZATION_PLAN.md`](docs/INTEL_B580_OPTIMIZATION_PLAN.md)**: **Intel Xe2 / Arc B580 Optimization Plan**
+4. **[`docs/INTEL_B580_OPTIMIZATION_PLAN.md`](docs/INTEL_B580_OPTIMIZATION_PLAN.md)**: **Intel Xe2 / Arc B580 Optimization Plan**
    - Microarchitecture details for Intel Arc B580 (Xe2-HPG) and Lunar Lake (Xe2-LPG `0x64a0`).
    - Phase-by-phase implementation: Ahead-of-Time compilation (`bmg`), native SIMD16 subgroup reductions (`SUB_GROUP_SIZE = 16`), hardware XMX systolic matrix acceleration (`joint_matrix`), and SLM bank alignment.
-   - Complete 19-benchmark performance tuning suite in `perf/sycl/` and `tools/` with real measured hardware throughputs and latency improvements across all critical Xe2/B580 execution stages (including Tier 3 composite pipelines and Tier 4 system endpoints).
+   - Complete 19-benchmark performance tuning suite in `perf/sycl/` and `tools/` with real measured hardware throughputs and latency improvements across all critical Xe2/B580 execution stages (including Tier 3 composite pipelines, Tier 4 system endpoints, and the multi-version workstream suite).
 
-4. **[`HANDOVER.md`](HANDOVER.md)**: **Active Session Handover**
+5. **[`docs/B580_SETUP_GUIDE.md`](docs/B580_SETUP_GUIDE.md)**: **Arc B580 Deployment & Serving Guide**
+   - End-to-end guide for downloading, quantizing, serving, and calibrating Qwen models on Arc B580 (12 GB VRAM) + 64 GB RAM.
+
+6. **[`HANDOVER.md`](HANDOVER.md)**: **Active Engineering Handover**
    - Work items, active task state, and reproduction steps for live GPU validation.
 
 ---
@@ -55,7 +62,7 @@ Recent fixes applied for Intel Arc B580 discrete GPU (`STRATA_AOT_BMG=ON`, `STRA
 # Source Intel oneAPI 2026.1 environment
 source /opt/intel/oneapi/setvars.sh --force 2>/dev/null
 
-# Compile and run SYCL unit test suite on GPU (CI fast check: 16/16 pass)
+# Compile and run SYCL unit test suite on GPU (CI fast check: 20/20 pass)
 make -C build_sycl -j$(nproc) check-sycl
 
 # Run full parity suite
