@@ -1,9 +1,19 @@
 # Upstream CUDA Optimization Audit & SYCL Porting Plan for Intel Arc B580 (v0.2.2)
 
+> [!NOTE]
+> **HISTORICAL / COMPLETED MILESTONE ARCHIVE**  
+> This porting plan documented the upstream CUDA optimization audit from Strata v0.2.2 (commits `477ac13c` &rarr; `011c9e60`).  
+> All 8 phases (Dual Gate+Up GEMV, Multi-format quantizer, Paired BF16 GEMV, Wide 8-byte INT8 KV gather, Register-shuffled QSA scores, Direct pointer-table MMQ, Chunked GDN recurrence, and Gyro Trellis TQ decoder) have been **100% completed**, parity-verified, and merged into the engine.  
+> 
+> For the current architecture, tuning, and deployment documentation on v0.2.6, see:
+> - Master Optimization Plan: [`docs/INTEL_B580_OPTIMIZATION_PLAN.md`](../INTEL_B580_OPTIMIZATION_PLAN.md)
+> - Kernel Autotuning Guide: [`docs/SYCL_TUNING.md`](../SYCL_TUNING.md)
+> - B580 Setup & Serving Guide: [`docs/B580_SETUP_GUIDE.md`](../B580_SETUP_GUIDE.md)
+
 > **Target Hardware**: Intel Arc B580 Desktop GPU (Battlemage Xe2-HPG, BMG-G21)  
 > **Microarchitecture**: 20 Xe2-cores (160 Vector Engines, 160 XMX Matrix Engines), 12 GB GDDR6 @ 456 GB/s, 16 MB L2/L3 Adamantine cache, 64 KB SLM per core (16 banks).  
 > **Upstream Audit Baseline**: Commit `477ac13c` $\rightarrow$ `011c9e60` (Strata v0.2.2 / Engine 0.1.47).  
-> **Status**: Ready for implementation.
+> **Status**: **100% COMPLETE & MERGED** across all 8 phases.
 
 ---
 

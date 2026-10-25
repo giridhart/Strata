@@ -1,6 +1,12 @@
 # SYCL On-Device Kernel Autotuning & Testing Hardening Implementation Plan
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
+> [!NOTE]
+> **HISTORICAL / COMPLETED IMPLEMENTATION PLAN**  
+> All autotuning and testing hardening tasks in this plan (Tasks 1 through 7) are **100% COMPLETE** and verified in commit `3741d6c8` (20/20 SYCL CTests passing).  
+> 
+> For the user-facing and developer documentation on the on-device autotuner, see:
+> - [`docs/SYCL_TUNING.md`](../SYCL_TUNING.md): Complete autotuning guide, shape capture, and performance tables.
+> - [`docs/B580_SETUP_GUIDE.md#step-64-on-device-sycl-kernel-autotuning--shape-capture-tune_sycl_kernels`](../B580_SETUP_GUIDE.md#step-64-on-device-sycl-kernel-autotuning--shape-capture-tune_sycl_kernels): On-device autotuning instructions on Arc B580.
 
 **Goal:** Implement a robust, device-specific on-target kernel autotuning system for Intel GPUs (specifically Intel Arc B580) with a safe 3-tier fallback hierarchy, streaming/uncached memory hints, and comprehensive boundary and parity test suites to eliminate code brittleness.
 
@@ -17,9 +23,9 @@
 | **Task 1** | Tuning Registry Core Unit Test | **COMPLETE** | Tested fingerprint matching, format parsing, fallback, mismatch rejection, malformed safety |
 | **Task 2** | Core Header & In-Memory Registry | **COMPLETE** | `include/strata/core/sycl_tuning.hpp` with O(1) 64-bit key, auto-load, strict device validation |
 | **Task 3** | Boundary & Fuzz Testing | **COMPLETE** | `tests/sycl/sycl_tuning_fuzz_test.cpp` sweeps TPR 16-256 and boundary shapes (1..128) |
-| **Task 4** | Workload Shape Capture Tracing | **IN PROGRESS** | Non-invasive logger hook gated by `STRATA_SYCL_RECORD_SHAPES` |
+| **Task 4** | Workload Shape Capture Tracing | **COMPLETE** | Non-invasive logger hook gated by `STRATA_SYCL_RECORD_SHAPES` |
 | **Task 5** | Standalone On-Device Autotuner | **COMPLETE** | `tools/sycl/tune_sycl_kernels.cpp` sweeps LWS/TPR, outputs device-locked table |
-| **Task 6** | Wire Tuning into GEMV & Norm Kernels | **IN PROGRESS** | Wired `bf16_gemv` and `s_gemv_q8k_split` / `s_gemv_q8_0_split` with fallback |
+| **Task 6** | Wire Tuning into GEMV & Norm Kernels | **COMPLETE** | Wired `bf16_gemv` and `s_gemv_q8k_split` / `s_gemv_q8_0_split` with fallback |
 | **Task 7** | Full CTest Suite Validation | **COMPLETE** | **20/20 SYCL CTests passing (100%)** |
 
 ---
