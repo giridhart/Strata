@@ -1855,6 +1855,27 @@ endif()
     add_test(NAME sycl_xe2_subgroup_gemv COMMAND sycl_xe2_subgroup_gemv)
   endif()
 
+  if(STRATA_ENABLE_SYCL AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/sycl/qsa_negative_cell_guard_test.cpp")
+    add_executable(sycl_qsa_negative_cell_guard tests/sycl/qsa_negative_cell_guard_test.cpp)
+    target_include_directories(sycl_qsa_negative_cell_guard PRIVATE ${_strata_gpu_include_directories})
+    target_link_libraries(sycl_qsa_negative_cell_guard PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+    add_test(NAME sycl_qsa_negative_cell_guard COMMAND sycl_qsa_negative_cell_guard)
+  endif()
+
+  if(STRATA_ENABLE_SYCL AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/sycl/sycl_queue_sync_test.cpp")
+    add_executable(sycl_queue_sync_test tests/sycl/sycl_queue_sync_test.cpp)
+    target_include_directories(sycl_queue_sync_test PRIVATE ${_strata_gpu_include_directories})
+    target_link_libraries(sycl_queue_sync_test PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+    add_test(NAME sycl_queue_sync_test COMMAND sycl_queue_sync_test)
+  endif()
+
+  if(STRATA_ENABLE_SYCL AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/sycl/subgroup_divergence_test.cpp")
+    add_executable(sycl_subgroup_divergence_test tests/sycl/subgroup_divergence_test.cpp)
+    target_include_directories(sycl_subgroup_divergence_test PRIVATE ${_strata_gpu_include_directories})
+    target_link_libraries(sycl_subgroup_divergence_test PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+    add_test(NAME sycl_subgroup_divergence_test COMMAND sycl_subgroup_divergence_test)
+  endif()
+
   if(STRATA_ENABLE_SYCL AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/sycl/xmx_joint_matrix_test.cpp")
     add_executable(sycl_xmx_joint_matrix tests/sycl/xmx_joint_matrix_test.cpp)
     target_include_directories(sycl_xmx_joint_matrix PRIVATE ${_strata_gpu_include_directories})
@@ -3082,6 +3103,7 @@ if(STRATA_ENABLE_SYCL)
             sycl_native_flash_attn sycl_native_mmvq sycl_fused_gdn
             sycl_dequant_bf16 sycl_verify_kernels sycl_graph strata-device
             sycl_native_gr_norm sycl_xe2_subgroup_gemv sycl_xmx_joint_matrix
+            sycl_qsa_negative_cell_guard sycl_queue_sync_test sycl_subgroup_divergence_test
             s_gemv_pair_parity quantize_act_images_parity bf16_gemv_pair_parity
             kv_gather_wide_parity qsa_scores_rows_parity prefill_mmq_tab_parity
             gdn_chunk_parity trellis_parity finish_test gemv_rows_test numerics_test

@@ -179,8 +179,10 @@ void attn_chunk_kernel(sycl::nd_item<3> item, const float* __restrict__ q, QsaAt
         long long r = -1;
         if (t < n_here) {
             const int cell = ids[c0 + t];
-            const long long page = (long long)p.page_table[cell / page_size];
-            if (page >= 0) r = (page * n_kv_heads + kvh) * page_size + (cell % page_size);
+            if (cell >= 0) {
+                const long long page = (long long)p.page_table[cell / page_size];
+                if (page >= 0) r = (page * n_kv_heads + kvh) * page_size + (cell % page_size);
+            }
         }
         srow[t] = r;
     }
@@ -306,8 +308,10 @@ void attn_chunk_kernel_pre75(sycl::nd_item<3> item, const float* __restrict__ q,
         long long r = -1;
         if (t < n_here) {
             const int cell = ids[c0 + t];
-            const long long page = (long long)p.page_table[cell / page_size];
-            if (page >= 0) r = (page * n_kv_heads + kvh) * page_size + (cell % page_size);
+            if (cell >= 0) {
+                const long long page = (long long)p.page_table[cell / page_size];
+                if (page >= 0) r = (page * n_kv_heads + kvh) * page_size + (cell % page_size);
+            }
         }
         srow[t] = r;
     }

@@ -95,7 +95,8 @@ DevicePools make_pools(int64_t rows, int64_t D, std::mt19937& rng, sycl::queue& 
     return p;
 }
 
-constexpr int64_t kCells = 32768, kHole = 12800;
+constexpr int64_t kCells = 40960;
+constexpr int64_t kHole = 8192;
 
 struct Case {
     int fmt = 0;
@@ -104,18 +105,20 @@ struct Case {
     std::vector<int32_t> widths;
 };
 
-void selection(int32_t* ids, int64_t cap, int32_t width, int shape, std::mt19937& rng) {
-    const int64_t w = std::max<int64_t>(0, std::min<int64_t>(cap, width < 0 ? cap : width));
-    if (shape == 0) {
-        const int64_t start = kHole - w / 2;
-        for (int64_t j = 0; j < w; ++j) ids[j] = (int32_t) (start + j);
-        for (int64_t j = w; j < cap; ++j) ids[j] = 0;
-    } else if (shape == 1) {
+void selection(int32_t* ids, int64_t cap, int width, int shape, std::mt19937& rng) {
+    const int64_t w = std::max<int64_t>(0, std::min<int64_t>(width < 0 ? cap : (int64_t)width, cap));
+    if (shape == 0) {   // the drafter's window: consecutive cells (window_ids), often across the unresident run
+        int64_t start;
+        if (rng() % 2 == 0) start = std::max<int64_t>(0, kHole - 64 * (int64_t) (rng() % 8));   // chunk-aligned on it
+        else start = (int64_t) (rng() % (uint32_t) (kCells - std::max<int64_t>(w, (int64_t)1)));
+        if (start + w > kCells) start = kCells - w;
+        for (int64_t j = 0; j < cap; ++j) ids[j] = (int32_t) ((start + j) % kCells);
+    } else if (shape == 1) {   // the indexer's: ascending with gaps
         std::vector<int32_t> v((size_t) cap);
-        for (int64_t j = 0; j < cap; ++j) v[(size_t) j] = (int32_t) (rng() % (uint32_t) kCells);
+        for (auto& x : v) x = (int32_t) (rng() % (uint32_t) kCells);
         std::sort(v.begin(), v.begin() + w);
         std::copy(v.begin(), v.end(), ids);
-    } else {
+    } else {   // unordered, with repeats
         for (int64_t j = 0; j < cap; ++j) ids[j] = (int32_t) (rng() % (uint32_t) kCells);
     }
 }

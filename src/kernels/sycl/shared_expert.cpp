@@ -42,6 +42,11 @@ namespace {
 constexpr int THREADS = 128;
 bool native_bf16 = false;
 
+inline sycl::queue& default_queue() {
+    static sycl::queue q{sycl::default_selector_v, sycl::property::queue::in_order()};
+    return q;
+}
+
 // `f32_to_f16` used to live here as a private copy.  Round 198 found it - and the identical one in
 // `quantize_act.cu` - returning a NaN for every FINITE value that overflows fp16 (1e30, 65536, 1e45) instead
 // of saturating to inf, because `exp >= 31` conflates an f32 inf/NaN with an out-of-range finite exponent.
@@ -80,20 +85,18 @@ inline double warp_sum_d(sycl::sub_group sg, double v) {
 void scalar_gate_kernel(const uint16_t* __restrict__ x_bf16, const uint16_t* __restrict__ w_bf16,
                         float* __restrict__ out, int n_embd, double* scratch, const sycl::nd_item<1>& item) {
     auto sg = item.get_sub_group();
-    // 8 warps: the launch is <<<1, 256>>>
     double acc = 0.0;
     for (int i = item.get_local_id(0); i < n_embd; i += item.get_local_range(0))
         acc += (double)f32_from_bf16(x_bf16[i]) * (double)f32_from_bf16(w_bf16[i]);
+    acc = sycl::reduce_over_group(sg, acc, sycl::plus<double>());
+    const int sg_id = sg.get_group_id()[0];
+    const int sg_num = sg.get_group_range()[0];
+    if (sg.get_local_id()[0] == 0) scratch[sg_id] = acc;
     item.barrier(sycl::access::fence_space::local_space);
-    const int lane = item.get_local_id(0) & 31, warp = item.get_local_id(0) >> 5;
-    acc = warp_sum_d(sg, acc);
-    if (lane == 0) scratch[warp] = acc;
-    item.barrier(sycl::access::fence_space::local_space);
-    const int nw = ((int)item.get_local_range(0) + 31) >> 5;
-    if (warp == 0) {
-        acc = (int(item.get_local_id(0)) < nw) ? scratch[item.get_local_id(0)] : 0.0;
-        acc = warp_sum_d(sg, acc);
-        if (item.get_local_id(0) == 0) out[0] = (float)(1.0 / (1.0 + sycl::exp(-acc)));
+    if (sg_id == 0) {
+        double val = (sg.get_local_id()[0] < sg_num) ? scratch[sg.get_local_id()[0]] : 0.0;
+        val = sycl::reduce_over_group(sg, val, sycl::plus<double>());
+        if (sg.get_local_id()[0] == 0) out[0] = (float)(1.0 / (1.0 + sycl::exp(-val)));
     }
 }
 
@@ -166,54 +169,53 @@ void shared_expert_multi(int n_tok, const float* x, const uint16_t* x_bf16, cons
     (void)lfuse;
     if (n_tok < 1 || n_tok > 8 || !nw.q8_1 || !nw.gate_data || !nw.up_data || !nw.down_data || !stream)
         throw std::invalid_argument("shared_expert_multi: needs 1..8 tokens, native weights, scratch and a stream");
-    static sycl::queue default_queue;
-    sycl::queue* q = stream ? static_cast<sycl::queue*>(stream) : &default_queue;
+    sycl::queue* q = stream ? static_cast<sycl::queue*>(stream) : &default_queue();
     const void* x_q8_1 = nw.x_q8_1;
     if (!x_q8_1) {
-        native_quantize_q8_1(x, nw.q8_1, (int)n_embd, n_tok, stream);
+        native_quantize_q8_1(x, nw.q8_1, (int)n_embd, n_tok, q);
         x_q8_1 = nw.q8_1;
     }
-    native_mmvq(nw.gate_type, nw.gate_data, x_q8_1, gate, (int)n_embd, (int)n_ff, n_tok, stream);
-    native_mmvq(nw.up_type, nw.up_data, x_q8_1, up, (int)n_embd, (int)n_ff, n_tok, stream);
+    native_mmvq(nw.gate_type, nw.gate_data, x_q8_1, gate, (int)n_embd, (int)n_ff, n_tok, q);
+    native_mmvq(nw.up_type, nw.up_data, x_q8_1, up, (int)n_embd, (int)n_ff, n_tok, q);
     const int n = (int)(n_ff * n_tok);
     if (fused_swiglu_q81_enabled()) {
-        native_swiglu_quantize_q8_1(gate, up, nw.q8_1, (int)n_ff, n_tok, stream);
+        native_swiglu_quantize_q8_1(gate, up, nw.q8_1, (int)n_ff, n_tok, q);
     } else {
         const unsigned grid_swiglu = (unsigned)((n + THREADS - 1) / THREADS);
         q->parallel_for(sycl::nd_range<1>(sycl::range<1>(grid_swiglu * THREADS), sycl::range<1>(THREADS)),
                         [=](sycl::nd_item<1> item) { native_swiglu_kernel(gate, up, gate, n, item); });
-        native_quantize_q8_1(gate, nw.q8_1, (int)n_ff, n_tok, stream);
+        native_quantize_q8_1(gate, nw.q8_1, (int)n_ff, n_tok, q);
     }
-    native_mmvq(nw.down_type, nw.down_data, nw.q8_1, out, (int)n_ff, (int)n_embd, n_tok, stream);
+    native_mmvq(nw.down_type, nw.down_data, nw.q8_1, out, (int)n_ff, (int)n_embd, n_tok, q);
     static const bool batch = [] {
         const char* v = std::getenv("STRATA_DEC_BATCH");
         return v == nullptr || std::atoi(v) != 0;
     }();
     const unsigned grid_scale = (unsigned)((n_embd + THREADS - 1) / THREADS);
     if (native_bf16 && batch && n_tok > 1) {  // one gemv for all rows (outputs identical), fused sigmoid+scale
-        bf16_gemv_fp32_mmvf_multi(x, n_embd, gate_inp_bf16, g, 1, n_embd, 1, n_tok, stream);
+        bf16_gemv_fp32_mmvf_multi(x, n_embd, gate_inp_bf16, g, 1, n_embd, 1, n_tok, q);
         q->parallel_for(
             sycl::nd_range<2>(sycl::range<2>((unsigned)n_tok, grid_scale * THREADS), sycl::range<2>(1, THREADS)),
             [=](sycl::nd_item<2> item) { sigmoid_scale_rows_kernel(out, g, (int)n_embd, item); });
     } else if (native_bf16 && n_tok == 1) {
-        bf16_gemv_fp32_mmvf(x, gate_inp_bf16, g, n_embd, 1, stream);
+        bf16_gemv_fp32_mmvf(x, gate_inp_bf16, g, n_embd, 1, q);
         q->parallel_for(
             sycl::nd_range<2>(sycl::range<2>(1, grid_scale * THREADS), sycl::range<2>(1, THREADS)),
             [=](sycl::nd_item<2> item) { sigmoid_scale_rows_kernel(out, g, (int)n_embd, item); });
     } else {
         for (int t = 0; t < n_tok; ++t) {
             if (native_bf16) {
-                bf16_gemv_fp32_mmvf(x + (size_t)t * n_embd, gate_inp_bf16, g + t, n_embd, 1, stream);
+                bf16_gemv_fp32_mmvf(x + (size_t)t * n_embd, gate_inp_bf16, g + t, n_embd, 1, q);
                 auto g_t = g + t;
                 q->single_task([=]() { native_scalar_sigmoid_kernel(g_t); });
             } else {
                 q->submit([&](sycl::handler& cgh) {
-                    sycl::local_accessor<double, 1> scratch_acc(sycl::range<1>(8), cgh);
+                    sycl::local_accessor<double, 1> scratch_acc(sycl::range<1>(16), cgh);
                     auto x_t = x_bf16 + (size_t)t * n_embd;
                     auto g_t = g + t;
 
                     cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(256), sycl::range<1>(256)),
-                                     [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(32)]] {
+                                     [=](sycl::nd_item<1> item) {
                                          scalar_gate_kernel(
                                              x_t, gate_inp_bf16, g_t, (int)n_embd,
                                              scratch_acc.get_multi_ptr<sycl::access::decorated::no>().get(), item);
@@ -225,7 +227,7 @@ void shared_expert_multi(int n_tok, const float* x, const uint16_t* x_bf16, cons
             sycl::nd_range<2>(sycl::range<2>((unsigned)n_tok, grid_scale * THREADS), sycl::range<2>(1, THREADS)),
             [=](sycl::nd_item<2> item) { scale_rows_kernel(out, g, (int)n_embd, item); });
     }
-    if (!stream) default_queue.wait();
+    if (!stream) q->wait();
 }
 
 uint64_t shared_expert_scratch_bytes(int64_t n_ff) {
@@ -277,21 +279,20 @@ void shared_expert(const uint8_t* x_q8_0, const uint8_t* x_q8k, const uint16_t* 
     uint8_t* h_q8k = (uint8_t*)(p + a * 2 + q0);
     float* g = (float*)(p + a * 2 + q0 + qk);
 
+    sycl::queue* q = stream ? static_cast<sycl::queue*>(stream) : &default_queue();
+
     // WHICH ACTIVATION THIS PROJECTION WANTS, READ FROM ITS OWN FORM.  See `SForm::act_kind`: the three
     // families cannot be told apart by the other fields, so the kind is carried rather than derived.
     auto gemv = [&](const SForm& f, const uint8_t* codes, const float* scales, const float* off, const uint8_t* act80,
                     const uint8_t* actq8k, float* y, int64_t nin, int64_t nout) {
         if (f.code_bits == 2) {
-            s2_gemv_q8(act80, codes, scales, y, nin, nout, tpr, stream);
+            s2_gemv_q8(act80, codes, scales, y, nin, nout, tpr, q);
         } else if (f.act_kind == 1) {
-            s_gemv_q8k_split(actq8k, codes, scales, off, y, nin, nout, f, stream);
+            s_gemv_q8k_split(actq8k, codes, scales, off, y, nin, nout, f, q);
         } else {
-            s_gemv_q8_0_split(act80, codes, scales, off, y, nin, nout, f, stream);
+            s_gemv_q8_0_split(act80, codes, scales, off, y, nin, nout, f, q);
         }
     };
-
-    static sycl::queue default_queue;
-    sycl::queue* q = stream ? static_cast<sycl::queue*>(stream) : &default_queue;
 
     const unsigned g_ff = (unsigned)((n_ff + THREADS - 1) / THREADS);
     const unsigned g_embd = (unsigned)((n_embd + THREADS - 1) / THREADS);
@@ -300,19 +301,19 @@ void shared_expert(const uint8_t* x_q8_0, const uint8_t* x_q8k, const uint16_t* 
     // When both projections are S-family, we fuse both GEMVs and the SwiGLU into `s_gemv_pair_silu`:
     // one read of the activation vector x, dual accumulations in registers, and SwiGLU in the epilogue.
     bool paired = false;
-    if (native_gate || native_up) native_quantize_q8_1(x_f32, native->q8_1, (int)n_embd, 1, stream);
+    if (native_gate || native_up) native_quantize_q8_1(x_f32, native->q8_1, (int)n_embd, 1, q);
     if (!native_gate && !native_up) {
         paired = s_gemv_pair_silu(x_q8_0, x_q8k, gate_form, gate_codes, gate_scales, gate_off,
                                   up_form, up_codes, up_scales, up_off, gate, n_embd, n_ff, tpr,
-                                  native_projection ? 2 : 0, stream);
+                                  native_projection ? 2 : 0, q);
     }
     if (!paired) {
         if (native_gate)
-            native_mmvq(native->gate_type, native->gate_data, native->q8_1, gate, (int)n_embd, (int)n_ff, 1, stream);
+            native_mmvq(native->gate_type, native->gate_data, native->q8_1, gate, (int)n_embd, (int)n_ff, 1, q);
         else
             gemv(gate_form, gate_codes, gate_scales, gate_off, x_q8_0, x_q8k, gate, n_embd, n_ff);
         if (native_up)
-            native_mmvq(native->up_type, native->up_data, native->q8_1, up, (int)n_embd, (int)n_ff, 1, stream);
+            native_mmvq(native->up_type, native->up_data, native->q8_1, up, (int)n_embd, (int)n_ff, 1, q);
         else
             gemv(up_form, up_codes, up_scales, up_off, x_q8_0, x_q8k, up, n_embd, n_ff);
     }
@@ -320,8 +321,8 @@ void shared_expert(const uint8_t* x_q8_0, const uint8_t* x_q8k, const uint16_t* 
     if (paired) {
         // `gate` already holds the SwiGLU products silu(gate)*up from the fused pair kernel.
         if (native_down) {
-            native_quantize_q8_1(gate, native->q8_1, (int)n_ff, 1, stream);
-            native_mmvq(native->down_type, native->down_data, native->q8_1, out, (int)n_ff, (int)n_embd, 1, stream);
+            native_quantize_q8_1(gate, native->q8_1, (int)n_ff, 1, q);
+            native_mmvq(native->down_type, native->down_data, native->q8_1, out, (int)n_ff, (int)n_embd, 1, q);
         } else if (down_form.act_kind == 1) {
             if (n_ff % 256 != 0) {
                 std::fprintf(stderr,
@@ -330,18 +331,18 @@ void shared_expert(const uint8_t* x_q8_0, const uint8_t* x_q8k, const uint16_t* 
                              (long long)n_ff);
                 std::exit(1);
             }
-            quantize_q8_K(gate, h_q8k, n_ff, stream);
+            quantize_q8_K(gate, h_q8k, n_ff, q);
             gemv(down_form, down_codes, down_scales, down_off, h_q8_0, h_q8k, out, n_ff, n_embd);
         } else if (down_form.code_bits == 2) {
-            quantize_q8_0(gate, h_q8_0, n_ff, stream);
+            quantize_q8_0(gate, h_q8_0, n_ff, q);
             gemv(down_form, down_codes, down_scales, down_off, h_q8_0, h_q8k, out, n_ff, n_embd);
         } else {
-            quantize_q8_0(gate, h_q8_0, n_ff, stream);
+            quantize_q8_0(gate, h_q8_0, n_ff, q);
             gemv(down_form, down_codes, down_scales, down_off, h_q8_0, h_q8k, out, n_ff, n_embd);
         }
     } else if (native_projection && native_down && fused_swiglu_q81_enabled()) {
-        native_swiglu_quantize_q8_1(gate, up, native->q8_1, (int)n_ff, 1, stream);
-        native_mmvq(native->down_type, native->down_data, native->q8_1, out, (int)n_ff, (int)n_embd, 1, stream);
+        native_swiglu_quantize_q8_1(gate, up, native->q8_1, (int)n_ff, 1, q);
+        native_mmvq(native->down_type, native->down_data, native->q8_1, out, (int)n_ff, (int)n_embd, 1, q);
     } else {
         if (native_projection)
             q->parallel_for(sycl::nd_range<1>(sycl::range<1>(g_ff * THREADS), sycl::range<1>(THREADS)),
@@ -355,8 +356,8 @@ void shared_expert(const uint8_t* x_q8_0, const uint8_t* x_q8k, const uint16_t* 
         // what `ggml_mul_mat` does for every matmul in the model.  It used to be rounded to fp16 with no
         // justification beyond "the kernel takes fp16".
         if (native_down) {
-            native_quantize_q8_1(gate, native->q8_1, (int)n_ff, 1, stream);
-            native_mmvq(native->down_type, native->down_data, native->q8_1, out, (int)n_ff, (int)n_embd, 1, stream);
+            native_quantize_q8_1(gate, native->q8_1, (int)n_ff, 1, q);
+            native_mmvq(native->down_type, native->down_data, native->q8_1, out, (int)n_ff, (int)n_embd, 1, q);
         } else if (down_form.act_kind == 1) {
             if (n_ff % 256 != 0) {
                 std::fprintf(stderr,
@@ -365,13 +366,13 @@ void shared_expert(const uint8_t* x_q8_0, const uint8_t* x_q8k, const uint16_t* 
                              (long long)n_ff);
                 std::exit(1);
             }
-            quantize_q8_K(gate, h_q8k, n_ff, stream);
+            quantize_q8_K(gate, h_q8k, n_ff, q);
             gemv(down_form, down_codes, down_scales, down_off, h_q8_0, h_q8k, out, n_ff, n_embd);
         } else if (down_form.code_bits == 2) {
-            quantize_q8_0(gate, h_q8_0, n_ff, stream);
+            quantize_q8_0(gate, h_q8_0, n_ff, q);
             gemv(down_form, down_codes, down_scales, down_off, h_q8_0, h_q8k, out, n_ff, n_embd);
         } else {
-            quantize_q8_0(gate, h_q8_0, n_ff, stream);
+            quantize_q8_0(gate, h_q8_0, n_ff, q);
             gemv(down_form, down_codes, down_scales, down_off, h_q8_0, h_q8k, out, n_ff, n_embd);
         }
     }
@@ -382,16 +383,16 @@ void shared_expert(const uint8_t* x_q8_0, const uint8_t* x_q8k, const uint16_t* 
     // `<<<1, 256>>>`: one block, because the output is ONE scalar and a second block would only add a global
     // round trip.  256 threads is the reduction's width, not the problem's size.
     if (use_native) {
-        bf16_gemv_fp32_mmvf(x_f32, gate_inp_bf16, g, n_embd, 1, stream);
+        bf16_gemv_fp32_mmvf(x_f32, gate_inp_bf16, g, n_embd, 1, q);
         q->parallel_for(
             sycl::nd_range<2>(sycl::range<2>(1, g_embd * THREADS), sycl::range<2>(1, THREADS)),
             [=](sycl::nd_item<2> item) { sigmoid_scale_rows_kernel(out, g, (int)n_embd, item); });
     } else {
         q->submit([&](sycl::handler& cgh) {
-            sycl::local_accessor<double, 1> scratch_acc(sycl::range<1>(8), cgh);
+            sycl::local_accessor<double, 1> scratch_acc(sycl::range<1>(16), cgh);
 
             cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(256), sycl::range<1>(256)),
-                             [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(32)]] {
+                             [=](sycl::nd_item<1> item) {
                                  scalar_gate_kernel(x_bf16, gate_inp_bf16, g, (int)n_embd,
                                                     scratch_acc.get_multi_ptr<sycl::access::decorated::no>().get(),
                                                     item);
@@ -401,7 +402,7 @@ void shared_expert(const uint8_t* x_q8_0, const uint8_t* x_q8k, const uint16_t* 
                         [=](sycl::nd_item<1> item) { scale_kernel(out, g, (int)n_embd, item); });
     }
 
-    if (!stream) default_queue.wait();
+    if (!stream) q->wait();
 }
 
 void moe_combine(const float* parts, const float* weights, const float* shared, float* y, int64_t n_embd, int64_t k,
@@ -413,8 +414,7 @@ void moe_combine(const float* parts, const float* weights, const float* shared, 
         std::fprintf(stderr, "moe_combine: k = %lld exceeds 64\n", (long long)k);
         std::exit(1);
     }
-    static sycl::queue default_queue;
-    sycl::queue* q = stream ? static_cast<sycl::queue*>(stream) : &default_queue;
+    sycl::queue* q = stream ? static_cast<sycl::queue*>(stream) : &default_queue();
     const unsigned grid = (unsigned)((n_embd + THREADS - 1) / THREADS);
     const int shared_nullptr = shared != nullptr;
 
@@ -423,7 +423,7 @@ void moe_combine(const float* parts, const float* weights, const float* shared, 
                         moe_combine_kernel(parts, weights, shared, y, (int)n_embd, (int)k, shared_nullptr, item);
                     });
 
-    if (!stream) default_queue.wait();
+    if (!stream) q->wait();
 }
 
 }  // namespace strata::kernels
