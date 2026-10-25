@@ -56,7 +56,8 @@ Terminal cannot run. Strata's MCP server ([docs/MCP_SERVER.md](docs/MCP_SERVER.m
 - The Terminal: [docs/TERMINAL.md](docs/TERMINAL.md) and [docs/TERMINAL_LAUNCH.md](docs/TERMINAL_LAUNCH.md). The app,
   the packages and the update feed: [packaging/README.md](packaging/README.md) and [packaging/UPDATES.md](packaging/UPDATES.md).
 - AMD (HIP) build and validation: [docs/AMD_HIP.md](docs/AMD_HIP.md); multi-GPU: [docs/MULTI_GPU.md](docs/MULTI_GPU.md);
-  Mac (Metal): [docs/MAC.md](docs/MAC.md); Intel (SYCL 2020 & Command Graphs): [docs/SYCL_PORTING_GUIDE.md](docs/SYCL_PORTING_GUIDE.md).
+  Mac (Metal): [docs/MAC.md](docs/MAC.md); Intel (SYCL 2020 & Command Graphs): [docs/SYCL_PORTING_GUIDE.md](docs/SYCL_PORTING_GUIDE.md),
+  tuning: [docs/SYCL_TUNING.md](docs/SYCL_TUNING.md).
 - Tests: the Terminal and Control tests are in `tests/terminal` (`python -m pytest tests/terminal`). The app's UI
   tests run with `npm test` in `apps/host`. Setup's own tests run without a GPU or downloads:
   `python tools/test_setup_<name>.py` (for example `tools/test_setup_amd.py`, `tools/test_setup_choices.py`).

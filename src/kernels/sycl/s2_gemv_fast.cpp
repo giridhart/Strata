@@ -29,6 +29,7 @@
 // either.
 #include <sycl/sycl.hpp>
 #include "strata/core/sycl_arch.hpp"
+#include "strata/core/sycl_tuning.hpp"
 #include "strata/kernels/s_gemv.hpp"
 
 #include <cstdio>
@@ -133,8 +134,20 @@ void s2_gemv_fast(const uint16_t* x, const uint8_t* codes, const float* scales, 
                      MAX_SHARED_HALVES);
         std::exit(1);
     }
-    const size_t smem_floats = (stage_x ? (MAX_SHARED_HALVES / 2) : 0) + (size_t)threads_per_row;
     auto& q = default_queue();
+
+    STRATA_SYCL_RECORD_SHAPE(strata::sycl_tuning::KernelType::S2_GEMV, n_in, n_out, 2, QK_S2, 0);
+    auto& reg = strata::sycl_tuning::SyclTuningRegistry::instance();
+    reg.try_auto_load(q.get_device());
+    const uint64_t key = strata::sycl_tuning::make_kernel_key(
+        strata::sycl_tuning::KernelType::S2_GEMV, n_in, n_out, 2, QK_S2, 0);
+    const auto tuned = reg.get_or_fallback(
+        key, { 256, (n_out <= 640 ? 64 : 128), 0, strata::sycl_tuning::CachePolicy::StreamingL3 });
+    if (threads_per_row <= 0) {
+        threads_per_row = tuned.tpr > 0 ? tuned.tpr : 64;
+    }
+
+    const size_t smem_floats = (stage_x ? (MAX_SHARED_HALVES / 2) : 0) + (size_t)threads_per_row;
     const sycl::nd_range<1> range(sycl::range<1>((size_t)n_out * threads_per_row), sycl::range<1>(threads_per_row));
     if (stage_x) {
         q.submit([&](sycl::handler& cgh) {

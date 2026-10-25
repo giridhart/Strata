@@ -6,6 +6,7 @@
 // tensor and a 13-way switch inside the inner loop would be the naive-but-wrong kind of naive.
 #include <sycl/sycl.hpp>
 #include "strata/core/sycl_arch.hpp"
+#include "strata/core/sycl_tuning.hpp"
 #include "strata/kernels/s_gemv.hpp"
 #include "strata/kernels/f16_bits.hpp"
 
@@ -671,7 +672,13 @@ void s_gemv_q8k_split(const uint8_t* x_q8k, const uint8_t* codes, const float* s
     }
     static sycl::queue default_queue;
     sycl::queue* q = stream ? static_cast<sycl::queue*>(stream) : &default_queue;
-    const int threads = 256;
+    STRATA_SYCL_RECORD_SHAPE(strata::sycl_tuning::KernelType::S_GEMV_Q8K, n_in, n_out, form.code_bits, form.group_elems, 1);
+    auto& reg = strata::sycl_tuning::SyclTuningRegistry::instance();
+    reg.try_auto_load(q->get_device());
+    const uint64_t key = strata::sycl_tuning::make_kernel_key(
+        strata::sycl_tuning::KernelType::S_GEMV_Q8K, n_in, n_out, form.code_bits, form.group_elems, 1);
+    const auto tuned = reg.get_or_fallback(key, {256, 0, 0, strata::sycl_tuning::CachePolicy::Default});
+    const int threads = (tuned.lws > 0 && tuned.lws % SG_SIZE == 0) ? tuned.lws : 256;
     const int sgs = threads / SG_SIZE;
     const unsigned blocks = (unsigned)((n_out + sgs - 1) / sgs);
     const int cb = (int)form.codebook;
@@ -728,7 +735,13 @@ void s_gemv_q8_0_split(const uint8_t* x_q8_0, const uint8_t* codes, const float*
 
     static sycl::queue default_queue;
     sycl::queue* q = stream ? static_cast<sycl::queue*>(stream) : &default_queue;
-    const int threads = 256;
+    STRATA_SYCL_RECORD_SHAPE(strata::sycl_tuning::KernelType::S_GEMV_Q8_0, n_in, n_out, form.code_bits, form.group_elems, 0);
+    auto& reg = strata::sycl_tuning::SyclTuningRegistry::instance();
+    reg.try_auto_load(q->get_device());
+    const uint64_t key = strata::sycl_tuning::make_kernel_key(
+        strata::sycl_tuning::KernelType::S_GEMV_Q8_0, n_in, n_out, form.code_bits, form.group_elems, 0);
+    const auto tuned = reg.get_or_fallback(key, {256, 0, 0, strata::sycl_tuning::CachePolicy::Default});
+    const int threads = (tuned.lws > 0 && tuned.lws % SG_SIZE == 0) ? tuned.lws : 256;
     const int sgs = threads / SG_SIZE;
     const unsigned blocks = (unsigned)((n_out + sgs - 1) / sgs);
     const int cb = (int)form.codebook;

@@ -26,6 +26,7 @@ __pycache__/
 td.log
 
 # created by setup.py on the user's machine
+ARC_B580_AGENTIC_WORKFLOW.md
 /.venv/
 /build/
 /models/

@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <algorithm>
 #include "strata/core/sycl_arch.hpp"
+#include "strata/core/sycl_tuning.hpp"
 #include "strata/kernels/bf16_gemv.hpp"
 #include "strata/kernels/bf16_bits.hpp"
 
@@ -201,26 +202,40 @@ void bf16_gemv_split_kernel(sycl::nd_item<1> item, const uint16_t* __restrict__ 
 void bf16_gemv(const uint16_t* x, const uint16_t* w, float* y, int64_t n_in, int64_t n_out, void* stream) {
     sycl::queue* q = stream ? static_cast<sycl::queue*>(stream) : &default_queue();
     if (n_in <= 0 || n_out <= 0) return;
+    STRATA_SYCL_RECORD_SHAPE(strata::sycl_tuning::KernelType::BF16_GEMV, n_in, n_out, 0, 0, 0);
+    auto& reg = strata::sycl_tuning::SyclTuningRegistry::instance();
+    reg.try_auto_load(q->get_device());
+
     const auto prof = strata::sycl_arch::get_xe2_tuning_profile(q->get_device());
-    if (n_out >= 64) {
-        const int sgs = THREADS / SG_SIZE;
-        const unsigned grid = (unsigned)((n_out + sgs - 1) / sgs);
-        if (prof.enable_streaming_hints) {
-            q->parallel_for(sycl::nd_range<1>(sycl::range<1>((grid) * (THREADS)), sycl::range<1>(THREADS)),
-                            [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
-                                bf16_gemv_subgroup_kernel<SG_SIZE, true>(item, x, w, y, n_in, n_out);
-                            });
-        } else {
-            q->parallel_for(sycl::nd_range<1>(sycl::range<1>((grid) * (THREADS)), sycl::range<1>(THREADS)),
-                            [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
-                                bf16_gemv_subgroup_kernel<SG_SIZE, false>(item, x, w, y, n_in, n_out);
-                            });
-        }
+    const uint64_t key = strata::sycl_tuning::make_kernel_key(
+        strata::sycl_tuning::KernelType::BF16_GEMV, n_in, n_out, 0, 0, 0);
+
+    const strata::sycl_tuning::LaunchParams fallback{
+        256, (n_out < 64 ? 128 : 0), 0,
+        (prof.enable_streaming_hints ? strata::sycl_tuning::CachePolicy::StreamingL3 : strata::sycl_tuning::CachePolicy::Default)};
+    const auto tuned = reg.get_or_fallback(key, fallback);
+
+    if (tuned.tpr > 0) {
+        bf16_gemv_split(x, w, y, n_in, n_out, tuned.tpr, stream);
         return;
     }
-    // For narrow shapes (n_out < 64, e.g. ssm_alpha [2560, 48]), dispatch the SLM split reduction
-    // with 128 threads per row to fully saturate Xe2 Vector Engines (160 engines).
-    bf16_gemv_split(x, w, y, n_in, n_out, 128, stream);
+
+    const int threads = (tuned.lws > 0 && tuned.lws % SG_SIZE == 0) ? tuned.lws : THREADS;
+    const int sgs = threads / SG_SIZE;
+    const unsigned grid = (unsigned)((n_out + sgs - 1) / sgs);
+    const bool use_streaming = (tuned.cache == strata::sycl_tuning::CachePolicy::StreamingL3) || prof.enable_streaming_hints;
+
+    if (use_streaming) {
+        q->parallel_for(sycl::nd_range<1>(sycl::range<1>((grid) * (threads)), sycl::range<1>(threads)),
+                        [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
+                            bf16_gemv_subgroup_kernel<SG_SIZE, true>(item, x, w, y, n_in, n_out);
+                        });
+    } else {
+        q->parallel_for(sycl::nd_range<1>(sycl::range<1>((grid) * (threads)), sycl::range<1>(threads)),
+                        [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
+                            bf16_gemv_subgroup_kernel<SG_SIZE, false>(item, x, w, y, n_in, n_out);
+                        });
+    }
 }
 
 void bf16_gemv_pair(const uint16_t* x, const uint16_t* w1, float* y1, int64_t n_out1,

@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <algorithm>
 #include "strata/core/sycl_arch.hpp"
+#include "strata/core/sycl_tuning.hpp"
 #include "strata/kernels/s2_gemv.hpp"
 
 #include <cstdio>
@@ -48,7 +49,7 @@ inline sycl::queue& default_queue() {
     y[o] = acc;
 }
 
-template <int SUB_SIZE = SG_SIZE>
+template <int SUB_SIZE = SG_SIZE, bool STREAMING = false>
 void s2_gemv_subgroup_kernel(sycl::nd_item<1> item, const uint16_t* __restrict__ x, const uint8_t* __restrict__ codes,
                              const float* __restrict__ scales, float* __restrict__ y, long long n_in, long long n_out) {
     const auto sg = item.get_sub_group();
@@ -62,28 +63,62 @@ void s2_gemv_subgroup_kernel(sycl::nd_item<1> item, const uint16_t* __restrict__
     const float* s = scales + o * nb;
 
     float acc = 0.0f;
-    for (long long b = 0; b < nb; ++b) {
-        const float d = s[b];
-        const uint8_t* cb = c + b * (QK / 4);
-        const uint16_t* xb = x + b * QK;
+    if constexpr (STREAMING) {
+        auto stream_props = sycl::ext::oneapi::experimental::properties{
+            sycl::ext::intel::experimental::read_hint<
+                sycl::ext::intel::experimental::cache_control<
+                    sycl::ext::intel::experimental::cache_mode::streaming,
+                    sycl::ext::oneapi::experimental::cache_level::L3>>};
+        sycl::ext::oneapi::experimental::annotated_ptr<
+            const uint8_t, decltype(stream_props)> c_stream(c, stream_props);
+        for (long long b = 0; b < nb; ++b) {
+            const float d = s[b];
+            const auto cb = c_stream + b * (QK / 4);
+            const uint16_t* xb = x + b * QK;
 
-        for (int j_byte = lane; j_byte < QK / 4; j_byte += SUB_SIZE) {
-            const uint8_t byte = cb[j_byte];
-            const int base_j = j_byte * 4;
-            const int c0 = (byte >> 0) & 0x03;
-            const int c1 = (byte >> 2) & 0x03;
-            const int c2 = (byte >> 4) & 0x03;
-            const int c3 = (byte >> 6) & 0x03;
+            for (int j_byte = lane; j_byte < QK / 4; j_byte += SUB_SIZE) {
+                const uint8_t byte = uint8_t(cb[j_byte]);
+                const int base_j = j_byte * 4;
+                const int c0 = (byte >> 0) & 0x03;
+                const int c1 = (byte >> 2) & 0x03;
+                const int c2 = (byte >> 4) & 0x03;
+                const int c3 = (byte >> 6) & 0x03;
 
-            const sycl::half h0 = sycl::bit_cast<sycl::half, unsigned short>(xb[base_j + 0]);
-            const sycl::half h1 = sycl::bit_cast<sycl::half, unsigned short>(xb[base_j + 1]);
-            const sycl::half h2 = sycl::bit_cast<sycl::half, unsigned short>(xb[base_j + 2]);
-            const sycl::half h3 = sycl::bit_cast<sycl::half, unsigned short>(xb[base_j + 3]);
+                const sycl::half h0 = sycl::bit_cast<sycl::half, unsigned short>(xb[base_j + 0]);
+                const sycl::half h1 = sycl::bit_cast<sycl::half, unsigned short>(xb[base_j + 1]);
+                const sycl::half h2 = sycl::bit_cast<sycl::half, unsigned short>(xb[base_j + 2]);
+                const sycl::half h3 = sycl::bit_cast<sycl::half, unsigned short>(xb[base_j + 3]);
 
-            acc += (float)(c0 - 1) * d * static_cast<float>(h0);
-            acc += (float)(c1 - 1) * d * static_cast<float>(h1);
-            acc += (float)(c2 - 1) * d * static_cast<float>(h2);
-            acc += (float)(c3 - 1) * d * static_cast<float>(h3);
+                acc += (float)(c0 - 1) * d * static_cast<float>(h0);
+                acc += (float)(c1 - 1) * d * static_cast<float>(h1);
+                acc += (float)(c2 - 1) * d * static_cast<float>(h2);
+                acc += (float)(c3 - 1) * d * static_cast<float>(h3);
+            }
+        }
+    } else {
+        for (long long b = 0; b < nb; ++b) {
+            const float d = s[b];
+            const uint8_t* cb = c + b * (QK / 4);
+            const uint16_t* xb = x + b * QK;
+
+            for (int j_byte = lane; j_byte < QK / 4; j_byte += SUB_SIZE) {
+                const uint8_t byte = cb[j_byte];
+                const int base_j = j_byte * 4;
+                const int c0 = (byte >> 0) & 0x03;
+                const int c1 = (byte >> 2) & 0x03;
+                const int c2 = (byte >> 4) & 0x03;
+                const int c3 = (byte >> 6) & 0x03;
+
+                const sycl::half h0 = sycl::bit_cast<sycl::half, unsigned short>(xb[base_j + 0]);
+                const sycl::half h1 = sycl::bit_cast<sycl::half, unsigned short>(xb[base_j + 1]);
+                const sycl::half h2 = sycl::bit_cast<sycl::half, unsigned short>(xb[base_j + 2]);
+                const sycl::half h3 = sycl::bit_cast<sycl::half, unsigned short>(xb[base_j + 3]);
+
+                acc += (float)(c0 - 1) * d * static_cast<float>(h0);
+                acc += (float)(c1 - 1) * d * static_cast<float>(h1);
+                acc += (float)(c2 - 1) * d * static_cast<float>(h2);
+                acc += (float)(c3 - 1) * d * static_cast<float>(h3);
+            }
         }
     }
     acc = sycl::reduce_over_group(sg, acc, sycl::plus<float>());
@@ -99,13 +134,31 @@ void s2_gemv(const uint16_t* x, const uint8_t* codes, const float* scales, float
         std::exit(1);
     }
     auto& q = default_queue();
-    constexpr int threads = 256;
+
+    STRATA_SYCL_RECORD_SHAPE(strata::sycl_tuning::KernelType::S2_GEMV, n_in, n_out, 2, QK, 0);
+    auto& reg = strata::sycl_tuning::SyclTuningRegistry::instance();
+    reg.try_auto_load(q.get_device());
+    const uint64_t key = strata::sycl_tuning::make_kernel_key(
+        strata::sycl_tuning::KernelType::S2_GEMV, n_in, n_out, 2, QK, 0);
+    const auto tuned = reg.get_or_fallback(
+        key, { 256, (n_out <= 640 ? 64 : 128), 0, strata::sycl_tuning::CachePolicy::StreamingL3 });
+
+    const int threads = (tuned.lws > 0 && tuned.lws % SG_SIZE == 0) ? tuned.lws : 256;
     const int sgs = threads / SG_SIZE;
     const unsigned blocks = (unsigned)((n_out + sgs - 1) / sgs);
-    q.parallel_for(sycl::nd_range<1>(sycl::range<1>(blocks * threads), sycl::range<1>(threads)),
-                   [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
-                       s2_gemv_subgroup_kernel<SG_SIZE>(item, x, codes, scales, y, n_in, n_out);
-                   });
+
+    const bool use_streaming = (tuned.cache == strata::sycl_tuning::CachePolicy::StreamingL3);
+    if (use_streaming) {
+        q.parallel_for(sycl::nd_range<1>(sycl::range<1>(blocks * threads), sycl::range<1>(threads)),
+                       [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
+                           s2_gemv_subgroup_kernel<SG_SIZE, true>(item, x, codes, scales, y, n_in, n_out);
+                       });
+    } else {
+        q.parallel_for(sycl::nd_range<1>(sycl::range<1>(blocks * threads), sycl::range<1>(threads)),
+                       [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
+                           s2_gemv_subgroup_kernel<SG_SIZE, false>(item, x, codes, scales, y, n_in, n_out);
+                       });
+    }
     q.wait();
 }
 

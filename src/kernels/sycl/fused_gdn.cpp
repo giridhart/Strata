@@ -2,6 +2,7 @@
 // see include/strata/kernels/fused_gdn.hpp.
 #include <sycl/sycl.hpp>
 #include "strata/core/sycl_arch.hpp"
+#include "strata/core/sycl_tuning.hpp"
 #include "strata/kernels/fused_gdn.hpp"
 
 #include <cstdio>
@@ -209,6 +210,15 @@ void fused_gdn_conv_l2(float* history, const float* qkv, const float* conv_w, fl
         std::exit(1);
     }
     sycl::queue* q = stream ? static_cast<sycl::queue*>(stream) : &default_queue();
+
+    STRATA_SYCL_RECORD_SHAPE(strata::sycl_tuning::KernelType::GDN, channels, qk_heads, 32, S, 0);
+    auto& reg = strata::sycl_tuning::SyclTuningRegistry::instance();
+    reg.try_auto_load(q->get_device());
+    const uint64_t key = strata::sycl_tuning::make_kernel_key(
+        strata::sycl_tuning::KernelType::GDN, channels, qk_heads, 32, S, 0);
+    const auto tuned = reg.get_or_fallback(key, {S, 0, 0, strata::sycl_tuning::CachePolicy::Default});
+    (void)tuned;
+
     q->submit([&](sycl::handler& cgh) {
         sycl::local_accessor<float, 1> part_acc(sycl::range<1>(S / 32), cgh);
         cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(channels), sycl::range<1>(S)),
@@ -226,6 +236,15 @@ void fused_gdn_ab(const float* x, const uint16_t* w_alpha, const uint16_t* w_bet
         std::exit(1);
     }
     sycl::queue* q = stream ? static_cast<sycl::queue*>(stream) : &default_queue();
+
+    STRATA_SYCL_RECORD_SHAPE(strata::sycl_tuning::KernelType::GDN, n_embd, h_v, 16, 32, 0);
+    auto& reg = strata::sycl_tuning::SyclTuningRegistry::instance();
+    reg.try_auto_load(q->get_device());
+    const uint64_t key = strata::sycl_tuning::make_kernel_key(
+        strata::sycl_tuning::KernelType::GDN, n_embd, h_v, 16, 32, 0);
+    const auto tuned = reg.get_or_fallback(key, {256, 0, 0, strata::sycl_tuning::CachePolicy::Default});
+    (void)tuned;
+
     const unsigned blocks = (unsigned)((2 * h_v + 7) / 8);
     q->parallel_for(sycl::nd_range<1>(sycl::range<1>(blocks * 256), sycl::range<1>(256)),
                     [=](sycl::nd_item<1> item_ct1) [[sycl::reqd_sub_group_size(32)]] {
@@ -236,12 +255,32 @@ void fused_gdn_ab(const float* x, const uint16_t* w_alpha, const uint16_t* w_bet
 void fused_gdn_step_norm(float* state, const float* q, const float* k, const float* v, const float* gate,
                          const float* beta, const float* z, const float* gamma, float eps, float* y, int h_k, int h_v,
                          void* stream) {
+    sycl::queue* q_ptr = stream ? static_cast<sycl::queue*>(stream) : &default_queue();
+
+    STRATA_SYCL_RECORD_SHAPE(strata::sycl_tuning::KernelType::GDN, S, h_v, 32, h_k, 0);
+    auto& reg = strata::sycl_tuning::SyclTuningRegistry::instance();
+    reg.try_auto_load(q_ptr->get_device());
+    const uint64_t key = strata::sycl_tuning::make_kernel_key(
+        strata::sycl_tuning::KernelType::GDN, S, h_v, 32, h_k, 0);
+    const auto tuned = reg.get_or_fallback(key, {S, 0, 0, strata::sycl_tuning::CachePolicy::Default});
+    (void)tuned;
+
     step_norm_impl<false>(state, q, k, v, gate, beta, z, gamma, eps, y, h_k, h_v, stream);
 }
 
 void fused_gdn_step_norm_silu(float* state, const float* q, const float* k, const float* v, const float* gate,
                               const float* beta, const float* z, const float* gamma, float eps, float* y, int h_k,
                               int h_v, void* stream) {
+    sycl::queue* q_ptr = stream ? static_cast<sycl::queue*>(stream) : &default_queue();
+
+    STRATA_SYCL_RECORD_SHAPE(strata::sycl_tuning::KernelType::GDN, S, h_v, 32, h_k, 1);
+    auto& reg = strata::sycl_tuning::SyclTuningRegistry::instance();
+    reg.try_auto_load(q_ptr->get_device());
+    const uint64_t key = strata::sycl_tuning::make_kernel_key(
+        strata::sycl_tuning::KernelType::GDN, S, h_v, 32, h_k, 1);
+    const auto tuned = reg.get_or_fallback(key, {S, 0, 0, strata::sycl_tuning::CachePolicy::Default});
+    (void)tuned;
+
     step_norm_impl<true>(state, q, k, v, gate, beta, z, gamma, eps, y, h_k, h_v, stream);
 }
 
