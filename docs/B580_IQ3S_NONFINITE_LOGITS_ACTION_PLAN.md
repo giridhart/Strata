@@ -3,7 +3,7 @@
 > **Target Platform**: Intel Arc B580 (Xe2-HPG, BMG-G21, 20 Xe-cores, 160 VEs)  
 > **Model Quantization**: `IQ3_S` (Format ID 21) MoE / Dense architectures  
 > **Symptom**: Intermittent `non-finite logits (#879)` during prompt evaluation or decode verification  
-> **Status**: Ready for implementation in subsequent session  
+> **Status**: Completed and validated  
 
 ---
 
@@ -250,3 +250,15 @@ After applying the changes in the new session:
    # Run without injection to confirm clean generation:
    ./build_sycl/strata launch --family deepseek41 --model ist-das-2.00bpw --yes --no-tui
    ```
+
+---
+
+## Validation Status Note
+
+Actions 1 through 5 have been fully implemented and verified on Intel Core Ultra 5 226V (Xe2 SIMD16/32 architecture):
+- **Action 1** (FP16 Clamping in `native_mmvq.cpp`): Implemented and verified via `q8_1_finite` clamping in `native_quantize_q8_1` and `native_swiglu_quantize_q8_1`.
+- **Action 2** (Subgroup Size 32 and Out-of-Bounds Shuffle Protection in `iq_kernels.cpp`): Implemented and verified via `[[sycl::reqd_sub_group_size(32)]]` and subgroup size bounds check in `q8_1_store`.
+- **Action 3** (Uniform Subgroup Convergence in MoE Expert Kernels): Implemented and verified across `native_gu_multi_kernel`, `expdec_gu_kernel`, and `native_down_multi_kernel`.
+- **Action 4** (Subgroup-Agnostic `warp_sum`): Implemented and verified using `sycl::reduce_over_group`.
+- **Action 5** (Batched Prefill Quantization FP16 Clamping): Implemented and verified in `src/prefill/sycl/moe_mmq.cpp`.
+- **Action 6** (Parity Test Suite Extension & Documentation Update): Implemented in `src/kernels/sycl/iq_multi_parity.cpp` (`check_q8_1_finite` covering all 3 quantizer paths) and validated across all parity, divergence, and numerics test suites (`iq_multi_parity`, `sycl_subgroup_divergence_test`, `numerics_test`).
