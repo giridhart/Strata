@@ -28,6 +28,7 @@
 #include "strata/kernels/native_mmvq.hpp"
 #include "strata/kernels/dp4a.hpp"
 #include "strata/kernels/iq_kernels.hpp"
+#include "strata/kernels/q8_1_finite.hpp"
 #include "strata/core/sycl_doorbell.hpp"
 
 #include <algorithm>
@@ -199,10 +200,10 @@ void native_quantize_q8_1_kernel(const float* __restrict__ x, Q81Block* __restri
     const float xi = x[i];
     const float amax = warp_max(sycl::fabs(xi));
     const float sum = warp_sum(xi);
-    const float d = amax / 127.0f;
-    const int8_t q = amax == 0.0f ? 0 : sycl::round(xi / d);
+    const float d = strata::kernels::q8_1_finite(amax / 127.0f);
+    const int8_t q = strata::kernels::q8_1_quant(xi, d, amax);
     y[i / Q8K].qs[i % Q8K] = q;
-    if (i % Q8K == 0) y[i / Q8K].ds = sycl::half2(d, sum);
+    if (i % Q8K == 0) y[i / Q8K].ds = strata::kernels::q8_1_ds(d, sum);
 }
 
 void native_swiglu_quantize_q8_1_kernel(const float* __restrict__ gate,
@@ -215,10 +216,10 @@ void native_swiglu_quantize_q8_1_kernel(const float* __restrict__ gate,
     const float xi = (gi / (1.0f + sycl::native::exp(-gi))) * up[i];
     const float amax = warp_max(sycl::fabs(xi));
     const float sum = warp_sum(xi);
-    const float d = amax / 127.0f;
-    const int8_t q = amax == 0.0f ? 0 : sycl::round(xi / d);
+    const float d = strata::kernels::q8_1_finite(amax / 127.0f);
+    const int8_t q = strata::kernels::q8_1_quant(xi, d, amax);
     y[i / Q8K].qs[i % Q8K] = q;
-    if (i % Q8K == 0) y[i / Q8K].ds = sycl::half2(d, sum);
+    if (i % Q8K == 0) y[i / Q8K].ds = strata::kernels::q8_1_ds(d, sum);
 }
 
 // Exact pinned vec_dot_q5_K_q8_1_impl_vmmq expression and integer dot order.
