@@ -2436,10 +2436,13 @@ void expdec_down_kernel(const unsigned long long* __restrict__ grp_ptr,
 inline void q8_1_store(const float xi, block_q8_1* __restrict__ y, const long long i) {
     float amax = sycl::fabs(xi), sum = xi;
     auto sg = sycl::ext::oneapi::this_work_item::get_sub_group();
+    const uint32_t sg_size = sg.get_local_range()[0];
 #pragma unroll
     for (int o = 16; o > 0; o >>= 1) {
-        amax = sycl::fmax(amax, sycl::permute_group_by_xor(sg, amax, o));
-        sum += sycl::permute_group_by_xor(sg, sum, o);
+        if (o < (int)sg_size) {
+            amax = sycl::fmax(amax, sycl::permute_group_by_xor(sg, amax, o));
+            sum += sycl::permute_group_by_xor(sg, sum, o);
+        }
     }
     const float d = q8_1_finite(amax / 127.0f);
     const int8_t q = q8_1_quant(xi, d, amax);
@@ -3436,7 +3439,9 @@ void quantize_q8_1_rows(const float* x, int64_t n_rows, int64_t n_cols, void* y,
         cgh.parallel_for(
             sycl::nd_range<3>(sycl::range<3>(1, 1, (unsigned)((n + 255) / 256)) * sycl::range<3>(1, 1, 256),
                               sycl::range<3>(1, 1, 256)),
-            [=](sycl::nd_item<3> /*item_ct1*/) { quantize_q8_1_kernel(x, (block_q8_1*)y, n); });
+            [=](sycl::nd_item<3> /*item_ct1*/) [[sycl::reqd_sub_group_size(32)]] {
+                quantize_q8_1_kernel(x, (block_q8_1*)y, n);
+            });
     });
     check("quantize_q8_1_rows");
 }
@@ -3651,7 +3656,9 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
                 cgh.parallel_for(
                     sycl::nd_range<3>(sycl::range<3>(1, 1, (unsigned)((nh + 255) / 256)) * sycl::range<3>(1, 1, 256),
                                       sycl::range<3>(1, 1, 256)),
-                    [=](sycl::nd_item<3> /*item_ct1*/) { quantize_q8_1_kernel(h, hq, nh); });
+                    [=](sycl::nd_item<3> /*item_ct1*/) [[sycl::reqd_sub_group_size(32)]] {
+                        quantize_q8_1_kernel(h, hq, nh);
+                    });
             });
         } else {
             s->parallel_for(
