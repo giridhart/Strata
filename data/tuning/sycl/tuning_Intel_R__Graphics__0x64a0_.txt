@@ -2,9 +2,9 @@
 STRATA_SYCL_TUNING_V1 "Intel(R) Graphics [0x64a0]" "1.14.37020+3" 64 16
 # kernel_name n_in n_out code_bits group_elems act_kind lws tpr slm_pad w_cache x_cache out_cache
 bf16_gemv 2560 48 0 0 0 256 256 0 streaming cached default
-bf16_gemv 2560 64 0 0 0 128 128 0 streaming cached default
-bf16_gemv 2560 128 0 0 0 256 256 0 streaming cached default
-bf16_gemv 2560 256 0 0 0 32 16 0 streaming cached default
+bf16_gemv 2560 64 0 0 0 64 64 0 streaming cached default
+bf16_gemv 2560 128 0 0 0 32 16 0 streaming cached default
+bf16_gemv 2560 256 0 0 0 32 32 0 streaming cached default
 bf16_gemv 2560 512 0 0 0 32 32 0 streaming cached default
 bf16_gemv 2560 640 0 0 0 32 16 0 streaming cached default
 bf16_gemv 2560 2560 0 0 0 32 16 0 streaming cached default

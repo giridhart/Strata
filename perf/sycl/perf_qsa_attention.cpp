@@ -23,6 +23,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <random>
 #include <vector>
 
 namespace {
@@ -131,11 +132,21 @@ static void BM_Xe2_QSA_PromptAttention(benchmark::State& state) {
         return;
     }
 
-    q.fill(d_q, 0.05f, n_head * head_dim);
-    q.fill(d_k, sycl::half{0.05f}, static_cast<size_t>(width) * n_head_kv * head_dim);
-    q.fill(d_v, sycl::half{0.05f}, static_cast<size_t>(width) * n_head_kv * head_dim);
-    q.fill(d_out, 0.0f, n_head * head_dim);
-    q.wait_and_throw();
+    std::mt19937 rng(1337 + width);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    std::vector<float> h_q(n_head * head_dim);
+    std::vector<sycl::half> h_k(static_cast<size_t>(width) * n_head_kv * head_dim);
+    std::vector<sycl::half> h_v(static_cast<size_t>(width) * n_head_kv * head_dim);
+
+    const float var_scale = 1.0f / std::sqrt((float)head_dim);
+    for (auto& x : h_q) x = dist(rng) * var_scale;
+    for (auto& x : h_k) x = sycl::half(dist(rng) * var_scale);
+    for (auto& x : h_v) x = sycl::half(dist(rng) * var_scale);
+
+    q.copy(h_q.data(), d_q, h_q.size()).wait();
+    q.copy(h_k.data(), d_k, h_k.size()).wait();
+    q.copy(h_v.data(), d_v, h_v.size()).wait();
+    q.fill(d_out, 0.0f, n_head * head_dim).wait();
 
     auto launch = [&](sycl::handler& cgh) {
         sycl::local_accessor<float, 1> s_dots(sycl::range<1>(16), cgh);
@@ -144,6 +155,18 @@ static void BM_Xe2_QSA_PromptAttention(benchmark::State& state) {
                              qsa_flash_attn_kernel(item, d_q, d_k, d_v, d_out, width, scale, s_dots);
                          });
     };
+
+    // 0. Pre-flight Numerical Verification: check finiteness
+    q.submit(launch).wait_and_throw();
+    std::vector<float> h_out(n_head * head_dim);
+    q.copy(d_out, h_out.data(), h_out.size()).wait();
+    for (size_t i = 0; i < h_out.size(); ++i) {
+        if (std::isnan(h_out[i]) || std::isinf(h_out[i])) {
+            state.SkipWithError("Pre-flight numerical verification failed: non-finite logits detected");
+            sycl::free(d_q, q); sycl::free(d_k, q); sycl::free(d_v, q); sycl::free(d_out, q);
+            return;
+        }
+    }
 
     // Warmup
     for (int i = 0; i < 5; ++i) {

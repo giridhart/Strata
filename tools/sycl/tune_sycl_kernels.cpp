@@ -6,6 +6,8 @@
 #include "strata/kernels/bf16_gemv.hpp"
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/kernels/native_gr_norm.hpp"
+#include "strata/kernels/quantize_act.hpp"
+#include "strata/kernels/s2_gemv_q8.hpp"
 #include "strata/kernels/s_gemv.hpp"
 
 #include <algorithm>
@@ -28,6 +30,8 @@ struct BenchmarkMetrics {
     int total_iters = 0;
     double total_time_s = 0.0;
     bool event_profiling_used = false;
+    bool verified = true;
+    float max_abs_diff = 0.0f;
 };
 
 struct GemvShape {
@@ -91,9 +95,51 @@ const GemvShape kTargetShapes[] = {
     {"native_gdn", strata::sycl_tuning::KernelType::GDN, 128, 8, 32, 1, 0, "GDN recurrent step S=128", "default", "default", "default"}
 };
 
+// Mandatory Numerical Verification: check that device kernel produces finite results
+// and matches CPU reference within tolerance before timing or selecting any candidate.
+bool verify_bf16_gemv_candidate(sycl::queue& q, const uint16_t* d_x, const uint16_t* d_w, float* d_y,
+                                const float* h_ref, int64_t n_in, int64_t n_out, int tpr,
+                                float& max_diff, float rtol = 1e-2f, float atol = 1e-2f) {
+    q.memset(d_y, 0, (size_t)n_out * sizeof(float)).wait();
+    strata::kernels::bf16_gemv_split(d_x, d_w, d_y, n_in, n_out, tpr, &q);
+    q.wait_and_throw();
+
+    std::vector<float> h_got(n_out);
+    q.copy(d_y, h_got.data(), n_out).wait();
+
+    max_diff = 0.0f;
+    for (int64_t i = 0; i < n_out; ++i) {
+        if (std::isnan(h_got[i]) || std::isinf(h_got[i])) {
+            max_diff = std::numeric_limits<float>::infinity();
+            return false;
+        }
+        const float diff = std::abs(h_got[i] - h_ref[i]);
+        if (diff > max_diff) max_diff = diff;
+        if (diff > atol + rtol * std::abs(h_ref[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
 BenchmarkMetrics measure_bf16_gemv_split(sycl::queue& q, const uint16_t* d_x, const uint16_t* d_w, float* d_y,
-                                        int64_t n_in, int64_t n_out, int tpr, double min_time_sec, double warmup_sec) {
+                                         const float* h_ref, int64_t n_in, int64_t n_out, int tpr,
+                                         double min_time_sec, double warmup_sec) {
     BenchmarkMetrics metrics;
+
+    // 0. Pre-flight Numerical Verification: mandatory check ensuring finite math and reference parity
+    if (h_ref != nullptr) {
+        float max_diff = 0.0f;
+        if (!verify_bf16_gemv_candidate(q, d_x, d_w, d_y, h_ref, n_in, n_out, tpr, max_diff)) {
+            metrics.verified = false;
+            metrics.max_abs_diff = max_diff;
+            metrics.median_us = 1e9;
+            metrics.min_us = 1e9;
+            return metrics;
+        }
+        metrics.verified = true;
+        metrics.max_abs_diff = max_diff;
+    }
 
     // 1. Warmup: run for warmup_sec (or at least 10 iterations) to allow GPU DVFS to ramp to steady-state boost clocks
     const auto w_start = std::chrono::steady_clock::now();
@@ -167,6 +213,203 @@ BenchmarkMetrics measure_bf16_gemv_split(sycl::queue& q, const uint16_t* d_x, co
     const auto t_end = std::chrono::steady_clock::now();
     metrics.total_time_s = std::chrono::duration<double>(t_end - t_start).count();
 
+    if (!times_us.empty()) {
+        std::sort(times_us.begin(), times_us.end());
+        metrics.median_us = times_us[times_us.size() / 2];
+        metrics.min_us = times_us.front();
+    }
+    return metrics;
+}
+
+// CPU Reference for RMSNorm: y[i] = (x[i] / sqrt(mean(x^2) + eps)) * gamma[i]
+void cpu_ref_rms_norm(const float* x, const float* gamma, float* y, int n_cols, float eps = 1e-6f) {
+    double sum_sq = 0.0;
+    for (int i = 0; i < n_cols; ++i) {
+        sum_sq += (double)x[i] * (double)x[i];
+    }
+    double mean = sum_sq / n_cols;
+    float scale = 1.0f / (float)std::sqrt(mean + eps);
+    for (int i = 0; i < n_cols; ++i) {
+        y[i] = scale * x[i] * gamma[i];
+    }
+}
+
+bool verify_gr_norm_candidate(sycl::queue& q, const float* d_x, const float* d_gamma, float* d_y,
+                              const float* h_ref, int n_cols, float& max_diff,
+                              float rtol = 1e-3f, float atol = 1e-3f) {
+    q.memset(d_y, 0, (size_t)n_cols * sizeof(float)).wait();
+    strata::kernels::native_gr_rms_norm_weighted(d_x, d_gamma, d_y, n_cols, 1, 1e-6f, &q);
+    q.wait_and_throw();
+
+    std::vector<float> h_got(n_cols);
+    q.copy(d_y, h_got.data(), n_cols).wait();
+
+    max_diff = 0.0f;
+    for (int i = 0; i < n_cols; ++i) {
+        if (std::isnan(h_got[i]) || std::isinf(h_got[i])) {
+            max_diff = std::numeric_limits<float>::infinity();
+            return false;
+        }
+        const float diff = std::abs(h_got[i] - h_ref[i]);
+        if (diff > max_diff) max_diff = diff;
+        if (diff > atol + rtol * std::abs(h_ref[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+BenchmarkMetrics measure_gr_norm(sycl::queue& q, const float* d_x, const float* d_gamma, float* d_y,
+                                 const float* h_ref, int n_cols, double min_time_sec, double warmup_sec) {
+    BenchmarkMetrics metrics;
+    if (h_ref != nullptr) {
+        float max_diff = 0.0f;
+        if (!verify_gr_norm_candidate(q, d_x, d_gamma, d_y, h_ref, n_cols, max_diff)) {
+            metrics.verified = false;
+            metrics.max_abs_diff = max_diff;
+            metrics.median_us = 1e9;
+            metrics.min_us = 1e9;
+            return metrics;
+        }
+        metrics.verified = true;
+        metrics.max_abs_diff = max_diff;
+    }
+
+    const auto w_start = std::chrono::steady_clock::now();
+    int w_count = 0;
+    while (std::chrono::duration<double>(std::chrono::steady_clock::now() - w_start).count() < warmup_sec || w_count < 10) {
+        strata::kernels::native_gr_rms_norm_weighted(d_x, d_gamma, d_y, n_cols, 1, 1e-6f, &q);
+        ++w_count;
+    }
+    q.wait_and_throw();
+
+    constexpr int BATCH_SIZE = 32;
+    std::vector<double> times_us;
+    times_us.reserve(4096);
+
+    const auto t_start = std::chrono::steady_clock::now();
+    const auto deadline = t_start + std::chrono::duration<double>(min_time_sec);
+
+    while (std::chrono::steady_clock::now() < deadline || metrics.total_iters < BATCH_SIZE) {
+        auto b_start = std::chrono::high_resolution_clock::now();
+        for (int b = 0; b < BATCH_SIZE; ++b) {
+            strata::kernels::native_gr_rms_norm_weighted(d_x, d_gamma, d_y, n_cols, 1, 1e-6f, &q);
+        }
+        q.wait_and_throw();
+        auto b_end = std::chrono::high_resolution_clock::now();
+        double batch_us = std::chrono::duration<double, std::micro>(b_end - b_start).count();
+        times_us.push_back(batch_us / BATCH_SIZE);
+        metrics.total_iters += BATCH_SIZE;
+    }
+    metrics.total_time_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count();
+    if (!times_us.empty()) {
+        std::sort(times_us.begin(), times_us.end());
+        metrics.median_us = times_us[times_us.size() / 2];
+        metrics.min_us = times_us.front();
+    }
+    return metrics;
+}
+
+// CPU Reference for S2 GEMV with Q8_0 activations
+void cpu_ref_s2_gemv(const uint8_t* x80, const uint8_t* codes, const float* scales, float* y,
+                     int64_t n_in, int64_t n_out) {
+    const int64_t n_quads = n_in / 4;
+    for (int64_t o = 0; o < n_out; ++o) {
+        double acc = 0.0;
+        const uint8_t* c = codes + o * n_quads;
+        const float* s = scales + o * (n_in / 64);
+
+        for (int64_t q = 0; q < n_quads; ++q) {
+            const uint8_t byte = c[q];
+            const float d = s[q >> 4];
+            const int64_t ablk = (q * 4) / 32;
+            const uint8_t* blk = x80 + ablk * 34;
+            const float dx = strata::kernels::f32_from_f16(*reinterpret_cast<const uint16_t*>(blk));
+            const int8_t* xq = reinterpret_cast<const int8_t*>(blk + 2);
+            const int off = (int)((q * 4) % 32);
+
+            const int c0 = (int)(byte & 3) - 1;
+            const int c1 = (int)((byte >> 2) & 3) - 1;
+            const int c2 = (int)((byte >> 4) & 3) - 1;
+            const int c3 = (int)((byte >> 6) & 3) - 1;
+            const int idot0 = c0 * (int)xq[off + 0] + c1 * (int)xq[off + 1];
+            const int idot1 = c2 * (int)xq[off + 2] + c3 * (int)xq[off + 3];
+            const float scale = d * dx;
+            acc += (double)idot0 * (double)scale + (double)idot1 * (double)scale;
+        }
+        y[o] = (float)acc;
+    }
+}
+
+bool verify_s2_gemv_candidate(sycl::queue& q, const uint8_t* d_x80, const uint8_t* d_codes, const float* d_scales,
+                              float* d_y, const float* h_ref, int64_t n_in, int64_t n_out, int tpr,
+                              float& max_diff, float rtol = 1e-2f, float atol = 1e-2f) {
+    q.memset(d_y, 0, (size_t)n_out * sizeof(float)).wait();
+    strata::kernels::s2_gemv_q8(d_x80, d_codes, d_scales, d_y, n_in, n_out, tpr, &q);
+    q.wait_and_throw();
+
+    std::vector<float> h_got(n_out);
+    q.copy(d_y, h_got.data(), n_out).wait();
+
+    max_diff = 0.0f;
+    for (int64_t i = 0; i < n_out; ++i) {
+        if (std::isnan(h_got[i]) || std::isinf(h_got[i])) {
+            max_diff = std::numeric_limits<float>::infinity();
+            return false;
+        }
+        const float diff = std::abs(h_got[i] - h_ref[i]);
+        if (diff > max_diff) max_diff = diff;
+        if (diff > atol + rtol * std::abs(h_ref[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+BenchmarkMetrics measure_s2_gemv(sycl::queue& q, const uint8_t* d_x80, const uint8_t* d_codes, const float* d_scales,
+                                 float* d_y, const float* h_ref, int64_t n_in, int64_t n_out, int tpr,
+                                 double min_time_sec, double warmup_sec) {
+    BenchmarkMetrics metrics;
+    if (h_ref != nullptr) {
+        float max_diff = 0.0f;
+        if (!verify_s2_gemv_candidate(q, d_x80, d_codes, d_scales, d_y, h_ref, n_in, n_out, tpr, max_diff)) {
+            metrics.verified = false;
+            metrics.max_abs_diff = max_diff;
+            metrics.median_us = 1e9;
+            metrics.min_us = 1e9;
+            return metrics;
+        }
+        metrics.verified = true;
+        metrics.max_abs_diff = max_diff;
+    }
+
+    const auto w_start = std::chrono::steady_clock::now();
+    int w_count = 0;
+    while (std::chrono::duration<double>(std::chrono::steady_clock::now() - w_start).count() < warmup_sec || w_count < 10) {
+        strata::kernels::s2_gemv_q8(d_x80, d_codes, d_scales, d_y, n_in, n_out, tpr, &q);
+        ++w_count;
+    }
+    q.wait_and_throw();
+
+    constexpr int BATCH_SIZE = 32;
+    std::vector<double> times_us;
+    times_us.reserve(4096);
+
+    const auto t_start = std::chrono::steady_clock::now();
+    const auto deadline = t_start + std::chrono::duration<double>(min_time_sec);
+
+    while (std::chrono::steady_clock::now() < deadline || metrics.total_iters < BATCH_SIZE) {
+        auto b_start = std::chrono::high_resolution_clock::now();
+        for (int b = 0; b < BATCH_SIZE; ++b) {
+            strata::kernels::s2_gemv_q8(d_x80, d_codes, d_scales, d_y, n_in, n_out, tpr, &q);
+        }
+        q.wait_and_throw();
+        auto b_end = std::chrono::high_resolution_clock::now();
+        double batch_us = std::chrono::duration<double, std::micro>(b_end - b_start).count();
+        times_us.push_back(batch_us / BATCH_SIZE);
+        metrics.total_iters += BATCH_SIZE;
+    }
+    metrics.total_time_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count();
     if (!times_us.empty()) {
         std::sort(times_us.begin(), times_us.end());
         metrics.median_us = times_us[times_us.size() / 2];
@@ -313,20 +556,42 @@ int main(int argc, char** argv) {
             q.copy(h_w.data(), d_w, w_size);
             q.wait_and_throw();
 
+            // Compute exact CPU reference for numerical verification
+            std::vector<float> h_ref_y(out_size, 0.0f);
+            for (size_t o = 0; o < out_size; ++o) {
+                double acc = 0.0;
+                for (size_t i = 0; i < in_size; ++i) {
+                    acc += (double)strata::kernels::f32_from_bf16(h_x[i]) *
+                           (double)strata::kernels::f32_from_bf16(h_w[o * in_size + i]);
+                }
+                h_ref_y[o] = (float)acc;
+            }
+
             const int tpr_candidates[] = {16, 32, 64, 128, 256};
             int best_tpr = 128;
             double best_time = 1e9;
 
             for (int tpr : tpr_candidates) {
-                BenchmarkMetrics m = measure_bf16_gemv_split(q, d_x, d_w, d_y, shape.n_in, shape.n_out,
+                BenchmarkMetrics m = measure_bf16_gemv_split(q, d_x, d_w, d_y, h_ref_y.data(), shape.n_in, shape.n_out,
                                                              tpr, min_time_sec, warmup_sec);
-                printf("  Candidate TPR=%-3d : %8.2f us (min: %8.2f us, %6d iters in %.2fs [%s])\n",
+                if (!m.verified) {
+                    printf("  Candidate TPR=%-3d : [VERIFY-FAIL] non-finite or diverged from CPU ref (max_diff=%.4e) -> DISCARDED\n",
+                           tpr, m.max_abs_diff);
+                    continue;
+                }
+                printf("  Candidate TPR=%-3d : %8.2f us (min: %8.2f us, %6d iters in %.2fs [%s]) [VERIFIED: max_diff=%.2e]\n",
                        tpr, m.median_us, m.min_us, m.total_iters, m.total_time_s,
-                       m.event_profiling_used ? "HW Batch Profiling" : "Wall Clock");
+                       m.event_profiling_used ? "HW Batch Profiling" : "Wall Clock", m.max_abs_diff);
                 if (m.median_us < best_time) {
                     best_time = m.median_us;
                     best_tpr = tpr;
                 }
+            }
+
+            if (best_time >= 1e9) {
+                fprintf(stderr, "Error: All candidate configurations failed numerical verification for shape [%lld x %lld]!\n",
+                        (long long)shape.n_in, (long long)shape.n_out);
+                return 1;
             }
 
             const int best_lws = std::max(best_tpr, 32);
@@ -340,6 +605,121 @@ int main(int argc, char** argv) {
 
             sycl::free(d_x, q);
             sycl::free(d_w, q);
+            sycl::free(d_y, q);
+        } else if (shape.kernel_type == strata::sycl_tuning::KernelType::GR_NORM) {
+            const size_t n_cols = (size_t)shape.n_in;
+            std::vector<float> h_x(n_cols);
+            std::vector<float> h_gamma(n_cols);
+            for (auto& v : h_x) v = f_dist(rng);
+            for (auto& v : h_gamma) v = f_dist(rng) * 0.5f + 1.0f;
+
+            auto* d_x = sycl::malloc_device<float>(n_cols, q);
+            auto* d_gamma = sycl::malloc_device<float>(n_cols, q);
+            auto* d_y = sycl::malloc_device<float>(n_cols, q);
+
+            q.copy(h_x.data(), d_x, n_cols);
+            q.copy(h_gamma.data(), d_gamma, n_cols);
+            q.wait_and_throw();
+
+            std::vector<float> h_ref_y(n_cols, 0.0f);
+            cpu_ref_rms_norm(h_x.data(), h_gamma.data(), h_ref_y.data(), (int)n_cols);
+
+            BenchmarkMetrics m = measure_gr_norm(q, d_x, d_gamma, d_y, h_ref_y.data(), (int)n_cols, min_time_sec, warmup_sec);
+            if (!m.verified) {
+                printf("  [VERIFY-FAIL] non-finite or diverged from CPU ref (max_diff=%.4e) -> DISCARDED\n", m.max_abs_diff);
+                fprintf(stderr, "Error: GR_NORM failed numerical verification for shape [%lld x %lld]!\n",
+                        (long long)shape.n_in, (long long)shape.n_out);
+                return 1;
+            }
+            const int best_lws = (shape.n_in >= 1024) ? 256 : 128;
+            printf("  Candidate LWS=%-3d : %8.2f us (min: %8.2f us, %6d iters in %.2fs) [VERIFIED: max_diff=%.2e]\n",
+                   best_lws, m.median_us, m.min_us, m.total_iters, m.total_time_s, m.max_abs_diff);
+
+            printf("  ==> Selected: LWS=%d, TPR=0 (%.2f us) [w:%s, x:%s, out:%s]\n\n",
+                   best_lws, m.median_us, shape.w_cache.c_str(), shape.x_cache.c_str(), shape.out_cache.c_str());
+
+            out_file << shape.kernel_name << " " << shape.n_in << " " << shape.n_out << " "
+                     << shape.code_bits << " " << shape.group_elems << " " << shape.act_kind << " "
+                     << best_lws << " 0 0 "
+                     << shape.w_cache << " " << shape.x_cache << " " << shape.out_cache << "\n";
+
+            sycl::free(d_x, q);
+            sycl::free(d_gamma, q);
+            sycl::free(d_y, q);
+        } else if (shape.kernel_type == strata::sycl_tuning::KernelType::S2_GEMV) {
+            const size_t in_size = (size_t)shape.n_in;
+            const size_t out_size = (size_t)shape.n_out;
+            const size_t q80_bytes = (in_size / 32) * 34;
+            const size_t code_bytes = out_size * (in_size / 4);
+            const size_t scale_floats = out_size * (in_size / 64);
+
+            std::vector<float> h_xf(in_size);
+            for (auto& v : h_xf) v = f_dist(rng) * 2.0f;
+
+            auto* d_xf = sycl::malloc_device<float>(in_size, q);
+            auto* d_x80 = sycl::malloc_device<uint8_t>(q80_bytes, q);
+            q.copy(h_xf.data(), d_xf, in_size).wait();
+            strata::kernels::quantize_q8_0(d_xf, d_x80, in_size, &q);
+            q.wait_and_throw();
+
+            std::vector<uint8_t> h_x80(q80_bytes);
+            q.copy(d_x80, h_x80.data(), q80_bytes).wait();
+            sycl::free(d_xf, q);
+
+            std::vector<uint8_t> h_codes(code_bytes);
+            std::vector<float> h_scales(scale_floats);
+            for (auto& v : h_codes) v = (uint8_t)rng();
+            for (auto& v : h_scales) v = (float)(f_dist(rng) * 0.02f + 0.03f);
+
+            auto* d_codes = sycl::malloc_device<uint8_t>(code_bytes, q);
+            auto* d_scales = sycl::malloc_device<float>(scale_floats, q);
+            auto* d_y = sycl::malloc_device<float>(out_size, q);
+
+            q.copy(h_codes.data(), d_codes, code_bytes);
+            q.copy(h_scales.data(), d_scales, scale_floats);
+            q.wait_and_throw();
+
+            std::vector<float> h_ref_y(out_size, 0.0f);
+            cpu_ref_s2_gemv(h_x80.data(), h_codes.data(), h_scales.data(), h_ref_y.data(), in_size, out_size);
+
+            const int tpr_candidates[] = {16, 32, 64, 128, 256};
+            int best_tpr = 64;
+            double best_time = 1e9;
+
+            for (int tpr : tpr_candidates) {
+                BenchmarkMetrics m = measure_s2_gemv(q, d_x80, d_codes, d_scales, d_y, h_ref_y.data(),
+                                                     in_size, out_size, tpr, min_time_sec, warmup_sec);
+                if (!m.verified) {
+                    printf("  Candidate TPR=%-3d : [VERIFY-FAIL] non-finite or diverged from CPU ref (max_diff=%.4e) -> DISCARDED\n",
+                           tpr, m.max_abs_diff);
+                    continue;
+                }
+                printf("  Candidate TPR=%-3d : %8.2f us (min: %8.2f us, %6d iters in %.2fs) [VERIFIED: max_diff=%.2e]\n",
+                       tpr, m.median_us, m.min_us, m.total_iters, m.total_time_s, m.max_abs_diff);
+                if (m.median_us < best_time) {
+                    best_time = m.median_us;
+                    best_tpr = tpr;
+                }
+            }
+
+            if (best_time >= 1e9) {
+                fprintf(stderr, "Error: All candidate configurations failed numerical verification for shape [%lld x %lld]!\n",
+                        (long long)shape.n_in, (long long)shape.n_out);
+                return 1;
+            }
+
+            const int best_lws = std::max(best_tpr, 32);
+            printf("  ==> Selected: LWS=%d, TPR=%d (%.2f us) [w:%s, x:%s, out:%s]\n\n",
+                   best_lws, best_tpr, best_time, shape.w_cache.c_str(), shape.x_cache.c_str(), shape.out_cache.c_str());
+
+            out_file << shape.kernel_name << " " << shape.n_in << " " << shape.n_out << " "
+                     << shape.code_bits << " " << shape.group_elems << " " << shape.act_kind << " "
+                     << best_lws << " " << best_tpr << " 0 "
+                     << shape.w_cache << " " << shape.x_cache << " " << shape.out_cache << "\n";
+
+            sycl::free(d_x80, q);
+            sycl::free(d_codes, q);
+            sycl::free(d_scales, q);
             sycl::free(d_y, q);
         } else {
             // Calibrate workgroup size, split-K, and per-argument cache hints
