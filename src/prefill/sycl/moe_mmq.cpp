@@ -3,6 +3,7 @@
 #include <sycl/sycl.hpp>
 #include "strata/prefill/moe_mmq.hpp"
 #include "strata/core/sycl_arch.hpp"
+#include "strata/kernels/q8_1_finite.hpp"
 
 #include "ggml.h"
 #define GGML_COMMON_DECL_SYCL
@@ -464,8 +465,7 @@ void quantize(const float* x, const int32_t* ids, void* xq, int t, int64_t cols,
             const float* src_row = x + src_row_idx * ld;
 
             if (b * 32 >= cols) {
-                bq->ds[0] = sycl::vec<float, 1>(0.0f).convert<sycl::half, sycl::rounding_mode::automatic>()[0];
-                bq->ds[1] = sycl::vec<float, 1>(0.0f).convert<sycl::half, sycl::rounding_mode::automatic>()[0];
+                bq->ds = strata::kernels::q8_1_ds(0.0f, 0.0f);
                 for (int i = 0; i < 32; ++i) bq->qs[i] = 0;
                 return;
             }
@@ -478,13 +478,12 @@ void quantize(const float* x, const int32_t* ids, void* xq, int t, int64_t cols,
             }
 
             if (amax == 0.0f) {
-                bq->ds[0] = sycl::vec<float, 1>(0.0f).convert<sycl::half, sycl::rounding_mode::automatic>()[0];
-                bq->ds[1] = sycl::vec<float, 1>(0.0f).convert<sycl::half, sycl::rounding_mode::automatic>()[0];
+                bq->ds = strata::kernels::q8_1_ds(0.0f, 0.0f);
                 for (int i = 0; i < 32; ++i) bq->qs[i] = 0;
                 return;
             }
 
-            const float d = amax / 127.0f;
+            const float d = strata::kernels::q8_1_finite(amax / 127.0f);
             const float id = 1.0f / d;
             float sum = 0.0f;
             for (int i = 0; i < 32; ++i) {
@@ -495,8 +494,7 @@ void quantize(const float* x, const int32_t* ids, void* xq, int t, int64_t cols,
                 bq->qs[i] = (int8_t)q0;
                 sum += (float)q0;
             }
-            bq->ds[0] = sycl::vec<float, 1>(d).convert<sycl::half, sycl::rounding_mode::automatic>()[0];
-            bq->ds[1] = sycl::vec<float, 1>(d * sum).convert<sycl::half, sycl::rounding_mode::automatic>()[0];
+            bq->ds = strata::kernels::q8_1_ds(d, d * sum);
         });
 }
 
