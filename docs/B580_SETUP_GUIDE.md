@@ -332,16 +332,25 @@ Strata includes an on-device kernel autotuning engine and dynamic shape capture 
 #### 2. Running Shape Capture & Calibration on Arc B580
 ```bash
 # 1. Capture exact tensor shapes during model execution or prompt evaluation:
+# (Option A: via C++ engine binary with pre-tokenized IDs)
 export STRATA_SYCL_RECORD_SHAPES=1
-strata launch --model q2_0 --prompt "Hello world" --max-tokens 32
+./build_sycl/strata --pack pack/full --tokens "151644,872,198" --max-new 32
 unset STRATA_SYCL_RECORD_SHAPES
 
-# 2. Run the on-device autotuner against captured shapes:
+# (Option B: or serve via Python CLI, send a test request, and stop)
+export STRATA_SYCL_RECORD_SHAPES=1
+strata launch --model q2_0 --no-tui &
+curl -s http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/json" \
+  -d '{"messages": [{"role": "user", "content": "Hello world"}], "max_tokens": 32}'
+strata launch --stop
+unset STRATA_SYCL_RECORD_SHAPES
+
+# 2. Run the on-device autotuner against captured shapes (using pipelined hardware event profiling):
 ./build_sycl/tune_sycl_kernels --workload data/tuning/sycl/workload_Intel_Arc_B580.txt \
                               --output data/tuning/sycl/tuning_Intel_Arc_B580.txt
 
-# Or sweep all 9 kernel families across standard model shapes without a trace:
-./build_sycl/tune_sycl_kernels --output data/tuning/sycl/tuning_Intel_Arc_B580.txt
+# Or sweep all standard model shapes with a 2-second timing budget per configuration:
+./build_sycl/tune_sycl_kernels --min-time 2.0 --output data/tuning/sycl/tuning_Intel_Arc_B580.txt
 ```
 
 #### 3. Empirical Reference: Measured Improvements on Intel Xe2 Hardware

@@ -41,7 +41,7 @@ void bf16_gemv_pair(const uint16_t* x, const uint16_t* w1, float* y1, int64_t n_
 /// NOT bit-identical to `bf16_gemv`: the partial sums are added in a different order.  Both are kept and both
 /// are tested, because the naive one is the reference the split one is checked against.
 void bf16_gemv_split(const uint16_t* x, const uint16_t* w, float* y, int64_t n_in, int64_t n_out,
-                     int threads_per_row, void* stream);
+                     int threads_per_row, void* stream, void* out_event = nullptr);
 
 /// Single-token, contiguous 2D BF16-weight/F32-activation MMVF from the pinned llama.cpp CUDA path.
 /// Preserves pair accumulation, adaptive block size and warp-XOR reduction order. This is a separate

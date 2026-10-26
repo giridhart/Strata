@@ -163,7 +163,7 @@ void bf16_gemv_pair(const uint16_t* x, const uint16_t* w1, float* y1, int64_t n_
 }
 
 void bf16_gemv_split(const uint16_t* x, const uint16_t* w, float* y, int64_t n_in, int64_t n_out,
-                     int threads_per_row, void* stream) {
+                     int threads_per_row, void* stream, void* /*out_event*/) {
     if (n_in <= 0 || n_out <= 0) return;
     // WARP-PER-ROW when the caller asks for 32, because that path needs no shared memory and no barrier - and
     // with 48 output rows it is the configuration that fills the machine.  A `tpr` that is not 32 and not a

@@ -104,21 +104,33 @@ Follow these three steps on any Intel GPU (Arc B580, A770, or Core Ultra):
 ### Step 1: Capture Workload Shapes
 Run your desired model or prompt workload with shape recording enabled:
 ```bash
+# Option A: Run directly via C++ engine binary with pre-tokenized IDs:
 export STRATA_SYCL_RECORD_SHAPES=1
-strata launch --model q2_0 --prompt "Explain quantum computing" --max-tokens 32
+./build_sycl/strata --pack pack/full --tokens "151644,872,198" --max-new 32
+unset STRATA_SYCL_RECORD_SHAPES
+
+# Option B: Or serve via Python CLI, send a test request, and stop:
+export STRATA_SYCL_RECORD_SHAPES=1
+strata launch --model q2_0 --no-tui &
+curl -s http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/json" \
+  -d '{"messages": [{"role": "user", "content": "Explain quantum computing"}], "max_tokens": 32}'
+strata launch --stop
 unset STRATA_SYCL_RECORD_SHAPES
 ```
 This saves the exact tensor dimensions to `data/tuning/sycl/workload_<device>.txt`.
 
 ### Step 2: Run the Autotuner
-Run `tune_sycl_kernels` to sweep configurations and generate your calibrated tuning table:
+Run `tune_sycl_kernels` to sweep configurations using pipelined hardware event profiling:
 ```bash
-# Tune the recorded shapes from your workload file:
+# Tune the recorded shapes from your workload file (default 1.0s profiling per candidate):
 ./build_sycl/tune_sycl_kernels --workload data/tuning/sycl/workload_<device>.txt \
                               --output data/tuning/sycl/tuning_<device>.txt
 
-# Or sweep all standard model shapes if you did not capture a workload:
-./build_sycl/tune_sycl_kernels --output data/tuning/sycl/tuning_<device>.txt
+# Or sweep all standard model shapes with a 2-second timing budget per configuration:
+./build_sycl/tune_sycl_kernels --min-time 2.0 --output data/tuning/sycl/tuning_<device>.txt
+
+# Quick smoke sweep (0.1s per candidate):
+./build_sycl/tune_sycl_kernels --quick --output data/tuning/sycl/tuning_<device>.txt
 ```
 
 ### Step 3: Run Strata
