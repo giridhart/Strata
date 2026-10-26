@@ -1790,12 +1790,15 @@ void native_gu_multi_kernel(const unsigned long long* __restrict__ grp_ptr, cons
     const int nb = (int)(L.n_embd / Fmt<TG>::qk), xb = (int)(L.n_embd / 32);
     if constexpr (SUB16 && (Fmt<TG>::qk / Fmt<TG>::ipb == 32)) {
         if (xb == 80) {
+            const int warp = item_ct1.get_local_id(2) >> 5;
+            const int row_warp_base = item_ct1.get_group(2) * 16 + warp * 2;
+            if (row_warp_base >= 2 * L.n_ff) return;
             const int subwarp = item_ct1.get_local_id(2) >> 4, t = item_ct1.get_local_id(2) & 15;
             const int row = item_ct1.get_group(2) * 16 + subwarp;  // 0 .. 2*n_ff
-            if (row >= 2 * L.n_ff) return;
+            const bool valid_row = (row < 2 * L.n_ff);
             const bool is_up = row >= L.n_ff;
-            const int r = is_up ? row - (int)L.n_ff : row;
-            const size_t w_off = (is_up ? L.up_off : 0) + (size_t)r * L.gu_row;
+            const int r = is_up ? (valid_row ? row - (int)L.n_ff : 0) : row;
+            const size_t w_off = (is_up ? L.up_off : 0) + (size_t)(valid_row ? r : 0) * L.gu_row;
             float* dst = is_up ? up : gate;
             for (int g = item_ct1.get_group(1); g < ng; g += item_ct1.get_group_range(1)) {
                 const uint8_t* blob = (const uint8_t*)grp_ptr[g];
@@ -1808,22 +1811,22 @@ void native_gu_multi_kernel(const unsigned long long* __restrict__ grp_ptr, cons
                         const int off1[1] = { ent_tok[e] * 80 };
                         float s1[1];
                         row_dot_80_sub16<TG, 1, true>(wr, xq, off1, 1, t, s1);
-                        if (t == 0) dst[(size_t)e * L.n_ff + r] = s1[0] * sc;
+                        if (valid_row && t == 0) dst[(size_t)e * L.n_ff + r] = s1[0] * sc;
                     } else if (n == 2) {
                         const int off2[2] = { ent_tok[e] * 80, ent_tok[e + 1] * 80 };
                         float s2[2];
                         row_dot_80_sub16<TG, 2, true>(wr, xq, off2, 2, t, s2);
-                        if (t < 2) dst[(size_t)(e + t) * L.n_ff + r] = s2[t] * sc;
+                        if (valid_row && t < 2) dst[(size_t)(e + t) * L.n_ff + r] = s2[t] * sc;
                     } else if (n == 3) {
                         const int off3[3] = { ent_tok[e] * 80, ent_tok[e + 1] * 80, ent_tok[e + 2] * 80 };
                         float s3[3];
                         row_dot_80_sub16<TG, 3, true>(wr, xq, off3, 3, t, s3);
-                        if (t < 3) dst[(size_t)(e + t) * L.n_ff + r] = s3[t] * sc;
+                        if (valid_row && t < 3) dst[(size_t)(e + t) * L.n_ff + r] = s3[t] * sc;
                     } else {
                         const int off4[4] = { ent_tok[e] * 80, ent_tok[e + 1] * 80, ent_tok[e + 2] * 80, ent_tok[e + 3] * 80 };
                         float s4[4];
                         row_dot_80_sub16<TG, 4, true>(wr, xq, off4, 4, t, s4);
-                        if (t < 4) dst[(size_t)(e + t) * L.n_ff + r] = s4[t] * sc;
+                        if (valid_row && t < 4) dst[(size_t)(e + t) * L.n_ff + r] = s4[t] * sc;
                     }
                 }
             }
@@ -1930,28 +1933,26 @@ void native_down_multi_kernel(const unsigned long long* __restrict__ grp_ptr, co
                     item_ct1.barrier(sycl::access::fence_space::local_space);
                     for (int i = item_ct1.get_local_id(2); i < words; i += 256) s_hq_buf[i] = src[i];
                     item_ct1.barrier(sycl::access::fence_space::local_space);
-                    if (valid_r) {
-                        if (n == 1) {
-                            const int off1[1] = { 0 };
-                            float s1[1];
-                            row_dot_sub8<TD, 1, true>(wr, s_hq, off1, 1, t, s1);
-                            if (t == 0) out[(size_t)ent_dst[e] * L.n_embd + r] = s1[0] * sd;
-                        } else if (n == 2) {
-                            const int off2[2] = { 0, 20 };
-                            float s2[2];
-                            row_dot_sub8<TD, 2, true>(wr, s_hq, off2, 2, t, s2);
-                            if (t < 2) out[(size_t)ent_dst[e + t] * L.n_embd + r] = s2[t] * sd;
-                        } else if (n == 3) {
-                            const int off3[3] = { 0, 20, 40 };
-                            float s3[3];
-                            row_dot_sub8<TD, 3, true>(wr, s_hq, off3, 3, t, s3);
-                            if (t < 3) out[(size_t)ent_dst[e + t] * L.n_embd + r] = s3[t] * sd;
-                        } else {
-                            const int off4[4] = { 0, 20, 40, 60 };
-                            float s4[4];
-                            row_dot_sub8<TD, 4, true>(wr, s_hq, off4, 4, t, s4);
-                            if (t < 4) out[(size_t)ent_dst[e + t] * L.n_embd + r] = s4[t] * sd;
-                        }
+                    if (n == 1) {
+                        const int off1[1] = { 0 };
+                        float s1[1];
+                        row_dot_sub8<TD, 1, true>(wr, s_hq, off1, 1, t, s1);
+                        if (valid_r && t == 0) out[(size_t)ent_dst[e] * L.n_embd + r] = s1[0] * sd;
+                    } else if (n == 2) {
+                        const int off2[2] = { 0, 20 };
+                        float s2[2];
+                        row_dot_sub8<TD, 2, true>(wr, s_hq, off2, 2, t, s2);
+                        if (valid_r && t < 2) out[(size_t)ent_dst[e + t] * L.n_embd + r] = s2[t] * sd;
+                    } else if (n == 3) {
+                        const int off3[3] = { 0, 20, 40 };
+                        float s3[3];
+                        row_dot_sub8<TD, 3, true>(wr, s_hq, off3, 3, t, s3);
+                        if (valid_r && t < 3) out[(size_t)ent_dst[e + t] * L.n_embd + r] = s3[t] * sd;
+                    } else {
+                        const int off4[4] = { 0, 20, 40, 60 };
+                        float s4[4];
+                        row_dot_sub8<TD, 4, true>(wr, s_hq, off4, 4, t, s4);
+                        if (valid_r && t < 4) out[(size_t)ent_dst[e + t] * L.n_embd + r] = s4[t] * sd;
                     }
                 }
             }
@@ -1976,28 +1977,26 @@ void native_down_multi_kernel(const unsigned long long* __restrict__ grp_ptr, co
                     item_ct1.barrier(sycl::access::fence_space::local_space);
                     for (int i = item_ct1.get_local_id(2); i < words; i += 256) s_hq_buf[i] = src[i];
                     item_ct1.barrier(sycl::access::fence_space::local_space);
-                    if (valid_r) {
-                        if (n == 1) {
-                            const int off1[1] = { 0 };
-                            float s1[1];
-                            row_dot_20_sub16<TD, 1, true>(wr, s_hq, off1, 1, t, s1);
-                            if (t == 0) out[(size_t)ent_dst[e] * L.n_embd + r] = s1[0] * sd;
-                        } else if (n == 2) {
-                            const int off2[2] = { 0, 20 };
-                            float s2[2];
-                            row_dot_20_sub16<TD, 2, true>(wr, s_hq, off2, 2, t, s2);
-                            if (t < 2) out[(size_t)ent_dst[e + t] * L.n_embd + r] = s2[t] * sd;
-                        } else if (n == 3) {
-                            const int off3[3] = { 0, 20, 40 };
-                            float s3[3];
-                            row_dot_20_sub16<TD, 3, true>(wr, s_hq, off3, 3, t, s3);
-                            if (t < 3) out[(size_t)ent_dst[e + t] * L.n_embd + r] = s3[t] * sd;
-                        } else {
-                            const int off4[4] = { 0, 20, 40, 60 };
-                            float s4[4];
-                            row_dot_20_sub16<TD, 4, true>(wr, s_hq, off4, 4, t, s4);
-                            if (t < 4) out[(size_t)ent_dst[e + t] * L.n_embd + r] = s4[t] * sd;
-                        }
+                    if (n == 1) {
+                        const int off1[1] = { 0 };
+                        float s1[1];
+                        row_dot_20_sub16<TD, 1, true>(wr, s_hq, off1, 1, t, s1);
+                        if (valid_r && t == 0) out[(size_t)ent_dst[e] * L.n_embd + r] = s1[0] * sd;
+                    } else if (n == 2) {
+                        const int off2[2] = { 0, 20 };
+                        float s2[2];
+                        row_dot_20_sub16<TD, 2, true>(wr, s_hq, off2, 2, t, s2);
+                        if (valid_r && t < 2) out[(size_t)ent_dst[e + t] * L.n_embd + r] = s2[t] * sd;
+                    } else if (n == 3) {
+                        const int off3[3] = { 0, 20, 40 };
+                        float s3[3];
+                        row_dot_20_sub16<TD, 3, true>(wr, s_hq, off3, 3, t, s3);
+                        if (valid_r && t < 3) out[(size_t)ent_dst[e + t] * L.n_embd + r] = s3[t] * sd;
+                    } else {
+                        const int off4[4] = { 0, 20, 40, 60 };
+                        float s4[4];
+                        row_dot_20_sub16<TD, 4, true>(wr, s_hq, off4, 4, t, s4);
+                        if (valid_r && t < 4) out[(size_t)ent_dst[e + t] * L.n_embd + r] = s4[t] * sd;
                     }
                 }
             }
@@ -2022,27 +2021,25 @@ void native_down_multi_kernel(const unsigned long long* __restrict__ grp_ptr, co
                 item_ct1.barrier(sycl::access::fence_space::local_space);
                 for (int i = item_ct1.get_local_id(2); i < words; i += 256) s_hq_buf[i] = src[i];
                 item_ct1.barrier(sycl::access::fence_space::local_space);
-                if (valid_r) {
-                    if (n == 1) {
-                        const int off1[1] = { 0 };
-                        float s1[1];
-                        row_dot_multi<TD, 1>(wr, s_hq, off1, 1, nb, lane, s1);
-                        if (lane == 0) out[(size_t)ent_dst[e] * L.n_embd + r] = s1[0] * sd;
-                    } else if (n == 2) {
-                        const int off2[2] = { 0, 20 };
-                        float s2[2];
-                        row_dot_multi<TD, 2>(wr, s_hq, off2, 2, nb, lane, s2);
-                        if (lane < 2) out[(size_t)ent_dst[e + lane] * L.n_embd + r] = s2[lane] * sd;
-                    } else {
-                        int off[GRP_NC];
+                if (n == 1) {
+                    const int off1[1] = { 0 };
+                    float s1[1];
+                    row_dot_multi<TD, 1>(wr, s_hq, off1, 1, nb, lane, s1);
+                    if (valid_r && lane == 0) out[(size_t)ent_dst[e] * L.n_embd + r] = s1[0] * sd;
+                } else if (n == 2) {
+                    const int off2[2] = { 0, 20 };
+                    float s2[2];
+                    row_dot_multi<TD, 2>(wr, s_hq, off2, 2, nb, lane, s2);
+                    if (valid_r && lane < 2) out[(size_t)ent_dst[e + lane] * L.n_embd + r] = s2[lane] * sd;
+                } else {
+                    int off[GRP_NC];
 #pragma unroll
-                        for (int c = 0; c < GRP_NC; ++c) off[c] = sycl::min(c, n - 1) * 20;
-                        float s[GRP_NC];
-                        row_dot_multi<TD, GRP_NC>(wr, s_hq, off, n, nb, lane, s);
+                    for (int c = 0; c < GRP_NC; ++c) off[c] = sycl::min(c, n - 1) * 20;
+                    float s[GRP_NC];
+                    row_dot_multi<TD, GRP_NC>(wr, s_hq, off, n, nb, lane, s);
 #pragma unroll
-                        for (int c = 0; c < GRP_NC; ++c)
-                            if (c < n && lane == c) out[(size_t)ent_dst[e + c] * L.n_embd + r] = s[c] * sd;
-                    }
+                    for (int c = 0; c < GRP_NC; ++c)
+                        if (valid_r && c < n && lane == c) out[(size_t)ent_dst[e + c] * L.n_embd + r] = s[c] * sd;
                 }
             }
         } else if (valid_r) {
@@ -2216,14 +2213,17 @@ void expdec_gu_kernel(const unsigned long long* __restrict__ grp_ptr,
             for (int c = 0; c < n; ++c) ed_stage_entry<ED_XB, true>(s_u, s_ds, c, xq + (size_t)ent_tok[e + c] * ED_XB, tid);
             item_ct1.barrier(sycl::access::fence_space::local_space);
             for (int p = 0; p * 16 * R < rb; ++p) {
+                const int sw_warp_base = (tid >> 5) * 2;
+                const int row0_warp_base = row_base + p * 16 * R + sw_warp_base * R;
+                if (row0_warp_base >= nrow) break;
                 const int row0 = row_base + p * 16 * R + sw * R;
-                if (row0 >= nrow) break;
+                const bool valid_row = (row0 < nrow);
                 const bool is_up = row0 >= n_ff;
-                const int r0 = is_up ? row0 - n_ff : row0;
+                const int r0 = is_up ? (valid_row ? row0 - n_ff : 0) : row0;
                 const float sc = L.tail_off ? ((const float*)(blob + L.tail_off))[is_up ? 1 : 0] : 1.0f;
                 const uint8_t* wr[R];
 #pragma unroll
-                for (int r = 0; r < R; ++r) wr[r] = blob + (is_up ? L.up_off : 0) + (size_t)(r0 + r) * L.gu_row;
+                for (int r = 0; r < R; ++r) wr[r] = blob + (is_up ? L.up_off : 0) + (size_t)(valid_row ? (r0 + r) : 0) * L.gu_row;
                 float* dst = is_up ? up : gate;
                 auto run = [&](auto nc) {
                     constexpr int NC = decltype(nc)::value;
@@ -2231,7 +2231,7 @@ void expdec_gu_kernel(const unsigned long long* __restrict__ grp_ptr,
                     ed_gu_rows<TG, R, NC>(wr, s_u, s_ds, s_grid_buf, t, s);
 #pragma unroll
                     for (int c = 0; c < NC; ++c)
-                        if (t == c)
+                        if (valid_row && t == c)
 #pragma unroll
                             for (int r = 0; r < R; ++r) dst[(size_t)(e + c) * n_ff + r0 + r] = s[r][c] * sc;
                 };
@@ -2403,11 +2403,14 @@ void expdec_down_kernel(const unsigned long long* __restrict__ grp_ptr,
             for (int c = 0; c < n; ++c) ed_stage_entry<ED_HB, TD == 42>(s_u, s_ds, c, hq + (size_t)(e + c) * ED_HB, tid);
             item_ct1.barrier(sycl::access::fence_space::local_space);
             for (int p = 0; p * RPP < rb; ++p) {
+                const int sw_warp_base = (tid / 32) * (32 / LANES);
+                const int row0_warp_base = row_base + p * RPP + sw_warp_base * R;
+                if (row0_warp_base >= nrow) break;
                 const int row0 = row_base + p * RPP + sw * R;
-                if (row0 >= nrow) break;
+                const bool valid_row = (row0 < nrow);
                 const uint8_t* wr[R];
 #pragma unroll
-                for (int r = 0; r < R; ++r) wr[r] = blob + (size_t)(row0 + r) * L.d_row;
+                for (int r = 0; r < R; ++r) wr[r] = blob + (size_t)(valid_row ? (row0 + r) : 0) * L.d_row;
                 auto run = [&](auto nc) {
                     constexpr int NC = decltype(nc)::value;
                     float s[R][NC];
@@ -2415,7 +2418,7 @@ void expdec_down_kernel(const unsigned long long* __restrict__ grp_ptr,
                     else ed_d42_rows<R, NC>(wr, s_u, s_ds, t, s);
 #pragma unroll
                     for (int c = 0; c < NC; ++c)
-                        if (t == c) {
+                        if (valid_row && t == c) {
                             const size_t o = (size_t)ent_dst[e + c] * L.n_embd + row0;
 #pragma unroll
                             for (int r = 0; r < R; ++r) out[o + r] = s[r][c] * sd;
