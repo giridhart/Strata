@@ -805,11 +805,7 @@ struct Fmt<40> {
 
 inline float warp_sum(float v) {
     auto sg = sycl::ext::oneapi::this_work_item::get_sub_group();
-#pragma unroll
-    for (int o = 16; o > 0; o >>= 1) {
-        v += sycl::permute_group_by_xor(sg, v, o);
-    }
-    return v;
+    return sycl::reduce_over_group(sg, v, sycl::plus<float>());
 }
 
 inline float sub16_sum(float v) {
@@ -3342,8 +3338,7 @@ inline void iq3s_wide_kernel(const uint8_t* __restrict__ w, size_t rb, const blo
 #pragma unroll
     for (int c = 0; c < NCOLS; ++c) {
         float v = acc[c];
-#pragma unroll
-        for (int o = 16; o > 0; o >>= 1) v += sycl::permute_group_by_xor(sg, v, o);
+        v = sycl::reduce_over_group(sg, v, sycl::plus<float>());
         if (lane == 0) y[(size_t)c * n_out + row] = v;
     }
 }
