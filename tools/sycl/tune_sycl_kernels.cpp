@@ -9,6 +9,7 @@
 #include "strata/kernels/s_gemv.hpp"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -20,6 +21,14 @@
 #include <vector>
 
 namespace {
+
+struct BenchmarkMetrics {
+    double median_us = 0.0;
+    double min_us = 0.0;
+    int total_iters = 0;
+    double total_time_s = 0.0;
+    bool event_profiling_used = false;
+};
 
 struct GemvShape {
     std::string kernel_name;
@@ -82,33 +91,95 @@ const GemvShape kTargetShapes[] = {
     {"native_gdn", strata::sycl_tuning::KernelType::GDN, 128, 8, 32, 1, 0, "GDN recurrent step S=128", "default", "default", "default"}
 };
 
-double measure_bf16_gemv_split(sycl::queue& q, const uint16_t* d_x, const uint16_t* d_w, float* d_y,
-                              int64_t n_in, int64_t n_out, int tpr, int warmup_iters, int timed_iters) {
-    for (int w = 0; w < warmup_iters; ++w) {
+BenchmarkMetrics measure_bf16_gemv_split(sycl::queue& q, const uint16_t* d_x, const uint16_t* d_w, float* d_y,
+                                        int64_t n_in, int64_t n_out, int tpr, double min_time_sec, double warmup_sec) {
+    BenchmarkMetrics metrics;
+
+    // 1. Warmup: run for warmup_sec (or at least 10 iterations) to allow GPU DVFS to ramp to steady-state boost clocks
+    const auto w_start = std::chrono::steady_clock::now();
+    int w_count = 0;
+    while (std::chrono::duration<double>(std::chrono::steady_clock::now() - w_start).count() < warmup_sec || w_count < 10) {
         strata::kernels::bf16_gemv_split(d_x, d_w, d_y, n_in, n_out, tpr, &q);
+        ++w_count;
     }
     q.wait_and_throw();
 
-    std::vector<double> times_us;
-    times_us.reserve((size_t)timed_iters);
-
-    for (int it = 0; it < timed_iters; ++it) {
-        auto t0 = std::chrono::high_resolution_clock::now();
-        strata::kernels::bf16_gemv_split(d_x, d_w, d_y, n_in, n_out, tpr, &q);
-        q.wait_and_throw();
-        auto t1 = std::chrono::high_resolution_clock::now();
-        double us = std::chrono::duration<double, std::micro>(t1 - t0).count();
-        times_us.push_back(us);
+    // 2. Check if event profiling is available and functional on this queue/device
+    bool can_event_profile = false;
+    try {
+        sycl::event test_ev;
+        strata::kernels::bf16_gemv_split(d_x, d_w, d_y, n_in, n_out, tpr, &q, &test_ev);
+        test_ev.wait();
+        auto s = test_ev.get_profiling_info<sycl::info::event_profiling::command_start>();
+        auto e = test_ev.get_profiling_info<sycl::info::event_profiling::command_end>();
+        if (e >= s) {
+            can_event_profile = true;
+        }
+    } catch (...) {
+        can_event_profile = false;
     }
+    metrics.event_profiling_used = can_event_profile;
 
-    std::sort(times_us.begin(), times_us.end());
-    return times_us[times_us.size() / 2]; // Return median execution time in microseconds
+    // 3. Timed benchmark: submit in pipelined batches of BATCH_SIZE.
+    // In an in-order queue, ev_first command_start marks when the first kernel begins on the GPU,
+    // and ev_last command_end marks when the final kernel completes on the GPU.
+    // This captures the entire unbroken GPU execution span with zero driver dispatch overhead.
+    constexpr int BATCH_SIZE = 32;
+    std::vector<double> times_us;
+    times_us.reserve(4096);
+
+    const auto t_start = std::chrono::steady_clock::now();
+    const auto deadline = t_start + std::chrono::duration<double>(min_time_sec);
+
+    while (std::chrono::steady_clock::now() < deadline || metrics.total_iters < BATCH_SIZE) {
+        if (can_event_profile) {
+            sycl::event ev_first, ev_last;
+            for (int b = 0; b < BATCH_SIZE; ++b) {
+                if (b == 0) {
+                    strata::kernels::bf16_gemv_split(d_x, d_w, d_y, n_in, n_out, tpr, &q, &ev_first);
+                } else if (b == BATCH_SIZE - 1) {
+                    strata::kernels::bf16_gemv_split(d_x, d_w, d_y, n_in, n_out, tpr, &q, &ev_last);
+                } else {
+                    strata::kernels::bf16_gemv_split(d_x, d_w, d_y, n_in, n_out, tpr, &q, nullptr);
+                }
+            }
+            q.wait_and_throw();
+            uint64_t s = ev_first.get_profiling_info<sycl::info::event_profiling::command_start>();
+            uint64_t e = ev_last.get_profiling_info<sycl::info::event_profiling::command_end>();
+            if (e >= s) {
+                double batch_us = static_cast<double>(e - s) * 1e-3;
+                double per_kernel_us = batch_us / BATCH_SIZE;
+                times_us.push_back(per_kernel_us);
+            }
+        } else {
+            auto b_start = std::chrono::high_resolution_clock::now();
+            for (int b = 0; b < BATCH_SIZE; ++b) {
+                strata::kernels::bf16_gemv_split(d_x, d_w, d_y, n_in, n_out, tpr, &q);
+            }
+            q.wait_and_throw();
+            auto b_end = std::chrono::high_resolution_clock::now();
+            double batch_us = std::chrono::duration<double, std::micro>(b_end - b_start).count();
+            double per_kernel_us = batch_us / BATCH_SIZE;
+            times_us.push_back(per_kernel_us);
+        }
+        metrics.total_iters += BATCH_SIZE;
+    }
+    const auto t_end = std::chrono::steady_clock::now();
+    metrics.total_time_s = std::chrono::duration<double>(t_end - t_start).count();
+
+    if (!times_us.empty()) {
+        std::sort(times_us.begin(), times_us.end());
+        metrics.median_us = times_us[times_us.size() / 2];
+        metrics.min_us = times_us.front();
+    }
+    return metrics;
 }
 
 }  // namespace
 
 int main(int argc, char** argv) {
     bool quick = false;
+    double min_time_sec = -1.0;
     std::string out_path = "";
     std::string workload_path = "";
 
@@ -116,20 +187,28 @@ int main(int argc, char** argv) {
         std::string arg = argv[i];
         if (arg == "--quick") {
             quick = true;
+        } else if (arg == "--min-time" && i + 1 < argc) {
+            min_time_sec = std::atof(argv[++i]);
         } else if (arg == "--out" && i + 1 < argc) {
             out_path = argv[++i];
         } else if (arg == "--workload" && i + 1 < argc) {
             workload_path = argv[++i];
         } else if (arg == "--help" || arg == "-h") {
             printf("Usage: %s [options]\n", argv[0]);
-            printf("  --quick            Run fast sweep with fewer iterations\n");
+            printf("  --quick            Run fast sweep (0.1s per candidate)\n");
+            printf("  --min-time <sec>   Target benchmark duration per candidate in seconds (default: 1.0s, or 0.1s with --quick)\n");
             printf("  --workload <path>  Tune kernels captured from a workload file\n");
             printf("  --out <path>       Custom output path for calibration table\n");
             return 0;
         }
     }
 
-    sycl::queue q{sycl::default_selector_v, {sycl::property::queue::enable_profiling()}};
+    if (min_time_sec <= 0.0) {
+        min_time_sec = quick ? 0.1 : 1.0;
+    }
+    const double warmup_sec = quick ? 0.05 : 0.20;
+
+    sycl::queue q{sycl::default_selector_v, {sycl::property::queue::in_order{}, sycl::property::queue::enable_profiling()}};
     const auto& dev = q.get_device();
     const auto fp = strata::sycl_tuning::DeviceFingerprint::from_device(dev);
 
@@ -139,14 +218,11 @@ int main(int argc, char** argv) {
     printf("Driver Version: %s\n", fp.driver_version.c_str());
     printf("Compute Units : %u Xe-cores/VEs\n", fp.compute_units);
     printf("Sub-group Size: %d\n", fp.native_subgroup_size);
-    printf("Tuning Mode   : %s\n", quick ? "QUICK (Fast sweep)" : "FULL (Accurate calibration)");
+    printf("Tuning Mode   : %s (min_time = %.2fs per candidate)\n", quick ? "QUICK (Fast sweep)" : "FULL (Accurate calibration)", min_time_sec);
     if (!workload_path.empty()) {
         printf("Workload File : %s\n", workload_path.c_str());
     }
     printf("====================================================================\n");
-
-    const int warmup_iters = quick ? 5 : 15;
-    const int timed_iters  = quick ? 10 : 30;
 
     std::vector<GemvShape> target_shapes;
 
@@ -242,11 +318,13 @@ int main(int argc, char** argv) {
             double best_time = 1e9;
 
             for (int tpr : tpr_candidates) {
-                double t_us = measure_bf16_gemv_split(q, d_x, d_w, d_y, shape.n_in, shape.n_out,
-                                                      tpr, warmup_iters, timed_iters);
-                printf("  Candidate TPR=%-3d : %8.2f us\n", tpr, t_us);
-                if (t_us < best_time) {
-                    best_time = t_us;
+                BenchmarkMetrics m = measure_bf16_gemv_split(q, d_x, d_w, d_y, shape.n_in, shape.n_out,
+                                                             tpr, min_time_sec, warmup_sec);
+                printf("  Candidate TPR=%-3d : %8.2f us (min: %8.2f us, %6d iters in %.2fs [%s])\n",
+                       tpr, m.median_us, m.min_us, m.total_iters, m.total_time_s,
+                       m.event_profiling_used ? "HW Batch Profiling" : "Wall Clock");
+                if (m.median_us < best_time) {
+                    best_time = m.median_us;
                     best_tpr = tpr;
                 }
             }

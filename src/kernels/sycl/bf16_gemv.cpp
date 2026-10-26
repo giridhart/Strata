@@ -260,23 +260,27 @@ void bf16_gemv_pair(const uint16_t* x, const uint16_t* w1, float* y1, int64_t n_
 }
 
 void bf16_gemv_split(const uint16_t* x, const uint16_t* w, float* y, int64_t n_in, int64_t n_out, int threads_per_row,
-                     void* stream) {
+                     void* stream, void* out_event) {
     sycl::queue* q = stream ? static_cast<sycl::queue*>(stream) : &default_queue();
     if (n_in <= 0 || n_out <= 0) return;
     const auto prof = strata::sycl_arch::get_xe2_tuning_profile(q->get_device());
     if (threads_per_row == 32 || threads_per_row == SG_SIZE) {
         const int sgs = THREADS / SG_SIZE;
         const unsigned grid = (unsigned)((n_out + sgs - 1) / sgs);
+        sycl::event ev;
         if (prof.enable_streaming_hints) {
-            q->parallel_for(sycl::nd_range<1>(sycl::range<1>((grid) * (THREADS)), sycl::range<1>(THREADS)),
-                            [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
-                                bf16_gemv_subgroup_kernel<SG_SIZE, true>(item, x, w, y, n_in, n_out);
-                            });
+            ev = q->parallel_for(sycl::nd_range<1>(sycl::range<1>((grid) * (THREADS)), sycl::range<1>(THREADS)),
+                                 [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
+                                     bf16_gemv_subgroup_kernel<SG_SIZE, true>(item, x, w, y, n_in, n_out);
+                                 });
         } else {
-            q->parallel_for(sycl::nd_range<1>(sycl::range<1>((grid) * (THREADS)), sycl::range<1>(THREADS)),
-                            [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
-                                bf16_gemv_subgroup_kernel<SG_SIZE, false>(item, x, w, y, n_in, n_out);
-                            });
+            ev = q->parallel_for(sycl::nd_range<1>(sycl::range<1>((grid) * (THREADS)), sycl::range<1>(THREADS)),
+                                 [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
+                                     bf16_gemv_subgroup_kernel<SG_SIZE, false>(item, x, w, y, n_in, n_out);
+                                 });
+        }
+        if (out_event) {
+            *static_cast<sycl::event*>(out_event) = ev;
         }
         return;
     }
@@ -288,7 +292,7 @@ void bf16_gemv_split(const uint16_t* x, const uint16_t* w, float* y, int64_t n_i
         std::exit(1);
     }
     const unsigned grid = (unsigned)n_out;
-    q->submit([&](sycl::handler& cgh) {
+    auto ev = q->submit([&](sycl::handler& cgh) {
         sycl::local_accessor<float, 1> scratch_acc(sycl::range<1>(threads_per_row), cgh);
         if (prof.enable_streaming_hints) {
             cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>((grid) * (threads_per_row)), sycl::range<1>(threads_per_row)),
@@ -302,6 +306,9 @@ void bf16_gemv_split(const uint16_t* x, const uint16_t* w, float* y, int64_t n_i
                              });
         }
     });
+    if (out_event) {
+        *static_cast<sycl::event*>(out_event) = ev;
+    }
 }
 
 }  // namespace strata::kernels
