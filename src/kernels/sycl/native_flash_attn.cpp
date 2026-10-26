@@ -43,8 +43,10 @@ inline float warp_sum(sycl::sub_group sg, float x) {
         return sycl::reduce_over_group(sg, x, sycl::plus<float>());
     } else {
 #pragma unroll
-        for (int offset = Width / 2; offset; offset >>= 1)
-            x += sycl::permute_group_by_xor(sg, x, offset);
+        for (int offset = Width / 2; offset; offset >>= 1) {
+            if ((size_t)offset < sg.get_local_range()[0])
+                x += sycl::permute_group_by_xor(sg, x, offset);
+        }
         return x;
     }
 }
@@ -115,8 +117,10 @@ void attend(sycl::nd_item<2> item, const float* __restrict__ q, const sycl::half
             if (lane % 8 == row) score = dot;
         }
 #pragma unroll
-        for (int offset = 8; offset < 32; offset <<= 1)
-            next_max = sycl::fmax(next_max, sycl::permute_group_by_xor(sg, next_max, offset));
+        for (int offset = 8; offset < 32; offset <<= 1) {
+            if ((size_t)offset < sg.get_local_range()[0])
+                next_max = sycl::fmax(next_max, sycl::permute_group_by_xor(sg, next_max, offset));
+        }
         const float rescale = sycl::native::exp(maximum - next_max);
         maximum = next_max;
         score = sycl::native::exp(score - maximum);

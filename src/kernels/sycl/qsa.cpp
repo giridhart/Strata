@@ -451,14 +451,6 @@ void kv_gather_kernel(const uint16_t* __restrict__ k_pool, const uint16_t* __res
 
 // ================= 6. qsa_attend =================
 
-inline float warp_max(float v) {
-    return sycl::reduce_over_group(sycl::ext::oneapi::this_work_item::get_sub_group(), v, sycl::maximum<float>());
-}
-
-inline float warp_sum(float v) {
-    return sycl::reduce_over_group(sycl::ext::oneapi::this_work_item::get_sub_group(), v, sycl::plus<float>());
-}
-
 /// One block per query head.  `s` holds the scores, which are then overwritten with the softmax weights.
 
 void qsa_attend_kernel(const float* __restrict__ q, const uint16_t* __restrict__ k_scratch,
@@ -469,7 +461,6 @@ void qsa_attend_kernel(const float* __restrict__ q, const uint16_t* __restrict__
     const long long n_ids = (long long)*(step + kStepWidth);
     auto s_w = (float*)local_mem;  // CAPACITY floats (scores, then weights) +
                                    // 32 for the reductions
-    float* red = s_w;              // red[0..31] live past the scores/weights: see the launch
     float* w = s_w + 32;
     const int h = item_ct1.get_group(2);
     const int d = item_ct1.get_local_id(2);
@@ -485,7 +476,6 @@ void qsa_attend_kernel(const float* __restrict__ q, const uint16_t* __restrict__
     }
     const int kv = h / (n_head / n_head_kv);  // ops.cpp L8729: iv2 = iq2 / rv2, NOT h % n_head_kv
     const float scale = 1.0f / sycl::sqrt((float)head_dim);
-    const int lane = d & 31, wid = d >> 5, nwarp = (int)((item_ct1.get_local_range(2) + 31) >> 5);
 
     for (long long j = d; j < n_ids; j += item_ct1.get_local_range(2)) {
         const uint16_t* krow = k_scratch + (j * n_head_kv + kv) * head_dim;
@@ -500,20 +490,7 @@ void qsa_attend_kernel(const float* __restrict__ q, const uint16_t* __restrict__
     float mx = -FLT_MAX;  // not -inf, whose double -> float conversion nvcc warns about
     for (long long j = d; j < n_ids; j += item_ct1.get_local_range(2))
         mx = sycl::fmax(mx, w[j]);
-    mx = warp_max(mx);
-    if (lane == 0) red[wid] = mx;
-
-    item_ct1.barrier();
-    if (wid == 0) {
-        mx = (lane < nwarp) ? red[lane] : -FLT_MAX;
-        mx = warp_max(mx);
-        if (lane == 0) red[0] = mx;
-    }
-
-    item_ct1.barrier();
-    mx = red[0];
-
-    item_ct1.barrier();
+    mx = sycl::reduce_over_group(item_ct1.get_group(), mx, sycl::maximum<float>());
 
     float sum = 0.0f;
     for (long long j = d; j < n_ids; j += item_ct1.get_local_range(2)) {
@@ -521,18 +498,8 @@ void qsa_attend_kernel(const float* __restrict__ q, const uint16_t* __restrict__
         w[j] = e;
         sum += e;
     }
-    sum = warp_sum(sum);
-    if (lane == 0) red[wid] = sum;
-
-    item_ct1.barrier();
-    if (wid == 0) {
-        sum = (lane < nwarp) ? red[lane] : 0.0f;
-        sum = warp_sum(sum);
-        if (lane == 0) red[0] = 1.0f / sum;
-    }
-
-    item_ct1.barrier();
-    const float inv = red[0];
+    sum = sycl::reduce_over_group(item_ct1.get_group(), sum, sycl::plus<float>());
+    const float inv = 1.0f / sum;
 
     item_ct1.barrier();
 
@@ -584,12 +551,10 @@ void qsa_attend_splitk_stage1_kernel(const float* __restrict__ q, const uint16_t
     }
 
     auto s_w = (float*)local_mem;
-    float* red = s_w;
     float* w = s_w + 32;
 
     const int kv = h / (n_head / n_head_kv);
     const float scale = 1.0f / sycl::sqrt((float)head_dim);
-    const int lane = d & 31, wid = d >> 5, nwarp = (threads + 31) >> 5;
 
     for (long long j_rel = d; j_rel < n_here; j_rel += threads) {
         const long long j = t_start + j_rel;
@@ -605,19 +570,7 @@ void qsa_attend_splitk_stage1_kernel(const float* __restrict__ q, const uint16_t
     float mx = -FLT_MAX;
     for (long long j_rel = d; j_rel < n_here; j_rel += threads)
         mx = sycl::fmax(mx, w[j_rel]);
-    mx = warp_max(mx);
-    if (lane == 0) red[wid] = mx;
-
-    item.barrier();
-    if (wid == 0) {
-        mx = (lane < nwarp) ? red[lane] : -FLT_MAX;
-        mx = warp_max(mx);
-        if (lane == 0) red[0] = mx;
-    }
-
-    item.barrier();
-    mx = red[0];
-    item.barrier();
+    mx = sycl::reduce_over_group(item.get_group(), mx, sycl::maximum<float>());
 
     float sum = 0.0f;
     for (long long j_rel = d; j_rel < n_here; j_rel += threads) {
@@ -625,18 +578,8 @@ void qsa_attend_splitk_stage1_kernel(const float* __restrict__ q, const uint16_t
         w[j_rel] = e;
         sum += e;
     }
-    sum = warp_sum(sum);
-    if (lane == 0) red[wid] = sum;
+    sum = sycl::reduce_over_group(item.get_group(), sum, sycl::plus<float>());
 
-    item.barrier();
-    if (wid == 0) {
-        sum = (lane < nwarp) ? red[lane] : 0.0f;
-        sum = warp_sum(sum);
-        if (lane == 0) red[0] = sum;
-    }
-
-    item.barrier();
-    sum = red[0];
     item.barrier();
 
     float acc = 0.0f;
@@ -706,6 +649,7 @@ struct SplitKScratch {
                 buf = nullptr;
             }
             buf = sycl::malloc_device<float>(needed_floats, *queue);
+            queue->memset(buf, 0, needed_floats * sizeof(float)).wait();
             floats = needed_floats;
             q = queue;
         }

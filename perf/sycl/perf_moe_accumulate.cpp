@@ -21,6 +21,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -28,6 +29,22 @@ namespace {
 
 constexpr int N_EXPERTS = 10;
 constexpr int N_EMBD = 2560;
+
+bool verify_moe_combine_cpu(const float* h_parts, const float* h_weights, const float* h_out, int B, int n_embd, int k,
+                            float rtol = 1e-4f, float atol = 1e-4f) {
+    for (int b = 0; b < B; ++b) {
+        for (int col = 0; col < n_embd; ++col) {
+            double ref = 0.0;
+            for (int e = 0; e < k; ++e) {
+                ref += (double)h_parts[(size_t)(b * k + e) * n_embd + col] * (double)h_weights[b * k + e];
+            }
+            float val = h_out[b * n_embd + col];
+            if (std::isnan(val) || std::isinf(val)) return false;
+            if (std::abs(val - (float)ref) > atol + rtol * std::abs((float)ref)) return false;
+        }
+    }
+    return true;
+}
 
 // ============================================================================
 // MoE Reduction Kernels
@@ -121,10 +138,15 @@ static void BM_Xe2_MoE_Atomic(benchmark::State& state) {
         return;
     }
 
-    q.fill(d_parts, 0.1f, parts_size);
-    q.fill(d_weights, 0.1f, weights_size);
-    q.fill(d_out, 0.0f, out_size);
-    q.wait_and_throw();
+    std::mt19937 rng(1337 + B);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    std::vector<float> h_parts(parts_size);
+    std::vector<float> h_weights(weights_size);
+    for (auto& v : h_parts) v = dist(rng) * (1.0f / std::sqrt((float)N_EMBD));
+    for (auto& v : h_weights) v = dist(rng) * 0.1f + 0.1f;
+    q.copy(h_parts.data(), d_parts, parts_size).wait();
+    q.copy(h_weights.data(), d_weights, weights_size).wait();
+    q.fill(d_out, 0.0f, out_size).wait();
 
     constexpr int WG = 256;
     const size_t total_items = parts_size;
@@ -136,6 +158,19 @@ static void BM_Xe2_MoE_Atomic(benchmark::State& state) {
                              moe_atomic_kernel(item, d_parts, d_weights, d_out, B, N_EMBD, N_EXPERTS);
                          });
     };
+
+    // 0. Pre-flight Numerical Verification against double-precision CPU reference
+    q.fill(d_out, 0.0f, out_size).wait();
+    q.submit(launch).wait_and_throw();
+    std::vector<float> h_got(out_size);
+    q.copy(d_out, h_got.data(), out_size).wait();
+    if (!verify_moe_combine_cpu(h_parts.data(), h_weights.data(), h_got.data(), B, N_EMBD, N_EXPERTS)) {
+        state.SkipWithError("Pre-flight numerical verification failed: non-finite or diverged from CPU reference");
+        sycl::free(d_parts, q);
+        sycl::free(d_weights, q);
+        sycl::free(d_out, q);
+        return;
+    }
 
     // Warmup
     for (int i = 0; i < 5; ++i) {
@@ -186,10 +221,15 @@ static void BM_Xe2_MoE_DirectCombine(benchmark::State& state) {
         return;
     }
 
-    q.fill(d_parts, 0.1f, parts_size);
-    q.fill(d_weights, 0.1f, weights_size);
-    q.fill(d_out, 0.0f, out_size);
-    q.wait_and_throw();
+    std::mt19937 rng(1337 + B);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    std::vector<float> h_parts(parts_size);
+    std::vector<float> h_weights(weights_size);
+    for (auto& v : h_parts) v = dist(rng) * (1.0f / std::sqrt((float)N_EMBD));
+    for (auto& v : h_weights) v = dist(rng) * 0.1f + 0.1f;
+    q.copy(h_parts.data(), d_parts, parts_size).wait();
+    q.copy(h_weights.data(), d_weights, weights_size).wait();
+    q.fill(d_out, 0.0f, out_size).wait();
 
     constexpr int WG = 256;
     const size_t n_blocks = (N_EMBD + WG - 1) / WG;
@@ -200,6 +240,19 @@ static void BM_Xe2_MoE_DirectCombine(benchmark::State& state) {
                              moe_combine_kernel(item, d_parts, d_weights, d_out, N_EMBD, N_EXPERTS);
                          });
     };
+
+    // 0. Pre-flight Numerical Verification against double-precision CPU reference
+    q.fill(d_out, 0.0f, out_size).wait();
+    q.submit(launch).wait_and_throw();
+    std::vector<float> h_got(out_size);
+    q.copy(d_out, h_got.data(), out_size).wait();
+    if (!verify_moe_combine_cpu(h_parts.data(), h_weights.data(), h_got.data(), B, N_EMBD, N_EXPERTS)) {
+        state.SkipWithError("Pre-flight numerical verification failed: non-finite or diverged from CPU reference");
+        sycl::free(d_parts, q);
+        sycl::free(d_weights, q);
+        sycl::free(d_out, q);
+        return;
+    }
 
     // Warmup
     for (int i = 0; i < 5; ++i) {

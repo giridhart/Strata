@@ -28,6 +28,15 @@ constexpr int HEAD_DIM = 128;
 constexpr int NUM_HEADS = 16;
 constexpr int SG_SIZE = strata::sycl_arch::SUB_GROUP_SIZE;
 
+bool verify_output_finite(sycl::queue& q, const float* d_out, size_t n) {
+    std::vector<float> h(n);
+    q.copy(d_out, h.data(), n).wait();
+    for (size_t i = 0; i < n; ++i) {
+        if (std::isnan(h[i]) || std::isinf(h[i])) return false;
+    }
+    return true;
+}
+
 // FP16 Decode Attention Kernel (Single query token reading historical KV cache)
 void kv_decode_fp16_kernel(sycl::nd_item<1> item, const sycl::half* __restrict__ q,
                            const sycl::half* __restrict__ k_cache, const sycl::half* __restrict__ v_cache,
@@ -315,6 +324,12 @@ static void BM_Xe2_KV_Decode_FP16(benchmark::State& state) {
                        }).wait();
     }
 
+    if (!verify_output_finite(q, d_out, q_elements)) {
+        state.SkipWithError("Pre-flight numerical verification failed: non-finite output detected");
+        sycl::free(d_q, q); sycl::free(d_k, q); sycl::free(d_v, q); sycl::free(d_out, q);
+        return;
+    }
+
     for (auto _ : state) {
         auto ev = q.parallel_for(sycl::nd_range<1>(NUM_HEADS * SG_SIZE, SG_SIZE),
                                  [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
@@ -371,6 +386,13 @@ static void BM_Xe2_KV_Decode_INT8(benchmark::State& state) {
                        [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
                            kv_decode_int8_kernel(item, d_q, d_k, d_v, d_ks, d_vs, d_out, T, scale);
                        }).wait();
+    }
+
+    if (!verify_output_finite(q, d_out, q_elements)) {
+        state.SkipWithError("Pre-flight numerical verification failed: non-finite output detected");
+        sycl::free(d_q, q); sycl::free(d_k, q); sycl::free(d_v, q);
+        sycl::free(d_ks, q); sycl::free(d_vs, q); sycl::free(d_out, q);
+        return;
     }
 
     for (auto _ : state) {
@@ -437,6 +459,13 @@ static void BM_Xe2_KV_Decode_FP16_SplitK(benchmark::State& state) {
                        [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
                            kv_decode_splitk_merge_kernel(item, d_part_max, d_part_sum, d_part_acc, d_out, num_splits);
                        }).wait();
+    }
+
+    if (!verify_output_finite(q, d_out, q_elements)) {
+        state.SkipWithError("Pre-flight numerical verification failed: non-finite output detected");
+        sycl::free(d_q, q); sycl::free(d_k, q); sycl::free(d_v, q);
+        sycl::free(d_part_max, q); sycl::free(d_part_sum, q); sycl::free(d_part_acc, q); sycl::free(d_out, q);
+        return;
     }
 
     for (auto _ : state) {
@@ -518,6 +547,13 @@ static void BM_Xe2_KV_Decode_INT8_SplitK(benchmark::State& state) {
                        [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
                            kv_decode_splitk_merge_kernel(item, d_part_max, d_part_sum, d_part_acc, d_out, num_splits);
                        }).wait();
+    }
+
+    if (!verify_output_finite(q, d_out, q_elements)) {
+        state.SkipWithError("Pre-flight numerical verification failed: non-finite output detected");
+        sycl::free(d_q, q); sycl::free(d_k, q); sycl::free(d_v, q);
+        sycl::free(d_part_max, q); sycl::free(d_part_sum, q); sycl::free(d_part_acc, q); sycl::free(d_out, q);
+        return;
     }
 
     for (auto _ : state) {

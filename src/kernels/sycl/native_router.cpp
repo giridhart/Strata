@@ -87,11 +87,13 @@ inline void route_token_k(const float* logits, int32_t* ids, float* weights, siz
         }
 #pragma unroll
         for (int mask = 16; mask; mask >>= 1) {
-            const float other = sycl::permute_group_by_xor(sg, best, mask);
-            const int other_id = sycl::permute_group_by_xor(sg, expert, mask);
-            if (other > best || (other == best && other_id < expert)) {
-                best = other;
-                expert = other_id;
+            if ((size_t)mask < sg.get_local_range()[0]) {
+                const float other = sycl::permute_group_by_xor(sg, best, mask);
+                const int other_id = sycl::permute_group_by_xor(sg, expert, mask);
+                if (other > best || (other == best && other_id < expert)) {
+                    best = other;
+                    expert = other_id;
+                }
             }
         }
         if ((expert & 31) == lane) {
@@ -149,11 +151,13 @@ void route_resident_k(const float* __restrict__ logits, int32_t* __restrict__ id
         }
 #pragma unroll
         for (int off = 16; off > 0; off >>= 1) {
-            const float ov = sycl::shift_group_left(sg, bv, off);
-            const int oi = sycl::shift_group_left(sg, bi, off);
-            if (ov > bv || (ov == bv && oi >= 0 && (bi < 0 || oi < bi))) {
-                bv = ov;
-                bi = oi;
+            if ((size_t)off < sg.get_local_range()[0]) {
+                const float ov = sycl::shift_group_left(sg, bv, off);
+                const int oi = sycl::shift_group_left(sg, bi, off);
+                if (ov > bv || (ov == bv && oi >= 0 && (bi < 0 || oi < bi))) {
+                    bv = ov;
+                    bi = oi;
+                }
             }
         }
         if (lane == 0 && bi >= 0 && l[e] - bv <= margin) {

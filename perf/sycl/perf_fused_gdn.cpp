@@ -25,6 +25,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <random>
 #include <vector>
 
 namespace {
@@ -32,6 +33,16 @@ namespace {
 constexpr int S = 128;
 constexpr int DEFAULT_HV = 16;
 constexpr int DEFAULT_HK = 16;
+
+bool verify_output_finite(sycl::queue& q, const float* d_out, size_t n) {
+    if (!d_out || n == 0) return true;
+    std::vector<float> h(n);
+    q.copy(d_out, h.data(), n).wait();
+    for (size_t i = 0; i < n; ++i) {
+        if (std::isnan(h[i]) || std::isinf(h[i])) return false;
+    }
+    return true;
+}
 
 // ============================================================================
 // GDN Computational Kernels
@@ -184,15 +195,59 @@ static void BM_Xe2_GDN_Unfused(benchmark::State& state) {
     auto* d_beta   = sycl::malloc_device<float>(h_v, q);
     auto* d_output = sycl::malloc_device<float>(out_elements, q);
 
-    q.fill(d_state, 0.01f, state_elements);
-    q.fill(d_q, 0.05f, qk_elements);
-    q.fill(d_k, 0.05f, qk_elements);
-    q.fill(d_v, 0.1f, out_elements);
-    q.fill(d_gate, -0.5f, h_v);
-    q.fill(d_beta, 0.8f, h_v);
-    q.wait();
+    if (!d_state || !d_q || !d_k || !d_v || !d_gate || !d_beta || !d_output) {
+        state.SkipWithError("USM allocation failure in BM_Xe2_GDN_Unfused");
+        if (d_state) sycl::free(d_state, q);
+        if (d_q) sycl::free(d_q, q);
+        if (d_k) sycl::free(d_k, q);
+        if (d_v) sycl::free(d_v, q);
+        if (d_gate) sycl::free(d_gate, q);
+        if (d_beta) sycl::free(d_beta, q);
+        if (d_output) sycl::free(d_output, q);
+        return;
+    }
+
+    std::mt19937 rng(1337 + h_v);
+    std::normal_distribution<float> dist(0.0f, 1.0f);
+    const float var_scale = 1.0f / std::sqrt((float)S);
+
+    std::vector<float> h_state(state_elements);
+    std::vector<float> h_q(qk_elements);
+    std::vector<float> h_k_vec(qk_elements);
+    std::vector<float> h_v_vec(out_elements);
+    std::vector<float> h_gate(h_v);
+    std::vector<float> h_beta(h_v);
+
+    for (auto& x : h_state) x = dist(rng) * 0.05f;
+    for (auto& x : h_q) x = dist(rng) * var_scale;
+    for (auto& x : h_k_vec) x = dist(rng) * var_scale;
+    for (auto& x : h_v_vec) x = dist(rng) * var_scale;
+    for (auto& x : h_gate) x = -0.1f * std::fabs(dist(rng));
+    for (auto& x : h_beta) x = 1.0f / (1.0f + std::exp(-dist(rng)));
+
+    q.copy(h_state.data(), d_state, state_elements).wait();
+    q.copy(h_q.data(), d_q, qk_elements).wait();
+    q.copy(h_k_vec.data(), d_k, qk_elements).wait();
+    q.copy(h_v_vec.data(), d_v, out_elements).wait();
+    q.copy(h_gate.data(), d_gate, h_v).wait();
+    q.copy(h_beta.data(), d_beta, h_v).wait();
+    q.fill(d_output, 0.0f, out_elements).wait();
 
     const float scale = 1.0f / std::sqrt((float)S);
+
+    // Pre-flight numerical verification:
+    q.parallel_for(sycl::nd_range<2>(sycl::range<2>(h_v * 4, (S / 4) * 16), sycl::range<2>(4, 16)),
+                   [=](sycl::nd_item<2> item) [[sycl::reqd_sub_group_size(16)]] {
+                       gdn_unfused_step_kernel<16>(item, d_state, d_q, d_k, d_v, d_gate, d_beta, d_output,
+                                                   h_k, h_v, scale);
+                   }).wait_and_throw();
+
+    if (!verify_output_finite(q, d_output, out_elements) || !verify_output_finite(q, d_state, state_elements)) {
+        state.SkipWithError("Pre-flight verification failed: non-finite output detected in BM_Xe2_GDN_Unfused");
+        sycl::free(d_state, q); sycl::free(d_q, q); sycl::free(d_k, q); sycl::free(d_v, q);
+        sycl::free(d_gate, q); sycl::free(d_beta, q); sycl::free(d_output, q);
+        return;
+    }
 
     // Warmup
     for (int w = 0; w < 5; ++w) {
@@ -231,6 +286,91 @@ static void BM_Xe2_GDN_Unfused(benchmark::State& state) {
 }
 
 // ============================================================================
+// Helper: GDN Buffers with Variance-Scaled Initialization
+// ============================================================================
+
+struct GDNBuffers {
+    float* d_state  = nullptr;
+    float* d_q      = nullptr;
+    float* d_k      = nullptr;
+    float* d_v      = nullptr;
+    float* d_gate   = nullptr;
+    float* d_beta   = nullptr;
+    float* d_z      = nullptr;
+    float* d_gamma  = nullptr;
+    float* d_y      = nullptr;
+    size_t state_elements = 0;
+    size_t qk_elements = 0;
+    size_t out_elements = 0;
+
+    bool allocate_and_init(sycl::queue& q, int h_v, int h_k, uint32_t seed) {
+        state_elements = (size_t)S * S * h_v;
+        qk_elements = (size_t)S * h_k;
+        out_elements = (size_t)S * h_v;
+
+        d_state  = sycl::malloc_device<float>(state_elements, q);
+        d_q      = sycl::malloc_device<float>(qk_elements, q);
+        d_k      = sycl::malloc_device<float>(qk_elements, q);
+        d_v      = sycl::malloc_device<float>(out_elements, q);
+        d_gate   = sycl::malloc_device<float>(h_v, q);
+        d_beta   = sycl::malloc_device<float>(h_v, q);
+        d_z      = sycl::malloc_device<float>(out_elements, q);
+        d_gamma  = sycl::malloc_device<float>(S, q);
+        d_y      = sycl::malloc_device<float>(out_elements, q);
+
+        if (!d_state || !d_q || !d_k || !d_v || !d_gate || !d_beta || !d_z || !d_gamma || !d_y) {
+            free(q);
+            return false;
+        }
+
+        std::mt19937 rng(seed);
+        std::normal_distribution<float> dist(0.0f, 1.0f);
+        const float var_scale = 1.0f / std::sqrt((float)S);
+
+        std::vector<float> h_state(state_elements);
+        std::vector<float> h_q(qk_elements);
+        std::vector<float> h_k_vec(qk_elements);
+        std::vector<float> h_v_vec(out_elements);
+        std::vector<float> h_gate(h_v);
+        std::vector<float> h_beta(h_v);
+        std::vector<float> h_z(out_elements);
+        std::vector<float> h_gamma(S);
+
+        for (auto& x : h_state) x = dist(rng) * 0.05f;
+        for (auto& x : h_q) x = dist(rng) * var_scale;
+        for (auto& x : h_k_vec) x = dist(rng) * var_scale;
+        for (auto& x : h_v_vec) x = dist(rng) * var_scale;
+        for (auto& x : h_gate) x = -0.1f * std::fabs(dist(rng));
+        for (auto& x : h_beta) x = 1.0f / (1.0f + std::exp(-dist(rng)));
+        for (auto& x : h_z) x = dist(rng);
+        for (auto& x : h_gamma) x = 1.0f + 0.1f * dist(rng);
+
+        q.copy(h_state.data(), d_state, state_elements).wait();
+        q.copy(h_q.data(), d_q, qk_elements).wait();
+        q.copy(h_k_vec.data(), d_k, qk_elements).wait();
+        q.copy(h_v_vec.data(), d_v, out_elements).wait();
+        q.copy(h_gate.data(), d_gate, h_v).wait();
+        q.copy(h_beta.data(), d_beta, h_v).wait();
+        q.copy(h_z.data(), d_z, out_elements).wait();
+        q.copy(h_gamma.data(), d_gamma, S).wait();
+        q.fill(d_y, 0.0f, out_elements).wait();
+        return true;
+    }
+
+    void free(sycl::queue& q) {
+        if (d_state) { sycl::free(d_state, q); d_state = nullptr; }
+        if (d_q)     { sycl::free(d_q, q); d_q = nullptr; }
+        if (d_k)     { sycl::free(d_k, q); d_k = nullptr; }
+        if (d_v)     { sycl::free(d_v, q); d_v = nullptr; }
+        if (d_gate)  { sycl::free(d_gate, q); d_gate = nullptr; }
+        if (d_beta)  { sycl::free(d_beta, q); d_beta = nullptr; }
+        if (d_z)     { sycl::free(d_z, q); d_z = nullptr; }
+        if (d_gamma) { sycl::free(d_gamma, q); d_gamma = nullptr; }
+        if (d_y)     { sycl::free(d_y, q); d_y = nullptr; }
+    }
+};
+
+// ============================================================================
 // Benchmark: BM_Xe2_GDN_Fused_SLM (Fused Step + Norm with Local Memory)
 // ============================================================================
 
@@ -240,29 +380,34 @@ static void BM_Xe2_GDN_Fused_SLM(benchmark::State& state) {
 
     sycl::queue q{sycl::default_selector_v, {sycl::property::queue::enable_profiling()}};
 
-    const size_t state_elements = (size_t)S * S * h_v;
-    const size_t qk_elements = (size_t)S * h_k;
-    const size_t out_elements = (size_t)S * h_v;
+    GDNBuffers buf;
+    if (!buf.allocate_and_init(q, h_v, h_k, 2026 + h_v)) {
+        state.SkipWithError("USM allocation failure in BM_Xe2_GDN_Fused_SLM");
+        return;
+    }
 
-    auto* d_state = sycl::malloc_device<float>(state_elements, q);
-    auto* d_q     = sycl::malloc_device<float>(qk_elements, q);
-    auto* d_k     = sycl::malloc_device<float>(qk_elements, q);
-    auto* d_v     = sycl::malloc_device<float>(out_elements, q);
-    auto* d_gate  = sycl::malloc_device<float>(h_v, q);
-    auto* d_beta  = sycl::malloc_device<float>(h_v, q);
-    auto* d_z     = sycl::malloc_device<float>(out_elements, q);
-    auto* d_gamma = sycl::malloc_device<float>(S, q);
-    auto* d_y     = sycl::malloc_device<float>(out_elements, q);
+    // Pre-flight numerical verification:
+    q.submit([&](sycl::handler& cgh) {
+        sycl::local_accessor<float, 1> sk(sycl::range<1>(S), cgh);
+        sycl::local_accessor<float, 1> sq(sycl::range<1>(S), cgh);
+        sycl::local_accessor<float, 2> red(sycl::range<2>(4, S), cgh);
+        sycl::local_accessor<float, 1> wsum(sycl::range<1>(32), cgh);
 
-    q.fill(d_state, 0.01f, state_elements);
-    q.fill(d_q, 0.05f, qk_elements);
-    q.fill(d_k, 0.05f, qk_elements);
-    q.fill(d_v, 0.1f, out_elements);
-    q.fill(d_gate, -0.5f, h_v);
-    q.fill(d_beta, 0.8f, h_v);
-    q.fill(d_z, 0.2f, out_elements);
-    q.fill(d_gamma, 1.0f, S);
-    q.wait();
+        cgh.parallel_for(sycl::nd_range<2>(sycl::range<2>(h_v, 512), sycl::range<2>(4, 128)),
+                         [=](sycl::nd_item<2> item) [[sycl::reqd_sub_group_size(16)]] {
+                             gdn_fused_step_norm_kernel(
+                                 buf.d_state, buf.d_q, buf.d_k, buf.d_v, buf.d_gate, buf.d_beta, buf.d_z, buf.d_gamma, 1e-5f, buf.d_y, h_k, h_v, item,
+                                 sk.get_multi_ptr<sycl::access::decorated::no>().get(),
+                                 sq.get_multi_ptr<sycl::access::decorated::no>().get(), red,
+                                 wsum.get_multi_ptr<sycl::access::decorated::no>().get());
+                         });
+    }).wait_and_throw();
+
+    if (!verify_output_finite(q, buf.d_y, buf.out_elements) || !verify_output_finite(q, buf.d_state, buf.state_elements)) {
+        state.SkipWithError("Pre-flight verification failed: non-finite output detected in BM_Xe2_GDN_Fused_SLM");
+        buf.free(q);
+        return;
+    }
 
     // Warmup
     for (int w = 0; w < 5; ++w) {
@@ -275,7 +420,7 @@ static void BM_Xe2_GDN_Fused_SLM(benchmark::State& state) {
             cgh.parallel_for(sycl::nd_range<2>(sycl::range<2>(h_v, 512), sycl::range<2>(4, 128)),
                              [=](sycl::nd_item<2> item) [[sycl::reqd_sub_group_size(16)]] {
                                  gdn_fused_step_norm_kernel(
-                                     d_state, d_q, d_k, d_v, d_gate, d_beta, d_z, d_gamma, 1e-5f, d_y, h_k, h_v, item,
+                                     buf.d_state, buf.d_q, buf.d_k, buf.d_v, buf.d_gate, buf.d_beta, buf.d_z, buf.d_gamma, 1e-5f, buf.d_y, h_k, h_v, item,
                                      sk.get_multi_ptr<sycl::access::decorated::no>().get(),
                                      sq.get_multi_ptr<sycl::access::decorated::no>().get(), red,
                                      wsum.get_multi_ptr<sycl::access::decorated::no>().get());
@@ -293,7 +438,7 @@ static void BM_Xe2_GDN_Fused_SLM(benchmark::State& state) {
             cgh.parallel_for(sycl::nd_range<2>(sycl::range<2>(h_v, 512), sycl::range<2>(4, 128)),
                              [=](sycl::nd_item<2> item) [[sycl::reqd_sub_group_size(16)]] {
                                  gdn_fused_step_norm_kernel(
-                                     d_state, d_q, d_k, d_v, d_gate, d_beta, d_z, d_gamma, 1e-5f, d_y, h_k, h_v, item,
+                                     buf.d_state, buf.d_q, buf.d_k, buf.d_v, buf.d_gate, buf.d_beta, buf.d_z, buf.d_gamma, 1e-5f, buf.d_y, h_k, h_v, item,
                                      sk.get_multi_ptr<sycl::access::decorated::no>().get(),
                                      sq.get_multi_ptr<sycl::access::decorated::no>().get(), red,
                                      wsum.get_multi_ptr<sycl::access::decorated::no>().get());
@@ -305,21 +450,13 @@ static void BM_Xe2_GDN_Fused_SLM(benchmark::State& state) {
         state.SetIterationTime((t1 - t0) * 1e-9);
     }
 
-    const double bytes_transferred = (double)(state_elements * 2 + qk_elements * 2 + out_elements * 3) * sizeof(float);
+    const double bytes_transferred = (double)(buf.state_elements * 2 + buf.qk_elements * 2 + buf.out_elements * 3) * sizeof(float);
     state.counters["Bandwidth_GBps"] = benchmark::Counter(bytes_transferred, benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
     state.counters["Heads_HV"]       = benchmark::Counter(h_v);
     state.counters["Heads_HK"]       = benchmark::Counter(h_k);
-    state.counters["State_MB"]       = benchmark::Counter(state_elements * sizeof(float) / 1e6);
+    state.counters["State_MB"]       = benchmark::Counter(buf.state_elements * sizeof(float) / 1e6);
 
-    sycl::free(d_state, q);
-    sycl::free(d_q, q);
-    sycl::free(d_k, q);
-    sycl::free(d_v, q);
-    sycl::free(d_gate, q);
-    sycl::free(d_beta, q);
-    sycl::free(d_z, q);
-    sycl::free(d_gamma, q);
-    sycl::free(d_y, q);
+    buf.free(q);
 }
 
 // ============================================================================
@@ -333,29 +470,34 @@ static void BM_Xe2_GDN_Fused_SLM_Padded(benchmark::State& state) {
 
     sycl::queue q{sycl::default_selector_v, {sycl::property::queue::enable_profiling()}};
 
-    const size_t state_elements = (size_t)S * S * h_v;
-    const size_t qk_elements = (size_t)S * h_k;
-    const size_t out_elements = (size_t)S * h_v;
+    GDNBuffers buf;
+    if (!buf.allocate_and_init(q, h_v, h_k, 3000 + PAD + h_v)) {
+        state.SkipWithError("USM allocation failure in BM_Xe2_GDN_Fused_SLM_Padded");
+        return;
+    }
 
-    auto* d_state = sycl::malloc_device<float>(state_elements, q);
-    auto* d_q     = sycl::malloc_device<float>(qk_elements, q);
-    auto* d_k     = sycl::malloc_device<float>(qk_elements, q);
-    auto* d_v     = sycl::malloc_device<float>(out_elements, q);
-    auto* d_gate  = sycl::malloc_device<float>(h_v, q);
-    auto* d_beta  = sycl::malloc_device<float>(h_v, q);
-    auto* d_z     = sycl::malloc_device<float>(out_elements, q);
-    auto* d_gamma = sycl::malloc_device<float>(S, q);
-    auto* d_y     = sycl::malloc_device<float>(out_elements, q);
+    // Pre-flight numerical verification:
+    q.submit([&](sycl::handler& cgh) {
+        sycl::local_accessor<float, 1> sk(sycl::range<1>(S), cgh);
+        sycl::local_accessor<float, 1> sq(sycl::range<1>(S), cgh);
+        sycl::local_accessor<float, 2> red(sycl::range<2>(4, S + PAD), cgh);
+        sycl::local_accessor<float, 1> wsum(sycl::range<1>(32), cgh);
 
-    q.fill(d_state, 0.01f, state_elements);
-    q.fill(d_q, 0.05f, qk_elements);
-    q.fill(d_k, 0.05f, qk_elements);
-    q.fill(d_v, 0.1f, out_elements);
-    q.fill(d_gate, -0.5f, h_v);
-    q.fill(d_beta, 0.8f, h_v);
-    q.fill(d_z, 0.2f, out_elements);
-    q.fill(d_gamma, 1.0f, S);
-    q.wait();
+        cgh.parallel_for(sycl::nd_range<2>(sycl::range<2>(h_v, 512), sycl::range<2>(4, 128)),
+                         [=](sycl::nd_item<2> item) [[sycl::reqd_sub_group_size(16)]] {
+                             gdn_fused_step_norm_kernel(
+                                 buf.d_state, buf.d_q, buf.d_k, buf.d_v, buf.d_gate, buf.d_beta, buf.d_z, buf.d_gamma, 1e-5f, buf.d_y, h_k, h_v, item,
+                                 sk.get_multi_ptr<sycl::access::decorated::no>().get(),
+                                 sq.get_multi_ptr<sycl::access::decorated::no>().get(), red,
+                                 wsum.get_multi_ptr<sycl::access::decorated::no>().get());
+                         });
+    }).wait_and_throw();
+
+    if (!verify_output_finite(q, buf.d_y, buf.out_elements) || !verify_output_finite(q, buf.d_state, buf.state_elements)) {
+        state.SkipWithError("Pre-flight verification failed: non-finite output detected in BM_Xe2_GDN_Fused_SLM_Padded");
+        buf.free(q);
+        return;
+    }
 
     // Warmup
     for (int w = 0; w < 5; ++w) {
@@ -368,7 +510,7 @@ static void BM_Xe2_GDN_Fused_SLM_Padded(benchmark::State& state) {
             cgh.parallel_for(sycl::nd_range<2>(sycl::range<2>(h_v, 512), sycl::range<2>(4, 128)),
                              [=](sycl::nd_item<2> item) [[sycl::reqd_sub_group_size(16)]] {
                                  gdn_fused_step_norm_kernel(
-                                     d_state, d_q, d_k, d_v, d_gate, d_beta, d_z, d_gamma, 1e-5f, d_y, h_k, h_v, item,
+                                     buf.d_state, buf.d_q, buf.d_k, buf.d_v, buf.d_gate, buf.d_beta, buf.d_z, buf.d_gamma, 1e-5f, buf.d_y, h_k, h_v, item,
                                      sk.get_multi_ptr<sycl::access::decorated::no>().get(),
                                      sq.get_multi_ptr<sycl::access::decorated::no>().get(), red,
                                      wsum.get_multi_ptr<sycl::access::decorated::no>().get());
@@ -386,7 +528,7 @@ static void BM_Xe2_GDN_Fused_SLM_Padded(benchmark::State& state) {
             cgh.parallel_for(sycl::nd_range<2>(sycl::range<2>(h_v, 512), sycl::range<2>(4, 128)),
                              [=](sycl::nd_item<2> item) [[sycl::reqd_sub_group_size(16)]] {
                                  gdn_fused_step_norm_kernel(
-                                     d_state, d_q, d_k, d_v, d_gate, d_beta, d_z, d_gamma, 1e-5f, d_y, h_k, h_v, item,
+                                     buf.d_state, buf.d_q, buf.d_k, buf.d_v, buf.d_gate, buf.d_beta, buf.d_z, buf.d_gamma, 1e-5f, buf.d_y, h_k, h_v, item,
                                      sk.get_multi_ptr<sycl::access::decorated::no>().get(),
                                      sq.get_multi_ptr<sycl::access::decorated::no>().get(), red,
                                      wsum.get_multi_ptr<sycl::access::decorated::no>().get());
@@ -398,22 +540,14 @@ static void BM_Xe2_GDN_Fused_SLM_Padded(benchmark::State& state) {
         state.SetIterationTime((t1 - t0) * 1e-9);
     }
 
-    const double bytes_transferred = (double)(state_elements * 2 + qk_elements * 2 + out_elements * 3) * sizeof(float);
+    const double bytes_transferred = (double)(buf.state_elements * 2 + buf.qk_elements * 2 + buf.out_elements * 3) * sizeof(float);
     state.counters["Bandwidth_GBps"] = benchmark::Counter(bytes_transferred, benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
     state.counters["Heads_HV"]       = benchmark::Counter(h_v);
     state.counters["Heads_HK"]       = benchmark::Counter(h_k);
     state.counters["Pad_Elements"]   = benchmark::Counter(PAD);
-    state.counters["State_MB"]       = benchmark::Counter(state_elements * sizeof(float) / 1e6);
+    state.counters["State_MB"]       = benchmark::Counter(buf.state_elements * sizeof(float) / 1e6);
 
-    sycl::free(d_state, q);
-    sycl::free(d_q, q);
-    sycl::free(d_k, q);
-    sycl::free(d_v, q);
-    sycl::free(d_gate, q);
-    sycl::free(d_beta, q);
-    sycl::free(d_z, q);
-    sycl::free(d_gamma, q);
-    sycl::free(d_y, q);
+    buf.free(q);
 }
 
 static void BM_Xe2_GDN_Fused_Production_StepNormSiLU(benchmark::State& state) {
@@ -422,59 +556,43 @@ static void BM_Xe2_GDN_Fused_Production_StepNormSiLU(benchmark::State& state) {
 
     sycl::queue q{sycl::default_selector_v, {sycl::property::queue::enable_profiling()}};
 
-    const size_t state_elements = (size_t)S * S * h_v;
-    const size_t qk_elements = (size_t)S * h_k;
-    const size_t out_elements = (size_t)S * h_v;
+    GDNBuffers buf;
+    if (!buf.allocate_and_init(q, h_v, h_k, 4000 + h_v)) {
+        state.SkipWithError("USM allocation failure in BM_Xe2_GDN_Fused_Production_StepNormSiLU");
+        return;
+    }
 
-    auto* d_state  = sycl::malloc_device<float>(state_elements, q);
-    auto* d_q      = sycl::malloc_device<float>(qk_elements, q);
-    auto* d_k      = sycl::malloc_device<float>(qk_elements, q);
-    auto* d_v      = sycl::malloc_device<float>(out_elements, q);
-    auto* d_gate   = sycl::malloc_device<float>(h_v, q);
-    auto* d_beta   = sycl::malloc_device<float>(h_v, q);
-    auto* d_z      = sycl::malloc_device<float>(out_elements, q);
-    auto* d_gamma  = sycl::malloc_device<float>(S, q);
-    auto* d_y      = sycl::malloc_device<float>(out_elements, q);
+    // Pre-flight numerical verification:
+    strata::kernels::fused_gdn_step_norm_silu(buf.d_state, buf.d_q, buf.d_k, buf.d_v, buf.d_gate, buf.d_beta, buf.d_z, buf.d_gamma, 1e-5f, buf.d_y, h_k, h_v, &q);
+    q.wait_and_throw();
 
-    q.fill(d_state, 0.01f, state_elements);
-    q.fill(d_q, 0.05f, qk_elements);
-    q.fill(d_k, 0.05f, qk_elements);
-    q.fill(d_v, 0.1f, out_elements);
-    q.fill(d_gate, -0.5f, h_v);
-    q.fill(d_beta, 0.8f, h_v);
-    q.fill(d_z, 0.2f, out_elements);
-    q.fill(d_gamma, 1.0f, S);
-    q.wait();
+    if (!verify_output_finite(q, buf.d_y, buf.out_elements) || !verify_output_finite(q, buf.d_state, buf.state_elements)) {
+        state.SkipWithError("Pre-flight verification failed: non-finite output detected in BM_Xe2_GDN_Fused_Production_StepNormSiLU");
+        buf.free(q);
+        return;
+    }
 
     // Warmup
     for (int w = 0; w < 5; ++w) {
-        strata::kernels::fused_gdn_step_norm_silu(d_state, d_q, d_k, d_v, d_gate, d_beta, d_z, d_gamma, 1e-5f, d_y, h_k, h_v, &q);
+        strata::kernels::fused_gdn_step_norm_silu(buf.d_state, buf.d_q, buf.d_k, buf.d_v, buf.d_gate, buf.d_beta, buf.d_z, buf.d_gamma, 1e-5f, buf.d_y, h_k, h_v, &q);
     }
     q.wait();
 
     for (auto _ : state) {
         auto t0 = std::chrono::steady_clock::now();
-        strata::kernels::fused_gdn_step_norm_silu(d_state, d_q, d_k, d_v, d_gate, d_beta, d_z, d_gamma, 1e-5f, d_y, h_k, h_v, &q);
+        strata::kernels::fused_gdn_step_norm_silu(buf.d_state, buf.d_q, buf.d_k, buf.d_v, buf.d_gate, buf.d_beta, buf.d_z, buf.d_gamma, 1e-5f, buf.d_y, h_k, h_v, &q);
         q.wait();
         auto t1 = std::chrono::steady_clock::now();
         state.SetIterationTime(std::chrono::duration<double>(t1 - t0).count());
     }
 
-    const double bytes_transferred = (double)(state_elements * 2 + qk_elements * 2 + out_elements * 3) * sizeof(float);
+    const double bytes_transferred = (double)(buf.state_elements * 2 + buf.qk_elements * 2 + buf.out_elements * 3) * sizeof(float);
     state.counters["Bandwidth_GBps"] = benchmark::Counter(bytes_transferred, benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
     state.counters["Heads_HV"]       = benchmark::Counter(h_v);
     state.counters["Heads_HK"]       = benchmark::Counter(h_k);
-    state.counters["State_MB"]       = benchmark::Counter(state_elements * sizeof(float) / 1e6);
+    state.counters["State_MB"]       = benchmark::Counter(buf.state_elements * sizeof(float) / 1e6);
 
-    sycl::free(d_state, q);
-    sycl::free(d_q, q);
-    sycl::free(d_k, q);
-    sycl::free(d_v, q);
-    sycl::free(d_gate, q);
-    sycl::free(d_beta, q);
-    sycl::free(d_z, q);
-    sycl::free(d_gamma, q);
-    sycl::free(d_y, q);
+    buf.free(q);
 }
 
 /// Prefill GDN Recurrence Benchmark: compares STRATA_GDN_XE (variant 6, 16-lane subgroup shuffle)
@@ -517,13 +635,43 @@ static void BM_Xe2_GDN_Prefill_Prompt_Recurrence_XE(benchmark::State& state) {
         return;
     }
 
-    q.fill(d_state, 0.01f, state_elements);
-    q.fill(d_h, 0.05f, h_elements);
-    q.fill(d_gate, -0.5f, gb_elements);
-    q.fill(d_beta, 0.8f, gb_elements);
-    q.fill(d_z, 0.2f, z_elements);
-    q.fill(d_gamma, 1.0f, S_P);
-    q.wait();
+    std::mt19937 rng(5000 + T + variant);
+    std::normal_distribution<float> dist(0.0f, 1.0f);
+    const float var_scale = 1.0f / std::sqrt((float)S_P);
+
+    std::vector<float> h_state(state_elements);
+    std::vector<float> h_h(h_elements);
+    std::vector<float> h_gate(gb_elements);
+    std::vector<float> h_beta(gb_elements);
+    std::vector<float> h_z(z_elements);
+    std::vector<float> h_gamma(S_P);
+
+    for (auto& x : h_state) x = dist(rng) * 0.05f;
+    for (auto& x : h_h) x = dist(rng) * var_scale;
+    for (auto& x : h_gate) x = -0.1f * std::fabs(dist(rng));
+    for (auto& x : h_beta) x = 1.0f / (1.0f + std::exp(-dist(rng)));
+    for (auto& x : h_z) x = dist(rng);
+    for (auto& x : h_gamma) x = 1.0f + 0.1f * dist(rng);
+
+    q.copy(h_state.data(), d_state, state_elements).wait();
+    q.copy(h_h.data(), d_h, h_elements).wait();
+    q.copy(h_gate.data(), d_gate, gb_elements).wait();
+    q.copy(h_beta.data(), d_beta, gb_elements).wait();
+    q.copy(h_z.data(), d_z, z_elements).wait();
+    q.copy(h_gamma.data(), d_gamma, S_P).wait();
+    q.fill(d_y, 0.0f, y_elements).wait();
+    q.fill(d_y16, (uint16_t)0, y_elements).wait();
+
+    // Pre-flight numerical verification:
+    strata::prefill::gdn_recurrence_variant(variant, d_state, d_h, d_gate, d_beta, d_z, d_gamma, 1e-6f, d_y, d_y16, T, &q);
+    q.wait_and_throw();
+
+    if (!verify_output_finite(q, d_y, y_elements) || !verify_output_finite(q, d_state, state_elements)) {
+        state.SkipWithError("Pre-flight verification failed: non-finite output detected in BM_Xe2_GDN_Prefill_Prompt_Recurrence_XE");
+        sycl::free(d_state, q); sycl::free(d_h, q); sycl::free(d_gate, q); sycl::free(d_beta, q);
+        sycl::free(d_z, q); sycl::free(d_gamma, q); sycl::free(d_y, q); sycl::free(d_y16, q);
+        return;
+    }
 
     // Warmup
     for (int w = 0; w < 3; ++w) {

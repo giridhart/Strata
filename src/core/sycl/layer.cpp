@@ -59,6 +59,43 @@ bool g_fast_attn = true;
 bool g_publish_kernel = true;
 bool g_fused_gdn = true;
 bool g_fast_select = true;
+
+// VFO (Verification-First Optimization) Automated Per-Layer NaN Probe
+// Enabled via STRATA_DBG_LAYER_NAN=1 or STRATA_DBG_NAN=1
+static bool vfo_check_nan(const char* stage, int64_t layer, const float* dev_ptr, size_t n, void* stream, std::string& err) {
+    static const int env_checked = []() {
+        const char* e = std::getenv("STRATA_DBG_LAYER_NAN");
+        if (e && (std::strcmp(e, "1") == 0 || std::strcmp(e, "true") == 0)) return 1;
+        const char* e2 = std::getenv("STRATA_DBG_NAN");
+        if (e2 && (std::strcmp(e2, "1") == 0 || std::strcmp(e2, "layer") == 0)) return 1;
+        return 0;
+    }();
+    if (!env_checked || !dev_ptr || n == 0) return true;
+
+    sycl::queue* q = stream ? static_cast<sycl::queue*>(stream) : &get_default_queue();
+    try {
+        q->wait_and_throw();
+        const size_t check_count = std::min(n, (size_t)65536);
+        std::vector<float> h(check_count);
+        q->memcpy(h.data(), dev_ptr, check_count * sizeof(float)).wait();
+
+        for (size_t i = 0; i < check_count; ++i) {
+            if (std::isnan(h[i]) || std::isinf(h[i])) {
+                char buf[512];
+                std::snprintf(buf, sizeof(buf),
+                              "[VFO PROBE] Non-finite value (%s) detected at Layer %lld, %s! Element index %zu of %zu (val: %f)",
+                              std::isnan(h[i]) ? "NaN" : "Inf", (long long)layer, stage, i, n, h[i]);
+                std::fprintf(stderr, "\n%s\n\n", buf);
+                err = buf;
+                return false;
+            }
+        }
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "[VFO PROBE] Exception while checking buffer at Layer %lld, %s: %s\n",
+                     (long long)layer, stage, e.what());
+    }
+    return true;
+}
 }  // namespace
 namespace {
 constexpr int Q8K_BYTES_PER_BLOCK = 292;
@@ -564,6 +601,8 @@ bool gdn_layer(const WeightTable& tables, const ModelGeometry& g, int64_t layer,
         err = v.name("gdn_out_norm") + ": " + error.what();
         return false;
     }
+    if (!vfo_check_nan("Stage 2: Recurrent State (fused_gdn_step_norm -> b.y)", layer, b.y, (size_t)g.ssm_value_dim, stream, err))
+        return false;
     st_end(layer, 14, stream);
     // ---- 8. out = ssm_out @ y, whose activation is whatever THIS layer's `ssm_out` asks for
     st_begin(layer, 15, stream);
@@ -572,6 +611,8 @@ bool gdn_layer(const WeightTable& tables, const ModelGeometry& g, int64_t layer,
     }
     if (!gemv_quantized(*w_out, p_out, f_out, b.y_q8_0, b.y_q8k, out, g.ssm_value_dim, g.n_embd,
                         v.name("ssm_out.weight"), stream, err, b.y))
+        return false;
+    if (!vfo_check_nan("Stage 5: GDN Dense Projection (ssm_out -> out)", layer, out, (size_t)g.n_embd, stream, err))
         return false;
     st_end(layer, 15, stream);
     return true;
@@ -1573,6 +1614,9 @@ bool qsa_layer(const WeightTable& tables, const ModelGeometry& g, int64_t layer,
         } else
             qsa_attend_step(b.qcur, b.k_scratch, b.v_scratch, st.step, cap, s, b.attn, nullptr, stream);
     }
+    if (!vfo_check_nan("Stage 1: Attention (qsa_attend / flash_attn -> b.attn)", layer, b.attn,
+                       (size_t)g.n_head * g.head_dim, stream, err))
+        return false;
     if (st.kv_rot || st.kv_hybrid)
         strata::kernels::fwht256_inplace_cuda(b.attn, g.n_head, stream);  // the output back: H is self-inverse
     dump_slot(dump, g, layer, b.attn, (uint64_t)2 * g.n_embd + 2 * g.hc, (uint64_t)g.n_head * g.head_dim, stream);
@@ -1604,6 +1648,8 @@ bool qsa_layer(const WeightTable& tables, const ModelGeometry& g, int64_t layer,
         s_gemv_q8k_split(b.attn_q8k, p_o.codes, p_o.scales, p_o.offset, out, g.n_head * g.head_dim, g.n_embd, f_o,
                          stream);
     }
+    if (!vfo_check_nan("Stage 5: Attention Dense Projection (attn_output -> out)", layer, out, (size_t)g.n_embd, stream, err))
+        return false;
     return true;
 }
 // ================================ THE DOORBELL ================================
@@ -1939,6 +1985,8 @@ bool block_layer_pre(const WeightTable& tables, const ModelGeometry& g, int64_t 
                     (const uint16_t*)w_inject[0]->data, RMS_EPS, gs, bb.gr, bb.mixed, bb.inject, stream);
         }
         st_end(layer, 0, stream);
+        if (!vfo_check_nan("Stage 3: Pre-Attn RMSNorm (bb.mixed)", layer, bb.mixed, (size_t)g.n_embd, stream, err))
+            return false;
         dump_half(bb, g, layer, bb.inject, 2 * g.n_embd, g.hc, stream);
     }
     if (run1) {
@@ -1950,12 +1998,16 @@ bool block_layer_pre(const WeightTable& tables, const ModelGeometry& g, int64_t 
             if (!gdn_layer(tables, g, layer, gb, bb.mixed, bb.block_out, stream, err)) return false;
         }
         st_end(layer, 1, stream);
+        if (!vfo_check_nan("Stage 1/2: Mixer Block Out (bb.block_out)", layer, bb.block_out, (size_t)g.n_embd, stream, err))
+            return false;
         dump_half(bb, g, layer, bb.block_out, 0, g.n_embd, stream);
     }
     if (run2) {
         st_begin(layer, 2, stream);
         if (!fused) gr_write(R, bb.block_out, bb.inject, gs, R, stream);
         st_end(layer, 2, stream);
+        if (!vfo_check_nan("Stage 3: Post-Mixer Residual (bb.R)", layer, bb.R, (size_t)g.n_embd, stream, err))
+            return false;
         // ---- half 2, UP TO AND INCLUDING THE ROUTER.  `gr_read` leaves the normed activation in `bb.mixed` and
         // the per-stream injection in `bb.inject`, and BOTH must survive until `block_layer_post` runs - which is
         // the contract the two functions have with each other and with the host loop's ordering.
@@ -1986,6 +2038,8 @@ bool block_layer_pre(const WeightTable& tables, const ModelGeometry& g, int64_t 
                     (const uint16_t*)w_inject[1]->data, RMS_EPS, gs, bb.gr, bb.mixed, bb.inject, stream);
         }
         st_end(layer, 3, stream);
+        if (!vfo_check_nan("Stage 3: Pre-FFN RMSNorm (bb.mixed)", layer, bb.mixed, (size_t)g.n_embd, stream, err))
+            return false;
     }
     if (run4) {
         st_begin(layer, 4, stream);
@@ -1996,6 +2050,9 @@ bool block_layer_pre(const WeightTable& tables, const ModelGeometry& g, int64_t 
         }
         // Plan v0.3 P3: after the ring, so the GPU computes the shared expert while the host runs the pool.
         if (g_shared_early && !moe_shared(tables, g, layer, mb, bb.mixed, stream, err)) return false;
+        if (g_shared_early && mb.shared &&
+            !vfo_check_nan("Stage 4: Shared Expert Early (mb.shared)", layer, mb.shared, (size_t)g.n_embd, stream, err))
+            return false;
     }
     // Every stage this call was asked to run has run.  There is no other way out: the old `return ok;`
     // lived inside the stage-4 block and restructuring that left the function with no return at all.
@@ -2052,6 +2109,8 @@ bool block_layer_post(const WeightTable& tables, const ModelGeometry& g, int64_t
                        : !moe_finish(tables, g, layer, k, mb, bb.mixed, parts, bb.block_out, stream, err))
         return false;
     st_end(layer, 5, stream);
+    if (!vfo_check_nan("Stage 4: MoE Output (bb.block_out)", layer, bb.block_out, (size_t)g.n_embd, stream, err))
+        return false;
     dump_half(bb, g, layer, bb.block_out, (uint64_t)g.n_embd, g.n_embd, stream);
     dump_half(bb, g, layer, bb.inject, (uint64_t)2 * g.n_embd + g.hc, g.hc, stream);
     st_begin(layer, 6, stream);
@@ -2075,6 +2134,8 @@ bool block_layer_post(const WeightTable& tables, const ModelGeometry& g, int64_t
         return false;
     }
     st_end(layer, 6, stream);
+    if (!vfo_check_nan("Stage 3: Post-FFN Residual (bb.R)", layer, bb.R, (size_t)g.n_embd, stream, err))
+        return false;
     return true;
 }
 bool block_layer(const WeightTable& tables, const ModelGeometry& g, int64_t layer, int64_t pos, int32_t pos_base,

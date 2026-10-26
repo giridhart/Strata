@@ -94,6 +94,8 @@ class ReportCalibrator:
         )
 
         for line in self.lines:
+            if any(bad in line for bad in ("ERROR", "[VERIFY-FAIL]", "SKIPPED", "failed")):
+                continue
             m = pattern.search(line)
             if m:
                 t_ctx = int(m.group(1))
@@ -151,6 +153,8 @@ class ReportCalibrator:
         dual_lat: Optional[float] = None
 
         for line in self.lines:
+            if any(bad in line for bad in ("ERROR", "[VERIFY-FAIL]", "SKIPPED", "failed")):
+                continue
             if "BM_Xe2_MoE_Separate_Gate_Up_SwiGLU/1" in line:
                 m = re.search(r"\|\s*([\d.]+)\s*(ns|µs|us|ms)", line)
                 if m:
