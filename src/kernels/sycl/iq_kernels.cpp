@@ -2209,9 +2209,7 @@ void expdec_gu_kernel(const unsigned long long* __restrict__ grp_ptr,
             for (int c = 0; c < n; ++c) ed_stage_entry<ED_XB, true>(s_u, s_ds, c, xq + (size_t)ent_tok[e + c] * ED_XB, tid);
             item_ct1.barrier(sycl::access::fence_space::local_space);
             for (int p = 0; p * 16 * R < rb; ++p) {
-                const int sw_warp_base = (tid >> 5) * 2;
-                const int row0_warp_base = row_base + p * 16 * R + sw_warp_base * R;
-                if (row0_warp_base >= nrow) break;
+                if (row_base + p * 16 * R >= nrow) break;
                 const int row0 = row_base + p * 16 * R + sw * R;
                 const bool valid_row = (row0 < nrow);
                 const bool is_up = row0 >= n_ff;
@@ -2399,9 +2397,7 @@ void expdec_down_kernel(const unsigned long long* __restrict__ grp_ptr,
             for (int c = 0; c < n; ++c) ed_stage_entry<ED_HB, TD == 42>(s_u, s_ds, c, hq + (size_t)(e + c) * ED_HB, tid);
             item_ct1.barrier(sycl::access::fence_space::local_space);
             for (int p = 0; p * RPP < rb; ++p) {
-                const int sw_warp_base = (tid / 32) * (32 / LANES);
-                const int row0_warp_base = row_base + p * RPP + sw_warp_base * R;
-                if (row0_warp_base >= nrow) break;
+                if (row_base + p * RPP >= nrow) break;
                 const int row0 = row_base + p * RPP + sw * R;
                 const bool valid_row = (row0 < nrow);
                 const uint8_t* wr[R];
