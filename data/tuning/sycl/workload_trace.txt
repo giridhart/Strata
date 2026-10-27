@@ -1,9 +1,9 @@
 # Captured kernel workload for Strata SYCL Autotuning
 STRATA_SYCL_WORKLOAD_V1
 # kernel_name n_in n_out code_bits group_elems act_kind
-bf16_gemv 2560 48 0 0 0
-bf16_gemv 2560 256 0 0 0
-s_gemv_q8k 2560 640 8 64 1
 bf16_gemv 2560 128 0 0 0
 bf16_gemv 2560 512 0 0 0
 bf16_gemv 2560 64 0 0 0
+s_gemv_q8k 2560 640 8 64 1
+bf16_gemv 2560 256 0 0 0
+bf16_gemv 2560 48 0 0 0

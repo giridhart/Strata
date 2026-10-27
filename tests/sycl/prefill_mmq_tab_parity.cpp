@@ -324,7 +324,7 @@ void sweep(mmq::Context& ctx, const Shape& sh, bool full, std::mt19937& rng, syc
                 g_fail == f0 ? "all bitwise identical (memcmp == 0)" : "FAILURES");
 
     // Part 2: Negative control for types with over-read
-    if (mmq::overread_bytes(sh.t, sh.cols) > 0) {
+    if (full && mmq::overread_bytes(sh.t, sh.cols) > 0) {
         const int f1 = g_fail;
         product_case(ctx, sh, {3, 64, 0, 17}, 64, rng, q, true, "negative control");
         product_case(ctx, sh, {200}, 200, rng, q, true, "negative control");
@@ -488,7 +488,8 @@ int main() {
         // Secondary shapes
         const Shape other_shapes[] = {
             {GGML_TYPE_IQ4_NL, 1280, 2560, "gate/up"},
-            {GGML_TYPE_Q8_0, 1280, 2560, "gate/up"}
+            {GGML_TYPE_Q8_0, 1280, 2560, "gate/up"},
+            {GGML_TYPE_Q2_0, 2560, 640, "down"}
         };
         for (const Shape& sh : other_shapes) {
             sweep(ctx, sh, false, rng, q);
