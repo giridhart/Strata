@@ -111,7 +111,12 @@ void sampler_greedy_kernel(sycl::nd_item<1> item, const float* __restrict__ logi
         }
     }
     auto sg = item.get_sub_group();
-    for (int off = 16; off > 0; off >>= 1) {
+    const int sg_size = (int)sg.get_local_range()[0];
+    const int sg_lane = (int)sg.get_local_id()[0];
+    const int sg_id = (int)sg.get_group_id()[0];
+    const int num_sgs = (int)sg.get_group_range()[0];
+
+    for (int off = sg_size / 2; off > 0; off >>= 1) {
         const float ov = sycl::shift_group_left(sg, bv, off);
         const int oi = sycl::shift_group_left(sg, best, off);
         if (ov > bv || (ov == bv && oi < best)) {
@@ -120,17 +125,23 @@ void sampler_greedy_kernel(sycl::nd_item<1> item, const float* __restrict__ logi
         }
     }
 
-    const int warp = (int)(item.get_local_id(0) >> 5), lane = (int)(item.get_local_id(0) & 31);
-    if (lane == 0) {
-        sv[warp] = bv;
-        si[warp] = best;
+    if (sg_lane == 0) {
+        sv[sg_id] = bv;
+        si[sg_id] = best;
     }
     sycl::group_barrier(item.get_group());
-    if (warp == 0) {
-        const int nw = (int)((item.get_local_range(0) + 31) >> 5);
-        float wv = lane < nw ? sv[lane] : sycl::bit_cast<float, int>(0xff800000);
-        int wi = lane < nw ? si[lane] : n_vocab;
-        for (int off = 16; off > 0; off >>= 1) {
+    if (sg_id == 0) {
+        float wv = sycl::bit_cast<float, int>(0xff800000);
+        int wi = n_vocab;
+        for (int i = sg_lane; i < num_sgs; i += sg_size) {
+            const float v = sv[i];
+            const int id = si[i];
+            if (v > wv || (v == wv && id < wi)) {
+                wv = v;
+                wi = id;
+            }
+        }
+        for (int off = sg_size / 2; off > 0; off >>= 1) {
             const float ov = sycl::shift_group_left(sg, wv, off);
             const int oi = sycl::shift_group_left(sg, wi, off);
             if (ov > wv || (ov == wv && oi < wi)) {
@@ -138,7 +149,7 @@ void sampler_greedy_kernel(sycl::nd_item<1> item, const float* __restrict__ logi
                 wi = oi;
             }
         }
-        if (lane == 0) out[t] = (wi < n_vocab) ? wi : 0;
+        if (sg_lane == 0) out[t] = (wi < n_vocab) ? wi : 0;
     }
 }
 
@@ -184,6 +195,11 @@ void sampler_kernel(sycl::nd_item<1> item, const float* __restrict__ logits, int
     if (k > n_vocab) k = n_vocab;
 
     auto sg = item.get_sub_group();
+    const int sg_size = (int)sg.get_local_range()[0];
+    const int sg_lane = (int)sg.get_local_id()[0];
+    const int sg_id = (int)sg.get_group_id()[0];
+    const int num_sgs = (int)sg.get_group_range()[0];
+
     for (int i = 0; i < k; ++i) {
         float bv = sycl::bit_cast<float, int>(0xff800000);  // -inf
         int best = n_vocab;
@@ -201,7 +217,7 @@ void sampler_kernel(sycl::nd_item<1> item, const float* __restrict__ logits, int
                 best = v;
             }
         }
-        for (int off = 16; off > 0; off >>= 1) {
+        for (int off = sg_size / 2; off > 0; off >>= 1) {
             const float ov = sycl::shift_group_left(sg, bv, off);
             const int oi = sycl::shift_group_left(sg, best, off);
             if (ov > bv || (ov == bv && oi < best)) {
@@ -209,17 +225,23 @@ void sampler_kernel(sycl::nd_item<1> item, const float* __restrict__ logits, int
                 best = oi;
             }
         }
-        const int warp = (int)(item.get_local_id(0) >> 5), lane = (int)(item.get_local_id(0) & 31);
-        if (lane == 0) {
-            sv[warp] = bv;
-            si[warp] = best;
+        if (sg_lane == 0) {
+            sv[sg_id] = bv;
+            si[sg_id] = best;
         }
         sycl::group_barrier(item.get_group());
-        if (warp == 0) {
-            const int nw = (int)((item.get_local_range(0) + 31) >> 5);
-            float wv = lane < nw ? sv[lane] : sycl::bit_cast<float, int>(0xff800000);
-            int wi = lane < nw ? si[lane] : n_vocab;
-            for (int off = 16; off > 0; off >>= 1) {
+        if (sg_id == 0) {
+            float wv = sycl::bit_cast<float, int>(0xff800000);
+            int wi = n_vocab;
+            for (int s = sg_lane; s < num_sgs; s += sg_size) {
+                const float v = sv[s];
+                const int id = si[s];
+                if (v > wv || (v == wv && id < wi)) {
+                    wv = v;
+                    wi = id;
+                }
+            }
+            for (int off = sg_size / 2; off > 0; off >>= 1) {
                 const float ov = sycl::shift_group_left(sg, wv, off);
                 const int oi = sycl::shift_group_left(sg, wi, off);
                 if (ov > wv || (ov == wv && oi < wi)) {
@@ -227,7 +249,7 @@ void sampler_kernel(sycl::nd_item<1> item, const float* __restrict__ logits, int
                     wi = oi;
                 }
             }
-            if (lane == 0) {
+            if (sg_lane == 0) {
                 sel_ids[i] = (wi < n_vocab) ? wi : 0;
                 sel_logit[i] = wv;
             }
@@ -299,8 +321,9 @@ inline void take_first(float& bv, int& bi, float ov, int oi) {
 }
 
 inline void warp_first(sycl::sub_group sg, float& bv, int& bi) {
+    const int sg_size = (int)sg.get_local_range()[0];
 #pragma unroll
-    for (int off = 16; off > 0; off >>= 1) {
+    for (int off = sg_size / 2; off > 0; off >>= 1) {
         const float ov = sycl::permute_group_by_xor(sg, bv, off);
         const int oi = sycl::permute_group_by_xor(sg, bi, off);
         take_first(bv, bi, ov, oi);
@@ -312,13 +335,14 @@ inline void sampled_tail_warp(sycl::sub_group sg, const int* sel_ids, const floa
                               const SamplerParams& p, int t, int* __restrict__ out, double* ex,
                               float* prob_out = nullptr) {
     const int lane = (int)sg.get_local_linear_id();
+    const int sg_size = (int)sg.get_local_range()[0];
     const float inv_t = p.temperature > 0.0f ? 1.0f / p.temperature : 0.0f;
     int n_keep = k;
     float mx = sel_logit[0];
     for (int i = 1; i < k; ++i)
         mx = sycl::fmax(mx, sel_logit[i]);
     if (p.top_p < 1.0f) {
-        for (int i = lane; i < k; i += 32)
+        for (int i = lane; i < k; i += sg_size)
             ex[i] = sycl::exp((double)sel_logit[i] - (double)mx);
         sycl::group_barrier(sg);
         double sum = 0.0;
@@ -327,7 +351,7 @@ inline void sampled_tail_warp(sycl::sub_group sg, const int* sel_ids, const floa
                 sum += ex[i];
         sum = sycl::select_from_group(sg, sum, 0);
         sycl::group_barrier(sg);
-        for (int i = lane; i < k; i += 32)
+        for (int i = lane; i < k; i += sg_size)
             ex[i] = ex[i] / sum;
         sycl::group_barrier(sg);
         int cut = k;
@@ -357,7 +381,7 @@ inline void sampled_tail_warp(sycl::sub_group sg, const int* sel_ids, const floa
     float smx = sel_logit[0] * inv_t;
     for (int i = 1; i < n_keep; ++i)
         smx = sycl::fmax(smx, sel_logit[i] * inv_t);
-    for (int i = lane; i < n_keep; i += 32)
+    for (int i = lane; i < n_keep; i += sg_size)
         ex[i] = sycl::exp((double)(sel_logit[i] * inv_t) - (double)smx);
     sycl::group_barrier(sg);
     double sum = 0.0;
@@ -366,7 +390,7 @@ inline void sampled_tail_warp(sycl::sub_group sg, const int* sel_ids, const floa
             sum += ex[i];
     sum = sycl::select_from_group(sg, sum, 0);
     sycl::group_barrier(sg);
-    for (int i = lane; i < n_keep; i += 32)
+    for (int i = lane; i < n_keep; i += sg_size)
         ex[i] = ex[i] / sum;
     sycl::group_barrier(sg);
     if (lane == 0) {
@@ -422,10 +446,13 @@ void sampler_one_block_kernel(sycl::nd_item<1> item, const float* __restrict__ l
     };
 
     const int k = sampled_k(p.top_k, n_vocab);
-    const int warp = (int)(item.get_local_id(0) >> 5), lane = (int)(item.get_local_id(0) & 31);
     float prev_v = sycl::bit_cast<float>(0x7f800000);
     int prev_i = -1;
     auto sg = item.get_sub_group();
+    const int sg_size = (int)sg.get_local_range()[0];
+    const int sg_lane = (int)sg.get_local_id()[0];
+    const int sg_id = (int)sg.get_group_id()[0];
+    const int num_sgs = (int)sg.get_group_range()[0];
 
     for (int i = 0; i < k; ++i) {
         float bv = sycl::bit_cast<float, int>(0xff800000);
@@ -437,7 +464,7 @@ void sampler_one_block_kernel(sycl::nd_item<1> item, const float* __restrict__ l
                 best = v;
             }
         }
-        for (int off = 16; off > 0; off >>= 1) {
+        for (int off = sg_size / 2; off > 0; off >>= 1) {
             const float ov = sycl::shift_group_left(sg, bv, off);
             const int oi = sycl::shift_group_left(sg, best, off);
             if (ov > bv || (ov == bv && oi < best)) {
@@ -445,16 +472,23 @@ void sampler_one_block_kernel(sycl::nd_item<1> item, const float* __restrict__ l
                 best = oi;
             }
         }
-        if (lane == 0) {
-            sv[warp] = bv;
-            si[warp] = best;
+        if (sg_lane == 0) {
+            sv[sg_id] = bv;
+            si[sg_id] = best;
         }
         sycl::group_barrier(item.get_group());
-        if (warp == 0) {
-            const int nw = (int)((item.get_local_range(0) + 31) >> 5);
-            float wv = lane < nw ? sv[lane] : sycl::bit_cast<float, int>(0xff800000);
-            int wi = lane < nw ? si[lane] : n_vocab;
-            for (int off = 16; off > 0; off >>= 1) {
+        if (sg_id == 0) {
+            float wv = sycl::bit_cast<float, int>(0xff800000);
+            int wi = n_vocab;
+            for (int s = sg_lane; s < num_sgs; s += sg_size) {
+                const float v = sv[s];
+                const int id = si[s];
+                if (v > wv || (v == wv && id < wi)) {
+                    wv = v;
+                    wi = id;
+                }
+            }
+            for (int off = sg_size / 2; off > 0; off >>= 1) {
                 const float ov = sycl::shift_group_left(sg, wv, off);
                 const int oi = sycl::shift_group_left(sg, wi, off);
                 if (ov > wv || (ov == wv && oi < wi)) {
@@ -462,7 +496,7 @@ void sampler_one_block_kernel(sycl::nd_item<1> item, const float* __restrict__ l
                     wi = oi;
                 }
             }
-            if (lane == 0) {
+            if (sg_lane == 0) {
                 sel_ids[i] = (wi < n_vocab) ? wi : 0;
                 sel_logit[i] = wv;
             }
@@ -471,7 +505,7 @@ void sampler_one_block_kernel(sycl::nd_item<1> item, const float* __restrict__ l
         prev_v = sel_logit[i];
         prev_i = sel_ids[i];
     }
-    if (warp != 0) return;
+    if (sg_id != 0) return;
     sampled_tail_warp(sg, sel_ids, sel_logit, k, p, t, out, ex);
 }
 
@@ -796,8 +830,8 @@ void sample_tokens(const float* logits, int n_tokens, int n_vocab, const int* hi
         const int gthreads = 1024;
         q->submit([&](sycl::handler& cgh) {
             sycl::local_accessor<unsigned int, 1> penal_acc(sycl::range<1>(shmem_words > 0 ? shmem_words : 1), cgh);
-            sycl::local_accessor<float, 1> sv_acc(sycl::range<1>(32), cgh);
-            sycl::local_accessor<int, 1> si_acc(sycl::range<1>(32), cgh);
+            sycl::local_accessor<float, 1> sv_acc(sycl::range<1>(64), cgh);
+            sycl::local_accessor<int, 1> si_acc(sycl::range<1>(64), cgh);
 
             cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t)n_tokens * gthreads), sycl::range<1>(gthreads)),
                              [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(32)]] {
@@ -815,8 +849,8 @@ void sample_tokens(const float* logits, int n_tokens, int n_vocab, const int* hi
             sycl::local_accessor<unsigned int, 1> penal_acc(sycl::range<1>(shmem_words > 0 ? shmem_words : 1), cgh);
             sycl::local_accessor<int, 1> sel_ids_acc(sycl::range<1>(64), cgh);
             sycl::local_accessor<float, 1> sel_logit_acc(sycl::range<1>(64), cgh);
-            sycl::local_accessor<float, 1> sv_acc(sycl::range<1>(32), cgh);
-            sycl::local_accessor<int, 1> si_acc(sycl::range<1>(32), cgh);
+            sycl::local_accessor<float, 1> sv_acc(sycl::range<1>(64), cgh);
+            sycl::local_accessor<int, 1> si_acc(sycl::range<1>(64), cgh);
 
             cgh.parallel_for(
                 sycl::nd_range<1>(sycl::range<1>((size_t)n_tokens * 1024), sycl::range<1>(1024)),
@@ -874,8 +908,8 @@ void sample_tokens(const float* logits, int n_tokens, int n_vocab, const int* hi
                 sycl::local_accessor<int, 1> sel_ids_acc(sycl::range<1>(kSelMax), cgh);
                 sycl::local_accessor<float, 1> sel_logit_acc(sycl::range<1>(kSelMax), cgh);
                 sycl::local_accessor<double, 1> ex_acc(sycl::range<1>(kSelMax), cgh);
-                sycl::local_accessor<float, 1> sv_acc(sycl::range<1>(32), cgh);
-                sycl::local_accessor<int, 1> si_acc(sycl::range<1>(32), cgh);
+                sycl::local_accessor<float, 1> sv_acc(sycl::range<1>(64), cgh);
+                sycl::local_accessor<int, 1> si_acc(sycl::range<1>(64), cgh);
 
                 cgh.parallel_for(
                     sycl::nd_range<1>(sycl::range<1>((size_t)n_tokens * 1024), sycl::range<1>(1024)),

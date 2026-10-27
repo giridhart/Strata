@@ -1583,8 +1583,12 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         sample_tokens(head_logits_, T, (int)n_vocab_, hist_d_, hist_len_, sp, m_out_, cs_);
         cs_->wait();  // m_out_ is the mapped h_out_: synced, it is readable
     }
-    for (int t = 0; t < T; ++t)
+    for (int t = 0; t < T; ++t) {
         out[t] = ((volatile int32_t*)h_out_)[t];
+        if (static const bool dbg = std::getenv("STRATA_DBG_VERIFY") != nullptr; dbg) {
+            std::fprintf(stderr, "strata dbg: verify pos0=%lld t=%d emitted token=%d\n", (long long)pos0, t, out[t]);
+        }
+    }
     note_nonfinite(T, nullptr);
     if (static const bool dbg = std::getenv("STRATA_DBG_NAN") != nullptr; dbg) {  // debug: the first non-finite head
         static bool reported = false;
