@@ -121,6 +121,48 @@ int main() {
         strata::host_free_polled(h_flag, q);
     }
 
+    // Test 4: Lean / Zero-Doorbell Graph Execution (STRATA_VERIFY_NO_HOST path)
+    {
+        uint32_t* h_out = (uint32_t*)strata::host_malloc_polled(sizeof(uint32_t), q);
+        *h_out = 0;
+
+        cudaStreamBeginCapture(&q, 0);
+        q.parallel_for(sycl::range<1>(1024), [=](sycl::id<1> idx) {
+            if (idx == 0) *h_out = 42u;
+        });
+        cudaGraph_t graph = nullptr;
+        cudaStreamEndCapture(&q, &graph);
+
+        cudaGraphExec_t exec = nullptr;
+        cudaGraphInstantiate(&exec, graph, 0);
+        cudaGraphDestroy(graph);
+
+        const auto t0 = std::chrono::steady_clock::now();
+        cudaGraphLaunch_mock(exec, &q);
+
+        // Host in lean mode does not poll doorbells; it waits for queue to empty
+        while (!q.ext_oneapi_empty()) {
+            if (std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() > 2000.0) {
+                std::printf("FAIL: Lean graph timed out waiting for completion\n");
+                total_failures++;
+                break;
+            }
+            std::this_thread::yield();
+        }
+        q.wait();
+
+        if (*h_out != 42u) {
+            std::printf("FAIL: Lean graph output mismatch (expected 42, got %u)\n", *h_out);
+            total_failures++;
+        } else {
+            const auto ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            std::printf("PASS: Lean zero-doorbell graph completed in %.1f ms\n", ms);
+        }
+
+        cudaGraphExecDestroy_mock(exec);
+        strata::host_free_polled(h_out, q);
+    }
+
     std::printf("\ndoorbell_handshake_test: %s (total failures: %d)\n",
                 total_failures == 0 ? "PASSED" : "FAILED", total_failures);
     return total_failures == 0 ? 0 : 1;

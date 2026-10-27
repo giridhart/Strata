@@ -507,6 +507,12 @@ const float* Verifier::final_R(int t) const { return R_ + (size_t)t * (size_t)(g
 // ================================ THE WINDOW, AS CAPTURED ================================
 //
 // Plan v0.3 P6 (split window): with `groups_ == 2` the window's tokens are cut into two groups A = [0, T/2 up) and
+bool Verifier::is_lean() const {
+    static const bool lean_env = [] { const char* v = std::getenv("STRATA_VERIFY_LEAN"); return !(v && v[0] == '0'); }();
+    static const bool no_host_env = [] { const char* v = std::getenv("STRATA_VERIFY_NO_HOST"); return v && *v && std::strcmp(v, "0") != 0; }();
+    return lean_env && no_host_env && device_plan_ && !batch_rec_;
+}
+
 // B = the rest, and the stream is ordered
 //
 //     pre(0,A) pre(0,B) | post(0,A) pre(1,A) | post(0,B) pre(1,B) | post(1,A) pre(2,A) | ...
@@ -536,9 +542,7 @@ bool Verifier::record_window(int T, sycl::queue* cs, std::string& err) try {
         return v == nullptr || std::atoi(v) != 0;
     }();
     static const bool g_no_batch_kv = std::getenv("STRATA_NO_BATCH_KV_STEP") != nullptr;
-    static const bool lean_env = [] { const char* v = std::getenv("STRATA_VERIFY_LEAN"); return !(v && v[0] == '0'); }();
-    static const bool no_host_env = [] { const char* v = std::getenv("STRATA_VERIFY_NO_HOST"); return v && *v && std::strcmp(v, "0") != 0; }();
-    const bool lean = lean_env && no_host_env && device_plan_ && !batch_rec_;
+    const bool lean = is_lean();
     auto stamp = [&](int64_t l, int i, int grp) {
         if (prof_on_ && grp == 0) gpu_stamp(prof_, (int)(l * kProfPer + i), cs);
     };
@@ -1443,7 +1447,8 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     const int gtb[2] = {0, (T + 1) / 2}, gte[2] = {G == 2 ? (T + 1) / 2 : T, T};
     const int64_t steps = (le_ - lb_) * G;
     const bool test_stall = g_test_stall > 0 && windows + 1 == g_test_stall;  // #267 test hook (off: false)
-    for (int64_t k = 0; k < steps; ++k) {
+    const bool lean = is_lean();
+    for (int64_t k = 0; (!lean || test_stall) && k < steps; ++k) {
         const int64_t l = lb_ + k / G;
         const int grp = (int)(k % G);
         const uint32_t want = (uint32_t)(k + 1);
@@ -1462,6 +1467,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
                     is_empty = cs_->ext_oneapi_empty();
                 } catch (...) {
                 }
+                std::atomic_thread_fence(std::memory_order_seq_cst);
                 if (is_empty && *seq < want) {
                     err = "verify: layer " + std::to_string(l) + " never rang";
                     return false;
@@ -1500,6 +1506,9 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         ms_wait += std::chrono::duration<double, std::milli>(b - a).count();
         ms_pool += ms_since(b);
     }
+    if (lean && !test_stall) {
+        cur_layer_ = (uint32_t)(steps > 0 ? steps - 1 : 0);
+    }
     progress_at("verify window: waiting for the GPU to finish the window (flags A/B/M raised)", (int64_t)T);
     const auto t_wait_start = Clock::now();
     while (true) {
@@ -1515,6 +1524,15 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         }
         _mm_pause();
         std::this_thread::yield();
+    }
+    try {
+        cs_->wait();
+    } catch (const sycl::exception& e) {
+        err = std::string("verify: GPU execution failed: ") + e.what();
+        return false;
+    }
+    if (lean && !test_stall) {
+        ms_wait += std::chrono::duration<double, std::milli>(Clock::now() - t_wait_start).count();
     }
     progress_at("verify window: waiting for the expert copies", (int64_t)T);
     copy_->wait();             // no host function of this window may raise flag B in the next one
