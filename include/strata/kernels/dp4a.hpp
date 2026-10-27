@@ -53,7 +53,11 @@ inline int strata_dp4a(const int a, const int b, const int c) {
 /// contract, and only pre-Volta CUDA has no `__nanosleep` at all.
 #if defined(STRATA_ENABLE_SYCL) || (!defined(__CUDACC__) && !defined(__HIPCC__))
 inline void strata_spin_pause() {
-    // SYCL / host: bounded spin is the backoff
+    // SYCL / host: bounded spin with device delay loop matching __nanosleep
+#if defined(__SYCL_DEVICE_ONLY__)
+    volatile int dummy = 0;
+    for (int i = 0; i < 256; ++i) { dummy = dummy + 1; }
+#endif
 }
 #else
 __device__ __forceinline__ void strata_spin_pause() {
