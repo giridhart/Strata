@@ -73,6 +73,10 @@ float block_sum(float v, float* sh) {
     return sh[0];
 }
 void check(const char* what) { (void)what; }
+inline sycl::queue& get_default_queue() {
+    static sycl::queue q{sycl::default_selector_v, sycl::property::queue::in_order()};
+    return q;
+}
 unsigned blocks_for(int64_t n, int t = 256) { return (unsigned)((n + t - 1) / t); }
 
 // ---------------------------------------------------------------- hyper-connection
@@ -837,6 +841,25 @@ void moe_combine_kernel(const float* __restrict__ Dm, const int32_t* __restrict_
     }
     bo[i] = s + shared[i] * sigm(sg[t]);
 }
+void moe_shared_init_kernel(const float* __restrict__ shared, const float* __restrict__ sg,
+                            float* __restrict__ acc, int64_t T) {
+    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    const int64_t i = (int64_t)item_ct1.get_group(2) * item_ct1.get_local_range(2) + item_ct1.get_local_id(2);
+    if (i >= T * N) return;
+    acc[i] = shared[i] * sigm(sg[i / N]);
+}
+void moe_scatter_add_kernel(const float* __restrict__ Dm, const int32_t* __restrict__ u_tok,
+                            const int32_t* __restrict__ u_off, const int32_t* __restrict__ u_rows,
+                            const float* __restrict__ u_w, float* __restrict__ acc) {
+    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    const int64_t u = (int64_t)item_ct1.get_group(1);
+    const int64_t d = (int64_t)item_ct1.get_group(2) * item_ct1.get_local_range(2) + item_ct1.get_local_id(2);
+    if (d >= N) return;
+    float s = 0.0f;
+    for (int32_t j = u_off[u]; j < u_off[u + 1]; ++j)
+        s = sycl::fma(u_w[j], Dm[(int64_t)u_rows[j] * N + d], s);
+    acc[(int64_t)u_tok[u] * N + d] += s;
+}
 
 // ---------------------------------------------------------------- QSA helpers
 void rms_rows_kernel(float* __restrict__ x, const float* __restrict__ w, int64_t cols, int64_t ld, float eps,
@@ -1264,6 +1287,53 @@ void gdn_recurrence(float* state, const float* h, const float* gate, const float
     const int v = (!serial && gdn_xe_on(stream)) ? 6 : 0;
     gdn_recurrence_variant(v, state, h, gate, beta, z, gamma, eps, y, y16, T, stream, ldy);
 }
+void gdn_recurrence_state_only(float* state, const float* h, const float* gate, const float* beta, float* y,
+                               int64_t T, void* stream) {
+    if (T <= 0) return;
+    auto* q = stream ? static_cast<sycl::queue*>(stream) : &get_default_queue();
+    static const bool serial = std::getenv("STRATA_GDN_REC_HEADS") != nullptr;
+    const bool xe = !serial && gdn_xe_on(q);
+    if (xe) {
+        detail::gdn_xe_launch(*q, state, h, gate, beta, y, T);
+    } else {
+        static const bool pipe = [] {
+            const char* v = std::getenv("STRATA_GDN_PIPELINE");
+            return v == nullptr || std::atoi(v) != 0;
+        }();
+        if (pipe)
+            q->submit([&](sycl::handler& cgh) {
+                sycl::local_accessor<float, 1> sk_acc_ct1(sycl::range<1>(128 /*S*/), cgh);
+                sycl::local_accessor<float, 1> sq_acc_ct1(sycl::range<1>(128 /*S*/), cgh);
+                sycl::local_accessor<float[4 /*RG*/][32 /*CB*/], 0> red_acc_ct1(cgh);
+
+                cgh.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, HV * NCB) * sycl::range<3>(1, RG, CB),
+                                                   sycl::range<3>(1, RG, CB)),
+                                 [=](sycl::nd_item<3> /*item_ct1*/) {
+                                     gdn_rec_cols_pipe_kernel(
+                                         state, h, gate, beta, y, T,
+                                         sk_acc_ct1.get_multi_ptr<sycl::access::decorated::no>().get(),
+                                         sq_acc_ct1.get_multi_ptr<sycl::access::decorated::no>().get(), red_acc_ct1);
+                                 });
+            });
+        else
+            q->submit([&](sycl::handler& cgh) {
+                sycl::local_accessor<float, 1> sk_acc_ct1(sycl::range<1>(128 /*S*/), cgh);
+                sycl::local_accessor<float, 1> sq_acc_ct1(sycl::range<1>(128 /*S*/), cgh);
+                sycl::local_accessor<float[4 /*RG*/][32 /*CB*/], 0> red_acc_ct1(cgh);
+
+                cgh.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, HV * NCB) * sycl::range<3>(1, RG, CB),
+                                                   sycl::range<3>(1, RG, CB)),
+                                 [=](sycl::nd_item<3> /*item_ct1*/) {
+                                     gdn_rec_cols_kernel(state, h, gate, beta, y, T,
+                                                         sk_acc_ct1.get_multi_ptr<sycl::access::decorated::no>().get(),
+                                                         sq_acc_ct1.get_multi_ptr<sycl::access::decorated::no>().get(),
+                                                         red_acc_ct1);
+                                 });
+            });
+    }
+    check("gdn_recurrence_state_only");
+    if (!stream) q->wait();
+}
 void route(const float* logits, int32_t* ids, float* weights, int64_t T, int64_t n_expert, void* stream) {
     if (n_expert == 512)
         static_cast<sycl::queue*>(stream)->parallel_for(
@@ -1342,6 +1412,27 @@ void moe_combine(const float* Dm, const int32_t* slot, const float* w, const flo
                           sycl::range<3>(1, 1, 256)),
         [=](sycl::nd_item<3> /*item_ct1*/) { moe_combine_kernel(Dm, slot, w, shared, sg, bo, T, row_sd); });
     check("moe_combine");
+}
+void moe_shared_init(const float* shared, const float* sg, float* acc, int64_t T, void* stream) {
+    if (T <= 0) return;
+    auto* q = stream ? static_cast<sycl::queue*>(stream) : &get_default_queue();
+    q->parallel_for(
+        sycl::nd_range<3>(sycl::range<3>(1, 1, blocks_for(T * N)) * sycl::range<3>(1, 1, 256),
+                          sycl::range<3>(1, 1, 256)),
+        [=](sycl::nd_item<3> /*item_ct1*/) { moe_shared_init_kernel(shared, sg, acc, T); });
+    check("moe_shared_init");
+    if (!stream) q->wait();
+}
+void moe_scatter_add(const float* Dm, const int32_t* u_tok, const int32_t* u_off, const int32_t* u_rows,
+                     const float* u_w, int64_t n_u, float* acc, void* stream) {
+    if (n_u <= 0) return;
+    auto* q = stream ? static_cast<sycl::queue*>(stream) : &get_default_queue();
+    q->parallel_for(
+        sycl::nd_range<3>(sycl::range<3>(1, (unsigned)n_u, blocks_for(N)) * sycl::range<3>(1, 1, 256),
+                          sycl::range<3>(1, 1, 256)),
+        [=](sycl::nd_item<3> /*item_ct1*/) { moe_scatter_add_kernel(Dm, u_tok, u_off, u_rows, u_w, acc); });
+    check("moe_scatter_add");
+    if (!stream) q->wait();
 }
 void rms_rows(float* x, const float* w, int64_t rows, int64_t cols, int64_t ld, float eps, void* stream) {
     if (rows <= 0) return;
