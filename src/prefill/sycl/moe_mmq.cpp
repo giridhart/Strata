@@ -51,6 +51,27 @@ inline int get_int_b2(const void* x, const int& i32) {
 
 inline int get_int_b4(const void* x, const int& i32) { return ((const int*)x)[i32]; }
 
+inline unsigned int byte_permute(unsigned int a, unsigned int b, unsigned int s) {
+    const uint64_t v = ((uint64_t)b << 32) | a;
+    return (unsigned int)((((v >> ((s & 0x7) * 8)) & 0xff)) | ((((v >> (((s >> 4) & 0x7) * 8)) & 0xff) << 8)) |
+                          ((((v >> (((s >> 8) & 0x7) * 8)) & 0xff) << 16)) |
+                          ((((v >> (((s >> 12) & 0x7) * 8)) & 0xff) << 24)));
+}
+
+inline sycl::int2 get_int_from_table_16(const int& q4, const int8_t* table) {
+    const uint32_t* table32 = (const uint32_t*)table;
+    uint32_t tmp[2];
+    const uint32_t low_high_selection_indices = (0x32103210 | ((q4 & 0x88888888) >> 1));
+#pragma unroll
+    for (uint32_t i = 0; i < 2; ++i) {
+        const uint32_t shift = 16 * i;
+        const uint32_t low = byte_permute(table32[0], table32[1], q4 >> shift);
+        const uint32_t high = byte_permute(table32[2], table32[3], q4 >> shift);
+        tmp[i] = byte_permute(low, high, low_high_selection_indices >> shift);
+    }
+    return sycl::int2(byte_permute(tmp[0], tmp[1], 0x6420), byte_permute(tmp[0], tmp[1], 0x7531));
+}
+
 inline float vec_dot_q8_0_q8_1(const void* __restrict__ vbq, const block_q8_1* __restrict__ bq8_1, const int& kbx) {
     const block_q8_0* bq8_0 = (const block_q8_0*)vbq + kbx;
     int sumi = 0;
@@ -72,12 +93,9 @@ inline float vec_dot_iq4_nl_q8_1(const void* __restrict__ vbq, const block_q8_1*
 #pragma unroll
     for (int l = 0; l < 2; ++l) {
         const int aux_q4 = get_int_b2(bq4->qs, iqs + l);
-        int v0 = (int)kvalues_iq4nl[aux_q4 & 0x0F] | ((int)kvalues_iq4nl[(aux_q4 >> 4) & 0x0F] << 8) |
-                 ((int)kvalues_iq4nl[(aux_q4 >> 8) & 0x0F] << 16) | ((int)kvalues_iq4nl[(aux_q4 >> 12) & 0x0F] << 24);
-        int v1 = (int)kvalues_iq4nl[(aux_q4 >> 16) & 0x0F] | ((int)kvalues_iq4nl[(aux_q4 >> 20) & 0x0F] << 8) |
-                 ((int)kvalues_iq4nl[(aux_q4 >> 24) & 0x0F] << 16) | ((int)kvalues_iq4nl[(aux_q4 >> 28) & 0x0F] << 24);
-        sumi = dp4a(v0, q8[l + 0], sumi);
-        sumi = dp4a(v1, q8[l + 4], sumi);
+        const sycl::int2 v = get_int_from_table_16(aux_q4, kvalues_iq4nl);
+        sumi = dp4a(v.x(), q8[l + 0], sumi);
+        sumi = dp4a(v.y(), q8[l + 4], sumi);
     }
     const float d =
         sycl::vec<sycl::half, 1>(bq4->d).convert<float, sycl::rounding_mode::automatic>()[0] *
@@ -147,14 +165,11 @@ inline float vec_dot_iq4_xs_q8_1(const void* __restrict__ vbq, const block_q8_1*
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
         const int aux_q4 = get_int_b4(bq4->qs, iqs + j);
-        int v0 = (int)kvalues_iq4nl[aux_q4 & 0x0F] | ((int)kvalues_iq4nl[(aux_q4 >> 4) & 0x0F] << 8) |
-                 ((int)kvalues_iq4nl[(aux_q4 >> 8) & 0x0F] << 16) | ((int)kvalues_iq4nl[(aux_q4 >> 12) & 0x0F] << 24);
-        int v1 = (int)kvalues_iq4nl[(aux_q4 >> 16) & 0x0F] | ((int)kvalues_iq4nl[(aux_q4 >> 20) & 0x0F] << 8) |
-                 ((int)kvalues_iq4nl[(aux_q4 >> 24) & 0x0F] << 16) | ((int)kvalues_iq4nl[(aux_q4 >> 28) & 0x0F] << 24);
+        const sycl::int2 v = get_int_from_table_16(aux_q4, kvalues_iq4nl);
         const int u0 = get_int_b4(bq8_1[iqs / 4].qs, j + 0);
         const int u1 = get_int_b4(bq8_1[iqs / 4].qs, j + 4);
-        sumi = dp4a(v0, u0, sumi);
-        sumi = dp4a(v1, u1, sumi);
+        sumi = dp4a(v.x(), u0, sumi);
+        sumi = dp4a(v.y(), u1, sumi);
     }
     const int ls = ((bq4->scales_l[iqs / 8] >> (iqs & 0x04)) & 0x0F) | (((bq4->scales_h >> (iqs / 2)) & 0x03) << 4);
     sumi *= ls - 32;
@@ -328,6 +343,7 @@ void mmq_kernel(const int64_t total_rows, const int64_t w_rows, const int64_t w_
             const int n_blocks = ((int)(w_cols + 255) / 256) * 8;
             for (int b = 0; b < n_blocks; ++b) {
                 dot += vec_dot_iq4_nl_q8_1(w_row, x_row + b, b, 0);
+                dot += vec_dot_iq4_nl_q8_1(w_row, x_row + b, b, 2);
             }
             break;
         }
