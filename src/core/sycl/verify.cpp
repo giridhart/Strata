@@ -464,7 +464,8 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     // exact, but neutral on RIBPC 1-2 GPUs: off by default)
     {
         const char* v = std::getenv("STRATA_VERIFY_DEVICE_PLAN");
-        device_plan_ = v != nullptr && std::atoi(v) != 0;
+        const char* nh = std::getenv("STRATA_VERIFY_NO_HOST");
+        device_plan_ = (v != nullptr && std::atoi(v) != 0) || (nh != nullptr && *nh && std::strcmp(nh, "0") != 0);
     }
     if (device_plan_) {
         bool ok2 = true;
