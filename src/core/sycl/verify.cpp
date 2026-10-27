@@ -3,6 +3,8 @@
 #include <sycl/sycl.hpp>
 #include "strata/core/verify.hpp"
 #include "strata/core/sycl_doorbell.hpp"
+#include "strata/core/defaults_026.hpp"
+#include "strata/core/sm120_series.hpp"
 
 namespace {
 inline sycl::queue& get_default_queue() {
@@ -76,6 +78,57 @@ const bool g_dbg = std::getenv("STRATA_VERIFY_DEBUG") != nullptr;
             std::fflush(stderr);                              \
         }                                                     \
     } while (0)
+
+// STRATA_ROUTE_PRIOR=lambda: residency-biased routing on discrete GPUs <= 13 GiB
+inline float g_route_prior(sycl::queue* q = nullptr) {
+    static const char* const env_s = std::getenv("STRATA_ROUTE_PRIOR");
+    static const float env = env_s ? (float)std::atof(env_s) : 0.0f;
+    if (env_s != nullptr) return env;
+
+    static float cached_prior = -1.0f;
+    if (cached_prior >= 0.0f) return cached_prior;
+
+    try {
+        sycl::queue& target_q = (q != nullptr) ? *q : get_default_queue();
+        auto dev = target_q.get_device();
+#if defined(__clang__) || defined(__INTEL_LLVM_COMPILER)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+#endif
+        bool is_integrated = !dev.is_gpu() || dev.get_info<sycl::info::device::host_unified_memory>();
+#if defined(__clang__) || defined(__INTEL_LLVM_COMPILER)
+#pragma clang diagnostic pop
+#endif
+        double total_bytes = (double)dev.get_info<sycl::info::device::global_mem_size>();
+        cached_prior = strata::route_prior_default(false, is_integrated, total_bytes, strata::qwen_defaults_026());
+    } catch (...) {
+        cached_prior = 0.0f;
+    }
+    return cached_prior;
+}
+
+// STRATA_SELECT_LONG=1 (opt-in): decode select past select_long_at() cells takes long-context QSA select
+inline bool select_long_on() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_SELECT_LONG");
+        if (v == nullptr || v[0] != '1') return false;
+        if (strata::kernels::qsa_topk_multi_scratch_ints(1) <= 0) {
+            std::fprintf(stderr, "strata verify: STRATA_SELECT_LONG=1 needs the SYCL multi-CTA kernels; ignored\n");
+            return false;
+        }
+        return true;
+    }();
+    return on;
+}
+
+// STRATA_SELECT_LONG_AT: threshold in cells (default 65536; 0: always)
+inline int64_t select_long_at() {
+    static const int64_t at = [] {
+        const char* v = std::getenv("STRATA_SELECT_LONG_AT");
+        return v != nullptr && v[0] != 0 ? (int64_t)std::atoll(v) : (int64_t)65536;
+    }();
+    return at;
+}
 
 struct Bump {
     uint8_t* base = nullptr;
@@ -249,6 +302,12 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
                                         // GPU: its streams, graphs and
                                         // buffers live there
     strata::kernels::fused_gr_check();  // once per card: which bitwise-equal hyper-connection read runs there
+    {   // once per card, here: record_window reads the cached value
+        const float rp = g_route_prior();
+        if (rp > 0.0f && std::getenv("STRATA_ROUTE_PRIOR") == nullptr)
+            std::fprintf(stderr, "strata verify: residency-biased routing is on by default on this card (STRATA_ROUTE_PRIOR=%.1f: a card of 13 GiB "
+                                 "or less; it changes which experts run; STRATA_ROUTE_PRIOR=0 turns it off)\n", (double) rp);
+    }
     wt_ = &wt;
     g_ = &g;
     ss_ = &ss;
@@ -377,6 +436,8 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         qidx_ = b.take<float>(T * IQ * ID);
         scores_ = b.take<float>(T * (uint64_t)max_blocks_);
         sel_ = b.take<int32_t>(T * (uint64_t)cap_);
+        if (select_long_on() && strata::kernels::qsa_topk_multi_scratch_ints(T) > 0)
+            topk_scratch_ = b.take<int32_t>(strata::kernels::qsa_topk_multi_scratch_ints(T));
         attn_ = b.take<float>(T * NH * HD);
         attn32_ = b.take<float>(T * NH * HD);
         attn_scratch_ = b.take<float>(T * (uint64_t)attn_scratch_floats_);
@@ -882,10 +943,17 @@ bool Verifier::record_window(int T, sycl::queue* cs, std::string& err) try {
                     }
                 }
                 stamp(l, 10, grp);
-                qsa_block_scores(st.idx_pooled, st.idx_dead, qidx_ + tb * IQ * ID, step_ + tb * kStepCount, n,
-                                 max_blocks_, s, scores_ + (size_t)tb * max_blocks_, cs);
-                qsa_block_topk(scores_ + (size_t)tb * max_blocks_, step_ + tb * kStepCount, n, max_blocks_, cap_, s,
-                               sel_ + (size_t)tb * cap_, cs);
+                if (sel_long_) {
+                    qsa_block_scores_long(st.idx_pooled, st.idx_dead, qidx_ + tb * IQ * ID, step_ + tb * kStepCount, n,
+                                          max_blocks_, s, scores_ + (size_t)tb * max_blocks_, cs, -1);
+                    qsa_block_topk_long(scores_ + (size_t)tb * max_blocks_, step_ + tb * kStepCount, n, max_blocks_,
+                                        cap_, s, sel_ + (size_t)tb * cap_, cs, -1, topk_scratch_);
+                } else {
+                    qsa_block_scores(st.idx_pooled, st.idx_dead, qidx_ + tb * IQ * ID, step_ + tb * kStepCount, n,
+                                     max_blocks_, s, scores_ + (size_t)tb * max_blocks_, cs);
+                    qsa_block_topk(scores_ + (size_t)tb * max_blocks_, step_ + tb * kStepCount, n, max_blocks_, cap_, s,
+                                   sel_ + (size_t)tb * cap_, cs);
+                }
                 stamp(l, 11, grp);
                 // KV streaming: the n selections' blocks resident (device-side, inside the graph)
                 qsa_kv_resolve(st, *g_, sel_ + (size_t)tb * cap_, step_ + tb * kStepCount, n, cap_, cs);
@@ -947,10 +1015,7 @@ bool Verifier::record_window(int T, sycl::queue* cs, std::string& err) try {
                 mb.weights = w_ + t * K;
                 if (!moe_route(wt, g, l, K, mb, mixed_ + t * N, cs, err, nullptr)) return false;
             }
-        static const float route_prior = [] {
-            const char* v = std::getenv("STRATA_ROUTE_PRIOR");
-            return v ? (float)std::atof(v) : 0.0f;
-        }();
+        const float route_prior = g_route_prior(cs);
         if (route_prior > 0.0f && NE == 512 && K == 10 && hits_.d_res != nullptr)
             route_prior_top10(logits_ + tb * NE, hits_.d_res + l * g.n_expert, route_prior, ids_ + tb * K, w_ + tb * K,
                               n, cs);
@@ -1428,6 +1493,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     std::atomic_thread_fence(std::memory_order_seq_cst);
     last_t_ = T;
     last_pos0_ = pos0;
+    sel_long_ = select_long_on() && pos0 + T >= select_long_at() ? 1 : 0;
     for (int t = 0; t < T; ++t)
         last_tokens_[t] = tokens[t];
     ms_host += ms_since(t0);

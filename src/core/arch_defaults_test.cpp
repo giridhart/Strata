@@ -371,6 +371,10 @@ int main() {
         CHECK(route_prior_default(true, true, 12.0 * GiB) == 0.0f);         // Strix Halo with a small carve-out
         CHECK(route_prior_default(false, true, 8.0 * GiB) == 0.0f);         // an integrated GPU on CUDA (Jetson-like)
         CHECK(route_prior_default(false, false, 0.0) == 0.0f);              // unknown memory
+        // SYCL discrete GPUs: Intel Arc B580 (12.0 GiB) gets 1.5f, Arc A770 (16.0 GiB) gets 0.0f, Lunar Lake (integrated) gets 0.0f
+        CHECK(route_prior_default(false, false, 12.0 * GiB, false) == 1.5f); // Intel Arc B580 12 GB
+        CHECK(route_prior_default(false, false, 16.0 * GiB, false) == 0.0f); // Intel Arc A770 16 GB
+        CHECK(route_prior_default(false, true, 8.0 * GiB, false) == 0.0f);   // Lunar Lake integrated Xe2
         // the stream-split hyper-connection read: a discrete 12.0 card above 13 GiB (RTX PRO 5000 72 GB, RTX 5090 32 GB), nothing else
         CHECK(gr_v3_default(false, 12, 0, false, 72.0 * GiB));
         CHECK(gr_v3_default(false, 12, 0, false, 31.4 * GiB));              // RTX 5090
