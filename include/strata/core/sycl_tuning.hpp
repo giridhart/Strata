@@ -55,7 +55,10 @@ enum class KernelType : uint8_t {
     GR_NORM = 9,
     FLASH_ATTN = 10,
     ROUTER = 11,
-    GDN = 12
+    GDN = 12,
+    MOE_SCATTER_ADD = 13,
+    PLE_DEQUANT = 14,
+    QSA_SELECT_LONG = 15
 };
 
 inline const char* to_string(KernelType k) {
@@ -72,6 +75,9 @@ inline const char* to_string(KernelType k) {
         case KernelType::FLASH_ATTN:     return "flash_attn";
         case KernelType::ROUTER:         return "native_router";
         case KernelType::GDN:            return "native_gdn";
+        case KernelType::MOE_SCATTER_ADD: return "moe_scatter_add";
+        case KernelType::PLE_DEQUANT:     return "ple_dequant";
+        case KernelType::QSA_SELECT_LONG: return "qsa_select_long";
         case KernelType::UNKNOWN:
         default:                         return "unknown";
     }
@@ -90,6 +96,9 @@ inline KernelType parse_kernel_type(std::string_view s) {
     if (s == "flash_attn")     return KernelType::FLASH_ATTN;
     if (s == "native_router" || s == "router") return KernelType::ROUTER;
     if (s == "native_gdn" || s == "gdn") return KernelType::GDN;
+    if (s == "moe_scatter_add") return KernelType::MOE_SCATTER_ADD;
+    if (s == "ple_dequant")     return KernelType::PLE_DEQUANT;
+    if (s == "qsa_select_long") return KernelType::QSA_SELECT_LONG;
     return KernelType::UNKNOWN;
 }
 

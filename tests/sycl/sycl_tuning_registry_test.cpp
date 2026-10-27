@@ -42,7 +42,10 @@ void test_table_parsing_and_lookup(const sycl::device& dev) {
         "s_gemv_q8k 2560 640 8 64 1 128 64 4 streaming\n" +
         "s_gemv_q8k 2560 2560 4 64 1 256 128 0 cached\n" +
         "bf16_gemv 2560 48 0 0 0 128 128 0 streaming\n" +
-        "bf16_gemv 2560 640 0 0 0 64 64 0 streaming cached default\n";
+        "bf16_gemv 2560 640 0 0 0 64 64 0 streaming cached default\n" +
+        "moe_scatter_add 10 2560 0 0 0 256 0 0 streaming\n" +
+        "ple_dequant 64 256 4 32 0 256 0 0 streaming\n" +
+        "qsa_select_long 4096 4 0 0 0 128 0 0 cached\n";
 
     strata::sycl_tuning::SyclTuningRegistry reg;
     std::string err;
@@ -52,7 +55,7 @@ void test_table_parsing_and_lookup(const sycl::device& dev) {
         std::exit(1);
     }
     assert(reg.is_loaded());
-    assert(reg.entry_count() == 4);
+    assert(reg.entry_count() == 7);
 
     // Exact lookup for s_gemv_q8k [2560, 640]
     uint64_t key1 = strata::sycl_tuning::make_kernel_key(
@@ -80,6 +83,27 @@ void test_table_parsing_and_lookup(const sycl::device& dev) {
     assert(p3.hints.weight == strata::sycl_tuning::CachePolicy::StreamingL3);
     assert(p3.hints.activation == strata::sycl_tuning::CachePolicy::CachedL1L3);
     assert(p3.hints.output == strata::sycl_tuning::CachePolicy::Default);
+
+    // Exact lookup for moe_scatter_add [10, 2560]
+    uint64_t key4 = strata::sycl_tuning::make_kernel_key(
+        strata::sycl_tuning::KernelType::MOE_SCATTER_ADD, 10, 2560, 0, 0, 0);
+    auto p4 = reg.get_or_fallback(key4, {128, 0, 0, strata::sycl_tuning::CachePolicy::Default, {}});
+    assert(p4.lws == 256);
+    assert(p4.cache == strata::sycl_tuning::CachePolicy::StreamingL3);
+
+    // Exact lookup for ple_dequant [64, 256]
+    uint64_t key5 = strata::sycl_tuning::make_kernel_key(
+        strata::sycl_tuning::KernelType::PLE_DEQUANT, 64, 256, 4, 32, 0);
+    auto p5 = reg.get_or_fallback(key5, {128, 0, 0, strata::sycl_tuning::CachePolicy::Default, {}});
+    assert(p5.lws == 256);
+    assert(p5.cache == strata::sycl_tuning::CachePolicy::StreamingL3);
+
+    // Exact lookup for qsa_select_long [4096, 4]
+    uint64_t key6 = strata::sycl_tuning::make_kernel_key(
+        strata::sycl_tuning::KernelType::QSA_SELECT_LONG, 4096, 4, 0, 0, 0);
+    auto p6 = reg.get_or_fallback(key6, {256, 0, 0, strata::sycl_tuning::CachePolicy::Default, {}});
+    assert(p6.lws == 128);
+    assert(p6.cache == strata::sycl_tuning::CachePolicy::CachedL1L3);
 
     printf("      Table parsing and exact lookup: PASSED\n");
 }
@@ -148,8 +172,11 @@ void test_shape_collector() {
     STRATA_SYCL_RECORD_SHAPE(strata::sycl_tuning::KernelType::BF16_GEMV, 2560, 48, 0, 0, 0);
     STRATA_SYCL_RECORD_SHAPE(strata::sycl_tuning::KernelType::S_GEMV_Q8K, 2560, 640, 8, 64, 1);
     STRATA_SYCL_RECORD_SHAPE(strata::sycl_tuning::KernelType::BF16_GEMV, 2560, 48, 0, 0, 0); // duplicate must deduplicate
+    STRATA_SYCL_RECORD_SHAPE(strata::sycl_tuning::KernelType::MOE_SCATTER_ADD, 10, 2560, 0, 0, 0);
+    STRATA_SYCL_RECORD_SHAPE(strata::sycl_tuning::KernelType::PLE_DEQUANT, 64, 256, 4, 32, 0);
+    STRATA_SYCL_RECORD_SHAPE(strata::sycl_tuning::KernelType::QSA_SELECT_LONG, 4096, 4, 0, 0, 0);
 
-    assert(sc.count() == 2);
+    assert(sc.count() == 5);
 
     const std::string tmp_path = "test_captured_workload.txt";
     std::string err;
@@ -159,8 +186,18 @@ void test_shape_collector() {
     std::vector<strata::sycl_tuning::CapturedShape> loaded_shapes;
     bool load_ok = strata::sycl_tuning::ShapeCollector::load_workload(tmp_path, loaded_shapes, err);
     assert(load_ok);
-    assert(loaded_shapes.size() == 2);
-    assert(loaded_shapes[0].n_in == 2560 || loaded_shapes[1].n_in == 2560);
+    assert(loaded_shapes.size() == 5);
+    bool has_2560 = false, has_moe = false, has_ple = false, has_qsa = false;
+    for (const auto& s : loaded_shapes) {
+        if (s.n_in == 2560) has_2560 = true;
+        if (s.type == strata::sycl_tuning::KernelType::MOE_SCATTER_ADD && s.n_in == 10) has_moe = true;
+        if (s.type == strata::sycl_tuning::KernelType::PLE_DEQUANT && s.n_in == 64) has_ple = true;
+        if (s.type == strata::sycl_tuning::KernelType::QSA_SELECT_LONG && s.n_in == 4096) has_qsa = true;
+    }
+    assert(has_2560);
+    assert(has_moe);
+    assert(has_ple);
+    assert(has_qsa);
 
     std::remove(tmp_path.c_str());
     sc.enable(false);

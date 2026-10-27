@@ -1,6 +1,7 @@
 // src/prefill/kernels.cu - see include/strata/prefill/kernels.hpp.
 #include <sycl/sycl.hpp>
 #include "strata/prefill/kernels.hpp"
+#include "strata/core/sycl_tuning.hpp"
 #include "strata/prefill/gdn_xe.hpp"
 #include "strata/prefill/gdn_chunk.hpp"
 #include "strata/kernels/mrope.hpp"
@@ -1427,9 +1428,16 @@ void moe_scatter_add(const float* Dm, const int32_t* u_tok, const int32_t* u_off
                      const float* u_w, int64_t n_u, float* acc, void* stream) {
     if (n_u <= 0) return;
     auto* q = stream ? static_cast<sycl::queue*>(stream) : &get_default_queue();
+    STRATA_SYCL_RECORD_SHAPE(strata::sycl_tuning::KernelType::MOE_SCATTER_ADD, n_u, N, 0, 0, 0);
+    auto& reg = strata::sycl_tuning::SyclTuningRegistry::instance();
+    reg.try_auto_load(q->get_device());
+    const uint64_t key = strata::sycl_tuning::make_kernel_key(
+        strata::sycl_tuning::KernelType::MOE_SCATTER_ADD, n_u, N, 0, 0, 0);
+    const auto tuned = reg.get_or_fallback(key, {256, 0, 0, strata::sycl_tuning::CachePolicy::StreamingL3});
+    const int lws = (tuned.lws > 0 && tuned.lws % 16 == 0) ? tuned.lws : 256;
     q->parallel_for(
-        sycl::nd_range<3>(sycl::range<3>(1, (unsigned)n_u, blocks_for(N)) * sycl::range<3>(1, 1, 256),
-                          sycl::range<3>(1, 1, 256)),
+        sycl::nd_range<3>(sycl::range<3>(1, (unsigned)n_u, blocks_for(N, lws)) * sycl::range<3>(1, 1, lws),
+                          sycl::range<3>(1, 1, lws)),
         [=](sycl::nd_item<3> /*item_ct1*/) { moe_scatter_add_kernel(Dm, u_tok, u_off, u_rows, u_w, acc); });
     check("moe_scatter_add");
     if (!stream) q->wait();

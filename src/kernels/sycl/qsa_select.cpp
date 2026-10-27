@@ -1,6 +1,7 @@
 // src/kernels/sycl/qsa_select.dp.cpp - Pure SYCL 2020 migration of qsa_select
 #include <sycl/sycl.hpp>
 #include "strata/core/emulate.hpp"
+#include "strata/core/sycl_tuning.hpp"
 #include "strata/kernels/qsa_select.hpp"
 
 #include <algorithm>
@@ -1017,6 +1018,14 @@ bool qsa_block_scores_dx(const float* pooled, const float* dead, const float* q_
     if (nq < 1 || nq > MQ || !scores_dx_mode()) return false;
     static sycl::queue default_queue{sycl::property::queue::in_order()};
     sycl::queue* q = stream ? static_cast<sycl::queue*>(stream) : &default_queue;
+
+    STRATA_SYCL_RECORD_SHAPE(strata::sycl_tuning::KernelType::QSA_SELECT_LONG, max_blocks, nq, 0, 0, 0);
+    auto& reg = strata::sycl_tuning::SyclTuningRegistry::instance();
+    reg.try_auto_load(q->get_device());
+    const uint64_t key = strata::sycl_tuning::make_kernel_key(
+        strata::sycl_tuning::KernelType::QSA_SELECT_LONG, max_blocks, nq, 0, 0, 0);
+    const auto tuned = reg.get_or_fallback(key, {128, 0, 0, strata::sycl_tuning::CachePolicy::CachedL1L3});
+    (void)tuned;
 
     switch (nq) {
         case 1: scores_dx_launch<1>(pooled, q_idx, steps, max_blocks, scores, q); break;
