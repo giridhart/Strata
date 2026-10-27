@@ -90,6 +90,10 @@ void qsa_block_topk_long(const float* scores, const int32_t* steps, int64_t nq, 
                          const QsaShapes& s, int32_t* ids, void* stream, int64_t active_blocks, int32_t* multi_scratch);
 void qsa_block_scores_long(const float* pooled, const float* dead, const float* q_idx, const int32_t* steps, int64_t nq,
                            int64_t max_blocks, const QsaShapes& s, float* scores, void* stream, int64_t active_blocks);
+bool qsa_block_scores_dx(const float* pooled, const float* dead, const float* q_idx, const int32_t* steps,
+                         int64_t nq, int64_t max_blocks, float* scores, void* stream);
+bool qsa_block_topk_multi(const float* scores, const int32_t* steps, int64_t nq, int64_t max_blocks, int64_t cap,
+                          int32_t* ids, void* stream, int32_t* scratch);
 /// Device ints a qsa_block_topk_long call of `nq` queries may use as multi_scratch (0 on a build without the multi-CTA
 /// path: pass null).
 int64_t qsa_topk_multi_scratch_ints(int64_t nq);

@@ -844,4 +844,535 @@ void qsa_block_topk(const float* scores, const int32_t* steps, int64_t nq, int64
     }
 }
 
+// =========================================================================
+// STRATA_SELECT_LONG: Multi-Workgroup Top-K & DX Decode Scorer
+// =========================================================================
+
+constexpr int DX_NB = 32;                   // blocks per tile: one per lane
+constexpr int DX_T = 32 * IDX_HEADS;        // 128 threads: warp h: indexer head h
+constexpr int DX_KS = IDX_DIM + 4;          // key row in shared memory (132 floats)
+
+inline int dx_lane(int j) {
+    static constexpr uint8_t lut[32] = {
+        0, 16, 8, 24, 4, 20, 12, 28, 2, 18, 10, 26, 6, 22, 14, 30,
+        1, 17, 9, 25, 5, 21, 13, 29, 3, 19, 11, 27, 7, 23, 15, 31
+    };
+    return lut[j & 31];
+}
+
+template <int NQ>
+void block_scores_dx_kernel(const float* __restrict__ pooled,
+                            const float* __restrict__ q_idx,
+                            const int32_t* __restrict__ steps, int64_t max_blocks,
+                            float* __restrict__ out,
+                            float* dx_smem, int64_t* s_nbid,
+                            const sycl::nd_item<1>& item) {
+    float* Ks = dx_smem;
+    float* Qs = Ks + DX_NB * DX_KS;
+    float* Ds = Qs + NQ * IDX_HEADS * IDX_DIM;
+    const int t = item.get_local_id(0);
+    const int lane = t & 31;
+    const int h = t >> 5;
+    if (t < NQ) s_nbid[t] = steps[t * kStepCount + kStepNBid];
+    item.barrier(sycl::access::fence_space::local_space);
+    int64_t top = 0;
+#pragma unroll
+    for (int q = 0; q < NQ; ++q) top = s_nbid[q] > top ? s_nbid[q] : top;
+    if (top > max_blocks) top = max_blocks;
+    if ((int64_t)item.get_group(0) * DX_NB >= top) return;
+    for (int i = t; i < NQ * IDX_HEADS * IDX_DIM / 4; i += DX_T)
+        reinterpret_cast<sycl::float4*>(Qs)[i] = reinterpret_cast<const sycl::float4*>(q_idx)[i];
+    const float* krow = Ks + lane * DX_KS;
+    constexpr int PF = DX_NB * (IDX_DIM / 4) / DX_T;
+    sycl::float4 pre[PF];
+    const int64_t stride = (int64_t)item.get_group_range(0) * DX_NB;
+    auto fetch = [&](int64_t tb) {
+#pragma unroll
+        for (int i = 0; i < PF; ++i) {
+            const int idx = t + i * DX_T, row = idx / (IDX_DIM / 4), c4 = idx % (IDX_DIM / 4);
+            pre[i] = tb + row < top ? reinterpret_cast<const sycl::float4*>(pooled + (tb + row) * IDX_DIM)[c4]
+                                    : sycl::float4(0.0f, 0.0f, 0.0f, 0.0f);
+        }
+    };
+    fetch((int64_t)item.get_group(0) * DX_NB);
+    for (int64_t b0 = (int64_t)item.get_group(0) * DX_NB; b0 < top; b0 += stride) {
+#pragma unroll
+        for (int i = 0; i < PF; ++i) {
+            const int idx = t + i * DX_T, row = idx / (IDX_DIM / 4), c4 = idx % (IDX_DIM / 4);
+            reinterpret_cast<sycl::float4*>(Ks + row * DX_KS + c4 * 4)[0] = pre[i];
+        }
+        item.barrier(sycl::access::fence_space::local_space);
+        if (b0 + stride < top) fetch(b0 + stride);
+        float half0[NQ], half1[NQ];
+#pragma unroll 1
+        for (int c = 0; c < 4; ++c) {
+            float l0[NQ], l1[NQ], l2[NQ];
+#pragma unroll
+            for (int jj = 0; jj < 8; ++jj) {
+                const int L = dx_lane(8 * c + jj);
+                const sycl::float4 k4 = *reinterpret_cast<const sycl::float4*>(krow + L * 4);
+#pragma unroll
+                for (int q = 0; q < NQ; ++q) {
+                    const sycl::float4 q4 = *reinterpret_cast<const sycl::float4*>(Qs + (q * IDX_HEADS + h) * IDX_DIM + L * 4);
+                    const float d = k4.x() * q4.x() + k4.y() * q4.y() + k4.z() * q4.z() + k4.w() * q4.w();
+                    if (jj == 0 || jj == 2 || jj == 4 || jj == 6) l0[q] = d;
+                    else if (jj == 1 || jj == 5) l1[q] = l0[q] + d;
+                    else if (jj == 3) l2[q] = l1[q] + (l0[q] + d);
+                    else {
+                        const float oct = l2[q] + (l1[q] + (l0[q] + d));
+                        if (c == 0) half0[q] = oct;
+                        else if (c == 1) half0[q] = half0[q] + oct;
+                        else if (c == 2) half1[q] = oct;
+                        else half1[q] = half1[q] + oct;
+                    }
+                }
+            }
+        }
+#pragma unroll
+        for (int q = 0; q < NQ; ++q) Ds[(q * IDX_HEADS + h) * DX_NB + lane] = half0[q] + half1[q];
+        item.barrier(sycl::access::fence_space::local_space);
+        for (int q = h; q < NQ; q += IDX_HEADS) {
+            const int64_t b = b0 + lane;
+            if (b >= s_nbid[q]) continue;
+            float score = 0.0f;
+#pragma unroll
+            for (int hh = 0; hh < IDX_HEADS; ++hh) {
+                const float d = Ds[(q * IDX_HEADS + hh) * DX_NB + lane];
+                score += d > 0.0f ? d : 0.0f;
+            }
+            out[q * max_blocks + b] = score;
+        }
+    }
+}
+
+void block_scores_tail_kernel(const float* __restrict__ dead, const float* __restrict__ q_idx,
+                              const int32_t* __restrict__ steps, int64_t max_blocks, float* __restrict__ out,
+                              const sycl::nd_item<1>& item) {
+    const int64_t qi = item.get_group(0);
+    const int32_t* st = steps + qi * kStepCount;
+    const int64_t n_kv = st[kStepNKv], n_bid = st[kStepNBid];
+    if (n_bid >= max_blocks) return;
+    const int lane = item.get_local_id(0) & 31;
+    auto sg = item.get_sub_group();
+    const sycl::float4 k4 = *reinterpret_cast<const sycl::float4*>(dead + lane * 4);
+    const float* q = q_idx + qi * IDX_HEADS * IDX_DIM + lane * 4;
+    float score = 0.0f;
+#pragma unroll
+    for (int h = 0; h < IDX_HEADS; ++h) {
+        const sycl::float4 q4 = *reinterpret_cast<const sycl::float4*>(q + h * IDX_DIM);
+        float d = k4.x() * q4.x() + k4.y() * q4.y() + k4.z() * q4.z() + k4.w() * q4.w();
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) d += sycl::permute_group_by_xor(sg, d, o);
+        score += d > 0.0f ? d : 0.0f;
+    }
+    if (lane == 0) {
+        if (n_kv % R != 0) score += 1e9f;
+        out[qi * max_blocks + n_bid] = score;
+    }
+}
+
+template <int NQ>
+void scores_dx_launch(const float* pooled, const float* q_idx, const int32_t* steps, int64_t max_blocks,
+                      float* scores, sycl::queue* q) {
+    const size_t smem_floats = (size_t)(DX_NB * DX_KS + NQ * IDX_HEADS * IDX_DIM + NQ * IDX_HEADS * DX_NB);
+    const int64_t tiles = (max_blocks + DX_NB - 1) / DX_NB;
+    uint32_t cu_count = q->get_device().get_info<sycl::info::device::max_compute_units>();
+    int64_t want = (int64_t)cu_count * 2;
+    if (want < 1) want = 1;
+    const size_t grid = (size_t)(want < tiles ? want : tiles);
+    if (grid == 0) return;
+
+    q->submit([&](sycl::handler& cgh) {
+        sycl::local_accessor<float, 1> smem_acc(sycl::range<1>(smem_floats), cgh);
+        sycl::local_accessor<int64_t, 1> nbid_acc(sycl::range<1>(NQ), cgh);
+
+        cgh.parallel_for(
+            sycl::nd_range<1>(grid * DX_T, DX_T),
+            [=](sycl::nd_item<1> item) {
+                block_scores_dx_kernel<NQ>(
+                    pooled, q_idx, steps, max_blocks, scores,
+                    smem_acc.get_multi_ptr<sycl::access::decorated::no>().get(),
+                    nbid_acc.get_multi_ptr<sycl::access::decorated::no>().get(),
+                    item);
+            });
+    });
+}
+
+bool scores_multi_on() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_SCORES_MULTI"); return v == nullptr || std::atoi(v) != 0; }();
+    return on;
+}
+
+bool scores_dx_mode() {
+    static const int env = [] {
+        const char* v = std::getenv("STRATA_SCORES_DX");
+        return v == nullptr || *v == '\0' ? -1 : std::atoi(v);
+    }();
+    if (env >= 0) return env != 0;
+    return true;
+}
+
+bool qsa_block_scores_dx(const float* pooled, const float* dead, const float* q_idx, const int32_t* steps,
+                         int64_t nq, int64_t max_blocks, float* scores, void* stream) {
+    if (nq < 1 || nq > MQ || !scores_dx_mode()) return false;
+    static sycl::queue default_queue{sycl::property::queue::in_order()};
+    sycl::queue* q = stream ? static_cast<sycl::queue*>(stream) : &default_queue;
+
+    switch (nq) {
+        case 1: scores_dx_launch<1>(pooled, q_idx, steps, max_blocks, scores, q); break;
+        case 2: scores_dx_launch<2>(pooled, q_idx, steps, max_blocks, scores, q); break;
+        case 3: scores_dx_launch<3>(pooled, q_idx, steps, max_blocks, scores, q); break;
+        case 4: scores_dx_launch<4>(pooled, q_idx, steps, max_blocks, scores, q); break;
+        case 5: scores_dx_launch<5>(pooled, q_idx, steps, max_blocks, scores, q); break;
+        case 6: scores_dx_launch<6>(pooled, q_idx, steps, max_blocks, scores, q); break;
+        case 7: scores_dx_launch<7>(pooled, q_idx, steps, max_blocks, scores, q); break;
+        default: scores_dx_launch<8>(pooled, q_idx, steps, max_blocks, scores, q); break;
+    }
+
+    q->parallel_for(
+        sycl::nd_range<1>(nq * 32, 32),
+        [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(32)]] {
+            block_scores_tail_kernel(dead, q_idx, steps, max_blocks, scores, item);
+        });
+    return true;
+}
+
+constexpr int MT_T = 256;                   // threads per CTA
+constexpr int MT_W = MT_T / 32;             // 8 warps
+constexpr int MT_U = 4;                     // rows of loads in flight per warp
+constexpr int MT_NMAX = 32;                 // CTAs per query, at most
+constexpr int MT_MAXQ = 16;                 // more queries per call fill the GPU with one CTA each already
+constexpr int MT_ACC = MT_NMAX * 256, MT_STATE = MT_ACC + 3 * 256, MT_CNT = MT_STATE + 16;
+constexpr int MT_Q_INTS = MT_CNT + 2 * MT_NMAX * MT_W + 64;
+
+struct MtQuery {
+    int64_t n_kv, n_bid, width, lo, hi, row0;
+    int rpw, wtail;
+    bool all;
+};
+
+inline MtQuery mt_query(const int32_t* __restrict__ steps, int group_x, int group_y, int grid_x, int tid) {
+    const int32_t* st = steps + (int64_t)group_y * kStepCount;
+    MtQuery m;
+    m.n_kv = st[kStepNKv];
+    m.n_bid = st[kStepNBid];
+    m.width = st[kStepWidth];
+    m.all = m.n_kv <= m.width;
+    m.wtail = (int)(m.n_kv - m.n_bid * R);
+    const int64_t nbe = m.n_bid + (m.wtail > 0 ? 1 : 0);
+    const int64_t per = (nbe + grid_x - 1) / grid_x;
+    m.lo = (int64_t)group_x * per < nbe ? (int64_t)group_x * per : nbe;
+    m.hi = m.lo + per < nbe ? m.lo + per : nbe;
+    m.rpw = (int)(((m.hi - m.lo + 31) / 32 + MT_W - 1) / MT_W);
+    m.row0 = m.lo + (int64_t)(tid >> 5) * m.rpw * 32;
+    return m;
+}
+
+inline void mt_load(const MtQuery& m, const float* __restrict__ sc, int j0, uint32_t (&key)[MT_U], int lane) {
+#pragma unroll
+    for (int u = 0; u < MT_U; ++u) {
+        const int64_t b = m.row0 + 32 * (j0 + u) + lane;
+        key[u] = (j0 + u < m.rpw && b < m.hi) ? order_key(sc[b]) : 0u;
+    }
+}
+
+inline void mt_choose(int v, int64_t width, int shift, uint32_t& prefix, int& above, int* s_ex, int* s_i,
+                      const sycl::nd_item<1>& item) {
+    const int t = item.get_local_id(0);
+    if (t == 0) *s_i = 255;
+    item.barrier(sycl::access::fence_space::local_space);
+    const int incl = sycl::inclusive_scan_over_group(item.get_group(), v, sycl::plus<int>());
+    s_ex[t] = incl - v;
+    const int64_t need = width - above;
+    if (t < 255 && incl >= need && incl - v < need) *s_i = t;
+    item.barrier(sycl::access::fence_space::local_space);
+    const int i = *s_i;
+    prefix |= (uint32_t)(255 - i) << shift;
+    above += s_ex[i];
+    item.barrier(sycl::access::fence_space::local_space);
+}
+
+template <int PASS>
+void block_topk_multi_hist_kernel(const float* __restrict__ scores, const int32_t* __restrict__ steps,
+                                  int64_t max_blocks, int32_t* __restrict__ scratch,
+                                  int (*h)[256], int* s_ex, int* s_i,
+                                  int group_x, int group_y, int grid_x,
+                                  const sycl::nd_item<1>& item) {
+    const int t = item.get_local_id(0), lane = t & 31, warp = t >> 5;
+    const MtQuery m = mt_query(steps, group_x, group_y, grid_x, t);
+    if (m.all) return;
+    const float* sc = scores + (int64_t)group_y * max_blocks;
+    uint32_t key[MT_U];
+    mt_load(m, sc, 0, key, lane);
+    for (int i = t; i < MT_W * 256; i += MT_T) (&h[0][0])[i] = 0;
+    int32_t* qs = scratch + (int64_t)group_y * MT_Q_INTS;
+    uint32_t prefix = 0;
+    int above = 0;
+    if (PASS == 0) {
+        if (group_x == 0) {
+            for (int i = t; i < 3 * 256; i += MT_T) qs[MT_ACC + i] = 0;
+        }
+    } else {
+        int v = 0;
+        if (PASS == 1) {
+            for (int r = 0; r < grid_x; ++r) v += qs[r * 256 + 255 - t];
+        } else {
+            prefix = (uint32_t)qs[MT_STATE + 2 * (PASS - 1)];
+            above = qs[MT_STATE + 2 * (PASS - 1) + 1];
+            v = qs[MT_ACC + (PASS - 2) * 256 + 255 - t];
+        }
+        mt_choose(v, m.width, 32 - 8 * PASS, prefix, above, s_ex, s_i, item);
+        if (group_x == 0 && t == 0) {
+            qs[MT_STATE + 2 * PASS] = (int)prefix;
+            qs[MT_STATE + 2 * PASS + 1] = above;
+        }
+    }
+    item.barrier(sycl::access::fence_space::local_space);
+    const int shift = 24 - 8 * PASS;
+    const uint32_t hmask = PASS == 0 ? 0u : (0xffffffffu << (shift + 8));
+    for (int j0 = 0; j0 < m.rpw; j0 += MT_U) {
+        if (j0 > 0) mt_load(m, sc, j0, key, lane);
+#pragma unroll
+        for (int u = 0; u < MT_U; ++u) {
+            if (j0 + u >= m.rpw) break;
+            const int64_t b = m.row0 + 32 * (j0 + u) + lane;
+            const int bin = (b < m.hi && (key[u] & hmask) == prefix) ? (int)((key[u] >> shift) & 255) : -1;
+            if (bin >= 0) {
+                const int add_val = (b == m.n_bid) ? m.wtail : R;
+                sycl::atomic_ref<int, sycl::memory_order::relaxed, sycl::memory_scope::work_group,
+                                 sycl::access::address_space::local_space>(h[warp][bin]).fetch_add(add_val);
+            }
+        }
+    }
+    item.barrier(sycl::access::fence_space::local_space);
+    int sum = 0;
+#pragma unroll
+    for (int w = 0; w < MT_W; ++w) sum += h[w][t];
+    if (PASS == 0) qs[group_x * 256 + t] = sum;
+    else if (sum != 0) {
+        sycl::atomic_ref<int32_t, sycl::memory_order::relaxed, sycl::memory_scope::device,
+                         sycl::access::address_space::global_space>(qs[MT_ACC + (PASS - 1) * 256 + t]).fetch_add(sum);
+    }
+}
+
+void block_topk_multi_count_kernel(const float* __restrict__ scores, const int32_t* __restrict__ steps,
+                                   int64_t max_blocks, int32_t* __restrict__ scratch,
+                                   int* s_ex, int* s_i,
+                                   int group_x, int group_y, int grid_x,
+                                   const sycl::nd_item<1>& item) {
+    const int t = item.get_local_id(0), lane = t & 31, warp = t >> 5;
+    auto sg = item.get_sub_group();
+    const MtQuery m = mt_query(steps, group_x, group_y, grid_x, t);
+    if (m.all) return;
+    const float* sc = scores + (int64_t)group_y * max_blocks;
+    uint32_t key[MT_U];
+    mt_load(m, sc, 0, key, lane);
+    int32_t* qs = scratch + (int64_t)group_y * MT_Q_INTS;
+    uint32_t prefix = (uint32_t)qs[MT_STATE + 6];
+    int above = qs[MT_STATE + 7];
+    mt_choose(qs[MT_ACC + 2 * 256 + 255 - t], m.width, 0, prefix, above, s_ex, s_i, item);
+    if (group_x == 0 && t == 0) {
+        qs[MT_STATE + 8] = (int)prefix;
+        qs[MT_STATE + 9] = above;
+    }
+    const uint32_t thr = prefix;
+    int gt = 0, eq = 0;
+    for (int j0 = 0; j0 < m.rpw; j0 += MT_U) {
+        if (j0 > 0) mt_load(m, sc, j0, key, lane);
+#pragma unroll
+        for (int u = 0; u < MT_U; ++u) {
+            const int64_t b = m.row0 + 32 * (j0 + u) + lane;
+            if (j0 + u >= m.rpw || b >= m.hi) continue;
+            const int w = (b == m.n_bid) ? m.wtail : R;
+            if (key[u] > thr) gt += w;
+            else if (key[u] == thr) eq += w;
+        }
+    }
+    gt = sycl::reduce_over_group(sg, gt, sycl::plus<int>());
+    eq = sycl::reduce_over_group(sg, eq, sycl::plus<int>());
+    if (lane == 0) {
+        qs[MT_CNT + 2 * (group_x * MT_W + warp)] = gt;
+        qs[MT_CNT + 2 * (group_x * MT_W + warp) + 1] = eq;
+    }
+}
+
+void block_topk_multi_emit_kernel(const float* __restrict__ scores, const int32_t* __restrict__ steps,
+                                  int64_t max_blocks, int64_t cap, int32_t* __restrict__ ids,
+                                  const int32_t* __restrict__ scratch,
+                                  uint64_t* s_w,
+                                  int group_x, int group_y, int grid_x,
+                                  const sycl::nd_item<1>& item) {
+    const int t = item.get_local_id(0), lane = t & 31, warp = t >> 5;
+    auto sg = item.get_sub_group();
+    const MtQuery m = mt_query(steps, group_x, group_y, grid_x, t);
+    int32_t* out = ids + (int64_t)group_y * cap;
+    if (m.all) {
+        for (int64_t j = (int64_t)group_x * MT_T + t; j < m.n_kv; j += (int64_t)grid_x * MT_T) out[j] = (int32_t)j;
+        return;
+    }
+    const float* sc = scores + (int64_t)group_y * max_blocks;
+    uint32_t key[MT_U];
+    mt_load(m, sc, 0, key, lane);
+    const int32_t* qs = scratch + (int64_t)group_y * MT_Q_INTS;
+    const uint32_t thr = (uint32_t)qs[MT_STATE + 8];
+    const int eq_budget = (int)(m.width - qs[MT_STATE + 9]);
+    uint64_t c = 0;
+    if (t < group_x * MT_W)
+        c = (uint64_t)(uint32_t)qs[MT_CNT + 2 * t] | ((uint64_t)(uint32_t)qs[MT_CNT + 2 * t + 1] << 32);
+    c = sycl::reduce_over_group(sg, c, sycl::plus<uint64_t>());
+    if (lane == 0) s_w[warp] = c;
+    item.barrier(sycl::access::fence_space::local_space);
+    uint64_t before = 0;
+    for (int w = 0; w < MT_W; ++w) before += s_w[w];
+    for (int w = 0; w < warp; ++w) {
+        const int i = group_x * MT_W + w;
+        before += (uint64_t)(uint32_t)qs[MT_CNT + 2 * i] |
+                  ((uint64_t)(uint32_t)qs[MT_CNT + 2 * i + 1] << 32);
+    }
+    const int gt_before = (int)(before & 0xffffffffu), eq_before = (int)(before >> 32);
+    int run_sel = gt_before + (eq_before < eq_budget ? eq_before : eq_budget), run_eq = eq_before;
+    for (int j0 = 0; j0 < m.rpw; j0 += MT_U) {
+        if (j0 > 0) mt_load(m, sc, j0, key, lane);
+#pragma unroll
+        for (int u = 0; u < MT_U; ++u) {
+            if (j0 + u >= m.rpw) break;
+            const int64_t b = m.row0 + 32 * (j0 + u) + lane;
+            const int w = b < m.hi ? (b == m.n_bid ? m.wtail : R) : 0;
+            const uint32_t k = key[u];
+            const int my_gt = (w && k > thr) ? w : 0, my_eq = (w && k == thr) ? w : 0;
+            if (!sycl::any_of_group(sg, (my_gt | my_eq) != 0)) continue;
+            int pe = my_eq;
+#pragma unroll
+            for (int o = 1; o < 32; o <<= 1) {
+                const int y = sycl::shift_group_right(sg, pe, o);
+                if (lane >= o) pe += y;
+            }
+            const int left = eq_budget - (run_eq + pe - my_eq);
+            const int take = left < 0 ? 0 : (left > my_eq ? my_eq : left);
+            const int my_sel = my_gt + take;
+            int ps = my_sel;
+#pragma unroll
+            for (int o = 1; o < 32; o <<= 1) {
+                const int y = sycl::shift_group_right(sg, ps, o);
+                if (lane >= o) ps += y;
+            }
+            int32_t* dst = out + run_sel + ps - my_sel;
+            for (int cc = 0; cc < my_sel; ++cc) dst[cc] = (int32_t)(b * R + cc);
+            run_eq += sycl::select_from_group(sg, pe, 31);
+            run_sel += sycl::select_from_group(sg, ps, 31);
+        }
+    }
+}
+
+int topk_multi_mode() {
+    static const int env = [] {
+        const char* v = std::getenv("STRATA_TOPK_MULTI");
+        return v == nullptr || *v == '\0' ? -1 : std::atoi(v);
+    }();
+    if (env >= 0) return env != 0 ? 1 : 0;
+    return 2;
+}
+
+bool qsa_block_topk_multi(const float* scores, const int32_t* steps, int64_t nq, int64_t max_blocks, int64_t cap,
+                          int32_t* ids, void* stream, int32_t* scratch) {
+    static const int n_env = [] { const char* v = std::getenv("STRATA_TOPK_MULTI_N"); return v ? std::atoi(v) : 0; }();
+    int64_t n = n_env > 0 ? n_env : (max_blocks + 2047) / 2048;
+    n = n < 1 ? 1 : n > MT_NMAX ? MT_NMAX : n;
+
+    static sycl::queue default_queue{sycl::property::queue::in_order()};
+    sycl::queue* q = stream ? static_cast<sycl::queue*>(stream) : &default_queue;
+    const size_t total_threads = (size_t)(n * nq * MT_T);
+    const int grid_x = (int)n;
+
+    auto launch_hist = [&](auto pass_tag) {
+        constexpr int PASS = decltype(pass_tag)::value;
+        q->submit([&](sycl::handler& cgh) {
+            sycl::local_accessor<int[MT_W][256], 0> h_acc(cgh);
+            sycl::local_accessor<int, 1> s_ex_acc(sycl::range<1>(256), cgh);
+            sycl::local_accessor<int, 0> s_i_acc(cgh);
+
+            cgh.parallel_for(
+                sycl::nd_range<1>(total_threads, MT_T),
+                [=](sycl::nd_item<1> item) {
+                    const int group_linear = item.get_group(0);
+                    const int group_x = group_linear % grid_x;
+                    const int group_y = group_linear / grid_x;
+                    block_topk_multi_hist_kernel<PASS>(
+                        scores, steps, max_blocks, scratch,
+                        h_acc,
+                        s_ex_acc.get_multi_ptr<sycl::access::decorated::no>().get(),
+                        s_i_acc.get_multi_ptr<sycl::access::decorated::no>().get(),
+                        group_x, group_y, grid_x, item);
+                });
+        });
+    };
+
+    launch_hist(std::integral_constant<int, 0>{});
+    launch_hist(std::integral_constant<int, 1>{});
+    launch_hist(std::integral_constant<int, 2>{});
+    launch_hist(std::integral_constant<int, 3>{});
+
+    q->submit([&](sycl::handler& cgh) {
+        sycl::local_accessor<int, 1> s_ex_acc(sycl::range<1>(256), cgh);
+        sycl::local_accessor<int, 0> s_i_acc(cgh);
+
+        cgh.parallel_for(
+            sycl::nd_range<1>(total_threads, MT_T),
+            [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(32)]] {
+                const int group_linear = item.get_group(0);
+                const int group_x = group_linear % grid_x;
+                const int group_y = group_linear / grid_x;
+                block_topk_multi_count_kernel(
+                    scores, steps, max_blocks, scratch,
+                    s_ex_acc.get_multi_ptr<sycl::access::decorated::no>().get(),
+                    s_i_acc.get_multi_ptr<sycl::access::decorated::no>().get(),
+                    group_x, group_y, grid_x, item);
+            });
+    });
+
+    q->submit([&](sycl::handler& cgh) {
+        sycl::local_accessor<uint64_t, 1> s_w_acc(sycl::range<1>(MT_W), cgh);
+
+        cgh.parallel_for(
+            sycl::nd_range<1>(total_threads, MT_T),
+            [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(32)]] {
+                const int group_linear = item.get_group(0);
+                const int group_x = group_linear % grid_x;
+                const int group_y = group_linear / grid_x;
+                block_topk_multi_emit_kernel(
+                    scores, steps, max_blocks, cap, ids, scratch,
+                    s_w_acc.get_multi_ptr<sycl::access::decorated::no>().get(),
+                    group_x, group_y, grid_x, item);
+            });
+    });
+
+    return true;
+}
+
+int64_t qsa_topk_multi_scratch_ints(int64_t nq) {
+    return (nq < MT_MAXQ ? nq : MT_MAXQ) * (int64_t)MT_Q_INTS;
+}
+
+void qsa_block_topk_long(const float* scores, const int32_t* steps, int64_t nq, int64_t max_blocks, int64_t cap,
+                         const QsaShapes& s, int32_t* ids, void* stream, int64_t active_blocks, int32_t* multi_scratch) {
+    static const bool old = std::getenv("STRATA_TOPK_OLD") != nullptr;
+    if (nq > 0 && multi_scratch != nullptr && !old && active_blocks <= 0 && nq <= MT_MAXQ && s.idx_block == R &&
+        cap >= qsa_selection_width(kTopkMaxCells, s)) {
+        const int mode = topk_multi_mode();
+        if ((mode == 1 || (mode == 2 && max_blocks > (int64_t)TK_T * TK_PER)) &&
+            qsa_block_topk_multi(scores, steps, nq, max_blocks, cap, ids, stream, multi_scratch))
+            return;
+    }
+    qsa_block_topk(scores, steps, nq, max_blocks, cap, s, ids, stream, active_blocks);
+}
+
+void qsa_block_scores_long(const float* pooled, const float* dead, const float* q_idx, const int32_t* steps, int64_t nq,
+                           int64_t max_blocks, const QsaShapes& s, float* scores, void* stream, int64_t active_blocks) {
+    if (nq > 0 && s.idx_dim == IDX_DIM && s.idx_n_head == IDX_HEADS && s.idx_block == R && scores_multi_on() &&
+        nq <= MQ && active_blocks <= 0 &&
+        qsa_block_scores_dx(pooled, dead, q_idx, steps, nq, max_blocks, scores, stream))
+        return;
+    qsa_block_scores(pooled, dead, q_idx, steps, nq, max_blocks, s, scores, stream, active_blocks);
+}
+
 }  // namespace strata::kernels

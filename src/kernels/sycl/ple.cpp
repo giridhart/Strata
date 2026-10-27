@@ -458,4 +458,35 @@ void ple_block_projected(const float* projected_key, const float* projected_valu
     native_ple_postops(projected_key, hidden, projected_value, hist_rows, w, buffers, stream);
 }
 
+namespace {
+static const int8_t kPleIq4Nl[16] = {-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
+
+void ple_iq4nl_dequant_kernel(const uint8_t* __restrict__ raw, int64_t n, float* __restrict__ out,
+                              const sycl::nd_item<1>& item) {
+    const int64_t i = (int64_t)item.get_global_id(0);
+    if (i >= n) return;
+    const int64_t r = i / PLE_HEAD_DIM;
+    const int e = (int)(i - r * PLE_HEAD_DIM), b = e >> 5, j = e & 31;
+    const uint8_t* blk = raw + r * PLE_ROW_BYTES + b * 18;
+    const uint16_t dbits = (uint16_t)(blk[0] | (blk[1] << 8));
+    const float d = f32_from_f16(dbits);
+    const uint8_t q = blk[2 + (j & 15)];
+    out[i] = d * (float)kPleIq4Nl[j < 16 ? (q & 15) : (q >> 4)];
+}
+}  // namespace
+
+void ple_iq4nl_dequant(const uint8_t* raw, int64_t rows, float* out, void* stream) {
+    const int64_t n = rows * PLE_HEAD_DIM;
+    if (n <= 0) return;
+    static sycl::queue default_queue{sycl::property::queue::in_order()};
+    sycl::queue* q = stream ? static_cast<sycl::queue*>(stream) : &default_queue;
+    constexpr int block_size = 256;
+    const size_t total_items = ((size_t)n + block_size - 1) / block_size * block_size;
+    q->parallel_for(sycl::nd_range<1>(sycl::range<1>(total_items), sycl::range<1>(block_size)),
+                    [=](sycl::nd_item<1> item) {
+                        ple_iq4nl_dequant_kernel(raw, n, out, item);
+                    });
+    if (!stream) default_queue.wait();
+}
+
 }  // namespace strata::kernels
