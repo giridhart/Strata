@@ -121,20 +121,22 @@ inline float vec_dot_iq3_s_q8_1(const void* __restrict__ vbq, const block_q8_1* 
 inline float vec_dot_q2_0_q8_1(const void* __restrict__ vbq, const block_q8_1* __restrict__ bq8_1, const int& kbx,
                                const int& iqs) {
     const block_q2_0* bq2 = (const block_q2_0*)vbq + kbx;
+    const block_q8_1* bq8 = bq8_1 + iqs;
+    const uint8_t* qs = bq2->qs + iqs * 8;
     int sumi = 0;
 #pragma unroll
     for (int i = 0; i < 8; ++i) {
-        uint8_t c = bq2->qs[i];
+        uint8_t c = qs[i];
         int q0 = ((c >> 0) & 3) - 1;
         int q1 = ((c >> 2) & 3) - 1;
         int q2 = ((c >> 4) & 3) - 1;
         int q3 = ((c >> 6) & 3) - 1;
-        sumi += q0 * (int)bq8_1->qs[i * 4 + 0] + q1 * (int)bq8_1->qs[i * 4 + 1] +
-                q2 * (int)bq8_1->qs[i * 4 + 2] + q3 * (int)bq8_1->qs[i * 4 + 3];
+        sumi += q0 * (int)bq8->qs[i * 4 + 0] + q1 * (int)bq8->qs[i * 4 + 1] +
+                q2 * (int)bq8->qs[i * 4 + 2] + q3 * (int)bq8->qs[i * 4 + 3];
     }
     const float d =
         sycl::vec<sycl::half, 1>(bq2->d).convert<float, sycl::rounding_mode::automatic>()[0] *
-        sycl::vec<sycl::half, 1>(bq8_1->ds[0]).convert<float, sycl::rounding_mode::automatic>()[0];
+        sycl::vec<sycl::half, 1>(bq8->ds[0]).convert<float, sycl::rounding_mode::automatic>()[0];
     return d * sumi;
 }
 
@@ -339,9 +341,10 @@ void mmq_kernel(const int64_t total_rows, const int64_t w_rows, const int64_t w_
             break;
         }
         case GGML_TYPE_Q2_0: {
-            const int n_blocks = (int)(w_cols / 32);
+            const int n_blocks = (int)(w_cols / 64);
             for (int b = 0; b < n_blocks; ++b) {
-                dot += vec_dot_q2_0_q8_1(w_row, x_row + b, b, 0);
+                dot += vec_dot_q2_0_q8_1(w_row, x_row + b * 2, b, 0);
+                dot += vec_dot_q2_0_q8_1(w_row, x_row + b * 2, b, 1);
             }
             break;
         }
@@ -373,10 +376,6 @@ Nvfp4Mode nvfp4_mode() { return Nvfp4Mode::FP16; }
 bool supported(int t) {
     switch ((ggml_type)t) {
         case GGML_TYPE_Q2_0:
-        case GGML_TYPE_IQ2_XXS:
-        case GGML_TYPE_IQ2_XS:
-        case GGML_TYPE_IQ2_S:
-        case GGML_TYPE_IQ3_XXS:
         case GGML_TYPE_IQ3_S:
         case GGML_TYPE_IQ4_NL:
         case GGML_TYPE_IQ4_XS:
@@ -396,7 +395,7 @@ inline int64_t type_blck_size(int t) {
         case GGML_TYPE_Q8_0: return 32;
         case GGML_TYPE_IQ4_NL: return 32;
         case GGML_TYPE_IQ3_S: return 256;
-        case GGML_TYPE_Q2_0: return 32;
+        case GGML_TYPE_Q2_0: return 64;
         case GGML_TYPE_IQ2_XXS: return 256;
         case GGML_TYPE_IQ2_XS: return 256;
         case GGML_TYPE_IQ2_S: return 256;

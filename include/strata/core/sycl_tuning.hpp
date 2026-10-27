@@ -545,11 +545,18 @@ public:
         if (const char* disable = std::getenv("STRATA_SYCL_NO_TUNING")) {
             if (std::atoi(disable) != 0) return;
         }
+        const auto fp = DeviceFingerprint::from_device(dev);
         if (const char* env_path = std::getenv("STRATA_SYCL_TUNING_FILE")) {
             std::string err;
-            if (load_from_file(env_path, dev, err)) return;
+            if (load_from_file(env_path, dev, err)) {
+                std::fprintf(stderr, "strata: SYCL tuning table loaded for [%s] (%zu entries from %s)\n",
+                             fp.device_name.c_str(), entry_count(), env_path);
+                return;
+            } else {
+                std::fprintf(stderr, "strata: warning: STRATA_SYCL_TUNING_FILE=%s failed to load: %s\n",
+                             env_path, err.c_str());
+            }
         }
-        const auto fp = DeviceFingerprint::from_device(dev);
         std::string safe_dev = fp.device_name;
         for (char& c : safe_dev) {
             if (!std::isalnum(c)) c = '_';
