@@ -970,7 +970,7 @@ bool Verifier::record_window(int T, sycl::queue* cs, std::string& err) try {
                 return false;
             }
         }
-        if (device_plan_)  // E-6: every routed expert resident: this group's plan without the host
+        if (device_plan_ && hits_.d_res != nullptr)  // E-6: every routed expert resident: this group's plan without the host
             resident_plan(ids_ + tb * K, n * (int)K, (int)K, hits_.d_res + l * g.n_expert, (int)g.n_expert,
                           hits_.cache_base, slot_off_d_, (long long)hits_.blob,
                           plan_ + (size_t)grp * (size_t)(plan_i32_ + 16), (long long)max_t_ * K, skip_ + grp,

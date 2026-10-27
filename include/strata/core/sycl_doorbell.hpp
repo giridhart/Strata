@@ -51,9 +51,9 @@ inline uint32_t spin_max(const sycl::queue& q) {
     if (const char* e = std::getenv("STRATA_SPIN_MAX"); e && std::atol(e) > 0) {
         return (uint32_t)std::atol(e);
     }
-    // Default 2,000,000 reads gives CPU expert pool ample time (several seconds)
+    // Default 20,000,000 reads with device backoff gives CPU expert pool ample time (several seconds)
     // while guaranteeing the GPU never spins forever on a stalled or released engine.
-    return 2000000u;
+    return 20000000u;
 }
 
 namespace detail {
