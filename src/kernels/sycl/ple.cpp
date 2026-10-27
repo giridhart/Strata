@@ -23,6 +23,7 @@
 #include "strata/kernels/s2_gemv_q8.hpp"
 #include "strata/kernels/native_mmvq.hpp"
 #include "strata/kernels/native_ple_postops.hpp"
+#include "strata/core/sycl_tuning.hpp"
 
 #include <cmath>
 #include <cstdio>
@@ -480,7 +481,13 @@ void ple_iq4nl_dequant(const uint8_t* raw, int64_t rows, float* out, void* strea
     if (n <= 0) return;
     static sycl::queue default_queue{sycl::property::queue::in_order()};
     sycl::queue* q = stream ? static_cast<sycl::queue*>(stream) : &default_queue;
-    constexpr int block_size = 256;
+    STRATA_SYCL_RECORD_SHAPE(strata::sycl_tuning::KernelType::PLE_DEQUANT, rows, PLE_HEAD_DIM, 4, 32, 0);
+    auto& reg = strata::sycl_tuning::SyclTuningRegistry::instance();
+    reg.try_auto_load(q->get_device());
+    const uint64_t key = strata::sycl_tuning::make_kernel_key(
+        strata::sycl_tuning::KernelType::PLE_DEQUANT, rows, PLE_HEAD_DIM, 4, 32, 0);
+    const auto tuned = reg.get_or_fallback(key, {256, 0, 0, strata::sycl_tuning::CachePolicy::StreamingL3});
+    const int block_size = (tuned.lws > 0 && tuned.lws % 16 == 0) ? tuned.lws : 256;
     const size_t total_items = ((size_t)n + block_size - 1) / block_size * block_size;
     q->parallel_for(sycl::nd_range<1>(sycl::range<1>(total_items), sycl::range<1>(block_size)),
                     [=](sycl::nd_item<1> item) {

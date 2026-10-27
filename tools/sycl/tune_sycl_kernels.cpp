@@ -92,7 +92,13 @@ const GemvShape kTargetShapes[] = {
     {"flash_attn", strata::sycl_tuning::KernelType::FLASH_ATTN, 256, 24, 16, 256, 0, "Flash-Next Q24x256 / KV2x256", "default", "default", "default"},
 
     // 9. Native GDN (Gated Delta Net recurrent step)
-    {"native_gdn", strata::sycl_tuning::KernelType::GDN, 128, 8, 32, 1, 0, "GDN recurrent step S=128", "default", "default", "default"}
+    {"native_gdn", strata::sycl_tuning::KernelType::GDN, 128, 8, 32, 1, 0, "GDN recurrent step S=128", "default", "default", "default"},
+
+    // 10. Phase 1 & 2 Prefill and Speculative Selection Kernels
+    {"moe_scatter_add", strata::sycl_tuning::KernelType::MOE_SCATTER_ADD, 10, 2560, 0, 0, 0, "MoE scatter add n_u=10", "streaming", "cached", "default"},
+    {"moe_scatter_add", strata::sycl_tuning::KernelType::MOE_SCATTER_ADD, 32, 2560, 0, 0, 0, "MoE scatter add n_u=32", "streaming", "cached", "default"},
+    {"ple_dequant", strata::sycl_tuning::KernelType::PLE_DEQUANT, 64, 256, 4, 32, 0, "PLE IQ4_NL dequant 64 rows", "streaming", "cached", "default"},
+    {"qsa_select_long", strata::sycl_tuning::KernelType::QSA_SELECT_LONG, 4096, 4, 0, 0, 0, "QSA DX scorer 4k blocks nq=4", "cached", "cached", "default"}
 };
 
 // Mandatory Numerical Verification: check that device kernel produces finite results
@@ -740,6 +746,18 @@ int main(int argc, char** argv) {
                 pad = 0;
             } else if (shape.kernel_name == std::string("native_gdn")) {
                 best_lws = 64;
+                best_tpr = 0;
+                pad = 0;
+            } else if (shape.kernel_type == strata::sycl_tuning::KernelType::MOE_SCATTER_ADD) {
+                best_lws = 256;
+                best_tpr = 0;
+                pad = 0;
+            } else if (shape.kernel_type == strata::sycl_tuning::KernelType::PLE_DEQUANT) {
+                best_lws = 256;
+                best_tpr = 0;
+                pad = 0;
+            } else if (shape.kernel_type == strata::sycl_tuning::KernelType::QSA_SELECT_LONG) {
+                best_lws = 128;
                 best_tpr = 0;
                 pad = 0;
             }
