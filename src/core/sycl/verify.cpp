@@ -1501,7 +1501,21 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         ms_pool += ms_since(b);
     }
     progress_at("verify window: waiting for the GPU to finish the window (flags A/B/M raised)", (int64_t)T);
-    cs_->wait();
+    const auto t_wait_start = Clock::now();
+    while (true) {
+        bool is_empty = false;
+        try {
+            is_empty = cs_->ext_oneapi_empty();
+        } catch (...) {}
+        if (is_empty) break;
+        if (Clock::now() - t_wait_start > std::chrono::seconds(20)) {
+            err = "verify: timed out waiting for GPU graph execution to complete" +
+                  released_note(release_gpu_waits(5000));
+            return false;
+        }
+        _mm_pause();
+        std::this_thread::yield();
+    }
     progress_at("verify window: waiting for the expert copies", (int64_t)T);
     copy_->wait();             // no host function of this window may raise flag B in the next one
     if (prof_on_ && G == 1) {  // the window's GPU stage stamps
