@@ -4640,13 +4640,14 @@ int main(int argc, char** argv) try {
         }
     }
     if (o.serve) {
-        if (o.spec < 2 || o.mtp.empty() || o.prefill_chunk <= 0 ||
+        if (o.spec < 2 || o.prefill_chunk <= 0 ||
             (graph_hits && (thits.d_res == nullptr || host_res.empty()))) {
             std::fprintf(stderr,
-                         "strata serve: needs --spec T, --mtp DIR and --prefill CHUNK (and a fillable "
+                         "strata serve: needs --spec T and --prefill CHUNK (and a fillable "
                          "--expert-cache; the graphed hit path additionally needs --expert-profile P)\n");
             return 2;
         }
+        const bool use_mtp = !o.mtp.empty();
         strata::prefill::Prefill sp;
         void* borrow = nullptr;
         uint64_t borrow_bytes = 0;
@@ -5387,7 +5388,7 @@ int main(int argc, char** argv) try {
                 nxt[(size_t)t] = (int32_t)cur[(size_t)(p0 + t + 1)];
             // E-9: batched through the prompt path when it can (one GPU: a layer split's drafter is on the last stage)
             const bool batched = !multi_gpu && sp.draft_kv(mtp, R_rows, nxt.data(), T, p0, e);
-            if (!e.empty() || (!batched && !mtp.prefill(R_rows, nxt.data(), T, p0, e))) return false;
+            if (!e.empty() || (use_mtp && !batched && !mtp.prefill(R_rows, nxt.data(), T, p0, e))) return false;
             if (std::getenv("STRATA_SNAPSHOT_VERIFY") != nullptr)
                 std::fprintf(stderr, "strata serve: DRAFT_PREFILL path=%s mode=%d cells=%lld\n",
                              batched ? "batched" : "token", mtp.kv_state().kv_mode, (long long)T);
@@ -5770,6 +5771,13 @@ int main(int argc, char** argv) try {
                             since = now;
                             continue;
                         }
+                        const uint64_t cur_ticks = p.ticks.load();
+                        if (cur_ticks != ticks_at) {
+                            ticks_at = cur_ticks;
+                            since = now;
+                            continue;
+                        }
+                        if (strata::core::progress_now_ms() < p.allow_until_ms.load()) continue;
                         if (now - since < std::chrono::seconds(limit)) continue;
                         std::fprintf(stderr,
                                      "strata serve: no progress for %d s during a request (%s) - stopping "
@@ -6313,9 +6321,15 @@ int main(int argc, char** argv) try {
                     }();
                     if (logpos != nullptr && !ver.window_logprobs(nxt.data(), T, q, logpos_extra, logpos, e))
                         return false;
-                    if (!ver.commit(T, e) || !mtp.prefill(ver.final_R_all(), nxt.data(), T, q, e)) return false;
+                    if (!ver.commit(T, e) || (use_mtp && !mtp.prefill(ver.final_R_all(), nxt.data(), T, q, e))) return false;
                     q += T;
                     pp_reached = q;  // #471
+                    const double ms = std::chrono::duration<double, std::milli>(Clock::now() - pp_t0).count();
+                    std::printf("PP %lld %lld %.0f %.1f\n", (long long)q, (long long)pp_total, ms,
+                                ms > 0.0 ? 1000.0 * (double)(q - pp_from) / ms : 0.0);
+                    strata::core::progress_at("reading the prompt (verify windows), done up to token", q);
+                    strata::core::progress_beat();
+                    std::fflush(stdout);
                 }
                 // the batched prompt path (other streams), checkpoints and snapshots may follow: the last commit first
                 if (!ver.wait_commit(e)) return false;
