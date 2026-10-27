@@ -284,6 +284,7 @@ private:
     float* hist_snap_ = nullptr;                              // T * NG_HIST * NG_HC_DIM
     int64_t cap_ = 0, max_blocks_ = 0, attn_scratch_floats_ = 0;
     bool batch_rec_ = false;
+    bool is_lean() const;
 };
 
 }  // namespace strata::core
