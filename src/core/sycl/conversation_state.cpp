@@ -9,6 +9,9 @@
 #include <cmath>
 
 namespace strata::core {
+void conversation_checkpoint_join(const void* only) {
+    (void) only;
+}
 namespace {
 using conversation_detail::add;
 using conversation_detail::product;
