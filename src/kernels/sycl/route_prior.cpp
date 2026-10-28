@@ -38,10 +38,11 @@ void route_prior_k(const float* __restrict__ logits, const int32_t* __restrict__
     }
     mx = wmax(mx, sg);
     float sum = 0.0f;
+    const bool have_res = (res != nullptr);
 #pragma unroll
     for (int i = 0; i < 16; ++i) {
         const int e = lane + 32 * i;
-        s[i] = p[i] + (res[e] >= 0 ? lambda : 0.0f);  // the selection score
+        s[i] = p[i] + (have_res && res[e] >= 0 ? lambda : 0.0f);  // the selection score
         p[i] = sycl::exp(p[i] - mx);                  // router probability (unnormalised)
         sum += p[i];
     }

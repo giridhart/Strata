@@ -6279,6 +6279,7 @@ int main(int argc, char** argv) try {
             // tokens [a, b) through the windows: commit all of them, then give the draft layer their residuals
             auto read_windows = [&](int64_t a, int64_t b, std::string& e) -> bool {
                 strata::core::progress_at("reading the prompt (verify windows), from token", a);  // #217: not "batched"
+                strata::core::progress_beat();
                 // every token is committed and the picks are discarded: no head sampling (see set_head_sampling)
                 struct NoHeadSampling {
                     strata::core::Verifier& v;
