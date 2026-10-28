@@ -13,7 +13,37 @@ if [[ -f /opt/intel/oneapi/setvars.sh ]]; then
 fi
 
 RECONFIGURE=false
+BUILD_TYPE="${BUILD_TYPE:-Release}"
+EXTRA_CXX_FLAGS=""
 TARGETS=()
+
+print_help() {
+    cat <<EOF
+Usage: $(basename "$0") [options] [targets...]
+
+Options:
+  -r, --reconfigure        Force CMake reconfiguration
+  --clean                  Remove build directory before building
+  -p, --profile, -g,
+  --debug-info             Build with RelWithDebInfo and debug symbols (-gline-tables-only,
+                           -fno-omit-frame-pointer) for Intel VTune profiling
+  --build-type TYPE        Specify CMake build type (Release, RelWithDebInfo, Debug)
+                           (default: Release)
+  -h, --help               Show this help message and exit
+
+Environment Variables:
+  BUILD_TYPE=...           Set default build type (e.g. RelWithDebInfo)
+  PROFILE=1                Equivalent to --profile
+  AOT_BMG=1                Enable Ahead-Of-Time compilation for Intel Arc B580 (bmg)
+  JOBS=N                   Parallel compilation jobs (default: nproc or 4)
+
+Examples:
+  $(basename "$0")                          # Standard optimized Release build
+  $(basename "$0") --profile                # Build with debug line tables for VTune
+  $(basename "$0") -r verify_parity         # Reconfigure and build verify_parity
+EOF
+    exit 0
+}
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -28,12 +58,35 @@ while [[ $# -gt 0 ]]; do
             RECONFIGURE=true
             shift
             ;;
+        -p|--profile|--debug-info|-g)
+            BUILD_TYPE="RelWithDebInfo"
+            RECONFIGURE=true
+            shift
+            ;;
+        --build-type)
+            BUILD_TYPE="$2"
+            RECONFIGURE=true
+            shift 2
+            ;;
+        -h|--help)
+            print_help
+            ;;
         *)
             TARGETS+=("$1")
             shift
             ;;
     esac
 done
+
+if [[ "${PROFILE:-0}" == "1" ]]; then
+    BUILD_TYPE="RelWithDebInfo"
+fi
+
+if [[ "${BUILD_TYPE}" == "RelWithDebInfo" ]]; then
+    # -fno-omit-frame-pointer: full CPU and host worker call-stack unwinding in VTune
+    # Note: CMAKE_BUILD_TYPE=RelWithDebInfo natively passes -O2 -g -DNDEBUG to both host and SYCL device
+    EXTRA_CXX_FLAGS="-fno-omit-frame-pointer"
+fi
 
 if [[ ${#TARGETS[@]} -eq 0 ]]; then
     TARGETS=("strata")
@@ -51,15 +104,20 @@ fi
 
 # Ensure CMake is configured (or reconfigured if requested)
 if [[ ! -f "${BUILD_DIR}/Makefile" || "${RECONFIGURE}" == "true" ]]; then
-    echo "[INFO] Configuring CMake in ${BUILD_DIR} (AOT_BMG=${AOT_BMG:-0}, XMX_SG16=1)..."
+    echo "[INFO] Configuring CMake in ${BUILD_DIR} (BUILD_TYPE=${BUILD_TYPE}, AOT_BMG=${AOT_BMG:-0}, XMX_SG16=1)..."
+    CXX_FLAGS="-DSTRATA_XMX_SG16=1"
+    if [[ -n "${EXTRA_CXX_FLAGS}" ]]; then
+        CXX_FLAGS="${CXX_FLAGS} ${EXTRA_CXX_FLAGS}"
+    fi
+
     cmake -B "${BUILD_DIR}" -S "${REPO_DIR}" \
         -DCMAKE_CXX_COMPILER=icpx \
-        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_BUILD_TYPE="${BUILD_TYPE}" \
         -DSTRATA_ENABLE_SYCL=ON \
         -DSTRATA_TARGET_XE2=ON \
         -DSTRATA_XMX_SG16=ON \
         ${CMAKE_AOT_FLAG} \
-        -DCMAKE_CXX_FLAGS="-DSTRATA_XMX_SG16=1" \
+        -DCMAKE_CXX_FLAGS="${CXX_FLAGS}" \
         -DSTRATA_BUILD_PERF=ON \
         -DSTRATA_BUILD_TESTS=ON > "${LOG_FILE}" 2>&1 || {
             echo "[FAILED] CMake configure failed. Log excerpt:"
