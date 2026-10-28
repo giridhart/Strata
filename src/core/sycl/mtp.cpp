@@ -902,6 +902,7 @@ bool MtpDrafter::record_forward(int T, int step_row0, sycl::queue* cs, std::stri
 
 namespace {
 bool finish_capture(sycl::queue* cs, bool ok, cudaGraphExec_t& exec, const char* what, std::string& err) try {
+    const auto t_start = std::chrono::steady_clock::now();
     cudaGraph_t graph = nullptr;
     const int ce = cudaStreamEndCapture(cs, &graph);
     if (!ok) {
@@ -914,9 +915,11 @@ bool finish_capture(sycl::queue* cs, bool ok, cudaGraphExec_t& exec, const char*
         return false;
     }
     cudaGraphDestroy(graph);
-    // an explicit upload: the first launch's implicit one blocked behind a device-side spin (verify.cpp)
-    cudaGraphUpload(exec, cs);
-    cs->wait();
+    if (std::getenv("STRATA_VERIFY_DEBUG") != nullptr || std::getenv("STRATA_TRACE") != nullptr) {
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_start).count();
+        std::fprintf(stderr, "strata mtp: captured %s graph in %.2f ms\n", what, ms);
+        std::fflush(stderr);
+    }
     return true;
 } catch (const std::exception& exc) {
     err = std::string("mtp: ") + what + " capture exception: " + exc.what();
