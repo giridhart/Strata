@@ -218,9 +218,11 @@ bool Verifier::release_gpu_waits(int timeout_ms) try {
         }
     }
     return true;
-} catch (sycl::exception const& exc) {
-    std::cerr << exc.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
-    std::exit(1);
+} catch (const std::exception& exc) {
+    std::cerr << "Verifier::release_gpu_waits exception: " << exc.what() << std::endl;
+    return false;
+} catch (...) {
+    return false;
 }
 
 void Verifier::diag(std::FILE* f) const {
@@ -539,9 +541,11 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     std::fprintf(stderr, "strata verify: window up to %d tokens, %.1f MiB of device buffers\n", max_t,
                  (double)count.used / 1048576.0);
     return true;
-} catch (sycl::exception const& exc) {
-    std::cerr << exc.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
-    std::exit(1);
+} catch (const std::exception& exc) {
+    std::cerr << "Verifier::init exception: " << exc.what() << std::endl;
+    return false;
+} catch (...) {
+    return false;
 }
 
 const float* Verifier::final_R(int t) const { return R_ + (size_t)t * (size_t)(g_->hc * g_->n_embd); }
@@ -1238,9 +1242,11 @@ bool Verifier::record_window(int T, sycl::queue* cs, std::string& err) try {
     }
     stamp(g.n_layers, 1, 0);
     return true;
-} catch (sycl::exception const& exc) {
-    std::cerr << exc.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
-    std::exit(1);
+} catch (const std::exception& exc) {
+    std::cerr << "Verifier::record_window exception: " << exc.what() << std::endl;
+    return false;
+} catch (...) {
+    return false;
 }
 
 std::string Verifier::profile_report() {
@@ -1300,8 +1306,24 @@ std::string Verifier::profile_report() {
     return out;
 }
 
+inline bool verify_use_graph() {
+    // SYCL experimental command_graph on Level Zero runtime can hang or stall during g.finalize()
+    // on large monolithic verify graphs (1000+ nodes) on Intel Arc GPUs.
+    // Direct execution submits the exact same kernels to the in-order queue cs_ without graph compilation overhead.
+    // Graph capture can be opted into with STRATA_VERIFY_GRAPH=1.
+    static const bool enabled = [] {
+        const char* v = std::getenv("STRATA_VERIFY_GRAPH");
+        return v != nullptr && std::atoi(v) != 0;
+    }();
+    return enabled;
+}
+
 bool Verifier::capture(int T, std::string& err) try {
     if (exec_[T] != nullptr) return true;
+    if (!verify_use_graph()) {
+        VDBG("capture bypassed: direct execution mode active for T=%d (STRATA_VERIFY_GRAPH=0)\n", T);
+        return true;
+    }
     strata::core::progress_at("verify window: capturing graph", (int64_t)T);
     strata::core::progress_beat();
     VDBG("capture start: T=%d\n", T);
@@ -1336,31 +1358,78 @@ bool Verifier::capture(int T, std::string& err) try {
     const int ie = cudaGraphInstantiate(&exec_[T], graph, 0);
     cudaGraphDestroy(graph);
     if (ie != 0) {
-        err = "verify: instantiate error: " + std::to_string(ie);
-        return false;
+        std::fprintf(stderr, "strata verify: graph instantiation failed (code %d), falling back to direct execution\n", ie);
+        exec_[T] = nullptr;
+        return true;
     }
     VDBG("capture complete: T=%d in %.2f ms total\n", T, ms_since(t_start));
     strata::core::progress_beat();
     std::fprintf(stderr, "strata verify: captured the %d-token window\n", T);
     return true;
-} catch (sycl::exception const& exc) {
-    std::cerr << exc.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
-    std::exit(1);
+} catch (const std::exception& exc) {
+    std::cerr << "Verifier::copy_logits exception: " << exc.what() << std::endl;
+    return false;
+} catch (...) {
+    return false;
 }
 
-bool Verifier::capture_commit(std::string& err) try {
-    if (commit_exec_ != nullptr) return true;
+bool Verifier::record_commit(sycl::queue* cs, std::string& err) {
     using namespace strata::kernels;
     const ModelGeometry& g = *g_;
     SessionState& ss = *ss_;
-    VDBG("capture_commit start\n");
-    const Clock::time_point t_start = Clock::now();
     const QsaShapes s = shapes_of(g);
     const int64_t C = g.ssm_conv_channels, HV = g.ssm_v_heads, ID = g.idx_key_dim, MT = max_t_;
     const uint64_t gdn_floats = (uint64_t)g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size +
                                 (uint64_t)g.ssm_conv_channels * (g.ssm_d_conv - 1);
     const int64_t TS = (s.idx_block - 1) * ID;
     const int64_t HS = (int64_t)NG_HIST * NG_HC_DIM;
+    try {
+        copy_i32_from_mapped(commit_, m_commit_, 2 + MT, cs);
+        int64_t qsa_index = 0, gdn_index = 0;
+        for (int64_t l = 0; l < lb_; ++l)
+            (is_qsa_layer(g, l) ? qsa_index : gdn_index) += 1;
+        for (int64_t l = lb_; l < le_; ++l) {
+            const LayerView v(*wt_, l);
+            if (!is_qsa_layer(g, l)) {
+                const WeightRef* wnm = need(v, "ssm_norm.weight", err);
+                if (!wnm) return false;
+                float* state = ss.gdn_state + (size_t)(gdn_index - ss.gdn_ord0) * gdn_floats;
+                float* conv = state + (uint64_t)g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size;
+                const float* qkv = qkv_L_ + (size_t)gdn_index * MT * C;
+                gdn_conv_commit(conv, qkv, (int)C, commit_, cs);
+                gdn_step_norm_multi(state, h_L_ + (size_t)gdn_index * MT * C, (int)C,
+                                    gate_L_ + (size_t)gdn_index * MT * HV, beta_L_ + (size_t)gdn_index * MT * HV, z_,
+                                    (const float*)wnm->data, EPS, y_dummy_, (int)g.ssm_k_heads, (int)HV, (int)MT,
+                                    commit_, cs);
+                ++gdn_index;
+            } else {
+                const QsaState& st = ss.qsa_states[qsa_index];
+                const WeightRef* wikn = need(v, "indexer.k_norm.weight", err);
+                if (!wikn) return false;
+                copy_from_mapped(st.idx_tail, tail_snap_ + (size_t)qsa_index * TS, TS, cs);
+                const QsaIndexerBuffers ib{st.idx_tail, st.idx_dead, st.idx_pooled, st.idx_block_pos};
+                for (int64_t t = 0; t < MT; ++t)
+                    native_qsa_indexer_append(idx_raw_L_ + (size_t)(qsa_index * MT + t) * ID, commit_ + 2 + t, 0,
+                                              (const float*)wikn->data, EPS, ib, s, st.max_cells, rope_scaling(), cs);
+                ++qsa_index;
+            }
+        }
+        if (ss.ple.ready() && ple_stage()) copy_indexed(ss.ple.hist, hist_snap_, HS, commit_ + 1, HS, cs);
+    } catch (const std::exception& e) {
+        err = std::string("verify commit: ") + e.what();
+        return false;
+    }
+    return true;
+}
+
+bool Verifier::capture_commit(std::string& err) try {
+    if (commit_exec_ != nullptr) return true;
+    if (!verify_use_graph()) {
+        VDBG("capture_commit bypassed: direct execution mode active (STRATA_VERIFY_GRAPH=0)\n");
+        return true;
+    }
+    VDBG("capture_commit start\n");
+    const Clock::time_point t_start = Clock::now();
     /*
     DPCT1119:410: Migration of cudaStreamBeginCapture is not supported, please
     try to remigrate with option: --use-experimental-features=graph.
@@ -1369,66 +1438,29 @@ bool Verifier::capture_commit(std::string& err) try {
         err = "verify: begin commit capture failed";
         return false;
     }
-    bool ok = true;
-    try {
-        copy_i32_from_mapped(commit_, m_commit_, 2 + MT, cs_);
-        int64_t qsa_index = 0, gdn_index = 0;
-        for (int64_t l = 0; l < lb_; ++l)
-            (is_qsa_layer(g, l) ? qsa_index : gdn_index) += 1;
-        for (int64_t l = lb_; l < le_ && ok; ++l) {
-            const LayerView v(*wt_, l);
-            if (!is_qsa_layer(g, l)) {
-                const WeightRef* wnm = need(v, "ssm_norm.weight", err);
-                if (!wnm) {
-                    ok = false;
-                    break;
-                }
-                float* state = ss.gdn_state + (size_t)(gdn_index - ss.gdn_ord0) * gdn_floats;
-                float* conv = state + (uint64_t)g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size;
-                const float* qkv = qkv_L_ + (size_t)gdn_index * MT * C;
-                gdn_conv_commit(conv, qkv, (int)C, commit_, cs_);
-                gdn_step_norm_multi(state, h_L_ + (size_t)gdn_index * MT * C, (int)C,
-                                    gate_L_ + (size_t)gdn_index * MT * HV, beta_L_ + (size_t)gdn_index * MT * HV, z_,
-                                    (const float*)wnm->data, EPS, y_dummy_, (int)g.ssm_k_heads, (int)HV, (int)MT,
-                                    commit_, cs_);
-                ++gdn_index;
-            } else {
-                const QsaState& st = ss.qsa_states[qsa_index];
-                const WeightRef* wikn = need(v, "indexer.k_norm.weight", err);
-                if (!wikn) {
-                    ok = false;
-                    break;
-                }
-                copy_from_mapped(st.idx_tail, tail_snap_ + (size_t)qsa_index * TS, TS, cs_);
-                const QsaIndexerBuffers ib{st.idx_tail, st.idx_dead, st.idx_pooled, st.idx_block_pos};
-                for (int64_t t = 0; t < MT; ++t)
-                    native_qsa_indexer_append(idx_raw_L_ + (size_t)(qsa_index * MT + t) * ID, commit_ + 2 + t, 0,
-                                              (const float*)wikn->data, EPS, ib, s, st.max_cells, rope_scaling(), cs_);
-                ++qsa_index;
-            }
-        }
-        if (ok && ss.ple.ready() && ple_stage()) copy_indexed(ss.ple.hist, hist_snap_, HS, commit_ + 1, HS, cs_);
-    } catch (const std::exception& e) {
-        err = std::string("verify commit: ") + e.what();
-        ok = false;
-    }
+    std::string rerr;
+    const bool ok = record_commit(cs_, rerr);
     cudaGraph_t graph = nullptr;
     const int ce = cudaStreamEndCapture(cs_, &graph);
     if (!ok) {
         if (graph) cudaGraphDestroy(graph);
+        err = rerr;
         return false;
     }
     if (ce != 0 || cudaGraphInstantiate(&commit_exec_, graph, 0) != 0) {
         if (graph) cudaGraphDestroy(graph);
-        err = "verify: commit capture error: " + std::to_string(ce);
-        return false;
+        std::fprintf(stderr, "strata verify: commit graph instantiation skipped, falling back to direct execution\n");
+        commit_exec_ = nullptr;
+        return true;
     }
     cudaGraphDestroy(graph);
     VDBG("capture_commit complete in %.2f ms\n", ms_since(t_start));
     return true;
-} catch (sycl::exception const& exc) {
-    std::cerr << exc.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
-    std::exit(1);
+} catch (const std::exception& exc) {
+    std::cerr << "Verifier::capture_commit exception: " << exc.what() << std::endl;
+    return false;
+} catch (...) {
+    return false;
 }
 
 bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool, void* user, int32_t* out,
@@ -1486,13 +1518,21 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     for (int t = 0; t < T; ++t)
         last_tokens_[t] = tokens[t];
     ms_host += ms_since(t0);
-    VDBG("staged; launching\n");
+    VDBG("staged; launching (exec=%p)\n", exec_[T]);
     progress_at("verify window: launching", (int64_t)T);
     progress_beat();
-    const int le = cudaGraphLaunch_mock(exec_[T], cs_);
-    if (le != 0) {
-        err = std::string("verify: launch: error ") + std::to_string(le);
-        return false;
+    if (exec_[T] != nullptr) {
+        const int le = cudaGraphLaunch_mock(exec_[T], cs_);
+        if (le != 0) {
+            err = std::string("verify: launch: error ") + std::to_string(le);
+            return false;
+        }
+    } else {
+        std::string rerr;
+        if (!record_window(T, cs_, rerr)) {
+            err = "verify direct record: " + rerr;
+            return false;
+        }
     }
     try {
         (void)cs_->ext_oneapi_empty();
@@ -1672,9 +1712,11 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     progress_at("decode");
     progress_beat();
     return true;
-} catch (sycl::exception const& exc) {
-    std::cerr << exc.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
-    std::exit(1);
+} catch (const std::exception& exc) {
+    std::cerr << "Verifier::run exception: " << exc.what() << std::endl;
+    return false;
+} catch (...) {
+    return false;
 }
 
 void Verifier::set_plan_slot(int grp) {
@@ -1819,10 +1861,18 @@ bool Verifier::commit(int n_keep, std::string& err) try {
     for (int t = 0; t < max_t_; ++t)
         h_commit_[2 + t] = t < n_keep ? (int32_t)(last_pos0_ + t) : -1;
     std::atomic_thread_fence(std::memory_order_seq_cst);
-    const int le = cudaGraphLaunch_mock(commit_exec_, cs_);
-    if (le != 0) {
-        err = "verify: commit launch error: " + std::to_string(le);
-        return false;
+    if (commit_exec_ != nullptr) {
+        const int le = cudaGraphLaunch_mock(commit_exec_, cs_);
+        if (le != 0) {
+            err = "verify: commit launch error: " + std::to_string(le);
+            return false;
+        }
+    } else {
+        std::string rerr;
+        if (!record_commit(cs_, rerr)) {
+            err = "verify direct commit: " + rerr;
+            return false;
+        }
     }
     // set_commit_async: no wait here - the next window runs on the same stream after it, and the drafter (its own
     // stream) reads only this window's final rows and its own K/V. h_commit_ is next written after the next window's
@@ -1864,9 +1914,11 @@ bool Verifier::copy_logits(int t, float* host) const try {
         .memcpy(host, head_logits_ + (size_t)t * (size_t)n_vocab_, (size_t)n_vocab_ * sizeof(float))
         .wait();
     return true;
-} catch (sycl::exception const& exc) {
-    std::cerr << exc.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
-    std::exit(1);
+} catch (const std::exception& exc) {
+    std::cerr << "Verifier::copy_logits exception: " << exc.what() << std::endl;
+    return false;
+} catch (...) {
+    return false;
 }
 
 // #879: STRATA_NAN_GUARD=0 turns the guard off (no kernel is recorded; the graphs are captured once, so it is read once)

@@ -2,7 +2,10 @@
 #include <sycl/sycl.hpp>
 #include <sycl/ext/oneapi/experimental/graph.hpp>
 
+#include <chrono>
 #include <cstddef>
+#include <cstdio>
+#include <cstdlib>
 #include <map>
 #include <memory>
 
@@ -66,10 +69,36 @@ inline int cudaGraphGetNodes(void* graph, void*, size_t* count) {
 inline int cudaGraphInstantiate(void** out_exec, void* graph, ...) {
     if (!graph || !out_exec) return 1;
     auto* g = static_cast<strata_graph_detail::mod_graph_t*>(graph);
+    const bool trace = std::getenv("STRATA_VERIFY_DEBUG") != nullptr || std::getenv("STRATA_TRACE") != nullptr;
+    size_t nn = 0;
+    try {
+        nn = g->get_nodes().size();
+    } catch (...) {}
+    if (trace) {
+        std::fprintf(stderr, "strata graph: instantiating graph with %zu nodes...\n", nn);
+        std::fflush(stderr);
+    }
+    const auto t0 = std::chrono::steady_clock::now();
     try {
         auto* exec = new strata_graph_detail::exec_graph_t(g->finalize());
         *out_exec = static_cast<void*>(exec);
+        if (trace) {
+            const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            std::fprintf(stderr, "strata graph: finalized %zu nodes in %.2f ms\n", nn, ms);
+            std::fflush(stderr);
+        }
+    } catch (const std::exception& e) {
+        if (trace) {
+            std::fprintf(stderr, "strata graph: finalize exception: %s\n", e.what());
+            std::fflush(stderr);
+        }
+        *out_exec = nullptr;
+        return 1;
     } catch (...) {
+        if (trace) {
+            std::fprintf(stderr, "strata graph: finalize unknown exception\n");
+            std::fflush(stderr);
+        }
         *out_exec = nullptr;
         return 1;
     }
