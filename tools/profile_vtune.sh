@@ -12,16 +12,17 @@
 #   # 1. Profile using default settings (GPU Hotspots on prompt):
 #   ./tools/profile_vtune.sh
 #
-#   # 2. Profile an already-running Strata server:
-#   ./tools/profile_vtune.sh --url http://127.0.0.1:8080
+#   # 2. Profile a server that requires an API key:
+#   ./tools/profile_vtune.sh --api-key "my-secret-key"
+#   # Or via environment variable:
+#   STRATA_API_KEY="my-secret-key" ./tools/profile_vtune.sh
 #
-#   # 3. Launch with a specific model family / path:
+#   # 3. Profile an already-running Strata server with key:
+#   ./tools/profile_vtune.sh --url http://127.0.0.1:8080 --api-key "my-secret-key"
+#
+#   # 4. Launch with a specific model family / path:
 #   ./tools/profile_vtune.sh --family qwen --model q2_0
 #   ./tools/profile_vtune.sh --model-path /path/to/model.gguf
-#
-#   # 4. Run CPU Hotspots or XPU Offload analysis:
-#   ./tools/profile_vtune.sh --analysis hotspots
-#   ./tools/profile_vtune.sh --analysis xpu-offload
 # ==============================================================================
 
 set -euo pipefail
@@ -41,6 +42,7 @@ DATA_LIMIT=1000               # Result size limit in MB (0 = unlimited)
 SERVER_HOST="127.0.0.1"
 SERVER_PORT=8080
 SERVER_URL=""
+API_KEY="${API_KEY:-${STRATA_API_KEY:-}}"
 CUSTOM_OUT_DIR=""
 MODEL_FAMILY=""
 MODEL_SIZE=""
@@ -57,6 +59,8 @@ Usage: $(basename "$0") [options]
 Options:
   -p, --prompt TEXT        Inference prompt to profile
                            (default: "${PROMPT}")
+  -k, --api-key KEY        API key for Strata server authentication
+                           (default: reads \$STRATA_API_KEY or auto-detects)
   -a, --analysis TYPE      VTune analysis type: gpu-hotspots, hotspots,
                            xpu-offload, performance-snapshot (default: gpu-hotspots)
   -u, --url URL            URL of an already-running Strata server (skips server launch)
@@ -71,9 +75,9 @@ Options:
 
 Examples:
   $(basename "$0")
+  $(basename "$0") --api-key "strata-key-1234"
+  STRATA_API_KEY="strata-key-1234" $(basename "$0") --url http://127.0.0.1:8080
   $(basename "$0") --analysis hotspots --max-tokens 512
-  $(basename "$0") --url http://127.0.0.1:8080
-  $(basename "$0") --model-path /data/models/qwen --analysis gpu-hotspots
 EOF
     exit 0
 }
@@ -82,6 +86,10 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         -p|--prompt)
             PROMPT="$2"
+            shift 2
+            ;;
+        -k|--api-key|--key)
+            API_KEY="$2"
             shift 2
             ;;
         -a|--analysis)
@@ -135,6 +143,21 @@ if [[ -z "${SERVER_URL}" ]]; then
     SERVER_URL="http://${SERVER_HOST}:${SERVER_PORT}"
 fi
 
+# Auto-detect API key from running launch if not explicitly provided
+if [[ -z "${API_KEY}" && -f "${REPO_ROOT}/strata.py" ]]; then
+    DETECTED_KEY="$(python3 "${REPO_ROOT}/strata.py" launch --show-key 2>/dev/null | grep -v "There is no API key" | tr -d '[:space:]' || true)"
+    if [[ -n "${DETECTED_KEY}" ]]; then
+        API_KEY="${DETECTED_KEY}"
+        echo "[Auth] Auto-detected active API key from Strata preset."
+    fi
+fi
+
+# Prepare Authorization headers array for curl
+AUTH_HEADERS=()
+if [[ -n "${API_KEY}" ]]; then
+    AUTH_HEADERS=(-H "Authorization: Bearer ${API_KEY}")
+fi
+
 TIMESTAMP="$(date +'%Y%m%d_%H%M%S')"
 RESULT_DIR="${CUSTOM_OUT_DIR:-${REPO_ROOT}/vtune_profiles/strata_fibonacci_${ANALYSIS_TYPE}_${TIMESTAMP}}"
 
@@ -144,6 +167,12 @@ echo "========================================================================"
 echo "Target Prompt   : \"${PROMPT}\""
 echo "Analysis Type   : ${ANALYSIS_TYPE}"
 echo "Server Endpoint : ${SERVER_URL}"
+if [[ -n "${API_KEY}" ]]; then
+    MASKED_KEY="${API_KEY:0:4}...${API_KEY: -4}"
+    echo "API Key Auth    : Enabled (${MASKED_KEY})"
+else
+    echo "API Key Auth    : None (open access)"
+fi
 echo "Result Directory: ${RESULT_DIR}"
 echo "========================================================================"
 
@@ -237,7 +266,20 @@ SERVER_PID=""
 STARTED_SERVER=0
 
 is_server_ready() {
-    curl -s --connect-timeout 2 "${SERVER_URL}/v1/models" >/dev/null 2>&1
+    local status
+    status=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 2 ${AUTH_HEADERS[@]+"${AUTH_HEADERS[@]}"} "${SERVER_URL}/v1/models" 2>/dev/null || echo "000")
+    if [[ "${status}" == "200" ]]; then
+        return 0
+    elif [[ "${status}" == "401" ]]; then
+        echo "  [Auth Warning] Server returned 401 Unauthorized." >&2
+        if [[ -z "${API_KEY}" ]]; then
+            echo "                 Server requires an API key. Pass it via --api-key KEY or export STRATA_API_KEY=KEY." >&2
+        else
+            echo "                 The provided API key was rejected by the server." >&2
+        fi
+        return 2
+    fi
+    return 1
 }
 
 cleanup() {
@@ -253,13 +295,22 @@ trap 'cleanup INT' INT
 trap 'cleanup TERM' TERM
 trap 'cleanup EXIT' EXIT
 
-if is_server_ready; then
-    echo "  [Strata] Active server detected at ${SERVER_URL}."
+CHECK_CODE=0
+is_server_ready || CHECK_CODE=$?
+
+if [[ ${CHECK_CODE} -eq 0 ]]; then
+    echo "  [Strata] Active server detected at ${SERVER_URL} (authenticated)."
+elif [[ ${CHECK_CODE} -eq 2 ]]; then
+    echo "  [-] Error: Authentication failed against running server at ${SERVER_URL}." >&2
+    exit 1
 else
     echo "  [Strata] No running server found at ${SERVER_URL}."
     echo "  [Strata] Launching new Strata instance..."
 
     LAUNCH_ARGS=("--port" "${SERVER_PORT}" "--no-tui")
+    if [[ -n "${API_KEY}" ]]; then
+        LAUNCH_ARGS+=("--api-key" "${API_KEY}")
+    fi
     if [[ -n "${MODEL_PATH}" ]]; then
         LAUNCH_ARGS+=("--model-path" "${MODEL_PATH}")
     fi
@@ -345,6 +396,7 @@ run_prompt_inference() {
 
     curl -sN -X POST "${SERVER_URL}/v1/chat/completions" \
         -H "Content-Type: application/json" \
+        ${AUTH_HEADERS[@]+"${AUTH_HEADERS[@]}"} \
         -d "${payload}" | while IFS= read -r line; do
             if [[ "${line}" =~ ^data:\ (.*) ]]; then
                 chunk="${BASH_REMATCH[1]}"
@@ -384,10 +436,16 @@ else
     # Standalone command wrapper mode
     echo "  [VTune] Wrapping prompt execution under VTune..."
     WRAPPER_SCRIPT="/tmp/run_prompt_inference_${TIMESTAMP}.sh"
+    AUTH_FLAG=""
+    if [[ -n "${API_KEY}" ]]; then
+        AUTH_FLAG="-H \"Authorization: Bearer ${API_KEY}\""
+    fi
+
     cat <<EOF >"${WRAPPER_SCRIPT}"
 #!/usr/bin/env bash
 curl -sN -X POST "${SERVER_URL}/v1/chat/completions" \
   -H "Content-Type: application/json" \
+  ${AUTH_FLAG} \
   -d '{"model":"strata","messages":[{"role":"user","content":"${PROMPT}"}],"max_tokens":${MAX_TOKENS},"temperature":${TEMPERATURE},"stream":true}'
 EOF
     chmod +x "${WRAPPER_SCRIPT}"

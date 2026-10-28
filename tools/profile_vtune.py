@@ -8,10 +8,15 @@ Usage:
     # 1. Profile via Strata server (attaches to active inference or starts local instance)
     python3 tools/profile_vtune.py --analysis gpu-hotspots
 
-    # 2. Profile with custom prompt or generation parameters
+    # 2. Profile a server requiring an API key
+    python3 tools/profile_vtune.py --api-key "my-strata-key"
+    # Or via environment variable:
+    STRATA_API_KEY="my-strata-key" python3 tools/profile_vtune.py
+
+    # 3. Profile with custom prompt or generation parameters
     python3 tools/profile_vtune.py --prompt "write a cpp program to compute Nth fibonacci number" --max-tokens 512
 
-    # 3. Profile CPU hotspots or XPU offload analysis
+    # 4. Profile CPU hotspots or XPU offload analysis
     python3 tools/profile_vtune.py --analysis hotspots
     python3 tools/profile_vtune.py --analysis xpu-offload
 """
@@ -64,14 +69,21 @@ def get_environment() -> dict[str, str]:
     return env
 
 
-def is_server_ready(url: str) -> bool:
-    """Check if the Strata HTTP server is running and ready."""
+def is_server_ready(url: str, api_key: str = "") -> tuple[bool, str]:
+    """Check if the Strata HTTP server is running and ready. Returns (is_ready, error_msg)."""
+    headers = {}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
     try:
-        req = urllib.request.Request(f"{url.rstrip('/')}/v1/models", method="GET")
+        req = urllib.request.Request(f"{url.rstrip('/')}/v1/models", headers=headers, method="GET")
         with urllib.request.urlopen(req, timeout=2) as resp:
-            return resp.status == 200
-    except Exception:
-        return False
+            return resp.status == 200, ""
+    except urllib.error.HTTPError as e:
+        if e.code == 401:
+            return False, "401 Unauthorized: API key missing or invalid."
+        return False, f"HTTP Error {e.code}: {e.reason}"
+    except Exception as e:
+        return False, str(e)
 
 
 def find_target_pid() -> int | None:
@@ -81,7 +93,6 @@ def find_target_pid() -> int | None:
         try:
             out = subprocess.check_output(["pgrep", "-f", p], text=True).strip()
             if out:
-                # Return the last PID (child engine if spawned under server)
                 pids = [int(x) for x in out.splitlines() if x.strip().isdigit()]
                 if pids:
                     return pids[-1]
@@ -90,7 +101,7 @@ def find_target_pid() -> int | None:
     return None
 
 
-def send_prompt(url: str, prompt: str, max_tokens: int, temperature: float) -> str:
+def send_prompt(url: str, prompt: str, max_tokens: int, temperature: float, api_key: str = "") -> str:
     """Send prompt request to Strata /v1/chat/completions with streaming."""
     endpoint = f"{url.rstrip('/')}/v1/chat/completions"
     payload = {
@@ -101,30 +112,39 @@ def send_prompt(url: str, prompt: str, max_tokens: int, temperature: float) -> s
         "stream": True,
     }
     data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(endpoint, data=data, headers={"Content-Type": "application/json"})
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    
+    req = urllib.request.Request(endpoint, data=data, headers=headers)
     
     print(f"\n[Prompt Request] Sending prompt: \"{prompt}\"")
     print(f"[Streaming Output from {url}]:\n" + "-" * 40)
     full_output = []
     t0 = time.perf_counter()
     
-    with urllib.request.urlopen(req, timeout=120) as resp:
-        for raw_line in resp:
-            line = raw_line.decode("utf-8", errors="replace").strip()
-            if line.startswith("data: "):
-                chunk_str = line[len("data: "):].strip()
-                if chunk_str == "[DONE]":
-                    break
-                try:
-                    chunk = json.loads(chunk_str)
-                    delta = chunk.get("choices", [{}])[0].get("delta", {})
-                    content = delta.get("content", "")
-                    if content:
-                        sys.stdout.write(content)
-                        sys.stdout.flush()
-                        full_output.append(content)
-                except Exception:
-                    pass
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            for raw_line in resp:
+                line = raw_line.decode("utf-8", errors="replace").strip()
+                if line.startswith("data: "):
+                    chunk_str = line[len("data: "):].strip()
+                    if chunk_str == "[DONE]":
+                        break
+                    try:
+                        chunk = json.loads(chunk_str)
+                        delta = chunk.get("choices", [{}])[0].get("delta", {})
+                        content = delta.get("content", "")
+                        if content:
+                            sys.stdout.write(content)
+                            sys.stdout.flush()
+                            full_output.append(content)
+                    except Exception:
+                        pass
+    except urllib.error.HTTPError as e:
+        if e.code == 401:
+            sys.exit(f"\n[-] Authentication Error: Server returned 401 Unauthorized. Pass correct key via --api-key or STRATA_API_KEY.")
+        raise
 
     elapsed = time.perf_counter() - t0
     print("\n" + "-" * 40)
@@ -138,6 +158,11 @@ def main():
         "--prompt",
         default="write a cpp program to compute Nth fibonacci number",
         help="Inference prompt text (default: 'write a cpp program to compute Nth fibonacci number')",
+    )
+    parser.add_argument(
+        "-k", "--api-key",
+        default=os.environ.get("STRATA_API_KEY", ""),
+        help="API key for Strata server authentication (default: reads $STRATA_API_KEY)",
     )
     parser.add_argument(
         "--analysis",
@@ -167,19 +192,31 @@ def main():
     print(f"VTune Binary     : {vtune}")
     print(f"Analysis Type    : {args.analysis}")
     print(f"Target Prompt    : \"{args.prompt}\"")
+    print(f"Server URL       : {args.url}")
+    if args.api_key:
+        masked = args.api_key[:4] + "..." + args.api_key[-4:] if len(args.api_key) > 8 else "***"
+        print(f"API Key Auth     : Enabled ({masked})")
+    else:
+        print("API Key Auth     : None (open access)")
     print(f"Result Directory : {out_dir}")
     print("=======================================================")
 
     # Check if server is already running
     server_proc = None
-    if not is_server_ready(args.url):
+    ready, err = is_server_ready(args.url, args.api_key)
+    if not ready:
+        if "401" in err:
+            sys.exit(f"Error: Server at {args.url} rejected credentials ({err}). Check your --api-key.")
         print(f"[Strata] No active server found at {args.url}. Starting local instance...")
         server_cmd = [sys.executable, str(ROOT / "strata.py"), "serve", "--port", str(args.port)]
+        if args.api_key:
+            server_cmd.extend(["--api-key", args.api_key])
         server_proc = subprocess.Popen(server_cmd, cwd=ROOT, env=env)
         
         # Wait for server ready
         for _ in range(60):
-            if is_server_ready(args.url):
+            ready, _ = is_server_ready(args.url, args.api_key)
+            if ready:
                 break
             time.sleep(1)
         else:
@@ -188,7 +225,6 @@ def main():
             sys.exit(f"Error: Strata server failed to become ready at {args.url} within 60s.")
 
     try:
-        # Determine target PID for profiling
         target_pid = find_target_pid()
         if target_pid:
             print(f"[VTune] Attaching VTune to Strata Engine PID: {target_pid}...")
@@ -202,7 +238,7 @@ def main():
             time.sleep(2)  # Allow VTune collector to initialize hooks
 
             # Send prompt
-            send_prompt(args.url, args.prompt, args.max_tokens, args.temperature)
+            send_prompt(args.url, args.prompt, args.max_tokens, args.temperature, args.api_key)
 
             # Stop VTune
             print("[VTune] Stopping VTune data collection...")
@@ -214,7 +250,7 @@ def main():
             runner = [
                 sys.executable, "-c",
                 f"import sys; sys.path.insert(0, '{ROOT}/tools'); "
-                f"import profile_vtune; profile_vtune.send_prompt('{args.url}', '{args.prompt}', {args.max_tokens}, {args.temperature})"
+                f"import profile_vtune; profile_vtune.send_prompt('{args.url}', '{args.prompt}', {args.max_tokens}, {args.temperature}, '{args.api_key}')"
             ]
             vtune_cmd = [vtune, "-collect", args.analysis, "-result-dir", str(out_dir), "--", *runner]
             subprocess.run(vtune_cmd, env=env, check=False)
