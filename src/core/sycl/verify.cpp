@@ -173,10 +173,11 @@ void release_live_verifiers(std::FILE* f) {
         if (Verifier* v = slot.load()) {
             const Clock::time_point t0 = Clock::now();
             const bool done = v->release_gpu_waits(5000);
-            if (f != nullptr)
-                std::fprintf(f, "strata: released the verify window's GPU waits (#267): the GPU %s\n",
-                             done ? ("finished in " + std::to_string((long long)ms_since(t0)) + " ms").c_str()
-                                  : "did not finish within 5 s");
+            if (f != nullptr) {
+                const std::string detail = done ? ("finished in " + std::to_string((long long)ms_since(t0)) + " ms")
+                                                : "did not finish within 5 s";
+                std::fprintf(f, "strata: released the verify window's GPU waits (#267): the GPU %s\n", detail.c_str());
+            }
         }
     if (f != nullptr) std::fflush(f);
 }
@@ -1303,6 +1304,8 @@ bool Verifier::capture(int T, std::string& err) try {
     if (exec_[T] != nullptr) return true;
     strata::core::progress_at("verify window: capturing graph", (int64_t)T);
     strata::core::progress_beat();
+    VDBG("capture start: T=%d\n", T);
+    const Clock::time_point t_start = Clock::now();
     /*
     DPCT1119:389: Migration of cudaStreamBeginCapture is not supported, please
     try to remigrate with option: --use-experimental-features=graph.
@@ -1328,14 +1331,15 @@ bool Verifier::capture(int T, std::string& err) try {
         err = "verify: end capture error: " + std::to_string(ce);
         return false;
     }
+    VDBG("capture recorded: T=%d in %.2f ms, instantiating graph\n", T, ms_since(t_start));
+    strata::core::progress_at("verify window: instantiating graph", (int64_t)T);
     const int ie = cudaGraphInstantiate(&exec_[T], graph, 0);
     cudaGraphDestroy(graph);
     if (ie != 0) {
         err = "verify: instantiate error: " + std::to_string(ie);
         return false;
     }
-    cudaGraphUpload(exec_[T], cs_);
-    cs_->wait();
+    VDBG("capture complete: T=%d in %.2f ms total\n", T, ms_since(t_start));
     strata::core::progress_beat();
     std::fprintf(stderr, "strata verify: captured the %d-token window\n", T);
     return true;
@@ -1349,6 +1353,8 @@ bool Verifier::capture_commit(std::string& err) try {
     using namespace strata::kernels;
     const ModelGeometry& g = *g_;
     SessionState& ss = *ss_;
+    VDBG("capture_commit start\n");
+    const Clock::time_point t_start = Clock::now();
     const QsaShapes s = shapes_of(g);
     const int64_t C = g.ssm_conv_channels, HV = g.ssm_v_heads, ID = g.idx_key_dim, MT = max_t_;
     const uint64_t gdn_floats = (uint64_t)g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size +
@@ -1418,6 +1424,7 @@ bool Verifier::capture_commit(std::string& err) try {
         return false;
     }
     cudaGraphDestroy(graph);
+    VDBG("capture_commit complete in %.2f ms\n", ms_since(t_start));
     return true;
 } catch (sycl::exception const& exc) {
     std::cerr << exc.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
