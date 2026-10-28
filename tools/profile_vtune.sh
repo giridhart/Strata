@@ -2,283 +2,432 @@
 # ==============================================================================
 # profile_vtune.sh - Profile Strata Inference with Intel VTune Profiler
 #
-# Prompt: "write a cpp program to compute Nth fibonacci number"
+# Designed for bare-metal Linux machines equipped with Intel Arc / Xe2 GPUs.
+# Profiles prompt prefill and token generation with Intel VTune Profiler
+# without polluting traces with model loading / startup disk I/O.
 #
-# This script configures the Intel oneAPI environment, launches Strata,
-# runs the prompt through Strata CLI / API, and captures profiling data
-# (GPU Hotspots, CPU Hotspots, or Level Zero tracing) using Intel VTune.
+# Default Prompt: "write a cpp program to compute Nth fibonacci number"
+#
+# Usage:
+#   # 1. Profile using default settings (GPU Hotspots on prompt):
+#   ./tools/profile_vtune.sh
+#
+#   # 2. Profile an already-running Strata server:
+#   ./tools/profile_vtune.sh --url http://127.0.0.1:8080
+#
+#   # 3. Launch with a specific model family / path:
+#   ./tools/profile_vtune.sh --family qwen --model q2_0
+#   ./tools/profile_vtune.sh --model-path /path/to/model.gguf
+#
+#   # 4. Run CPU Hotspots or XPU Offload analysis:
+#   ./tools/profile_vtune.sh --analysis hotspots
+#   ./tools/profile_vtune.sh --analysis xpu-offload
 # ==============================================================================
 
 set -euo pipefail
 
 # ------------------------------------------------------------------------------
-# Configuration & Defaults
+# Default Settings
 # ------------------------------------------------------------------------------
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
-# Prompt requested by user
 PROMPT="write a cpp program to compute Nth fibonacci number"
-MAX_TOKENS="${MAX_TOKENS:-256}"
-TEMPERATURE="${TEMPERATURE:-0.0}"
+MAX_TOKENS=256
+TEMPERATURE=0.0
+ANALYSIS_TYPE="gpu-hotspots"  # gpu-hotspots, hotspots, xpu-offload, performance-snapshot
+DATA_LIMIT=1000               # Result size limit in MB (0 = unlimited)
 
-# VTune settings
-ANALYSIS_TYPE="${ANALYSIS_TYPE:-gpu-hotspots}"   # gpu-hotspots, hotspots, xpu-offload, performance-snapshot
+SERVER_HOST="127.0.0.1"
+SERVER_PORT=8080
+SERVER_URL=""
+CUSTOM_OUT_DIR=""
+MODEL_FAMILY=""
+MODEL_SIZE=""
+MODEL_PATH=""
+EXTRA_SERVER_ARGS=""
+
+# ------------------------------------------------------------------------------
+# CLI Argument Parsing
+# ------------------------------------------------------------------------------
+print_help() {
+    cat <<EOF
+Usage: $(basename "$0") [options]
+
+Options:
+  -p, --prompt TEXT        Inference prompt to profile
+                           (default: "${PROMPT}")
+  -a, --analysis TYPE      VTune analysis type: gpu-hotspots, hotspots,
+                           xpu-offload, performance-snapshot (default: gpu-hotspots)
+  -u, --url URL            URL of an already-running Strata server (skips server launch)
+  -m, --model NAME         Model size/preset (e.g. q2_0, iq3_xxs)
+  -f, --family NAME        Model family (e.g. qwen, deepseek41)
+      --model-path PATH    Path to local model weights (directory of shards or .gguf)
+      --port PORT          Port for Strata server if launched by this script (default: 8080)
+      --max-tokens N       Maximum new tokens to generate (default: 256)
+      --temperature T      Sampling temperature (default: 0.0)
+  -o, --out-dir DIR        Custom output directory for VTune results
+  -h, --help               Show this help message and exit
+
+Examples:
+  $(basename "$0")
+  $(basename "$0") --analysis hotspots --max-tokens 512
+  $(basename "$0") --url http://127.0.0.1:8080
+  $(basename "$0") --model-path /data/models/qwen --analysis gpu-hotspots
+EOF
+    exit 0
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -p|--prompt)
+            PROMPT="$2"
+            shift 2
+            ;;
+        -a|--analysis)
+            ANALYSIS_TYPE="$2"
+            shift 2
+            ;;
+        -u|--url)
+            SERVER_URL="$2"
+            shift 2
+            ;;
+        -m|--model)
+            MODEL_SIZE="$2"
+            shift 2
+            ;;
+        -f|--family)
+            MODEL_FAMILY="$2"
+            shift 2
+            ;;
+        --model-path)
+            MODEL_PATH="$2"
+            shift 2
+            ;;
+        --port)
+            SERVER_PORT="$2"
+            shift 2
+            ;;
+        --max-tokens)
+            MAX_TOKENS="$2"
+            shift 2
+            ;;
+        --temperature)
+            TEMPERATURE="$2"
+            shift 2
+            ;;
+        -o|--out-dir)
+            CUSTOM_OUT_DIR="$2"
+            shift 2
+            ;;
+        -h|--help)
+            print_help
+            ;;
+        *)
+            echo "Unknown argument: $1" >&2
+            echo "Run with --help for usage details." >&2
+            exit 1
+            ;;
+    esac
+done
+
+if [[ -z "${SERVER_URL}" ]]; then
+    SERVER_URL="http://${SERVER_HOST}:${SERVER_PORT}"
+fi
+
 TIMESTAMP="$(date +'%Y%m%d_%H%M%S')"
-RESULT_DIR="${RESULT_DIR:-${REPO_ROOT}/vtune_profiles/strata_fibonacci_${ANALYSIS_TYPE}_${TIMESTAMP}}"
-DATA_LIMIT="${DATA_LIMIT:-1000}"                 # Limit in MB (0 = unlimited)
+RESULT_DIR="${CUSTOM_OUT_DIR:-${REPO_ROOT}/vtune_profiles/strata_fibonacci_${ANALYSIS_TYPE}_${TIMESTAMP}}"
 
-# Strata server settings
-SERVER_PORT="${SERVER_PORT:-8080}"
-SERVER_HOST="${SERVER_HOST:-127.0.0.1}"
-SERVER_URL="http://${SERVER_HOST}:${SERVER_PORT}"
-MODEL_FAMILY="${MODEL_FAMILY:-qwen}"
-MODEL_SIZE="${MODEL_SIZE:-q2_0}"
-
-# Execution mode: "api" (via Strata server/client) or "engine" (direct SYCL binary)
-RUN_MODE="${RUN_MODE:-api}"
+echo "========================================================================"
+echo "           Strata Inference Profiling with Intel VTune                  "
+echo "========================================================================"
+echo "Target Prompt   : \"${PROMPT}\""
+echo "Analysis Type   : ${ANALYSIS_TYPE}"
+echo "Server Endpoint : ${SERVER_URL}"
+echo "Result Directory: ${RESULT_DIR}"
+echo "========================================================================"
 
 # ------------------------------------------------------------------------------
-# Step 1: Initialize Intel oneAPI and Python Environment
+# 1. Environment & Preflight Checks
 # ------------------------------------------------------------------------------
-echo "=== [1/5] Initializing oneAPI & Python Environment ==="
+echo ""
+echo "[Step 1/5] Preflight & Environment Configuration..."
 
-ONEAPI_SETVARS="/opt/intel/oneapi/setvars.sh"
+# 1.1 Source oneAPI setvars if present
+ONEAPI_SETVARS="${ONEAPI_ROOT:-/opt/intel/oneapi}/setvars.sh"
 if [[ -f "${ONEAPI_SETVARS}" ]]; then
-    echo "[oneAPI] Sourcing ${ONEAPI_SETVARS}..."
+    echo "  [oneAPI] Sourcing ${ONEAPI_SETVARS}..."
     # shellcheck disable=SC1090
     source "${ONEAPI_SETVARS}" --force >/dev/null 2>&1 || true
 else
-    echo "[oneAPI] Note: ${ONEAPI_SETVARS} not found, relying on current PATH."
+    echo "  [oneAPI] Info: ${ONEAPI_SETVARS} not found, relying on current PATH."
 fi
 
-# Ensure Python virtual environment if present
-if [[ -f "${REPO_ROOT}/.venv/bin/activate" ]]; then
-    echo "[Python] Activating .venv from ${REPO_ROOT}/.venv..."
-    # shellcheck disable=SC1091
-    source "${REPO_ROOT}/.venv/bin/activate"
-fi
-
-# Verify VTune availability
+# 1.2 Locate VTune binary
 VTUNE_BIN="$(which vtune 2>/dev/null || true)"
 if [[ -z "${VTUNE_BIN}" ]]; then
-    if [[ -x "/opt/intel/oneapi/vtune/latest/bin64/vtune" ]]; then
-        VTUNE_BIN="/opt/intel/oneapi/vtune/latest/bin64/vtune"
+    for candidate in \
+        "/opt/intel/oneapi/vtune/latest/bin64/vtune" \
+        "/opt/intel/oneapi/vtune/2026.6/bin64/vtune" \
+        "/opt/intel/oneapi/vtune/2025.0/bin64/vtune"; do
+        if [[ -x "${candidate}" ]]; then
+            VTUNE_BIN="${candidate}"
+            break
+        fi
+    done
+fi
+
+if [[ -z "${VTUNE_BIN}" ]]; then
+    echo "  [-] Error: Intel VTune binary ('vtune') not found." >&2
+    echo "      Install Intel oneAPI Base Toolkit or standalone VTune Profiler." >&2
+    exit 1
+fi
+echo "  [VTune] Using binary: ${VTUNE_BIN}"
+"${VTUNE_BIN}" --version | head -n 1
+
+# 1.3 Linux Kernel Profiling Permissions (for bare-metal execution)
+if [[ -f /proc/sys/kernel/perf_event_paranoid ]]; then
+    PARANOID="$(cat /proc/sys/kernel/perf_event_paranoid)"
+    if [[ "${PARANOID}" -gt 0 ]]; then
+        echo "  [Warning] /proc/sys/kernel/perf_event_paranoid is currently ${PARANOID}."
+        echo "            For hardware event-based profiling, run on target machine:"
+        echo "              sudo sysctl -w kernel.perf_event_paranoid=0"
     else
-        echo "[-] Error: 'vtune' not found in PATH or /opt/intel/oneapi/vtune."
-        echo "    Ensure Intel VTune Profiler is installed and setvars.sh is sourced."
-        exit 1
+        echo "  [Kernel] perf_event_paranoid is set to ${PARANOID} (OK)."
     fi
 fi
-echo "[VTune] Found VTune at: ${VTUNE_BIN}"
-"${VTUNE_BIN}" --version | head -n 2
 
-# Set GPU execution environment for Intel Arc (Level Zero)
+if [[ -f /proc/sys/dev/i915/perf_stream_paranoid ]]; then
+    I915_PARANOID="$(cat /proc/sys/dev/i915/perf_stream_paranoid)"
+    if [[ "${I915_PARANOID}" -ne 0 ]]; then
+        echo "  [Warning] /proc/sys/dev/i915/perf_stream_paranoid is ${I915_PARANOID}."
+        echo "            For Intel GPU metrics, run:"
+        echo "              sudo sysctl -w dev.i915.perf_stream_paranoid=0"
+    fi
+fi
+
+if [[ -f /proc/sys/dev/xe/observation_paranoid ]]; then
+    XE_PARANOID="$(cat /proc/sys/dev/xe/observation_paranoid)"
+    if [[ "${XE_PARANOID}" -ne 0 ]]; then
+        echo "  [Warning] /proc/sys/dev/xe/observation_paranoid is ${XE_PARANOID}."
+        echo "            For Intel Xe2 GPU metrics, run:"
+        echo "              sudo sysctl -w dev.xe.observation_paranoid=0"
+    fi
+fi
+
+# 1.4 GPU & Graph Environment
 export ONEAPI_DEVICE_SELECTOR="${ONEAPI_DEVICE_SELECTOR:-level_zero:gpu}"
 export ZE_ENABLE_TRACING="${ZE_ENABLE_TRACING:-1}"
 export STRATA_VERIFY_GRAPH="${STRATA_VERIFY_GRAPH:-1}"
 
-# Check for WSL2 environment virtualization note
-if grep -qi "microsoft" /proc/version 2>/dev/null; then
-    IS_WSL2=1
-    echo "[Environment] Detected WSL2 virtualized Linux environment."
-else
-    IS_WSL2=0
+# 1.5 Activate local Python virtualenv if available
+if [[ -f "${REPO_ROOT}/.venv/bin/activate" ]]; then
+    echo "  [Python] Activating virtual environment: ${REPO_ROOT}/.venv"
+    # shellcheck disable=SC1091
+    source "${REPO_ROOT}/.venv/bin/activate"
 fi
 
 # ------------------------------------------------------------------------------
-# Step 2: Prepare Profiling Destination
+# 2. Check or Launch Strata Inference Server
 # ------------------------------------------------------------------------------
-echo "=== [2/5] Profiling Destination ==="
-mkdir -p "$(dirname "${RESULT_DIR}")"
-echo "[Output] Target result directory: ${RESULT_DIR}"
-echo "[Config] Analysis Type: ${ANALYSIS_TYPE}"
-echo "[Config] Prompt: \"${PROMPT}\""
-
-# ------------------------------------------------------------------------------
-# Step 3: Check / Start Strata
-# ------------------------------------------------------------------------------
-echo "=== [3/5] Checking Strata Inference Service ==="
+echo ""
+echo "[Step 2/5] Connecting to Strata Server..."
 
 SERVER_PID=""
-STARTED_OURSELVES=0
+STARTED_SERVER=0
 
 is_server_ready() {
     curl -s --connect-timeout 2 "${SERVER_URL}/v1/models" >/dev/null 2>&1
 }
 
-if [[ "${RUN_MODE}" == "api" ]]; then
-    if is_server_ready; then
-        echo "[Strata] Existing Strata server detected responding on ${SERVER_URL}."
-    else
-        echo "[Strata] No running server found on ${SERVER_URL}."
-        echo "[Strata] Launching Strata server in background..."
-        
-        # Launch server in background
-        python3 "${REPO_ROOT}/strata.py" serve \
-            --port "${SERVER_PORT}" \
-            >/tmp/strata_vtune_server.log 2>&1 &
-        SERVER_PID=$!
-        STARTED_OURSELVES=1
-        
-        echo "[Strata] Waiting for server to initialize (PID: ${SERVER_PID})..."
-        WAIT_SECONDS=0
-        MAX_WAIT=60
-        until is_server_ready; do
-            if ! kill -0 "${SERVER_PID}" 2>/dev/null; then
-                echo "[-] Strata server failed to start. Logs:"
-                cat /tmp/strata_vtune_server.log | tail -n 20
-                exit 1
-            fi
-            sleep 1
-            WAIT_SECONDS=$((WAIT_SECONDS + 1))
-            if [[ ${WAIT_SECONDS} -ge ${MAX_WAIT} ]]; then
-                echo "[-] Timeout waiting for Strata server on ${SERVER_URL}."
-                exit 1
-            fi
-        done
-        echo "[Strata] Server ready at ${SERVER_URL}."
-    fi
-fi
-
-# Cleanup handler
 cleanup() {
-    if [[ "${STARTED_OURSELVES}" -eq 1 && -n "${SERVER_PID}" ]]; then
-        echo "[Cleanup] Stopping background Strata server (PID: ${SERVER_PID})..."
+    local sig="${1:-EXIT}"
+    if [[ "${STARTED_SERVER}" -eq 1 && -n "${SERVER_PID}" ]]; then
+        echo ""
+        echo "[Cleanup] Shutting down Strata server (PID: ${SERVER_PID})..."
         kill "${SERVER_PID}" 2>/dev/null || true
         wait "${SERVER_PID}" 2>/dev/null || true
     fi
 }
-trap cleanup EXIT INT TERM
+trap 'cleanup INT' INT
+trap 'cleanup TERM' TERM
+trap 'cleanup EXIT' EXIT
 
-# ------------------------------------------------------------------------------
-# Step 4: Run VTune Profiling
-# ------------------------------------------------------------------------------
-echo "=== [4/5] Executing Prompt and Capturing VTune Profile ==="
-
-# Locate active engine or server process PID
-TARGET_PID=""
-if [[ -n "${SERVER_PID}" ]]; then
-    # Look for child engine process if spawned, otherwise the server PID
-    CHILD_ENGINE_PID="$(pgrep -P "${SERVER_PID}" -f "strata|generate" 2>/dev/null | head -n 1 || true)"
-    TARGET_PID="${CHILD_ENGINE_PID:-${SERVER_PID}}"
+if is_server_ready; then
+    echo "  [Strata] Active server detected at ${SERVER_URL}."
 else
-    # Auto-detect running strata engine or python server
-    TARGET_PID="$(pgrep -f "build_sycl/strata|serve/server.py|strata.py serve" | head -n 1 || true)"
+    echo "  [Strata] No running server found at ${SERVER_URL}."
+    echo "  [Strata] Launching new Strata instance..."
+
+    LAUNCH_ARGS=("--port" "${SERVER_PORT}" "--no-tui")
+    if [[ -n "${MODEL_PATH}" ]]; then
+        LAUNCH_ARGS+=("--model-path" "${MODEL_PATH}")
+    fi
+    if [[ -n "${MODEL_FAMILY}" ]]; then
+        LAUNCH_ARGS+=("--family" "${MODEL_FAMILY}")
+    fi
+    if [[ -n "${MODEL_SIZE}" ]]; then
+        LAUNCH_ARGS+=("--model" "${MODEL_SIZE}")
+    fi
+
+    # Start server with strata.py launch or serve
+    if [[ -f "${REPO_ROOT}/strata.py" ]]; then
+        python3 "${REPO_ROOT}/strata.py" launch "${LAUNCH_ARGS[@]}" \
+            >/tmp/strata_vtune_server.log 2>&1 &
+        SERVER_PID=$!
+        STARTED_SERVER=1
+    else
+        echo "  [-] Error: strata.py not found in ${REPO_ROOT}." >&2
+        exit 1
+    fi
+
+    echo "  [Strata] Server starting in background (PID: ${SERVER_PID}). Waiting for ready..."
+    WAIT_COUNT=0
+    MAX_WAIT=120
+    until is_server_ready; do
+        if ! kill -0 "${SERVER_PID}" 2>/dev/null; then
+            echo "  [-] Error: Strata server terminated unexpectedly. Log output:" >&2
+            cat /tmp/strata_vtune_server.log | tail -n 25 >&2
+            exit 1
+        fi
+        sleep 1
+        WAIT_COUNT=$((WAIT_COUNT + 1))
+        if [[ ${WAIT_COUNT} -ge ${MAX_WAIT} ]]; then
+            echo "  [-] Error: Timed out waiting for Strata server on ${SERVER_URL}." >&2
+            exit 1
+        fi
+    done
+    echo "  [Strata] Server is online and ready for inference."
 fi
 
-echo "[Profiling] Target Process PID: ${TARGET_PID:-N/A}"
+# ------------------------------------------------------------------------------
+# 3. Locate Target Engine Process for Precision Profiling
+# ------------------------------------------------------------------------------
+echo ""
+echo "[Step 3/5] Locating Active Engine Process for Precision Attachment..."
 
-# Helper function to send the inference prompt
-send_prompt_request() {
-    echo "[Prompt Request] Sending: \"${PROMPT}\" to ${SERVER_URL}/v1/chat/completions..."
-    
-    # Generate JSON payload
-    local payload
-    payload="$(cat <<EOF
-{
-  "model": "strata",
-  "messages": [
-    {
-      "role": "user",
-      "content": "${PROMPT}"
-    }
-  ],
-  "max_tokens": ${MAX_TOKENS},
-  "temperature": ${TEMPERATURE},
-  "stream": true
-}
-EOF
-)"
+# By attaching to the engine right before sending the prompt and detaching
+# immediately when generation ends, we isolate 100% of the profile to inference
+# rather than polluting the trace with initial model loading / memory mapping.
+TARGET_PID=""
+for candidate in \
+    $(pgrep -f "build_sycl/strata" 2>/dev/null || true) \
+    $(pgrep -f "strata_engine" 2>/dev/null || true) \
+    $(pgrep -f "serve/server.py" 2>/dev/null || true); do
+    if kill -0 "${candidate}" 2>/dev/null; then
+        TARGET_PID="${candidate}"
+        break
+    fi
+done
 
-    echo "--- Model Output Stream ---"
+if [[ -z "${TARGET_PID}" && -n "${SERVER_PID}" ]]; then
+    TARGET_PID="${SERVER_PID}"
+fi
+
+echo "  [Target] Selected Process PID for profiling: ${TARGET_PID:-None (Wrapper mode)}"
+
+# ------------------------------------------------------------------------------
+# 4. Run VTune Collection During Prompt Inference
+# ------------------------------------------------------------------------------
+echo ""
+echo "[Step 4/5] Executing Prompt & Capturing VTune Trace..."
+mkdir -p "$(dirname "${RESULT_DIR}")"
+
+run_prompt_inference() {
+    echo ""
+    echo "--------------------------- Model Generation ---------------------------"
     local t0 t1 elapsed
     t0=$(date +%s%N)
-    
+
+    # Send request and stream tokens
+    local payload
+    payload=$(python3 -c "import json, sys; print(json.dumps({'model': 'strata', 'messages': [{'role': 'user', 'content': sys.argv[1]}], 'max_tokens': int(sys.argv[2]), 'temperature': float(sys.argv[3]), 'stream': True}))" "${PROMPT}" "${MAX_TOKENS}" "${TEMPERATURE}")
+
     curl -sN -X POST "${SERVER_URL}/v1/chat/completions" \
         -H "Content-Type: application/json" \
         -d "${payload}" | while IFS= read -r line; do
             if [[ "${line}" =~ ^data:\ (.*) ]]; then
                 chunk="${BASH_REMATCH[1]}"
                 if [[ "${chunk}" != "[DONE]" ]]; then
-                    # Extract delta content using python
-                    content="$(python3 -c "import json,sys; obj=json.loads(sys.argv[1]); delta=obj.get('choices',[{}])[0].get('delta',{}); print(delta.get('content',''), end='')" "${chunk}" 2>/dev/null || true)"
+                    content="$(python3 -c "import json, sys; obj=json.loads(sys.argv[1]); print(obj.get('choices',[{}])[0].get('delta',{}).get('content',''), end='')" "${chunk}" 2>/dev/null || true)"
                     printf "%s" "${content}"
                 fi
             fi
         done
+
     echo ""
-    echo "--- End Model Output ---"
+    echo "------------------------- End Model Generation -------------------------"
     t1=$(date +%s%N)
     elapsed=$(python3 -c "print(f'{(${t1} - ${t0}) / 1e9:.3f}')")
-    echo "[Timing] Request completed in ${elapsed} s."
+    echo "  [Timing] Inference duration: ${elapsed} seconds."
 }
 
-# Profiling Execution
 if [[ -n "${TARGET_PID}" ]]; then
-    echo "[VTune] Starting VTune collection attached to PID ${TARGET_PID}..."
-    
-    # Run vtune in background attached to target PID
+    echo "  [VTune] Attaching collector to PID ${TARGET_PID}..."
     "${VTUNE_BIN}" -collect "${ANALYSIS_TYPE}" \
         -result-dir "${RESULT_DIR}" \
         -data-limit "${DATA_LIMIT}" \
         -target-pid "${TARGET_PID}" >/tmp/vtune_collector.log 2>&1 &
     VTUNE_PID=$!
-    
-    # Give collector a moment to initialize probes
+
+    # Wait briefly for collector initialization
     sleep 2
-    
-    # Execute the user prompt
-    send_prompt_request
-    
-    # Tell VTune to stop collection
-    echo "[VTune] Stopping VTune collection..."
+
+    # Execute the requested prompt
+    run_prompt_inference
+
+    # Cleanly stop data collection
+    echo "  [VTune] Generation finished. Stopping data collection..."
     "${VTUNE_BIN}" -r "${RESULT_DIR}" -command stop >/dev/null 2>&1 || true
     wait "${VTUNE_PID}" 2>/dev/null || true
 else
-    echo "[VTune] Wrapping prompt generation script under VTune..."
-    
-    # Create self-contained runner script
-    RUNNER_SCRIPT="/tmp/run_prompt_${TIMESTAMP}.sh"
-    cat <<EOF >"${RUNNER_SCRIPT}"
+    # Standalone command wrapper mode
+    echo "  [VTune] Wrapping prompt execution under VTune..."
+    WRAPPER_SCRIPT="/tmp/run_prompt_inference_${TIMESTAMP}.sh"
+    cat <<EOF >"${WRAPPER_SCRIPT}"
 #!/usr/bin/env bash
 curl -sN -X POST "${SERVER_URL}/v1/chat/completions" \
   -H "Content-Type: application/json" \
   -d '{"model":"strata","messages":[{"role":"user","content":"${PROMPT}"}],"max_tokens":${MAX_TOKENS},"temperature":${TEMPERATURE},"stream":true}'
 EOF
-    chmod +x "${RUNNER_SCRIPT}"
+    chmod +x "${WRAPPER_SCRIPT}"
 
     "${VTUNE_BIN}" -collect "${ANALYSIS_TYPE}" \
         -result-dir "${RESULT_DIR}" \
         -data-limit "${DATA_LIMIT}" \
-        -- "${RUNNER_SCRIPT}" || {
-            echo "[-] VTune collection reported non-zero status."
-            if [[ ${IS_WSL2} -eq 1 ]]; then
-                echo "[WSL2 Diagnostic] VTune hardware sampling drivers (SEP) require bare-metal PMU access."
-                echo "                  In WSL2, use User-Mode Sampling, Intel PTI tracing, or VTune on Windows host."
-            fi
-        }
-    rm -f "${RUNNER_SCRIPT}"
+        -- "${WRAPPER_SCRIPT}"
+    rm -f "${WRAPPER_SCRIPT}"
 fi
 
 # ------------------------------------------------------------------------------
-# Step 5: Summary Report & Inspection
+# 5. Summarize & Export Profile Reports
 # ------------------------------------------------------------------------------
-echo "=== [5/5] Profiling Results ==="
+echo ""
+echo "[Step 5/5] Generating Summary Report..."
 
 if [[ -d "${RESULT_DIR}" ]]; then
-    echo "[Success] VTune profiling results saved to: ${RESULT_DIR}"
+    SUMMARY_FILE="${RESULT_DIR}/vtune_summary.txt"
+    "${VTUNE_BIN}" -report summary -result-dir "${RESULT_DIR}" -format text -report-output "${SUMMARY_FILE}" 2>/dev/null || true
     
-    # Attempt to print VTune summary report
-    echo "--- VTune Summary ---"
-    "${VTUNE_BIN}" -report summary -result-dir "${RESULT_DIR}" 2>/dev/null || true
-    
+    echo "========================================================================"
+    echo "VTune Profiling Complete!"
+    echo "Results stored at : ${RESULT_DIR}"
+    if [[ -f "${SUMMARY_FILE}" ]]; then
+        echo "Summary report at : ${SUMMARY_FILE}"
+        echo ""
+        echo "--- VTune Profile Summary ---"
+        head -n 35 "${SUMMARY_FILE}"
+        echo "-----------------------------"
+    fi
     echo ""
-    echo "To view detailed results interactively in VTune GUI:"
+    echo "To inspect kernels, timeline, and memory bandwidth interactively in GUI:"
     echo "  vtune-gui ${RESULT_DIR}"
+    echo "========================================================================"
 else
-    echo "[-] VTune result directory was not created. Check /tmp/vtune_collector.log:"
-    tail -n 25 /tmp/vtune_collector.log 2>/dev/null || true
+    echo "[-] VTune collection failed to produce result directory: ${RESULT_DIR}" >&2
+    if [[ -f /tmp/vtune_collector.log ]]; then
+        echo "Collector log tail:" >&2
+        cat /tmp/vtune_collector.log | tail -n 25 >&2
+    fi
+    exit 1
 fi
-
-echo "=== Done ==="
