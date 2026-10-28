@@ -79,32 +79,12 @@ const bool g_dbg = std::getenv("STRATA_VERIFY_DEBUG") != nullptr;
         }                                                     \
     } while (0)
 
-// STRATA_ROUTE_PRIOR=lambda: residency-biased routing on discrete GPUs <= 13 GiB
+// STRATA_ROUTE_PRIOR=lambda: residency-biased routing (opt-in on non-CUDA per upstream policy).
 inline float g_route_prior(sycl::queue* q = nullptr) {
+    (void)q;
     static const char* const env_s = std::getenv("STRATA_ROUTE_PRIOR");
     static const float env = env_s ? (float)std::atof(env_s) : 0.0f;
-    if (env_s != nullptr) return env;
-
-    static float cached_prior = -1.0f;
-    if (cached_prior >= 0.0f) return cached_prior;
-
-    try {
-        sycl::queue& target_q = (q != nullptr) ? *q : get_default_queue();
-        auto dev = target_q.get_device();
-#if defined(__clang__) || defined(__INTEL_LLVM_COMPILER)
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wdeprecated-declarations"
-#endif
-        bool is_integrated = !dev.is_gpu() || dev.get_info<sycl::info::device::host_unified_memory>();
-#if defined(__clang__) || defined(__INTEL_LLVM_COMPILER)
-#pragma clang diagnostic pop
-#endif
-        double total_bytes = (double)dev.get_info<sycl::info::device::global_mem_size>();
-        cached_prior = strata::route_prior_default(false, is_integrated, total_bytes, strata::qwen_defaults_026());
-    } catch (...) {
-        cached_prior = 0.0f;
-    }
-    return cached_prior;
+    return env;
 }
 
 // STRATA_SELECT_LONG=1 (opt-in): decode select past select_long_at() cells takes long-context QSA select
@@ -304,9 +284,8 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     strata::kernels::fused_gr_check();  // once per card: which bitwise-equal hyper-connection read runs there
     {   // once per card, here: record_window reads the cached value
         const float rp = g_route_prior();
-        if (rp > 0.0f && std::getenv("STRATA_ROUTE_PRIOR") == nullptr)
-            std::fprintf(stderr, "strata verify: residency-biased routing is on by default on this card (STRATA_ROUTE_PRIOR=%.1f: a card of 13 GiB "
-                                 "or less; it changes which experts run; STRATA_ROUTE_PRIOR=0 turns it off)\n", (double) rp);
+        if (rp > 0.0f)
+            std::fprintf(stderr, "strata verify: residency-biased routing is on (STRATA_ROUTE_PRIOR=%.1f: changes which experts run)\n", (double) rp);
     }
     wt_ = &wt;
     g_ = &g;
@@ -1322,6 +1301,8 @@ std::string Verifier::profile_report() {
 
 bool Verifier::capture(int T, std::string& err) try {
     if (exec_[T] != nullptr) return true;
+    strata::core::progress_at("verify window: capturing graph", (int64_t)T);
+    strata::core::progress_beat();
     /*
     DPCT1119:389: Migration of cudaStreamBeginCapture is not supported, please
     try to remigrate with option: --use-experimental-features=graph.
@@ -1355,6 +1336,7 @@ bool Verifier::capture(int T, std::string& err) try {
     }
     cudaGraphUpload(exec_[T], cs_);
     cs_->wait();
+    strata::core::progress_beat();
     std::fprintf(stderr, "strata verify: captured the %d-token window\n", T);
     return true;
 } catch (sycl::exception const& exc) {
@@ -1498,6 +1480,8 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         last_tokens_[t] = tokens[t];
     ms_host += ms_since(t0);
     VDBG("staged; launching\n");
+    progress_at("verify window: launching", (int64_t)T);
+    progress_beat();
     const int le = cudaGraphLaunch_mock(exec_[T], cs_);
     if (le != 0) {
         err = std::string("verify: launch: error ") + std::to_string(le);
