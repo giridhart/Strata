@@ -28,6 +28,26 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 
 
+def ensure_oneapi_env() -> dict[str, str]:
+    """Ensure Intel oneAPI environment variables are active in process env."""
+    env = os.environ.copy()
+    if "CMPLR_ROOT" in env or "ONEAPI_ROOT" in env or "MKLROOT" in env:
+        return env
+
+    setvars = Path("/opt/intel/oneapi/setvars.sh")
+    if not setvars.exists():
+        return env
+
+    cmd = f"source {setvars} --force 2>/dev/null && env"
+    proc = subprocess.run(["bash", "-c", cmd], stdout=subprocess.PIPE, text=True)
+    if proc.returncode == 0:
+        for line in proc.stdout.splitlines():
+            if "=" in line:
+                k, v = line.split("=", 1)
+                env[k] = v
+    return env
+
+
 def parse_length(s: str) -> int:
     s = s.strip().lower()
     if s.endswith("k"):
@@ -37,7 +57,7 @@ def parse_length(s: str) -> int:
     return int(s)
 
 
-def benchmark_cli(bin_path: str, tokens: int, no_capture: bool, extra_args: list[str]) -> dict:
+def benchmark_cli(bin_path: str, tokens: int, no_capture: bool, extra_args: list[str], env: dict[str, str]) -> dict:
     """Benchmark local strata binary execution."""
     cmd = [bin_path, "--tokens", str(tokens), "--no-ple", "--no-pool"]
     if no_capture:
@@ -47,7 +67,7 @@ def benchmark_cli(bin_path: str, tokens: int, no_capture: bool, extra_args: list
     print(f"Running command: {' '.join(cmd)}")
     t0 = time.perf_counter()
     try:
-        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=300)
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=300, env=env)
     except subprocess.TimeoutExpired:
         return {"error": "timeout", "elapsed_s": 300.0}
 
@@ -75,14 +95,15 @@ def benchmark_cli(bin_path: str, tokens: int, no_capture: bool, extra_args: list
         "tokens": tokens,
         "tok_per_sec": tok_per_sec,
         "no_capture": no_capture,
-        "stdout_tail": stdout[-500:] if stdout else "",
-        "stderr_tail": stderr[-500:] if stderr else "",
+        "stdout": stdout,
+        "stderr": stderr,
+        "stdout_tail": stdout[-1000:] if stdout else "",
+        "stderr_tail": stderr[-1000:] if stderr else "",
     }
 
 
 def benchmark_http(url: str, prompt_tokens: int, max_tokens: int, key: str) -> dict:
     """Benchmark through Strata HTTP API."""
-    # Synthetic prompt repeating words
     words = "The quick brown fox jumps over the lazy dog and explores the Intel Arc GPU architecture. "
     repeat = max(1, int((prompt_tokens * 4) / len(words)))
     prompt = (words * repeat)[: prompt_tokens * 4]
@@ -140,6 +161,7 @@ def main():
     p.add_argument("--out", default="", help="Path to write JSON results")
     args, extra = p.parse_known_args()
 
+    env = ensure_oneapi_env()
     results = {"device": "Intel Xe2 (B580/Lunar Lake)", "timestamp": time.time(), "runs": []}
 
     if args.url:
@@ -158,8 +180,13 @@ def main():
         for no_cap in [False, True]:
             mode = "without capture" if no_cap else "with graph capture"
             print(f"\n--- Testing CLI {mode} ---")
-            r = benchmark_cli(bin_path, args.tokens, no_cap, extra)
-            print(f"  Elapsed: {r.get('elapsed_s', 0):.3f}s | Success: {r.get('success')}")
+            r = benchmark_cli(bin_path, args.tokens, no_cap, extra, env)
+            print(f"  Elapsed: {r.get('elapsed_s', 0):.3f}s | Success: {r.get('success')} (exit code: {r.get('returncode')})")
+            if not r.get("success"):
+                if r.get("stderr_tail"):
+                    print(f"\n  [STDERR]:\n{r.get('stderr_tail').strip()}\n")
+                if r.get("stdout_tail"):
+                    print(f"  [STDOUT]:\n{r.get('stdout_tail').strip()}\n")
             if r.get("tok_per_sec"):
                 print(f"  Throughput: {r.get('tok_per_sec'):.2f} tok/s")
             results["runs"].append(r)
