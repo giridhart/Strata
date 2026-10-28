@@ -65,7 +65,7 @@ def get_environment() -> dict[str, str]:
                     env[k] = v
     env.setdefault("ONEAPI_DEVICE_SELECTOR", "level_zero:gpu")
     env.setdefault("ZE_ENABLE_TRACING", "1")
-    env.setdefault("STRATA_VERIFY_GRAPH", "1")
+    env.setdefault("STRATA_VERIFY_GRAPH", "0")
     return env
 
 
