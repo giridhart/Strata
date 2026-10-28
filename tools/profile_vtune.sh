@@ -247,7 +247,7 @@ fi
 # 1.4 GPU & Graph Environment
 export ONEAPI_DEVICE_SELECTOR="${ONEAPI_DEVICE_SELECTOR:-level_zero:gpu}"
 export ZE_ENABLE_TRACING="${ZE_ENABLE_TRACING:-1}"
-export STRATA_VERIFY_GRAPH="${STRATA_VERIFY_GRAPH:-1}"
+export STRATA_VERIFY_GRAPH="${STRATA_VERIFY_GRAPH:-0}"
 
 # 1.5 Activate local Python virtualenv if available
 if [[ -f "${REPO_ROOT}/.venv/bin/activate" ]]; then
