@@ -5,6 +5,8 @@
 // MIT license, third_party/ggml/LICENSE).  The block structs and codebook grids come from its ggml-common.h,
 // included unchanged.
 #include <sycl/sycl.hpp>
+#include <sycl/ext/intel/experimental/grf_size_properties.hpp>
+#include <sycl/ext/oneapi/matrix/matrix-unified.hpp>
 #include "strata/core/sycl_arch.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/dp4a.hpp"
@@ -3681,6 +3683,196 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
         }
     }
     check("native_expert_grouped/down");
+}
+
+// ================================================================ Grouped XMX (DPAS joint_matrix)
+// Up to kXmxGroupMax experts' products in ONE launch, the weight tiles decoded straight from
+// the quantized rows into local memory and multiplied via hardware DPAS joint_matrix (Xe2 8x16x16 / DG2 8x8x16).
+// Per expert i of the group: Y_i = X_i . W_i^T, rows back to back (cnt[i] each).
+// gate/up: b != nullptr, virtual row 2r = gate row r, 2r+1 = up row r (interleaved layout).
+// down: b == nullptr, a = the [N][K] rows.
+namespace xmxg {
+
+#if defined(STRATA_TARGET_BMG) || defined(STRATA_TARGET_XE2) || defined(__INTEL_XE2__) || defined(STRATA_XMX_SG16)
+constexpr int kSgW = 16;
+#else
+constexpr int kSgW = 8;
+#endif
+
+namespace jm = sycl::ext::oneapi::experimental::matrix;
+
+struct Grp {
+    const uint8_t* a[kXmxGroupMax];
+    const uint8_t* b[kXmxGroupMax];
+    int off[kXmxGroupMax + 1];
+    int tstart[kXmxGroupMax + 1];
+    int n;
+};
+
+template <int SGM_, int SGN_, int MT_, int NT_>
+struct Cfg {
+    static constexpr int SGM = SGM_, SGN = SGN_, MT = MT_, NT = NT_, KS = 32, SG = kSgW;
+    static constexpr int BM = SGM * MT * 8, BN = SGN * NT * kSgW, WG = SGM * SGN * kSgW;
+};
+
+template <class C, class Name>
+void launch(sycl::queue& q, int ty, bool gu, const sycl::half* X, float* Y, const Grp& gp, int ntiles, int N, int K) {
+    constexpr int BM = C::BM, BN = C::BN, KS = C::KS, WG = C::WG, SG = C::SG;
+    constexpr int LDA = KS + 8, LDB = KS + 8;
+    const int nb = N / BN;
+    constexpr int TN = kSgW;
+
+    q.submit([&](sycl::handler& h) {
+        sycl::local_accessor<sycl::half, 1> sa(BM * LDA, h), sb(BN * LDB, h);
+        auto props = sycl::ext::oneapi::experimental::properties{sycl::ext::intel::experimental::grf_size<256>};
+        h.parallel_for<Name>(sycl::nd_range<2>({(size_t) ntiles, (size_t) nb * WG}, {1, (size_t) WG}), props,
+                             [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(kSgW)]] {
+            auto sg = it.get_sub_group();
+            const int t = (int) it.get_group(0);
+            int e = 0;
+            while (e + 1 < gp.n && t >= gp.tstart[e + 1]) ++e;
+            const int m0 = (t - gp.tstart[e]) * BM;
+            const int rows = sycl::min(BM, gp.off[e + 1] - gp.off[e] - m0);
+            const sycl::half* Xe = X + ((size_t) gp.off[e] + m0) * K;
+            float* Ye = Y + ((size_t) gp.off[e] + m0) * N;
+            const uint8_t* wa = gp.a[e];
+            const uint8_t* wb = gp.b[e];
+            const int n0 = (int) it.get_group(1) * BN;
+            const int lid = (int) it.get_local_id(1), sgid = lid / SG;
+            const int sgm = sgid / C::SGN, sgn = sgid % C::SGN;
+
+            jm::joint_matrix<sycl::sub_group, float, jm::use::accumulator, 8, TN> acc[C::MT][C::NT];
+            for (int i = 0; i < C::MT; ++i)
+                for (int j = 0; j < C::NT; ++j) jm::joint_matrix_fill(sg, acc[i][j], 0.0f);
+
+            sycl::half* pa = sa.template get_multi_ptr<sycl::access::decorated::no>().get();
+            sycl::half* pb = sb.template get_multi_ptr<sycl::access::decorated::no>().get();
+
+            for (int k0 = 0; k0 < K; k0 += KS) {
+                constexpr int VA = BM * KS / 8;
+                for (int v = lid; v < VA; v += WG) {
+                    const int r = v / (KS / 8), c = (v % (KS / 8)) * 8;
+                    sycl::vec<sycl::half, 8> x(0);
+                    if (r < rows) x = *reinterpret_cast<const sycl::vec<sycl::half, 8>*>(Xe + (size_t) r * K + k0 + c);
+                    *reinterpret_cast<sycl::vec<sycl::half, 8>*>(pa + r * LDA + c) = x;
+                }
+
+                // B: row r of the tile, 32 values from k0 = 4 runs of 8, each one thread of the format's decoder
+                for (int v = lid; v < BN * 4; v += WG) {
+                    const int r = v >> 2, sub = v & 3, nr = n0 + r;
+                    const uint8_t* base = gu ? ((nr & 1) ? wb : wa) : wa;
+                    const int64_t row = gu ? (nr >> 1) : nr;
+                    const int64_t flat = row * K + k0;            // a multiple of 32
+                    const int64_t ibs = flat >> 8;
+                    const int o32 = (int) (flat & 255), o = o32 + 8 * sub;
+                    const bool run8 = ty == 16 || ty == 17 || ty == 18 || ty == 20 || ty == 21 || ty == 22 ||
+                                      ty == 29 || ty == 42 || ty == 144 || ty == 145 || ty == 146;
+                    const int tid = run8 ? (o >> 3) : (sub * 8 + (o32 >> 5));
+                    dq_dispatch<sycl::half>(ty, base, ibs, pb + r * LDB - o32, tid);
+                }
+
+                it.barrier(sycl::access::fence_space::local_space);
+
+                for (int kk = 0; kk < KS; kk += 16) {
+                    jm::joint_matrix<sycl::sub_group, sycl::half, jm::use::a, 8, 16, jm::layout::row_major> am[C::MT];
+                    jm::joint_matrix<sycl::sub_group, sycl::half, jm::use::b, 16, TN, jm::layout::col_major> bm[C::NT];
+                    for (int i = 0; i < C::MT; ++i)
+                        jm::joint_matrix_load(sg, am[i], sa.template get_multi_ptr<sycl::access::decorated::no>() +
+                                                             (sgm * C::MT * 8 + i * 8) * LDA + kk, LDA);
+                    for (int j = 0; j < C::NT; ++j)
+                        jm::joint_matrix_load(sg, bm[j], sb.template get_multi_ptr<sycl::access::decorated::no>() +
+                                                             (sgn * C::NT * TN + j * TN) * LDB + kk, LDB);
+                    for (int i = 0; i < C::MT; ++i)
+                        for (int j = 0; j < C::NT; ++j) jm::joint_matrix_mad(sg, acc[i][j], am[i], bm[j], acc[i][j]);
+                }
+
+                it.barrier(sycl::access::fence_space::local_space);
+            }
+
+            for (int i = 0; i < C::MT; ++i) {
+                const int r = sgm * C::MT * 8 + i * 8;
+                if (r >= rows) continue;
+                for (int j = 0; j < C::NT; ++j) {
+                    const int c = n0 + sgn * C::NT * TN + j * TN;
+                    if (r + 8 <= rows) {
+                        jm::joint_matrix_store(sg, acc[i][j],
+                            sycl::address_space_cast<sycl::access::address_space::global_space, sycl::access::decorated::no>(
+                                Ye + (size_t) r * N + c), N, jm::layout::row_major);
+                    } else {
+                        float* st = reinterpret_cast<float*>(pa) + sgid * 8 * TN;
+                        jm::joint_matrix_store(sg, acc[i][j],
+                            sycl::address_space_cast<sycl::access::address_space::local_space, sycl::access::decorated::no>(st),
+                            TN, jm::layout::row_major);
+                        sycl::group_barrier(sg);
+                        const int lim = rows - r, ln = (int) sg.get_local_linear_id();
+                        for (int rr = 0; rr < lim; ++rr) Ye[(size_t) (r + rr) * N + c + ln] = st[rr * TN + ln];
+                        sycl::group_barrier(sg);
+                    }
+                }
+            }
+        });
+    });
+}
+
+class k_xg_small;
+class k_xg_big;
+
+#if defined(STRATA_TARGET_BMG) || defined(STRATA_TARGET_XE2) || defined(__INTEL_XE2__) || defined(STRATA_XMX_SG16)
+using Small = Cfg<2, 4, 4, 2>;   // 64 x 128 (8 sub-groups of 16)
+using Big = Cfg<4, 2, 4, 4>;     // 128 x 128
+#else
+using Small = Cfg<2, 8, 4, 2>;   // 64 x 128
+using Big = Cfg<4, 4, 4, 4>;     // 128 x 128
+#endif
+
+template <class C>
+int fill(Grp& gp, const int32_t* cnt, int n) {
+    int t = 0, o = 0;
+    for (int i = 0; i < n; ++i) { gp.off[i] = o; gp.tstart[i] = t; o += cnt[i]; t += (cnt[i] + C::BM - 1) / C::BM; }
+    gp.off[n] = o; gp.tstart[n] = t; gp.n = n;
+    return t;
+}
+
+}  // namespace xmxg
+
+void iq_xmx_grouped(int ty, const uint8_t* const* a, const uint8_t* const* b, const int32_t* cnt, int n,
+                    const uint16_t* X, float* Y, int N, int K, void* stream) {
+    if (n <= 0) return;
+    if (n > kXmxGroupMax || N % 128 != 0 || K % 32 != 0 || !is_iq(ty)) {
+        std::fprintf(stderr, "iq_xmx_grouped: bad arguments (type %d, is_iq %d, n %d [max %d], N %d, K %d)\n",
+                     ty, (int)is_iq(ty), n, kXmxGroupMax, N, K);
+        std::exit(1);
+    }
+    xmxg::Grp gp{};
+    int64_t tot = 0;
+    for (int i = 0; i < n; ++i) { gp.a[i] = a[i]; gp.b[i] = b ? b[i] : nullptr; tot += cnt[i]; }
+    if (tot <= 0) return;
+    sycl::queue& q = *(stream ? (sycl::queue*)stream : &default_queue);
+    const auto* Xh = reinterpret_cast<const sycl::half*>(X);
+    const bool gu = b != nullptr;
+
+    const bool debug = [] {
+        const char* e1 = std::getenv("STRATA_XMXG_DEBUG");
+        const char* e2 = std::getenv("STRATA_DEBUG");
+        return (e1 && std::atoi(e1) != 0) || (e2 && std::atoi(e2) != 0);
+    }();
+
+    if (tot / n < 96) {
+        const int nt = xmxg::fill<xmxg::Small>(gp, cnt, n);
+        if (debug) {
+            std::fprintf(stderr, "[iq_xmx_grouped] ty=%d (%s), n=%d, rows=%lld (mean %.1f/exp), N=%d, K=%d -> Small (ntiles=%d)\n",
+                         ty, gu ? "gate/up" : "down", n, (long long)tot, (double)tot / n, N, K, nt);
+        }
+        xmxg::launch<xmxg::Small, xmxg::k_xg_small>(q, ty, gu, Xh, Y, gp, nt, N, K);
+    } else {
+        const int nt = xmxg::fill<xmxg::Big>(gp, cnt, n);
+        if (debug) {
+            std::fprintf(stderr, "[iq_xmx_grouped] ty=%d (%s), n=%d, rows=%lld (mean %.1f/exp), N=%d, K=%d -> Big (ntiles=%d)\n",
+                         ty, gu ? "gate/up" : "down", n, (long long)tot, (double)tot / n, N, K, nt);
+        }
+        xmxg::launch<xmxg::Big, xmxg::k_xg_big>(q, ty, gu, Xh, Y, gp, nt, N, K);
+    }
+    check("iq_xmx_grouped");
 }
 
 }  // namespace strata::kernels
