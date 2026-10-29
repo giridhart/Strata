@@ -18,11 +18,14 @@ from __future__ import annotations
 
 import collections
 import json
+import os
 import sys
 import time
 import urllib.parse
 import urllib.request
 from pathlib import Path
+
+os.environ.setdefault("STRATA_WATCHDOG_S", "180")
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent.parent
