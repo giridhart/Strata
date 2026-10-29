@@ -1,5 +1,6 @@
 // src/prefill/gemm.cu - see include/strata/prefill/gemm.hpp.
 #include <sycl/sycl.hpp>
+#include <sycl/ext/oneapi/matrix/matrix-unified.hpp>
 #include "strata/core/sycl_arch.hpp"
 #include "strata/kernels/bf16_bits.hpp"
 #include "strata/kernels/bf16_gemv.hpp"
@@ -390,6 +391,116 @@ void sycl_prefill_gemm_kernel(const uint16_t* __restrict__ X, const uint16_t* __
     }
 }
 
+template <bool IS_BF16, int SGM = 4, int SGN = 2, int TM = 8, int TN = 16, int KS = 32>
+void xmx_prefill_gemm_kernel(const uint16_t* __restrict__ X, const uint16_t* __restrict__ W, float* __restrict__ Y,
+                             int64_t T, int64_t N, int64_t K, int64_t ldy, float alpha, float beta,
+                             sycl::nd_item<2> item, sycl::local_accessor<uint16_t, 1> sa,
+                             sycl::local_accessor<uint16_t, 1> sb, sycl::local_accessor<float, 1> se) {
+    auto sg = item.get_sub_group();
+    constexpr int BM = SGM * TM;  // 32
+    constexpr int BN = SGN * TN;  // 32
+    constexpr int SG = 16;
+    constexpr int WG = SGM * SGN * SG;  // 128
+    constexpr int LDA = KS + 8;
+    constexpr int LDB = KS + 8;
+
+    const int t0 = (int)item.get_group(0) * BM;
+    const int n0 = (int)item.get_group(1) * BN;
+    const int lid = (int)item.get_local_linear_id();
+    const int sgid = lid / SG;
+    const int sgm = sgid / SGN;
+    const int sgn = sgid % SGN;
+
+    sycl::ext::oneapi::experimental::matrix::joint_matrix<
+        sycl::sub_group, float, sycl::ext::oneapi::experimental::matrix::use::accumulator, TM, TN>
+        acc;
+    sycl::ext::oneapi::experimental::matrix::joint_matrix_fill(sg, acc, 0.0f);
+
+    uint16_t* pa = sa.template get_multi_ptr<sycl::access::decorated::no>().get();
+    uint16_t* pb = sb.template get_multi_ptr<sycl::access::decorated::no>().get();
+
+    for (int k0 = 0; k0 < K; k0 += KS) {
+        // Cooperatively load X [BM x KS] into SLM pa
+        for (int v = lid; v < BM * (KS / 8); v += WG) {
+            const int r = v / (KS / 8), c = (v % (KS / 8)) * 8;
+            if (t0 + r < T && k0 + c < K) {
+                *reinterpret_cast<sycl::vec<uint16_t, 8>*>(pa + r * LDA + c) =
+                    *reinterpret_cast<const sycl::vec<uint16_t, 8>*>(X + (size_t)(t0 + r) * K + k0 + c);
+            } else {
+                *reinterpret_cast<sycl::vec<uint16_t, 8>*>(pa + r * LDA + c) = sycl::vec<uint16_t, 8>(0);
+            }
+        }
+        // Cooperatively load W [BN x KS] into SLM pb
+        for (int v = lid; v < BN * (KS / 8); v += WG) {
+            const int r = v / (KS / 8), c = (v % (KS / 8)) * 8;
+            if (n0 + r < N && k0 + c < K) {
+                *reinterpret_cast<sycl::vec<uint16_t, 8>*>(pb + r * LDB + c) =
+                    *reinterpret_cast<const sycl::vec<uint16_t, 8>*>(W + (size_t)(n0 + r) * K + k0 + c);
+            } else {
+                *reinterpret_cast<sycl::vec<uint16_t, 8>*>(pb + r * LDB + c) = sycl::vec<uint16_t, 8>(0);
+            }
+        }
+        item.barrier(sycl::access::fence_space::local_space);
+
+        // Compute KS in 16-step DPAS operations
+        for (int kk = 0; kk < KS; kk += 16) {
+            using elem_t = std::conditional_t<IS_BF16, sycl::ext::oneapi::bfloat16, sycl::half>;
+            sycl::ext::oneapi::experimental::matrix::joint_matrix<
+                sycl::sub_group, elem_t, sycl::ext::oneapi::experimental::matrix::use::a, TM, 16,
+                sycl::ext::oneapi::experimental::matrix::layout::row_major>
+                sub_a;
+            sycl::ext::oneapi::experimental::matrix::joint_matrix<
+                sycl::sub_group, elem_t, sycl::ext::oneapi::experimental::matrix::use::b, 16, TN,
+                sycl::ext::oneapi::experimental::matrix::layout::col_major>
+                sub_b;
+
+            auto lptr_a =
+                sycl::address_space_cast<sycl::access::address_space::local_space, sycl::access::decorated::no>(
+                    reinterpret_cast<elem_t*>(pa + (sgm * TM) * LDA + kk));
+            auto lptr_b =
+                sycl::address_space_cast<sycl::access::address_space::local_space, sycl::access::decorated::no>(
+                    reinterpret_cast<elem_t*>(pb + (sgn * TN) * LDB + kk));
+
+            sycl::ext::oneapi::experimental::matrix::joint_matrix_load(sg, sub_a, lptr_a, LDA);
+            sycl::ext::oneapi::experimental::matrix::joint_matrix_load(sg, sub_b, lptr_b, LDB);
+            sycl::ext::oneapi::experimental::matrix::joint_matrix_mad(sg, acc, sub_a, sub_b, acc);
+        }
+        item.barrier(sycl::access::fence_space::local_space);
+    }
+
+    const int r = t0 + sgm * TM;
+    const int c = n0 + sgn * TN;
+    if (r < T && c < N) {
+        if (r + TM <= T && beta == 0.0f && alpha == 1.0f) {
+            auto ptr_c =
+                sycl::address_space_cast<sycl::access::address_space::global_space, sycl::access::decorated::no>(
+                    Y + (size_t)r * ldy + c);
+            sycl::ext::oneapi::experimental::matrix::joint_matrix_store(
+                sg, acc, ptr_c, ldy, sycl::ext::oneapi::experimental::matrix::layout::row_major);
+        } else {
+            // Partial row stores or non-trivial alpha/beta through SLM
+            float* st = se.template get_multi_ptr<sycl::access::decorated::no>().get() + sgid * TM * TN;
+            auto ptr_tmp =
+                sycl::address_space_cast<sycl::access::address_space::local_space, sycl::access::decorated::no>(st);
+            sycl::ext::oneapi::experimental::matrix::joint_matrix_store(
+                sg, acc, ptr_tmp, TN, sycl::ext::oneapi::experimental::matrix::layout::row_major);
+            sycl::group_barrier(sg);
+            const size_t ln = sg.get_local_linear_id();
+            for (int rr = 0; rr < TM; ++rr) {
+                if (r + rr < T && c + ln < N) {
+                    const size_t idx = (size_t)(r + rr) * ldy + c + ln;
+                    if (beta == 0.0f) {
+                        Y[idx] = alpha * st[rr * TN + ln];
+                    } else {
+                        Y[idx] = alpha * st[rr * TN + ln] + beta * Y[idx];
+                    }
+                }
+            }
+            sycl::group_barrier(sg);
+        }
+    }
+}
+
 void Gemm::bf16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy,
                 float beta) {
     if (T <= 0 || N <= 0 || K <= 0) return;
@@ -399,6 +510,32 @@ void Gemm::bf16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64
 
     if (T == 1 && beta == 0.0f && ldy == N) {
         strata::kernels::bf16_gemv(X, W, Y, K, N, stream_);
+        return;
+    }
+
+    static const bool xmx_enabled = [] {
+        const char* v = std::getenv("STRATA_PREFILL_XMX_GEMM");
+        if (v) return std::atoi(v) != 0;
+        return strata::sycl_arch::IS_XE2;
+    }();
+
+    const bool use_xmx = xmx_enabled && (N % 16 == 0) && (K % 16 == 0) && (N >= 16) && (K >= 16);
+
+    if (use_xmx) {
+        constexpr int BM = 32, BN = 32, KS = 32, TM = 8, TN = 16;
+        constexpr int LDA = KS + 8, LDB = KS + 8;
+        constexpr int WG = 128;
+        const size_t group_t = ((size_t)T + BM - 1) / BM;
+        const size_t group_n = ((size_t)N + BN - 1) / BN;
+        q->submit([&](sycl::handler& h) {
+            sycl::local_accessor<uint16_t, 1> sa(BM * LDA, h);
+            sycl::local_accessor<uint16_t, 1> sb(BN * LDB, h);
+            sycl::local_accessor<float, 1> se(8 * TM * TN, h);
+            h.parallel_for(sycl::nd_range<2>(sycl::range<2>(group_t, group_n * WG), sycl::range<2>(1, WG)),
+                           [=](sycl::nd_item<2> item) [[sycl::reqd_sub_group_size(16)]] {
+                               xmx_prefill_gemm_kernel<true>(X, W, Y, T, N, K, ldy, 1.0f, beta, item, sa, sb, se);
+                           });
+        });
         return;
     }
 
@@ -418,6 +555,32 @@ void Gemm::f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_
     if (ldy <= 0) ldy = N;
     auto* q = static_cast<sycl::queue*>(stream_);
     if (!q) return;
+
+    static const bool xmx_enabled = [] {
+        const char* v = std::getenv("STRATA_PREFILL_XMX_GEMM");
+        if (v) return std::atoi(v) != 0;
+        return strata::sycl_arch::IS_XE2;
+    }();
+
+    const bool use_xmx = xmx_enabled && (N % 16 == 0) && (K % 16 == 0) && (N >= 16) && (K >= 16);
+
+    if (use_xmx) {
+        constexpr int BM = 32, BN = 32, KS = 32, TM = 8, TN = 16;
+        constexpr int LDA = KS + 8, LDB = KS + 8;
+        constexpr int WG = 128;
+        const size_t group_t = ((size_t)T + BM - 1) / BM;
+        const size_t group_n = ((size_t)N + BN - 1) / BN;
+        q->submit([&](sycl::handler& h) {
+            sycl::local_accessor<uint16_t, 1> sa(BM * LDA, h);
+            sycl::local_accessor<uint16_t, 1> sb(BN * LDB, h);
+            sycl::local_accessor<float, 1> se(8 * TM * TN, h);
+            h.parallel_for(sycl::nd_range<2>(sycl::range<2>(group_t, group_n * WG), sycl::range<2>(1, WG)),
+                           [=](sycl::nd_item<2> item) [[sycl::reqd_sub_group_size(16)]] {
+                               xmx_prefill_gemm_kernel<false>(X, W, Y, T, N, K, ldy, 1.0f, beta, item, sa, sb, se);
+                           });
+        });
+        return;
+    }
 
     const size_t local_t = 1;
     const size_t local_n = 256;

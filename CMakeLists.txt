@@ -2057,6 +2057,13 @@ endif()
     add_test(NAME qsa_scores_rows_parity COMMAND qsa_scores_rows_parity)
   endif()
 
+  if(STRATA_ENABLE_SYCL AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/sycl/prefill_gemm_parity.cpp")
+    add_executable(prefill_gemm_parity tests/sycl/prefill_gemm_parity.cpp)
+    target_include_directories(prefill_gemm_parity PRIVATE ${_strata_gpu_include_directories})
+    target_link_libraries(prefill_gemm_parity PRIVATE strata_prefill strata_kernels ${_strata_gpu_runtime_target})
+    add_test(NAME prefill_gemm_parity COMMAND prefill_gemm_parity)
+  endif()
+
   if(STRATA_ENABLE_SYCL AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/sycl/prefill_mmq_tab_parity.cpp")
     add_executable(prefill_mmq_tab_parity tests/sycl/prefill_mmq_tab_parity.cpp)
     target_include_directories(prefill_mmq_tab_parity PRIVATE
