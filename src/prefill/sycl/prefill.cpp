@@ -2770,7 +2770,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 xg_c[xg_n] = (int32_t)m.cnt[(size_t)e];
                                 ++xg_n;
                                 if (slot >= 0) xg_slots[xg_ns++] = slot;
-                                if (xg_n == strata::kernels::kXmxGroupMax || j + 1 == order.size()) {
+                                if (xg_n == strata::kernels::kXmxGroupMax || j + 1 == order.size() || (!stream_all && slot >= 0)) {
                                     xflush();
                                 }
                                 return true;
@@ -2921,6 +2921,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             const size_t kend = seq_start[(size_t)l + 1];
                             auto release_to = [&](int32_t e_stop) {
                                 while (k < kend && seq[k].e < e_stop) {
+                                    if (use_xmx && xg_n > 0) xflush();
                                     *m.used[k % (size_t)m.ring] = m.cs->ext_oneapi_submit_barrier();
                                     consumed = ++k;
                                     give_back(consumed);
@@ -2936,17 +2937,21 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     (m.cs)->ext_oneapi_submit_barrier({*m.copied[sl]});
                                     if (!compute(j, m.stage_dev[sl], sl, -1)) return false;
                                     consumed = ++k;
-                                    give_back(consumed);
+                                    if (xg_ns == 0) give_back(consumed);
                                 } else {
                                     ++stats_.experts_resident;
                                     const int32_t cslot = m.cache ? m.host_res[(size_t)l * m.g->n_expert + e] : -1;
                                     if (!compute(j, m.cache->device_slot(cslot), -1, cslot))
                                         return false;
+                                    if (xg_ns == 0) give_back(consumed);
                                 }
                             }
                             release_to(m.g->n_expert);
                         }
-                        if (use_xmx) xflush();
+                        if (use_xmx) {
+                            xflush();
+                            give_back(consumed);
+                        }
                     }
                     pt.mark(kPfCombine, cs);
                     moe_combine(m.Dm, m.slot_dev, m.w, m.shared, m.sg, m.bo, T, m.cs);

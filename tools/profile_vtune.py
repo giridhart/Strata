@@ -101,16 +101,26 @@ def find_target_pid() -> int | None:
     return None
 
 
-def send_prompt(url: str, prompt: str, max_tokens: int, temperature: float, api_key: str = "") -> str:
+def send_prompt(
+    url: str,
+    prompt: str,
+    max_tokens: int,
+    temperature: float,
+    api_key: str = "",
+    reasoning_effort: str | None = None,
+) -> str:
     """Send prompt request to Strata /v1/chat/completions with streaming."""
     endpoint = f"{url.rstrip('/')}/v1/chat/completions"
-    payload = {
+    payload: dict[str, object] = {
         "model": "strata",
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": max_tokens,
         "temperature": temperature,
         "stream": True,
     }
+    if reasoning_effort is not None:
+        payload["reasoning_effort"] = reasoning_effort
+
     data = json.dumps(payload).encode("utf-8")
     headers = {"Content-Type": "application/json"}
     if api_key:
@@ -120,7 +130,10 @@ def send_prompt(url: str, prompt: str, max_tokens: int, temperature: float, api_
     
     print(f"\n[Prompt Request] Sending prompt: \"{prompt}\"")
     print(f"[Streaming Output from {url}]:\n" + "-" * 40)
-    full_output = []
+    thought_chunks = []
+    answer_chunks = []
+    finish_reason = None
+    in_thought = False
     t0 = time.perf_counter()
     
     try:
@@ -133,12 +146,30 @@ def send_prompt(url: str, prompt: str, max_tokens: int, temperature: float, api_
                         break
                     try:
                         chunk = json.loads(chunk_str)
-                        delta = chunk.get("choices", [{}])[0].get("delta", {})
+                        choice = chunk.get("choices", [{}])[0]
+                        delta = choice.get("delta", {})
+                        if choice.get("finish_reason"):
+                            finish_reason = choice.get("finish_reason")
+
+                        # Reasoning models stream thinking under reasoning_content
+                        reasoning = delta.get("reasoning_content") or delta.get("reasoning")
                         content = delta.get("content", "")
+
+                        if reasoning:
+                            if not in_thought:
+                                sys.stdout.write("[Thinking]\n")
+                                in_thought = True
+                            sys.stdout.write(reasoning)
+                            sys.stdout.flush()
+                            thought_chunks.append(reasoning)
+
                         if content:
+                            if in_thought:
+                                sys.stdout.write("\n\n[Answer]\n")
+                                in_thought = False
                             sys.stdout.write(content)
                             sys.stdout.flush()
-                            full_output.append(content)
+                            answer_chunks.append(content)
                     except Exception:
                         pass
     except urllib.error.HTTPError as e:
@@ -147,9 +178,19 @@ def send_prompt(url: str, prompt: str, max_tokens: int, temperature: float, api_
         raise
 
     elapsed = time.perf_counter() - t0
+    total_thought = "".join(thought_chunks)
+    total_answer = "".join(answer_chunks)
+    total_chars = len(total_thought) + len(total_answer)
+
     print("\n" + "-" * 40)
-    print(f"[Timing] Completed in {elapsed:.2f} s ({len(''.join(full_output))} chars generated).\n")
-    return "".join(full_output)
+    print(f"[Timing] Completed in {elapsed:.2f} s ({len(total_thought)} thinking chars, {len(total_answer)} answer chars; {total_chars} total).")
+    if finish_reason == "length":
+        print(f"[Warning] Inference terminated due to max_tokens limit ({max_tokens}).")
+        if total_thought and not total_answer:
+            print("          The model exhausted its token budget while thinking before emitting any answer code.")
+            print("          Tip: Increase --max-tokens (e.g. --max-tokens 1024) or set --reasoning-effort none.")
+    print()
+    return total_answer or total_thought
 
 
 def main():
@@ -172,7 +213,13 @@ def main():
     )
     parser.add_argument("--url", default="http://127.0.0.1:8080", help="Strata server URL")
     parser.add_argument("--port", type=int, default=8080, help="Port to start server on if not running")
-    parser.add_argument("--max-tokens", type=int, default=256, help="Maximum new tokens to generate")
+    parser.add_argument("--max-tokens", type=int, default=512, help="Maximum new tokens to generate (default: 512)")
+    parser.add_argument(
+        "--reasoning-effort",
+        choices=["none", "low", "medium", "high"],
+        default=None,
+        help="Reasoning effort (set 'none' to disable thinking and generate code directly; default: model default)",
+    )
     parser.add_argument("--temperature", type=float, default=0.0, help="Sampling temperature")
     parser.add_argument("--out-dir", help="VTune output directory path")
     args = parser.parse_args()
@@ -238,19 +285,26 @@ def main():
             time.sleep(2)  # Allow VTune collector to initialize hooks
 
             # Send prompt
-            send_prompt(args.url, args.prompt, args.max_tokens, args.temperature, args.api_key)
+            send_prompt(args.url, args.prompt, args.max_tokens, args.temperature, args.api_key, args.reasoning_effort)
+
+            # Brief pause to allow GPU kernel events to flush
+            time.sleep(0.5)
 
             # Stop VTune
             print("[VTune] Stopping VTune data collection...")
             stop_cmd = [vtune, "-r", str(out_dir), "-command", "stop"]
             subprocess.run(stop_cmd, env=env, check=False)
-            vtune_proc.wait(timeout=30)
+            try:
+                vtune_proc.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                vtune_proc.terminate()
         else:
             print("[VTune] Running prompt client under VTune wrapper...")
+            effort_repr = repr(args.reasoning_effort)
             runner = [
                 sys.executable, "-c",
                 f"import sys; sys.path.insert(0, '{ROOT}/tools'); "
-                f"import profile_vtune; profile_vtune.send_prompt('{args.url}', '{args.prompt}', {args.max_tokens}, {args.temperature}, '{args.api_key}')"
+                f"import profile_vtune; profile_vtune.send_prompt('{args.url}', '{args.prompt}', {args.max_tokens}, {args.temperature}, '{args.api_key}', {effort_repr})"
             ]
             vtune_cmd = [vtune, "-collect", args.analysis, "-result-dir", str(out_dir), "--", *runner]
             subprocess.run(vtune_cmd, env=env, check=False)

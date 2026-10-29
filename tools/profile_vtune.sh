@@ -401,7 +401,7 @@ run_prompt_inference() {
             if [[ "${line}" =~ ^data:\ (.*) ]]; then
                 chunk="${BASH_REMATCH[1]}"
                 if [[ "${chunk}" != "[DONE]" ]]; then
-                    content="$(python3 -c "import json, sys; obj=json.loads(sys.argv[1]); print(obj.get('choices',[{}])[0].get('delta',{}).get('content',''), end='')" "${chunk}" 2>/dev/null || true)"
+                    content="$(python3 -c "import json, sys; obj=json.loads(sys.argv[1]); delta=obj.get('choices',[{}])[0].get('delta',{}); print((delta.get('content') or '') or (delta.get('reasoning_content') or ''), end='')" "${chunk}" 2>/dev/null || true)"
                     printf "%s" "${content}"
                 fi
             fi

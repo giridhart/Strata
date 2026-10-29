@@ -472,7 +472,7 @@ void xmx_prefill_gemm_kernel(const uint16_t* __restrict__ X, const uint16_t* __r
     const int r = t0 + sgm * TM;
     const int c = n0 + sgn * TN;
     if (r < T && c < N) {
-        if (r + TM <= T && beta == 0.0f && alpha == 1.0f) {
+        if (r + TM <= T && c + TN <= N && beta == 0.0f && alpha == 1.0f) {
             auto ptr_c =
                 sycl::address_space_cast<sycl::access::address_space::global_space, sycl::access::decorated::no>(
                     Y + (size_t)r * ldy + c);
@@ -526,7 +526,7 @@ void Gemm::bf16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64
         return d && std::atoi(d) != 0;
     }();
 
-    const bool use_xmx = xmx_enabled && (N % 16 == 0) && (K % 16 == 0) && (N >= 16) && (K >= 16);
+    const bool use_xmx = xmx_enabled && (K % 16 == 0) && (K >= 16);
 
     if (gemm_debug) {
         static std::atomic<bool> logged{false};
@@ -537,7 +537,7 @@ void Gemm::bf16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64
         }
         if (!use_xmx && xmx_enabled) {
             std::fprintf(stderr,
-                         "Gemm [DEBUG]: Gemm::bf16 fallback to scalar kernel for T=%ld, N=%ld, K=%ld (requires N,K mod 16 == 0)\n",
+                         "Gemm [DEBUG]: Gemm::bf16 fallback to scalar kernel for T=%ld, N=%ld, K=%ld (requires K mod 16 == 0)\n",
                          (long)T, (long)N, (long)K);
         }
     }
@@ -589,7 +589,7 @@ void Gemm::f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_
         return d && std::atoi(d) != 0;
     }();
 
-    const bool use_xmx = xmx_enabled && (N % 16 == 0) && (K % 16 == 0) && (N >= 16) && (K >= 16);
+    const bool use_xmx = xmx_enabled && (K % 16 == 0) && (K >= 16);
 
     if (gemm_debug) {
         static std::atomic<bool> logged{false};
@@ -600,7 +600,7 @@ void Gemm::f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_
         }
         if (!use_xmx && xmx_enabled) {
             std::fprintf(stderr,
-                         "Gemm [DEBUG]: Gemm::f16 fallback to scalar kernel for T=%ld, N=%ld, K=%ld (requires N,K mod 16 == 0)\n",
+                         "Gemm [DEBUG]: Gemm::f16 fallback to scalar kernel for T=%ld, N=%ld, K=%ld (requires K mod 16 == 0)\n",
                          (long)T, (long)N, (long)K);
         }
     }
