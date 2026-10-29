@@ -186,7 +186,7 @@ int main() {
         return 1;
     }
 
-    // Sweep across various prompt and expert chunk shapes
+    // Sweep across various prompt and expert chunk shapes, including skinny N=1 and N=4
     std::vector<int64_t> Ts = {1, 5, 8, 17, 32, 64, 128, 512};
     for (int64_t T : Ts) {
         test_f16_case(gemm, q, T, 640, 1280, 0.0f);
@@ -194,6 +194,16 @@ int main() {
         test_bf16_case(gemm, q, T, 640, 1280, 0.0f);
         test_bf16_case(gemm, q, T, 1280, 2560, 1.0f);
     }
+
+    // Specific skinny shapes reported in user prompts (shared gates N=1, SSM alpha/beta N=4)
+    std::printf("\n  Testing skinny shapes (N=1, N=4, non-multiple of 16)...\n");
+    test_bf16_case(gemm, q, 881, 4, 10240, 0.0f);
+    test_bf16_case(gemm, q, 881, 4, 10240, 1.0f);
+    test_bf16_case(gemm, q, 881, 1, 2560, 0.0f);
+    test_bf16_case(gemm, q, 5, 4, 10240, 0.0f);
+    test_bf16_case(gemm, q, 17, 7, 256, 0.0f);
+    test_f16_case(gemm, q, 881, 4, 10240, 0.0f);
+    test_f16_case(gemm, q, 881, 1, 2560, 0.0f);
 
     if (g_failures == 0) {
         std::printf("All Prefill Gemm parity tests PASSED!\n");
