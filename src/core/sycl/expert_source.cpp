@@ -1312,6 +1312,12 @@ bool FileExpertSource::pin_cache_complement(const ExpertCache& cache, std::strin
             const char* v = std::getenv("STRATA_PIN_SLICES");
             return v == nullptr || std::atoi(v) != 0;
         }();
+        const bool pin_debug = [] {
+            const char* v = std::getenv("STRATA_PIN_DEBUG");
+            if (v && std::atoi(v) != 0) return true;
+            const char* d = std::getenv("STRATA_DEBUG");
+            return d && std::atoi(d) != 0;
+        }();
 
         if (pin && pin_slices) {
             const char* pin_cap_env = std::getenv("STRATA_PARTIAL_PIN_GIB");
@@ -1344,6 +1350,11 @@ bool FileExpertSource::pin_cache_complement(const ExpertCache& cache, std::strin
                     }
                 }
                 if (cut_end <= current_arena_off) {
+                    if (pin_debug) {
+                        std::fprintf(stderr,
+                                     "FileExpertSource [PIN_DEBUG]: cut_end (%llu) <= current_off (%llu), stepping down step\n",
+                                     (unsigned long long)cut_end, (unsigned long long)current_arena_off);
+                    }
                     if (slice_step > min_slice_step) {
                         slice_step = min_slice_step;
                         continue;
@@ -1360,11 +1371,24 @@ bool FileExpertSource::pin_cache_complement(const ExpertCache& cache, std::strin
                 }
 
                 if (usm == nullptr) {
+                    if (pin_debug) {
+                        std::fprintf(stderr,
+                                     "FileExpertSource [PIN_DEBUG]: USM host allocation of %.2f GiB refused by runtime%s\n",
+                                     (double)slice_bytes / 1073741824.0,
+                                     slice_step > min_slice_step ? "; stepping down slice size" : "; halting slice allocation");
+                    }
                     if (slice_step > min_slice_step) {
                         slice_step = min_slice_step;
                         continue;
                     }
                     break;
+                }
+
+                if (pin_debug) {
+                    std::fprintf(stderr,
+                                 "FileExpertSource [PIN_DEBUG]: slice %zu allocated at %p [%.2f GiB, arena offset %llu..%llu)\n",
+                                 slices.size(), usm, (double)slice_bytes / 1073741824.0,
+                                 (unsigned long long)current_arena_off, (unsigned long long)cut_end);
                 }
 
                 slices.push_back({current_arena_off, {usm, slice_bytes}});
@@ -1382,6 +1406,13 @@ bool FileExpertSource::pin_cache_complement(const ExpertCache& cache, std::strin
                     }
                     const strata::platform::LockResult lr = strata::platform::lock_resident(tail_arena, tail_bytes);
                     locked = lr.locked_bytes;
+                    if (pin_debug) {
+                        std::fprintf(stderr,
+                                     "FileExpertSource [PIN_DEBUG]: allocated unpinned tail at %p [%.2f GiB, arena offset %llu..%llu), locked %llu bytes\n",
+                                     tail_arena, (double)tail_bytes / 1073741824.0,
+                                     (unsigned long long)current_arena_off, (unsigned long long)bytes,
+                                     (unsigned long long)locked);
+                    }
                     char msg[160];
                     std::snprintf(msg, sizeof msg, "%.2f GiB page-locked in %zu USM host slices; %.2f GiB pageable resident",
                                   (double)current_arena_off / 1073741824.0, slices.size(),
@@ -1717,6 +1748,20 @@ const uint8_t* FileExpertSource::complement_entry_ptr(uint64_t offset, uint64_t 
             if (offset + blob_bytes <= tail_off + tail_bytes) {
                 return (const uint8_t*)complement_arena_ + (offset - tail_off);
             }
+        }
+        static const bool pin_debug = [] {
+            const char* v = std::getenv("STRATA_PIN_DEBUG");
+            if (v && std::atoi(v) != 0) return true;
+            const char* d = std::getenv("STRATA_DEBUG");
+            return d && std::atoi(d) != 0;
+        }();
+        if (pin_debug) {
+            std::fprintf(stderr,
+                         "FileExpertSource [PIN_DEBUG]: complement_entry_ptr miss for offset=%llu, blob_bytes=%llu "
+                         "(slices=%zu, pin_limit=%.2f GiB, total=%.2f GiB)\n",
+                         (unsigned long long)offset, (unsigned long long)blob_bytes,
+                         complement_slices_.size(), (double)complement_pin_limit_ / 1073741824.0,
+                         (double)complement_bytes_ / 1073741824.0);
         }
         return nullptr;
     }

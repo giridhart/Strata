@@ -18,6 +18,7 @@
 #undef __ballot_sync
 #endif
 
+#include <atomic>
 #include <climits>
 #include <cstdio>
 #include <cstdlib>
@@ -487,7 +488,7 @@ void xmx_prefill_gemm_kernel(const uint16_t* __restrict__ X, const uint16_t* __r
             sycl::group_barrier(sg);
             const size_t ln = sg.get_local_linear_id();
             for (int rr = 0; rr < TM; ++rr) {
-                if (r + rr < T && c + ln < N) {
+                if ((size_t)(r + rr) < (size_t)T && c + ln < (size_t)N) {
                     const size_t idx = (size_t)(r + rr) * ldy + c + ln;
                     if (beta == 0.0f) {
                         Y[idx] = alpha * st[rr * TN + ln];
@@ -518,8 +519,28 @@ void Gemm::bf16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64
         if (v) return std::atoi(v) != 0;
         return strata::sycl_arch::IS_XE2;
     }();
+    static const bool gemm_debug = [] {
+        const char* v = std::getenv("STRATA_PREFILL_XMX_DEBUG");
+        if (v && std::atoi(v) != 0) return true;
+        const char* d = std::getenv("STRATA_DEBUG");
+        return d && std::atoi(d) != 0;
+    }();
 
     const bool use_xmx = xmx_enabled && (N % 16 == 0) && (K % 16 == 0) && (N >= 16) && (K >= 16);
+
+    if (gemm_debug) {
+        static std::atomic<bool> logged{false};
+        if (!logged.exchange(true)) {
+            std::fprintf(stderr, "Gemm [DEBUG]: XMX status - enabled=%d, IS_XE2=%d (GEMM path: %s)\n",
+                         xmx_enabled, (int)strata::sycl_arch::IS_XE2,
+                         xmx_enabled ? "XMX SLM-tiled DPAS" : "Scalar FMA");
+        }
+        if (!use_xmx && xmx_enabled) {
+            std::fprintf(stderr,
+                         "Gemm [DEBUG]: Gemm::bf16 fallback to scalar kernel for T=%ld, N=%ld, K=%ld (requires N,K mod 16 == 0)\n",
+                         (long)T, (long)N, (long)K);
+        }
+    }
 
     if (use_xmx) {
         constexpr int BM = 32, BN = 32, KS = 32, TM = 8, TN = 16;
@@ -561,8 +582,28 @@ void Gemm::f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_
         if (v) return std::atoi(v) != 0;
         return strata::sycl_arch::IS_XE2;
     }();
+    static const bool gemm_debug = [] {
+        const char* v = std::getenv("STRATA_PREFILL_XMX_DEBUG");
+        if (v && std::atoi(v) != 0) return true;
+        const char* d = std::getenv("STRATA_DEBUG");
+        return d && std::atoi(d) != 0;
+    }();
 
     const bool use_xmx = xmx_enabled && (N % 16 == 0) && (K % 16 == 0) && (N >= 16) && (K >= 16);
+
+    if (gemm_debug) {
+        static std::atomic<bool> logged{false};
+        if (!logged.exchange(true)) {
+            std::fprintf(stderr, "Gemm [DEBUG]: XMX status - enabled=%d, IS_XE2=%d (GEMM path: %s)\n",
+                         xmx_enabled, (int)strata::sycl_arch::IS_XE2,
+                         xmx_enabled ? "XMX SLM-tiled DPAS" : "Scalar FMA");
+        }
+        if (!use_xmx && xmx_enabled) {
+            std::fprintf(stderr,
+                         "Gemm [DEBUG]: Gemm::f16 fallback to scalar kernel for T=%ld, N=%ld, K=%ld (requires N,K mod 16 == 0)\n",
+                         (long)T, (long)N, (long)K);
+        }
+    }
 
     if (use_xmx) {
         constexpr int BM = 32, BN = 32, KS = 32, TM = 8, TN = 16;
