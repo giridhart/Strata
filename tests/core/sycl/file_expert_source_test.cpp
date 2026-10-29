@@ -11,6 +11,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -297,6 +298,92 @@ void test_cgroup_memory_budget() {
             "missing memory.stat counters did not fail closed");
 }
 
+void test_chunked_usm_pinning() {
+    using namespace strata::core;
+    using namespace strata::kernels::cpu;
+    constexpr int64_t layers = 2;
+    constexpr int64_t experts = 4;
+    const uint64_t blob_bytes = (uint64_t)BLOB;
+    TempDirectory dir;
+
+    std::string err;
+    require(expert_layout_load(dir.path.string(), layers, experts, err), err);
+
+    std::vector<std::vector<uint8_t>> truth((size_t)(layers * experts), std::vector<uint8_t>(blob_bytes));
+    {
+        std::ofstream out(dir.path / "experts.bin", std::ios::binary | std::ios::trunc);
+        for (size_t i = 0; i < truth.size(); ++i) {
+            for (size_t b = 0; b < blob_bytes; ++b) {
+                truth[i][b] = (uint8_t)((b * 131u + i * 37u) ^ (b >> 8));
+            }
+            out.write((const char*)truth[i].data(), (std::streamsize)blob_bytes);
+        }
+        require((bool)out, "could not write synthetic experts.bin");
+    }
+
+    setenv("STRATA_PIN_SLICES", "1", 1);
+    setenv("STRATA_PIN_SLICE_GIB", "0.0024", 1);
+    unsetenv("STRATA_PARTIAL_PIN_GIB");
+
+    FileExpertSource src;
+    require(src.open(dir.path.string(), layers, experts, err), err);
+
+    ExpertCache cache;
+    require(cache.open(2, layers, experts, blob_bytes, err), err);
+    int s0 = cache.admit(0, 0);
+    require(s0 >= 0 && cache.fill_slot_blocking(s0, truth[0].data(), err), err);
+    int s1 = cache.admit(1, 0);
+    require(s1 >= 0 && cache.fill_slot_blocking(s1, truth[experts].data(), err), err);
+
+    require(src.pin_cache_complement(cache, err, true), err);
+    require(src.complement_pinned(), "complement was not pinned");
+    require(src.complement_ready(), "complement is not ready");
+    require(src.pinned_bytes() == 6 * blob_bytes, "pinned bytes mismatch");
+
+    std::vector<uint8_t> buf(blob_bytes);
+    for (int64_t l = 0; l < layers; ++l) {
+        for (int64_t e = 0; e < experts; ++e) {
+            const size_t idx = (size_t)l * (size_t)experts + (size_t)e;
+            if ((l == 0 && e == 0) || (l == 1 && e == 0)) {
+                require(!src.has_resident(l, e), "cache-resident expert marked as complement resident");
+                require(!src.pinned(l, e), "cache-resident expert marked as pinned");
+                require(src.device_alias(l, e) == nullptr, "cache-resident expert has device alias");
+            } else {
+                require(src.has_resident(l, e), "complement expert not resident");
+                require(src.pinned(l, e), "complement expert not pinned");
+                const uint8_t* dev = src.device_alias(l, e);
+                require(dev != nullptr, "pinned complement expert has null device alias");
+                const uint8_t* res = src.resident_blob(l, e);
+                require(res != nullptr, "resident_blob returned null");
+                require(std::memcmp(res, truth[idx].data(), blob_bytes) == 0, "resident_blob corrupted bytes");
+                require(src.copy_blob(l, e, buf.data()), "copy_blob failed");
+                require(std::memcmp(buf.data(), truth[idx].data(), blob_bytes) == 0, "copy_blob corrupted bytes");
+                const uint8_t* b = src.blob(l, e);
+                require(b != nullptr, "blob returned null");
+                require(std::memcmp(b, truth[idx].data(), blob_bytes) == 0, "blob corrupted bytes");
+            }
+        }
+    }
+
+    src.close();
+    setenv("STRATA_PIN_SLICES", "0", 1);
+    require(src.open(dir.path.string(), layers, experts, err), err);
+    require(src.pin_cache_complement(cache, err, true), err);
+    require(src.complement_pinned(), "monolithic complement was not pinned");
+    for (int64_t l = 0; l < layers; ++l) {
+        for (int64_t e = 0; e < experts; ++e) {
+            const size_t idx = (size_t)l * (size_t)experts + (size_t)e;
+            if ((l == 0 && e == 0) || (l == 1 && e == 0)) continue;
+            require(src.pinned(l, e), "monolithic pinned failed");
+            const uint8_t* res = src.resident_blob(l, e);
+            require(res != nullptr && std::memcmp(res, truth[idx].data(), blob_bytes) == 0, "monolithic corrupted");
+        }
+    }
+    src.close();
+    unsetenv("STRATA_PIN_SLICES");
+    unsetenv("STRATA_PIN_SLICE_GIB");
+}
+
 }  // namespace
 
 int main() {
@@ -306,6 +393,7 @@ int main() {
         test_resident_exchange();
         test_cgroup_memory_budget();
         test_canonical_layout();
+        test_chunked_usm_pinning();
 #if defined(STRATA_NATIVE_EXPERTS)
         test_native_variable_layout();
 #endif
