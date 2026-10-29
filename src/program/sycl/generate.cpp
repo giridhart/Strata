@@ -117,6 +117,19 @@ inline void get_device_mem_info(size_t& free_b, size_t& total_b) {
         free_b = total_b = 0;
     }
 }
+
+#define GDBG(...)                                                   \
+    do {                                                            \
+        static const bool gdbg_on = [] {                           \
+            const char* e1 = std::getenv("STRATA_VERIFY_DEBUG");    \
+            const char* e2 = std::getenv("STRATA_TRACE");           \
+            return (e1 && std::atoi(e1) != 0) || e2 != nullptr;     \
+        }();                                                        \
+        if (gdbg_on) {                                              \
+            std::fprintf(stderr, "strata dbg: " __VA_ARGS__);       \
+            std::fflush(stderr);                                    \
+        }                                                           \
+    } while (0)
 }  // namespace
 
 namespace dpct {
@@ -828,10 +841,13 @@ void drive_pool_multi(void* user, const float* x_f, const int32_t* ids, int64_t 
                       int64_t layer) {
     Drive* t = (Drive*)user;
     t->d.layers = layer;
+    GDBG("drive_pool_multi: layer=%lld, n_tok=%lld, k=%lld\n", (long long)layer, (long long)n_tok, (long long)k);
     const Clock::time_point a = Clock::now();
     strata::core::expert_pool_dispatch_multi(t->d, x_f, ids, n_tok, k, out);
-    t->cpu_ms += std::chrono::duration<double, std::milli>(Clock::now() - a).count();
+    const double ms = std::chrono::duration<double, std::milli>(Clock::now() - a).count();
+    t->cpu_ms += ms;
     ++t->calls;
+    GDBG("drive_pool_multi: layer=%lld done in %.2f ms (failed=%d)\n", (long long)layer, ms, (int)t->d.failed);
     // the routing trace for the serve path: the same record format drive_pool writes (layer, k, ids, weights),
     // one record per token.  The multi dispatch fuses the router weights into the kernel and does not surface
     // them, so records carry unit weights: tools/make_profile.py ranks pairs by routed frequency, which is the
@@ -6278,6 +6294,8 @@ int main(int argc, char** argv) try {
             };
             // tokens [a, b) through the windows: commit all of them, then give the draft layer their residuals
             auto read_windows = [&](int64_t a, int64_t b, std::string& e) -> bool {
+                GDBG("read_windows start: [%lld, %lld), total=%lld, S=%d\n",
+                     (long long)a, (long long)b, (long long)(b - a), S);
                 strata::core::progress_at("reading the prompt (verify windows), from token", a);  // #217: not "batched"
                 strata::core::progress_beat();
                 // every token is committed and the picks are discarded: no head sampling (see set_head_sampling)
@@ -6300,10 +6318,15 @@ int main(int argc, char** argv) try {
                     drive.d.layers = 0;
                     drive.d.experts = 0;
                     drive.d.failed = false;
+                    GDBG("read_windows: calling ver.run(T=%d, q=%lld, win[0]=%d)\n", T, (long long)q, win[0]);
+                    const auto t_run0 = Clock::now();
                     if (!ver.run(T, win.data(), q, win_pool_fn, win_pool_user, outw.data(), e) || drive.d.failed) {
                         if (drive.d.failed && drive.d.fail) e = drive.d.fail;
+                        GDBG("read_windows: ver.run FAILED (q=%lld, T=%d): %s\n", (long long)q, T, e.c_str());
                         return false;
                     }
+                    GDBG("read_windows: ver.run succeeded in %.2f ms (q=%lld, T=%d)\n",
+                         std::chrono::duration<double, std::milli>(Clock::now() - t_run0).count(), (long long)q, T);
                     if (nonfinite_hit(ver, "prompt")) {
                         e = "non-finite logits (#879)";
                         return false;
@@ -6322,7 +6345,11 @@ int main(int argc, char** argv) try {
                     }();
                     if (logpos != nullptr && !ver.window_logprobs(nxt.data(), T, q, logpos_extra, logpos, e))
                         return false;
+                    GDBG("read_windows: calling ver.commit(T=%d)\n", T);
+                    const auto t_commit0 = Clock::now();
                     if (!ver.commit(T, e) || (use_mtp && !mtp.prefill(ver.final_R_all(), nxt.data(), T, q, e))) return false;
+                    GDBG("read_windows: ver.commit succeeded in %.2f ms\n",
+                         std::chrono::duration<double, std::milli>(Clock::now() - t_commit0).count());
                     q += T;
                     pp_reached = q;  // #471
                     const double ms = std::chrono::duration<double, std::milli>(Clock::now() - pp_t0).count();
@@ -6333,7 +6360,11 @@ int main(int argc, char** argv) try {
                     std::fflush(stdout);
                 }
                 // the batched prompt path (other streams), checkpoints and snapshots may follow: the last commit first
+                GDBG("read_windows: calling ver.wait_commit()\n");
+                const auto t_wc0 = Clock::now();
                 if (!ver.wait_commit(e)) return false;
+                GDBG("read_windows: ver.wait_commit succeeded in %.2f ms\n",
+                     std::chrono::duration<double, std::milli>(Clock::now() - t_wc0).count());
                 const double ms = std::chrono::duration<double, std::milli>(Clock::now() - pp_t0).count();
                 std::printf("PP %lld %lld %.0f %.1f\n", (long long)b, (long long)pp_total, ms,
                             ms > 0.0 ? 1000.0 * (double)(b - pp_from) / ms : 0.0);
@@ -6697,11 +6728,15 @@ int main(int argc, char** argv) try {
                         .wait();
                 }
                 tr("window", p, T);
+                GDBG("speculative: calling ver.run(T=%d, p=%lld, window[0]=%d)\n", T, (long long)p, window[0]);
                 const Clock::time_point tw0 = Clock::now();
                 if (!ver.run(T, window.data(), p, win_pool_fn, win_pool_user, outv.data(), err) || drive.d.failed) {
+                    GDBG("speculative: ver.run FAILED (p=%lld, T=%d): %s\n", (long long)p, T, err.c_str());
                     std::printf("ERR %s\n", drive.d.failed && drive.d.fail ? drive.d.fail : err.c_str());
                     return 1;
                 }
+                GDBG("speculative: ver.run succeeded in %.2f ms\n",
+                     std::chrono::duration<double, std::milli>(Clock::now() - tw0).count());
                 int a = 0;
                 while (a < T - 1 && window[(size_t)a + 1] == outv[(size_t)a])
                     ++a;
@@ -7662,10 +7697,15 @@ int main(int argc, char** argv) try {
             drive.d.experts = 0;
             drive.d.failed = false;
             apply_pending(false);
+            GDBG("generate: calling ver.run(T=%d, p=%lld, window[0]=%d)\n", T, (long long)p, window[0]);
+            const auto t_g0 = Clock::now();
             if (!ver.run(T, window.data(), p, &drive_pool_multi, &drive, outv.data(), err)) {
+                GDBG("generate: ver.run FAILED (p=%lld, T=%d): %s\n", (long long)p, T, err.c_str());
                 std::fprintf(stderr, "strata generate: %s\n", err.c_str());
                 return 1;
             }
+            GDBG("generate: ver.run succeeded in %.2f ms\n",
+                 std::chrono::duration<double, std::milli>(Clock::now() - t_g0).count());
             if (drive.d.failed) {
                 std::fprintf(stderr, "strata generate: the expert pool failed at layer %lld expert %lld: %s\n",
                              (long long)drive.d.fail_layer, (long long)drive.d.fail_expert,

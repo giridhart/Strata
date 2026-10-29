@@ -195,6 +195,14 @@ private:
     bool capture_commit(std::string& err);
     bool record_commit(sycl::queue* cs, std::string& err);
     bool record_window(int T, sycl::queue* cs, std::string &err);
+    bool record_window_prologue(int T, sycl::queue* cs, std::string& err);
+    bool record_layer_pre(int T, int64_t l, int grp, sycl::queue* cs, std::string& err);
+    bool record_layer_post(int T, int64_t l, int grp, sycl::queue* cs, std::string& err);
+    bool record_window_epilogue(int T, sycl::queue* cs, std::string& err);
+    float* Rt(int t) const;
+    void stamp(int64_t l, int i, int grp, sycl::queue* cs);
+    std::vector<int64_t> gdn_idx_;
+    std::vector<int64_t> qsa_idx_;
     static constexpr int kProfPer = 33;              // stamps per layer (32 left the hc-read second
                                       // half's up-stamp at slot 32 = the next layer's slot 0: D8)
     bool prof_on_ = false;
