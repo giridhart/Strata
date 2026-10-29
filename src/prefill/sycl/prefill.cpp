@@ -2698,8 +2698,83 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         mmq::WeightTab tgu{}, td{};
                         mmq::GuardTab gd{};
                         int ns = 0;
+
+                        const bool xmx_fmt = lay.native && [&]() {
+                            const auto& f = lay.fmt[(size_t)l];
+                            return (f.gu_type == 18 || f.gu_type == 21 || f.gu_type == 22 || f.gu_type == 23 ||
+                                    f.gu_type == 16 || f.gu_type == 17 || f.gu_type == 29) &&
+                                   (f.d_type == 20 || f.d_type == 42 || f.d_type == 23) &&
+                                   f.n_embd == N && f.n_ff == 640;
+                        }();
+
+                        static const int pf_xmx_opt = [] {
+                            const char* v = std::getenv("STRATA_PF_XMX");
+                            return v ? std::atoi(v) : 0;
+                        }();
+
+                        const bool use_xmx = !use_mmq && pf_xmx_opt > 0 && xmx_fmt;
+
+                        const uint8_t* xg_g[strata::kernels::kXmxGroupMax];
+                        const uint8_t* xg_u[strata::kernels::kXmxGroupMax];
+                        const uint8_t* xg_d[strata::kernels::kXmxGroupMax];
+                        int32_t xg_c[strata::kernels::kXmxGroupMax];
+                        int xg_slots[strata::kernels::kXmxGroupMax];
+                        int xg_n = 0, xg_ns = 0;
+                        int64_t xg_r0 = 0;
+
+                        auto xflush = [&]() {
+                            if (xg_n == 0) return;
+                            const auto& f = lay.fmt[(size_t)l];
+                            int64_t nr = 0;
+                            for (int i = 0; i < xg_n; ++i) nr += xg_c[i];
+
+                            static const bool debug = [] {
+                                const char* e1 = std::getenv("STRATA_XMXG_DEBUG");
+                                const char* e2 = std::getenv("STRATA_DEBUG");
+                                return (e1 && std::atoi(e1) != 0) || (e2 && std::atoi(e2) != 0);
+                            }();
+                            if (debug) {
+                                std::fprintf(stderr,
+                                             "[prefill:xmxg] layer %ld: flushing group of %d experts, total_rows=%ld, r0=%ld\n",
+                                             (long)l, xg_n, (long)nr, (long)xg_r0);
+                            }
+
+                            pt.mark(kPfGemmGU, cs);
+                            strata::kernels::iq_xmx_grouped(f.gu_type, xg_g, xg_u, xg_c, xg_n, m.Xs + xg_r0 * N,
+                                                            m.GU + xg_r0 * 1280, 1280, (int)N, m.cs);
+                            swiglu_interleaved(m.GU + xg_r0 * 1280, m.Hh + xg_r0 * 640, nr, m.cs);
+                            pt.mark(kPfGemmD, cs);
+                            strata::kernels::iq_xmx_grouped(f.d_type, xg_d, nullptr, xg_c, xg_n, m.Hh + xg_r0 * 640,
+                                                            m.Dm + xg_r0 * N, (int)N, 640, m.cs);
+
+                            if (xg_ns > 0) {
+                                auto bar = m.cs->ext_oneapi_submit_barrier();
+                                for (int i = 0; i < xg_ns; ++i) *m.used[xg_slots[i]] = bar;
+                            }
+                            xg_n = 0;
+                            xg_ns = 0;
+                        };
+
                         auto compute = [&](size_t j, const uint8_t* blob_dev, int slot, int32_t cslot) -> bool {
                             const int32_t e = order[j];
+                            if (use_xmx) {
+                                if (static bool said = false; !said) {
+                                    said = true;
+                                    std::fprintf(stderr, "strata: prompt experts on the fused grouped XMX (STRATA_PF_XMX=%d)\n", pf_xmx_opt);
+                                }
+                                const auto& f = lay.fmt[(size_t)l];
+                                if (xg_n == 0) xg_r0 = m.off[(size_t)e];
+                                xg_g[xg_n] = blob_dev;
+                                xg_u[xg_n] = blob_dev + f.up_off;
+                                xg_d[xg_n] = blob_dev + f.down_off;
+                                xg_c[xg_n] = (int32_t)m.cnt[(size_t)e];
+                                ++xg_n;
+                                if (slot >= 0) xg_slots[xg_ns++] = slot;
+                                if (xg_n == strata::kernels::kXmxGroupMax || j + 1 == order.size()) {
+                                    xflush();
+                                }
+                                return true;
+                            }
                             pt.mark(kPfDequant, cs);
                             if (use_mmq) {
                                 // gather the expert into its group slot (GGUF blocks, unchanged or converted)
@@ -2871,6 +2946,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             }
                             release_to(m.g->n_expert);
                         }
+                        if (use_xmx) xflush();
                     }
                     pt.mark(kPfCombine, cs);
                     moe_combine(m.Dm, m.slot_dev, m.w, m.shared, m.sg, m.bo, T, m.cs);
