@@ -62,6 +62,10 @@ inline std::mutex& uncached_mu() { static std::mutex m; return m; }
 }  // namespace detail
 
 inline void* host_malloc_polled(size_t bytes, sycl::queue& q) {
+    static const bool vdbg = [] {
+        const char* e = std::getenv("STRATA_VERIFY_DEBUG");
+        return e != nullptr && std::atoi(e) != 0;
+    }();
 #ifdef STRATA_HAVE_ZE
     static const bool on = [] { const char* v = std::getenv("STRATA_HOST_UNCACHED"); return !(v && v[0] == '0'); }();
     if (on && q.get_backend() == sycl::backend::ext_oneapi_level_zero) {
@@ -71,11 +75,20 @@ inline void* host_malloc_polled(size_t bytes, sycl::queue& q) {
         if (zeMemAllocHost(ctx, &d, bytes, 64, &p) == ZE_RESULT_SUCCESS && p != nullptr) {
             std::lock_guard<std::mutex> lk(detail::uncached_mu());
             detail::uncached_set().insert(p);
+            if (vdbg) {
+                std::fprintf(stderr, "doorbell dbg: host_malloc_polled(%zu) -> zeMemAllocHost uncached %p\n", bytes, p);
+                std::fflush(stderr);
+            }
             return p;
         }
     }
 #endif
-    return sycl::malloc_host(bytes, q);
+    void* p = sycl::malloc_host(bytes, q);
+    if (vdbg) {
+        std::fprintf(stderr, "doorbell dbg: host_malloc_polled(%zu) -> sycl::malloc_host %p\n", bytes, p);
+        std::fflush(stderr);
+    }
+    return p;
 }
 
 inline void host_free_polled(void* p, sycl::queue& q) {

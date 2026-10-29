@@ -1920,6 +1920,15 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         P.counts[1] = entries;
         P.counts[2] = fetches;
         std::atomic_thread_fence(std::memory_order_seq_cst);
+        static const bool vdbg = [] {
+            const char* e = std::getenv("STRATA_VERIFY_DEBUG");
+            return e != nullptr && std::atoi(e) != 0;
+        }();
+        if (vdbg) {
+            std::fprintf(stderr, "pool dbg: layer %lld: plan groups=%d (VRAM), entries=%d, fetches=%d (PCIe)\n",
+                         (long long)d.layers, P.counts[0], P.counts[1], P.counts[2]);
+            std::fflush(stderr);
+        }
         pt("publish", fetches);
         if (P.publish) P.publish(P.ctx);
         pt("fetch", fetches);
