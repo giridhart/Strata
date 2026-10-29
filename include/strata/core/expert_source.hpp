@@ -454,6 +454,8 @@ public:
     // `in`'s place, so the copy keeps holding exactly the experts the GPU does not - with no read of the file.
     /// Whether the compact copy holds `(layer, expert)`.
     bool has_resident(int64_t layer, int64_t expert) const;
+    /// The compact copy's blob of `(layer, expert)`, or null; not counted as a read.
+    const uint8_t* resident_blob(int64_t layer, int64_t expert) const;
     /// Host room for `n` evicted blobs (page-locked when possible).  Idempotent for the same or a smaller `n`.
     bool reserve_exchanges(int64_t n, std::string& err);
     int64_t exchange_capacity() const { return xstage_cap_; }
@@ -556,6 +558,8 @@ private:
     int64_t n_expert_ = 0;
     uint64_t mapped_bytes_ = 0;
     std::vector<uint64_t> layer_offsets_, layer_blob_bytes_;
+    const uint8_t* complement_entry_ptr(uint64_t offset, uint64_t blob_bytes) const;
+    std::vector<std::pair<uint64_t, std::pair<void*, uint64_t>>> complement_slices_;
     void* complement_arena_ = nullptr;
     const uint8_t* complement_host_ = nullptr;
     const uint8_t* complement_device_ = nullptr;
@@ -1443,6 +1447,8 @@ public:
     // differ in block size keeps spares per size).
     /// Whether the compact copy holds `(layer, expert)`.
     bool has_resident(int64_t layer, int64_t expert) const;
+    /// The compact copy's blob of `(layer, expert)`, or null; not counted as a read.
+    const uint8_t* resident_blob(int64_t layer, int64_t expert) const;
     /// Host room for `n` evicted blobs (page-locked when possible).  Idempotent for the same or a smaller `n`.
     /// `bounce`: how many of the last buffers are only staged through and never hold an exchange (STRATA_EXCHANGE_ROTATE
     /// keeps those in the largest block size alone).
@@ -1857,6 +1863,8 @@ private:
     int64_t n_expert_ = 0;
     uint64_t mapped_bytes_ = 0;
     std::vector<uint64_t> layer_offsets_, layer_blob_bytes_;
+    const uint8_t* complement_entry_ptr(uint64_t offset, uint64_t blob_bytes) const;
+    std::vector<std::pair<uint64_t, std::pair<void*, uint64_t>>> complement_slices_;
     void* complement_arena_ = nullptr;
     const uint8_t* complement_host_ = nullptr;
     const uint8_t* complement_device_ = nullptr;

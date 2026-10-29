@@ -516,8 +516,17 @@ bool FileExpertSource::open(const std::string& pack_dir, int64_t n_layers, int64
 }
 
 void FileExpertSource::close() {
+    for (auto& s : complement_slices_) {
+        if (s.second.first != nullptr) {
+            try {
+                sycl::free(s.second.first, default_queue());
+            } catch (...) {
+            }
+        }
+    }
+    complement_slices_.clear();
     if (complement_arena_ != nullptr) {
-        if (complement_pinned_ && !complement_partial_) {
+        if (complement_pinned_ && !complement_partial_ && complement_slices_.empty()) {
             try {
                 sycl::free(complement_arena_, default_queue());
             } catch (...) {
@@ -1054,8 +1063,7 @@ bool FileExpertSource::copy_blob(int64_t layer, int64_t expert, uint8_t* dst) {
     const size_t index = (size_t)layer * (size_t)n_expert_ + (size_t)expert;
     const uint64_t bytes = layer_blob_bytes_[(size_t)layer];
     if (complement_ready_) {
-        const uint8_t* held =
-            detail::cache_complement_blob_or_fallback(index, complement_offsets_, complement_host_, nullptr);
+        const uint8_t* held = resident_blob(layer, expert);
         if (held == nullptr && !override_.empty()) held = override_[index];
         if (held != nullptr) {
             std::memcpy(dst, held, (size_t)bytes);
@@ -1264,7 +1272,25 @@ bool FileExpertSource::pin_cache_complement(const ExpertCache& cache, std::strin
     uint64_t partial_pin = 0;  ///< CS-T: a registered prefix of a locked arena
     uint64_t lock_off = 0;     ///< where the working-set lock starts (after the registered prefix)
     std::string note;
+
+    std::vector<std::pair<uint64_t, std::pair<void*, uint64_t>>> slices;
+    void* tail_arena = nullptr;
+
     auto release = [&]() {
+        for (auto& s : slices) {
+            if (s.second.first != nullptr) {
+                try {
+                    sycl::free(s.second.first, default_queue());
+                } catch (...) {
+                }
+            }
+        }
+        slices.clear();
+        if (tail_arena != nullptr) {
+            if (locked > 0) strata::platform::unlock_resident(tail_arena, locked);
+            std::free(tail_arena);
+            tail_arena = nullptr;
+        }
         if (arena == nullptr) return;
         if (pinned_ok) {
             try {
@@ -1281,7 +1307,102 @@ bool FileExpertSource::pin_cache_complement(const ExpertCache& cache, std::strin
         std::fprintf(stderr, "FileExpertSource: allocating %.2f GiB %s cache complement\n",
                      (double)bytes / 1073741824.0, pin ? "page-locked" : "pageable resident");
         std::fflush(stderr);
-        if (pin) {
+
+        const bool pin_slices = [] {
+            const char* v = std::getenv("STRATA_PIN_SLICES");
+            return v == nullptr || std::atoi(v) != 0;
+        }();
+
+        if (pin && pin_slices) {
+            const char* pin_cap_env = std::getenv("STRATA_PARTIAL_PIN_GIB");
+            const uint64_t pin_cap = (uint64_t)((pin_cap_env != nullptr && std::atof(pin_cap_env) > 0
+                                                     ? std::atof(pin_cap_env)
+                                                     : 24.0) * 1073741824.0);
+            const uint64_t target_pin = std::min(bytes, pin_cap);
+
+            const char* slice_gib_env = std::getenv("STRATA_PIN_SLICE_GIB");
+            const uint64_t slice_init = (uint64_t)((slice_gib_env != nullptr && std::atof(slice_gib_env) > 0
+                                                       ? std::atof(slice_gib_env)
+                                                       : 2.0) * 1073741824.0);
+            uint64_t slice_step = slice_init > 0 ? slice_init : (2ull << 30);
+            const uint64_t min_slice_step = std::min<uint64_t>(1ull << 30, slice_step);
+
+            uint64_t current_arena_off = 0;
+            while (current_arena_off < target_pin) {
+                uint64_t want_end = std::min(bytes, current_arena_off + slice_step);
+                if (want_end <= current_arena_off) break;
+
+                uint64_t cut_end = want_end;
+                if (cut_end < bytes) {
+                    for (size_t i = 0; i < offsets.size(); ++i) {
+                        if (offsets[i] == kNoComplement) continue;
+                        const uint64_t b = layer_blob_bytes_[i / (size_t)n_expert_];
+                        if (offsets[i] < cut_end && offsets[i] + b > cut_end) {
+                            cut_end = offsets[i];
+                            break;
+                        }
+                    }
+                }
+                if (cut_end <= current_arena_off) {
+                    if (slice_step > min_slice_step) {
+                        slice_step = min_slice_step;
+                        continue;
+                    }
+                    break;
+                }
+
+                const uint64_t slice_bytes = cut_end - current_arena_off;
+                void* usm = nullptr;
+                try {
+                    usm = sycl::malloc_host((size_t)slice_bytes, default_queue());
+                } catch (...) {
+                    usm = nullptr;
+                }
+
+                if (usm == nullptr) {
+                    if (slice_step > min_slice_step) {
+                        slice_step = min_slice_step;
+                        continue;
+                    }
+                    break;
+                }
+
+                slices.push_back({current_arena_off, {usm, slice_bytes}});
+                current_arena_off = cut_end;
+            }
+
+            if (!slices.empty()) {
+                if (current_arena_off < bytes) {
+                    const uint64_t tail_bytes = bytes - current_arena_off;
+                    tail_arena = std::malloc((size_t)tail_bytes);
+                    if (tail_arena == nullptr) {
+                        release();
+                        err = "FileExpertSource: pageable resident complement tail allocation failed";
+                        return false;
+                    }
+                    const strata::platform::LockResult lr = strata::platform::lock_resident(tail_arena, tail_bytes);
+                    locked = lr.locked_bytes;
+                    char msg[160];
+                    std::snprintf(msg, sizeof msg, "%.2f GiB page-locked in %zu USM host slices; %.2f GiB pageable resident",
+                                  (double)current_arena_off / 1073741824.0, slices.size(),
+                                  (double)tail_bytes / 1073741824.0);
+                    note = msg + (lr.note.empty() ? "" : "; " + lr.note);
+                    pinned_ok = false;
+                    partial_pin = current_arena_off;
+                } else {
+                    char msg[160];
+                    std::snprintf(msg, sizeof msg, "page-locked and mapped in %zu USM host slices (%.2f GiB)",
+                                  slices.size(), (double)current_arena_off / 1073741824.0);
+                    note = msg;
+                    pinned_ok = true;
+                    partial_pin = 0;
+                }
+                host = (const uint8_t*)slices[0].second.first;
+                device = (const uint8_t*)slices[0].second.first;
+            } else {
+                note = "page-locking refused (out of USM host memory)";
+            }
+        } else if (pin) {
             try {
                 arena = sycl::malloc_host((size_t)bytes, default_queue());
             } catch (...) {
@@ -1295,7 +1416,7 @@ bool FileExpertSource::pin_cache_complement(const ExpertCache& cache, std::strin
                 note = "page-locking refused (out of USM host memory)";
             }
         }
-        if (arena == nullptr) {
+        if (arena == nullptr && slices.empty()) {
             arena = std::malloc((size_t)bytes);
             if (arena == nullptr) {
                 err = "FileExpertSource: pageable resident complement allocation failed";
@@ -1323,8 +1444,6 @@ bool FileExpertSource::pin_cache_complement(const ExpertCache& cache, std::strin
                 if (budget_bytes > 0 && partial_on) {
                     const uint64_t step = 2ull << 30;
                     for (uint64_t want = std::min(bytes, pin_cap); want >= step; want = want > step ? want - step : 0) {
-                        // cut at an expert boundary: a blob that started inside the registered range and ran past it
-                        // would be taken as page-locked by a cudaMemcpyAsync and refused ("adaptive refill failed")
                         uint64_t w = want;
                         for (size_t i = 0; i < offsets.size(); ++i) {
                             if (offsets[i] == kNoComplement) continue;
@@ -1335,43 +1454,14 @@ bool FileExpertSource::pin_cache_complement(const ExpertCache& cache, std::strin
                             }
                         }
                         if (w == 0) break;
-                        /*
-                        DPCT1027:152: The call to cudaHostRegister was replaced
-                        with 0 because SYCL currently does not support
-                        registering of existing host memory for use by device.
-                        Use USM to allocate memory for use by host and device.
-                        */
                         if (0 == 0) {
                             void* alias = (void*)arena;
                             if (alias != nullptr) {
                                 device = (const uint8_t*)alias;
                                 partial_pin = w;
-                            } else {
-                                /*
-                                DPCT1010:153: SYCL uses exceptions to report
-                                errors and does not use the error codes. The
-                                cudaGetLastError function call was replaced with
-                                0. You need to rewrite this code.
-                                */
-                                (void)0;
-                                /*
-                                DPCT1027:154: The call to cudaHostUnregister was
-                                replaced with 0 because SYCL currently does not
-                                support registering of existing host memory for
-                                use by device. Use USM to allocate memory for
-                                use by host and device.
-                                */
-                                (void)0;
                             }
                             break;
                         }
-                        /*
-                        DPCT1010:155: SYCL uses exceptions to report errors and
-                        does not use the error codes. The cudaGetLastError
-                        function call was replaced with 0. You need to rewrite
-                        this code.
-                        */
-                        (void)0;
                         if (want <= step) break;
                     }
                     char msg[160];
@@ -1386,7 +1476,7 @@ bool FileExpertSource::pin_cache_complement(const ExpertCache& cache, std::strin
                 note += (note.empty() ? "" : "; ") + lr.note;
             }
         }
-        host = (const uint8_t*)arena;
+        if (host == nullptr) host = (const uint8_t*)arena;
     }
 
     // Copied layer by layer on a few threads: the page faults of the mapped file are the cost, and they overlap.
@@ -1408,6 +1498,28 @@ bool FileExpertSource::pin_cache_complement(const ExpertCache& cache, std::strin
         if (fail_msg.empty()) fail_msg = m;
         failed.store(true);
     };
+    auto entry_ptr = [&](uint64_t offset, uint64_t blob_bytes) -> uint8_t* {
+        if (!slices.empty()) {
+            for (const auto& s : slices) {
+                const uint64_t s_off = s.first;
+                const uint64_t s_bytes = s.second.second;
+                if (offset >= s_off && offset + blob_bytes <= s_off + s_bytes) {
+                    return (uint8_t*)s.second.first + (offset - s_off);
+                }
+            }
+            if (tail_arena != nullptr && offset >= partial_pin) {
+                const uint64_t tail_bytes = bytes - partial_pin;
+                if (offset + blob_bytes <= partial_pin + tail_bytes) {
+                    return (uint8_t*)tail_arena + (offset - partial_pin);
+                }
+            }
+            return nullptr;
+        }
+        if (host != nullptr && offset <= bytes && blob_bytes <= bytes - offset) {
+            return (uint8_t*)host + (size_t)offset;
+        }
+        return nullptr;
+    };
     auto worker = [&]() {
         for (;;) {
             const int64_t layer = next_layer.fetch_add(1);
@@ -1417,8 +1529,9 @@ bool FileExpertSource::pin_cache_complement(const ExpertCache& cache, std::strin
                 const size_t index = (size_t)layer * (size_t)n_expert_ + (size_t)expert;
                 const uint64_t offset = offsets[index];
                 if (offset == kNoComplement) continue;
-                if (offset > bytes || blob_bytes > bytes - offset ||
-                    !copy_from_files(layer, expert, (uint8_t*)host + (size_t)offset)) {
+                uint8_t* dst = entry_ptr(offset, blob_bytes);
+                if (dst == nullptr || offset > bytes || blob_bytes > bytes - offset ||
+                    !copy_from_files(layer, expert, dst)) {
                     fail("FileExpertSource: invalid blob bounds while building the cache complement");
                     return;
                 }
@@ -1474,7 +1587,14 @@ bool FileExpertSource::pin_cache_complement(const ExpertCache& cache, std::strin
         (void)VirtualUnlock((LPVOID)m.base, (SIZE_T)m.bytes);
 #endif
 
-    complement_arena_ = arena;
+    if (!slices.empty()) {
+        complement_slices_ = std::move(slices);
+        complement_arena_ = tail_arena;
+        complement_lock_off_ = 0;
+    } else {
+        complement_arena_ = arena;
+        complement_lock_off_ = lock_off;
+    }
     complement_host_ = host;
     complement_device_ = device;
     complement_bytes_ = bytes;
@@ -1483,7 +1603,6 @@ bool FileExpertSource::pin_cache_complement(const ExpertCache& cache, std::strin
     complement_pin_limit_ = pinned_ok ? bytes : partial_pin;
     complement_partial_ = !pinned_ok && partial_pin > 0;
     complement_locked_ = locked;
-    complement_lock_off_ = lock_off;
     complement_lent_slots_ = lend ? n_slots - keep_from : 0;
     complement_ready_ = true;
     std::fprintf(stderr, "FileExpertSource: %s cache complement ready: resident %.2f GiB, pinned %.2f GiB%s%s\n",
@@ -1583,15 +1702,52 @@ bool FileExpertSource::stage_exchange(int64_t layer, int64_t in, int64_t out, in
     return true;
 }
 
+const uint8_t* FileExpertSource::complement_entry_ptr(uint64_t offset, uint64_t blob_bytes) const {
+    if (!complement_slices_.empty()) {
+        for (const auto& s : complement_slices_) {
+            const uint64_t s_off = s.first;
+            const uint64_t s_bytes = s.second.second;
+            if (offset >= s_off && offset + blob_bytes <= s_off + s_bytes) {
+                return (const uint8_t*)s.second.first + (offset - s_off);
+            }
+        }
+        if (complement_arena_ != nullptr && offset >= complement_pin_limit_) {
+            const uint64_t tail_off = complement_pin_limit_;
+            const uint64_t tail_bytes = complement_bytes_ > tail_off ? complement_bytes_ - tail_off : 0;
+            if (offset + blob_bytes <= tail_off + tail_bytes) {
+                return (const uint8_t*)complement_arena_ + (offset - tail_off);
+            }
+        }
+        return nullptr;
+    }
+    if (complement_host_ != nullptr && offset <= complement_bytes_ && blob_bytes <= complement_bytes_ - offset) {
+        return complement_host_ + (size_t)offset;
+    }
+    return nullptr;
+}
+
+const uint8_t* FileExpertSource::resident_blob(int64_t layer, int64_t expert) const {
+    if (!complement_ready_ || layer < 0 || expert < 0 || layer >= n_layers_ || expert >= n_expert_)
+        return nullptr;
+    const size_t index = (size_t)layer * (size_t)n_expert_ + (size_t)expert;
+    if (index >= complement_offsets_.size()) return nullptr;
+    const uint64_t offset = complement_offsets_[index];
+    if (offset == kNoComplement) return nullptr;
+    const uint64_t blob_bytes = layer_blob_bytes_[(size_t)layer];
+    return complement_entry_ptr(offset, blob_bytes);
+}
+
 int64_t FileExpertSource::commit_exchanges() {
     int64_t n = 0;
     for (const Exchange& x : staged_) {
         const uint8_t* src = override_[x.out];
         const uint64_t at = complement_offsets_[x.in];
-        if (src != nullptr && at != kNoComplement && at <= complement_bytes_ && x.bytes <= complement_bytes_ - at &&
-            complement_host_ != nullptr) {
-            std::memcpy((uint8_t*)complement_host_ + (size_t)at, src, (size_t)x.bytes);
-            if (detail::exchange_cache_complement(complement_offsets_, x.in, x.out)) ++n;
+        if (src != nullptr && at != kNoComplement && at <= complement_bytes_ && x.bytes <= complement_bytes_ - at) {
+            uint8_t* dst = const_cast<uint8_t*>(complement_entry_ptr(at, x.bytes));
+            if (dst != nullptr) {
+                std::memcpy(dst, src, (size_t)x.bytes);
+                if (detail::exchange_cache_complement(complement_offsets_, x.in, x.out)) ++n;
+            }
         }
         override_[x.out] = nullptr;
     }
@@ -1606,7 +1762,7 @@ const uint8_t* FileExpertSource::blob(int64_t layer, int64_t expert) {
     const uint8_t* result = nullptr;
     bool from_files = true;
     if (complement_ready_) {
-        result = detail::cache_complement_blob_or_fallback(index, complement_offsets_, complement_host_, nullptr);
+        result = resident_blob(layer, expert);
         if (result != nullptr) {
             ram_reads_.fetch_add(1, std::memory_order_relaxed);
             from_files = false;
@@ -1630,20 +1786,46 @@ const uint8_t* FileExpertSource::blob(int64_t layer, int64_t expert) {
 }
 
 bool FileExpertSource::pinned(int64_t layer, int64_t expert) const {
-    if (!complement_ready_ || !complement_pinned_ || complement_host_ == nullptr || layer < 0 || expert < 0 ||
+    if (!complement_ready_ || !complement_pinned_ || layer < 0 || expert < 0 ||
         layer >= n_layers_ || expert >= n_expert_)
         return false;
     const size_t index = (size_t)layer * (size_t)n_expert_ + (size_t)expert;
     if (index >= complement_offsets_.size() || complement_offsets_[index] == kNoComplement) return false;
+    const uint64_t offset = complement_offsets_[index];
+    const uint64_t blob_bytes = layer_blob_bytes_[(size_t)layer];
+    if (!complement_slices_.empty()) {
+        for (const auto& s : complement_slices_) {
+            const uint64_t s_off = s.first;
+            const uint64_t s_bytes = s.second.second;
+            if (offset >= s_off && offset + blob_bytes <= s_off + s_bytes) {
+                return true;
+            }
+        }
+        return false;
+    }
+    if (complement_host_ == nullptr) return false;
     // a partial pin (CS-T): only the registered prefix
     return !complement_partial_ ||
-           complement_offsets_[index] + layer_blob_bytes_[(size_t)layer] <= complement_pin_limit_;
+           (offset + blob_bytes <= complement_pin_limit_);
 }
 
 const uint8_t* FileExpertSource::device_alias(int64_t layer, int64_t expert) const {
-    if (!pinned(layer, expert) || complement_device_ == nullptr) return nullptr;
+    if (!pinned(layer, expert)) return nullptr;
     const size_t index = (size_t)layer * (size_t)n_expert_ + (size_t)expert;
-    return complement_device_ + (size_t)complement_offsets_[index];
+    const uint64_t offset = complement_offsets_[index];
+    const uint64_t blob_bytes = layer_blob_bytes_[(size_t)layer];
+    if (!complement_slices_.empty()) {
+        for (const auto& s : complement_slices_) {
+            const uint64_t s_off = s.first;
+            const uint64_t s_bytes = s.second.second;
+            if (offset >= s_off && offset + blob_bytes <= s_off + s_bytes) {
+                return (const uint8_t*)s.second.first + (offset - s_off);
+            }
+        }
+        return nullptr;
+    }
+    if (complement_device_ == nullptr) return nullptr;
+    return complement_device_ + (size_t)offset;
 }
 
 bool FileExpertSource::pcie_layer(int64_t layer) const {
