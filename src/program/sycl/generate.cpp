@@ -973,10 +973,12 @@ void stall_report(std::FILE* f, uint64_t layers_during) {
     strata::core::Progress& p = strata::core::progress();
     std::fprintf(f,
                  "strata serve: stall report (engine %s): stage \"%s\" for %lld s; %llu layers served since the "
-                 "last finished step (0 = stopped, more = slow)\n",
+                 "last finished step (0 = stopped, more = slow); allow_until_ms=%lld, now_ms=%lld\n",
                  STRATA_VERSION, stage_text().c_str(),
                  (long long)((strata::core::progress_now_ms() - p.since_ms.load()) / 1000),
-                 (unsigned long long)layers_during);
+                 (unsigned long long)layers_during,
+                 (long long)p.allow_until_ms.load(),
+                 (long long)strata::core::progress_now_ms());
     for (int pass = 0; pass < 2; ++pass) {
         if (pass == 1) {
             std::this_thread::sleep_for(std::chrono::seconds(2));
@@ -5771,7 +5773,7 @@ int main(int argc, char** argv) try {
         // part was doing (stall_report), so one occurrence says where the wait is.
         {
             const char* ws = std::getenv("STRATA_WATCHDOG_S");
-            const int limit = ws ? std::atoi(ws) : 60;  // one step (a prompt layer, a verify window) takes seconds
+            const int limit = ws ? std::atoi(ws) : 180;  // 180s on SYCL (cold JIT compilation on Intel Arc takes 60-90s)
             if (limit > 0)
                 std::thread([limit] {
                     strata::core::Progress& p = strata::core::progress();

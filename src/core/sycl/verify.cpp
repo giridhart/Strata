@@ -172,10 +172,10 @@ void release_live_verifiers(std::FILE* f) {
     for (auto& slot : g_live)
         if (Verifier* v = slot.load()) {
             const Clock::time_point t0 = Clock::now();
-            const bool done = v->release_gpu_waits(5000);
+            const bool done = v->release_gpu_waits(10000);
             if (f != nullptr) {
                 const std::string detail = done ? ("finished in " + std::to_string((long long)ms_since(t0)) + " ms")
-                                                : "did not finish within 5 s";
+                                                : "did not finish within 10 s";
                 std::fprintf(f, "strata: released the verify window's GPU waits (#267): the GPU %s\n", detail.c_str());
             }
         }
@@ -183,7 +183,7 @@ void release_live_verifiers(std::FILE* f) {
 }
 std::string released_note(bool drained) {
     return drained ? "; its GPU waits were released and the GPU finished (#267)"
-                   : "; its GPU waits were released but the GPU did not finish within 5 s (#267)";
+                   : "; its GPU waits were released but the GPU did not finish within 10 s (#267)";
 }
 // #267 test hook: STRATA_TEST_VERIFY_STALL=N withholds the last layer's flag in the N-th window (1-based), so the
 // GPU spins on a flag nobody raises - the bounded window wait and the release are then what ends it.  Unset: never.
@@ -671,6 +671,8 @@ bool Verifier::record_window_prologue(int T, sycl::queue* cs, std::string& err) 
 
 bool Verifier::record_layer_pre(int T, int64_t l, int grp, sycl::queue* cs, std::string& err) try {
     VDBG("layer_pre (l=%lld, grp=%d): begin\n", (long long)l, grp);
+    progress_at("verify window: layer pre", l);
+    progress_beat();
     using namespace strata::kernels;
     const ModelGeometry& g = *g_;
     const WeightTable& wt = *wt_;
@@ -766,6 +768,7 @@ bool Verifier::record_layer_pre(int T, int64_t l, int grp, sycl::queue* cs, std:
         VDBG("layer_pre (l=%lld, grp=%d): gr_read_group 0 start\n", (long long)l, grp);
         gr_read_group(0, pending, inj2_, inj_);
         VDBG("layer_pre (l=%lld, grp=%d): gr_read_group 0 done\n", (long long)l, grp);
+        progress_beat();
         stamp(l, 1, grp, cs);
         float* xm = mixed_ + tb * N;
         try {
@@ -814,6 +817,7 @@ bool Verifier::record_layer_pre(int T, int64_t l, int grp, sycl::queue* cs, std:
                 VDBG("layer_pre (l=%lld, grp=%d): GDN native_mmvq wout\n", (long long)l, grp);
                 native_mmvq(wout->native_type, wout->native_data, xq_, bo_ + tb * N, (int)ZV, (int)N, n, cs);
                 VDBG("layer_pre (l=%lld, grp=%d): GDN done\n", (long long)l, grp);
+                progress_beat();
             } else {
                 // ======================= QSA =======================
                 const int64_t qi = qsa_idx_[(size_t)l];
@@ -1033,6 +1037,7 @@ bool Verifier::record_layer_pre(int T, int64_t l, int grp, sycl::queue* cs, std:
         VDBG("layer_pre (l=%lld, grp=%d): gr_read_group 1 start\n", (long long)l, grp);
         gr_read_group(1, true, inj_, inj2_);
         VDBG("layer_pre (l=%lld, grp=%d): gr_read_group 1 done\n", (long long)l, grp);
+        progress_beat();
         // the window's rows routed in 2 launches (one router GEMV reading the weight once, one
         // top-10) instead of 2 per token; every row's arithmetic is the single-token call's (STRATA_DEC_BATCH=0: old)
         const WeightRef* w_router = v.get("ffn_gate_inp.weight");
@@ -1055,6 +1060,7 @@ bool Verifier::record_layer_pre(int T, int64_t l, int grp, sycl::queue* cs, std:
                 if (!moe_route(wt, g, l, K, mb, mixed_ + t * N, cs, err, nullptr)) return false;
             }
         VDBG("layer_pre (l=%lld, grp=%d): router done\n", (long long)l, grp);
+        progress_beat();
         const float route_prior = g_route_prior(cs);
         if (route_prior > 0.0f && NE == 512 && K == 10 && hits_.d_res != nullptr) {
             VDBG("layer_pre (l=%lld, grp=%d): route_prior_top10\n", (long long)l, grp);
@@ -1086,10 +1092,12 @@ bool Verifier::record_layer_pre(int T, int64_t l, int grp, sycl::queue* cs, std:
                           (uint32_t)((l - lb_) * G + grp + 1), cs);
         }
         if (!lean) {
-            VDBG("layer_pre (l=%lld, grp=%d): doorbell_publish (m_seq_=%p, n=%d, k=%ld)\n", (long long)l, grp, m_seq_, n, (long)K);
-            doorbell_publish(xm, ids_ + tb * K, w_ + tb * K, (int64_t)n * N, (int64_t)n * K, m_x_ + tb * N, m_ids_ + tb * K,
-                             m_w_ + tb * K, m_seq_, cs);
-            VDBG("layer_pre (l=%lld, grp=%d): doorbell_publish done\n", (long long)l, grp);
+            const uint32_t want = (uint32_t)((l - lb_) * G + grp + 1);
+            VDBG("layer_pre (l=%lld, grp=%d): doorbell_publish_value (m_seq_=%p, want=%u, n=%d, k=%ld)\n",
+                 (long long)l, grp, m_seq_, want, n, (long)K);
+            doorbell_publish_value(xm, ids_ + tb * K, w_ + tb * K, (int64_t)n * N, (int64_t)n * K, m_x_ + tb * N,
+                                   m_ids_ + tb * K, m_w_ + tb * K, m_seq_, want, cs);
+            VDBG("layer_pre (l=%lld, grp=%d): doorbell_publish_value done\n", (long long)l, grp);
         }
         stamp(l, 17, grp, cs);
         {
@@ -1128,6 +1136,7 @@ bool Verifier::record_layer_pre(int T, int64_t l, int grp, sycl::queue* cs, std:
                 return false;
             }
             VDBG("layer_pre (l=%lld, grp=%d): shared_expert done\n", (long long)l, grp);
+            progress_beat();
         }
         VDBG("layer_pre (l=%lld, grp=%d): quantize start\n", (long long)l, grp);
         if (strata::kernels::cpu::expert_layout().native)
@@ -1137,6 +1146,7 @@ bool Verifier::record_layer_pre(int T, int64_t l, int grp, sycl::queue* cs, std:
                                  (int64_t)n * N, cs);
         stamp(l, 18, grp, cs);
         VDBG("layer_pre (l=%lld, grp=%d): end\n", (long long)l, grp);
+        progress_beat();
         return true;
 
 } catch (const std::exception& exc) {
@@ -1150,6 +1160,8 @@ bool Verifier::record_layer_pre(int T, int64_t l, int grp, sycl::queue* cs, std:
 
 bool Verifier::record_layer_post(int T, int64_t l, int grp, sycl::queue* cs, std::string& err) try {
     VDBG("layer_post (l=%lld, grp=%d): begin\n", (long long)l, grp);
+    progress_at("verify window: layer post", l);
+    progress_beat();
     using namespace strata::kernels;
     const ModelGeometry& g = *g_;
     SessionState& ss = *ss_;
@@ -1307,6 +1319,8 @@ bool Verifier::record_layer_post(int T, int64_t l, int grp, sycl::queue* cs, std
 
 bool Verifier::record_window_epilogue(int T, sycl::queue* cs, std::string& err) try {
     VDBG("epilogue (T=%d): begin\n", T);
+    progress_at("verify window: epilogue", T);
+    progress_beat();
     using namespace strata::kernels;
     const ModelGeometry& g = *g_;
     const WeightTable& wt = *wt_;
@@ -1690,6 +1704,10 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     const bool progressive = (exec_[T] == nullptr);
     VDBG("staged in %.2f ms; launching (exec=%p, progressive=%d, G=%d)\n", ms_since(t0), exec_[T], (int)progressive, G);
     progress_at("verify window: launching", (int64_t)T);
+    struct AllowScope {
+        explicit AllowScope(int64_t seconds) { progress_allow(seconds); }
+        ~AllowScope() { progress_allow(0); }
+    } allow_scope(300);  // Allow up to 300 s for cold JIT compilation of SPIR-V modules on Intel Arc
     progress_beat();
     if (!progressive) {
         VDBG("launching graph exec=%p\n", exec_[T]);
@@ -1746,6 +1764,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
             const auto now = Clock::now();
             if (now - last_hb > std::chrono::milliseconds(500)) {
                 last_hb = now;
+                progress_beat();
                 bool is_empty = false;
                 try { is_empty = cs_->ext_oneapi_empty(); } catch (...) {}
                 VDBG("step k=%lld (layer %lld, grp=%d): still waiting want=%u, *seq=%u, *flag=%u, *flagA=%u, *flagB=%u, spins=%u, elapsed=%.1f ms, empty=%d\n",
@@ -1754,7 +1773,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
                      h_flagB_ ? *(volatile uint32_t*)h_flagB_ : 0u,
                      spins, std::chrono::duration<double, std::milli>(now - a).count(), (int)is_empty);
             }
-            if (now - last_flush > std::chrono::microseconds(2000)) {
+            if (now - last_flush > std::chrono::milliseconds(50)) {
                 last_flush = now;
                 bool is_empty = false;
                 try {
@@ -1763,13 +1782,17 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
                 }
                 std::atomic_thread_fence(std::memory_order_seq_cst);
                 if (is_empty && *seq < want) {
-                    err = "verify: layer " + std::to_string(l) + " never rang";
-                    return false;
+                    try { cs_->wait(); } catch (...) {}
+                    std::atomic_thread_fence(std::memory_order_seq_cst);
+                    if (*seq < want) {
+                        err = "verify: layer " + std::to_string(l) + " never rang";
+                        return false;
+                    }
                 }
             }
-            if (now - a > std::chrono::seconds(20)) {
+            if (now - a > std::chrono::seconds(60)) {
                 // #267: the caller ends the engine; no spin kernel may outlive it
-                err = "verify: timed out at layer " + std::to_string(l) + released_note(release_gpu_waits(5000));
+                err = "verify: timed out at layer " + std::to_string(l) + released_note(release_gpu_waits(10000));
                 return false;
             }
         }
@@ -1863,12 +1886,13 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         const auto now = Clock::now();
         if (now - last_empty_hb > std::chrono::milliseconds(500)) {
             last_empty_hb = now;
+            progress_beat();
             VDBG("still waiting for cs_ queue completion: elapsed=%.1f ms, empty=%d\n",
                  std::chrono::duration<double, std::milli>(now - t_wait_start).count(), (int)is_empty);
         }
-        if (now - t_wait_start > std::chrono::seconds(20)) {
+        if (now - t_wait_start > std::chrono::seconds(60)) {
             err = "verify: timed out waiting for GPU graph execution to complete" +
-                  released_note(release_gpu_waits(5000));
+                  released_note(release_gpu_waits(10000));
             return false;
         }
         _mm_pause();
