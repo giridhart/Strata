@@ -873,26 +873,53 @@ void resident_plan(const int32_t* ids, int n_entries, int k, const int32_t* res_
                    const uint8_t* cache_base, const unsigned long long* slot_off, long long blob, int32_t* plan,
                    long long capx, uint32_t* skip, uint32_t ring, void* stream, uint32_t* plan_err) {
     sycl::queue* q = stream ? static_cast<sycl::queue*>(stream) : &default_queue();
-    q->submit([&](sycl::handler& cgh) {
-        sycl::local_accessor<int32_t, 1> s_ids(sycl::range<1>(128), cgh);
-        sycl::local_accessor<unsigned long long, 1> s_ptr(sycl::range<1>(128), cgh);
-        sycl::local_accessor<int32_t, 1> s_first(sycl::range<1>(128), cgh);
-        sycl::local_accessor<int32_t, 1> s_cnt(sycl::range<1>(128), cgh);
-        sycl::local_accessor<int32_t, 1> s_gstart(sycl::range<1>(128), cgh);
-        sycl::local_accessor<int, 0> s_bad(cgh);
-        cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(128), sycl::range<1>(128)),
-                         [=](sycl::nd_item<1> item) {
-                             resident_plan_kernel(ids, n_entries, k, res_layer, n_expert, cache_base, slot_off, blob,
-                                                  plan, capx, skip, ring,
-                                                  s_ids.get_multi_ptr<sycl::access::decorated::no>().get(),
-                                                  s_ptr.get_multi_ptr<sycl::access::decorated::no>().get(),
-                                                  s_first.get_multi_ptr<sycl::access::decorated::no>().get(),
-                                                  s_cnt.get_multi_ptr<sycl::access::decorated::no>().get(),
-                                                  s_gstart.get_multi_ptr<sycl::access::decorated::no>().get(),
-                                                  s_bad.get_multi_ptr<sycl::access::decorated::no>().get(),
-                                                  item, plan_err);
-                         });
-    });
+    if (n_entries > 128) {
+        if (n_entries > 256) {
+            std::fprintf(stderr, "resident_plan: %d entries, at most 256\n", n_entries);
+            std::exit(1);
+        }
+        q->submit([&](sycl::handler& cgh) {
+            sycl::local_accessor<int32_t, 1> s_ids(sycl::range<1>(256), cgh);
+            sycl::local_accessor<unsigned long long, 1> s_ptr(sycl::range<1>(256), cgh);
+            sycl::local_accessor<int32_t, 1> s_first(sycl::range<1>(256), cgh);
+            sycl::local_accessor<int32_t, 1> s_cnt(sycl::range<1>(256), cgh);
+            sycl::local_accessor<int32_t, 1> s_gstart(sycl::range<1>(256), cgh);
+            sycl::local_accessor<int, 0> s_bad(cgh);
+            cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(256), sycl::range<1>(256)),
+                             [=](sycl::nd_item<1> item) {
+                                 resident_plan_kernel(ids, n_entries, k, res_layer, n_expert, cache_base, slot_off, blob,
+                                                      plan, capx, skip, ring,
+                                                      s_ids.get_multi_ptr<sycl::access::decorated::no>().get(),
+                                                      s_ptr.get_multi_ptr<sycl::access::decorated::no>().get(),
+                                                      s_first.get_multi_ptr<sycl::access::decorated::no>().get(),
+                                                      s_cnt.get_multi_ptr<sycl::access::decorated::no>().get(),
+                                                      s_gstart.get_multi_ptr<sycl::access::decorated::no>().get(),
+                                                      s_bad.get_multi_ptr<sycl::access::decorated::no>().get(),
+                                                      item, plan_err);
+                             });
+        });
+    } else {
+        q->submit([&](sycl::handler& cgh) {
+            sycl::local_accessor<int32_t, 1> s_ids(sycl::range<1>(128), cgh);
+            sycl::local_accessor<unsigned long long, 1> s_ptr(sycl::range<1>(128), cgh);
+            sycl::local_accessor<int32_t, 1> s_first(sycl::range<1>(128), cgh);
+            sycl::local_accessor<int32_t, 1> s_cnt(sycl::range<1>(128), cgh);
+            sycl::local_accessor<int32_t, 1> s_gstart(sycl::range<1>(128), cgh);
+            sycl::local_accessor<int, 0> s_bad(cgh);
+            cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(128), sycl::range<1>(128)),
+                             [=](sycl::nd_item<1> item) {
+                                 resident_plan_kernel(ids, n_entries, k, res_layer, n_expert, cache_base, slot_off, blob,
+                                                      plan, capx, skip, ring,
+                                                      s_ids.get_multi_ptr<sycl::access::decorated::no>().get(),
+                                                      s_ptr.get_multi_ptr<sycl::access::decorated::no>().get(),
+                                                      s_first.get_multi_ptr<sycl::access::decorated::no>().get(),
+                                                      s_cnt.get_multi_ptr<sycl::access::decorated::no>().get(),
+                                                      s_gstart.get_multi_ptr<sycl::access::decorated::no>().get(),
+                                                      s_bad.get_multi_ptr<sycl::access::decorated::no>().get(),
+                                                      item, plan_err);
+                             });
+        });
+    }
 }
 
 void wait_flag_ge_or(const uint32_t* flag, uint32_t value, const uint32_t* skip, void* stream) {

@@ -1007,6 +1007,7 @@ inline int chunk_int_diff(sycl::uint2 cb, const int* xw) {
 // its fp32 scales) are staged once into shared memory as aligned words; each warp then walks its rows, loading
 // each lane's code chunks once and dotting them with every entry.
 
+template <int SKIP = 0>
 void gu_grouped_kernel(const unsigned long long* __restrict__ grp_ptr, const int32_t* __restrict__ grp_start,
                        const int32_t* __restrict__ n_groups, const int32_t* __restrict__ ent_tok,
                        const uint8_t* __restrict__ x_q8_0, const float* __restrict__ x_scales,
@@ -1017,7 +1018,8 @@ void gu_grouped_kernel(const unsigned long long* __restrict__ grp_ptr, const int
 
     const int g = item_ct1.get_group(1);
     if (g >= *n_groups) return;
-    const int e0 = grp_start[g], ne = sycl::min(grp_start[g + 1] - e0, GMAX);
+    const int e0 = grp_start[g] + SKIP, ne = sycl::min(grp_start[g + 1] - e0, GMAX);
+    if (SKIP > 0 && ne <= 0) return;
     const int t = item_ct1.get_local_id(2), lane = t & 31, warp = t >> 5;
     for (int i = t; i < ne * (H / 32); i += item_ct1.get_local_range(2)) {
         const int k = i / (H / 32), c = i - k * (H / 32);
@@ -1068,6 +1070,7 @@ void gu_grouped_kernel(const unsigned long long* __restrict__ grp_ptr, const int
 
 // Down: a block = D_ROWS rows of ONE group; the entries' quantized intermediates staged once.  A down row is 20
 // chunks, so lanes 0..19 each hold one chunk, as in the per-entry kernel.
+template <int SKIP = 0>
 void down_grouped_kernel(const unsigned long long* __restrict__ grp_ptr, const int32_t* __restrict__ grp_start,
                          const int32_t* __restrict__ n_groups, const int32_t* __restrict__ ent_dst,
                          const uint8_t* __restrict__ h_q8_0, const float* __restrict__ h_scales,
@@ -1077,7 +1080,8 @@ void down_grouped_kernel(const unsigned long long* __restrict__ grp_ptr, const i
 
     const int g = item_ct1.get_group(1);
     if (g >= *n_groups) return;
-    const int e0 = grp_start[g], ne = sycl::min(grp_start[g + 1] - e0, GMAX);
+    const int e0 = grp_start[g] + SKIP, ne = sycl::min(grp_start[g + 1] - e0, GMAX);
+    if (SKIP > 0 && ne <= 0) return;
     const int t = item_ct1.get_local_id(2), lane = t & 31, warp = t >> 5;
     for (int i = t; i < ne * (FF / 32); i += item_ct1.get_local_range(2)) {
         const int k = i / (FF / 32), c = i - k * (FF / 32);
@@ -1140,6 +1144,7 @@ inline void stage_chunk(const uint8_t* __restrict__ xb, float dx, int* xs_w, syc
     xs_dh[i] = sycl::int2(sycl::bit_cast<int>(dx), hx);
 }
 
+template <int SKIP = 0>
 void gu_grouped_t_kernel(const unsigned long long* __restrict__ grp_ptr, const int32_t* __restrict__ grp_start,
                          const int32_t* __restrict__ n_groups, const int32_t* __restrict__ ent_tok,
                          const uint8_t* __restrict__ x_q8_0, const float* __restrict__ x_scales,
@@ -1150,7 +1155,8 @@ void gu_grouped_t_kernel(const unsigned long long* __restrict__ grp_ptr, const i
     // 5 KB: (dx as bits, hx)
     const int g = item_ct1.get_group(1);
     if (g >= *n_groups) return;
-    const int e0 = grp_start[g], ne = sycl::min(grp_start[g + 1] - e0, GMAX);
+    const int e0 = grp_start[g] + SKIP, ne = sycl::min(grp_start[g + 1] - e0, GMAX);
+    if (SKIP > 0 && ne <= 0) return;
     const int t = item_ct1.get_local_id(2), lane = t & 31, warp = t >> 5;
     for (int i = t; i < ne * NC; i += item_ct1.get_local_range(2)) {
         const int k = i / NC, c = i - k * NC;
@@ -1205,6 +1211,7 @@ void gu_grouped_t_kernel(const unsigned long long* __restrict__ grp_ptr, const i
     }
 }
 
+template <int SKIP = 0>
 void down_grouped_t_kernel(const unsigned long long* __restrict__ grp_ptr, const int32_t* __restrict__ grp_start,
                            const int32_t* __restrict__ n_groups, const int32_t* __restrict__ ent_dst,
                            const uint8_t* __restrict__ h_q8_0, const float* __restrict__ h_scales,
@@ -1214,7 +1221,8 @@ void down_grouped_t_kernel(const unsigned long long* __restrict__ grp_ptr, const
 
     const int g = item_ct1.get_group(1);
     if (g >= *n_groups) return;
-    const int e0 = grp_start[g], ne = sycl::min(grp_start[g + 1] - e0, GMAX);
+    const int e0 = grp_start[g] + SKIP, ne = sycl::min(grp_start[g + 1] - e0, GMAX);
+    if (SKIP > 0 && ne <= 0) return;
     const int t = item_ct1.get_local_id(2), lane = t & 31, warp = t >> 5;
     for (int i = t; i < ne * NC; i += item_ct1.get_local_range(2)) {
         const int k = i / NC, c = i - k * NC;
@@ -1341,10 +1349,19 @@ void moe_group_resident(const int32_t* ids, int n, int k_per_tok, const uint8_t*
     check("moe_group_resident", stream);
 }
 
-void moe_grouped_s2(const unsigned long long* grp_ptr, const int32_t* grp_start, const int32_t* n_groups,
-                    const int32_t* ent_dst, const int32_t* ent_tok, int64_t cap_groups, int64_t cap_entries,
-                    const uint8_t* x_q8_0, const float* x_scales, void* scratch, float* out, void* stream) {
+static void grouped_s2_impl(const unsigned long long* grp_ptr, const int32_t* grp_start, const int32_t* n_groups,
+                            const int32_t* ent_dst, const int32_t* ent_tok, int64_t cap_groups, int64_t cap_entries,
+                            const uint8_t* x_q8_0, const float* x_scales, void* scratch, float* out, void* stream,
+                            int max_group) {
     if (cap_groups <= 0 || cap_entries <= 0) return;
+    constexpr int kGroupPasses = (strata::kernels::kWindowMaxT + GMAX - 1) / GMAX;
+    if (max_group < 1 || max_group > kGroupPasses * GMAX) {
+        std::fprintf(stderr, "moe_grouped_s2: max_group out of range (%d, at most %d)\n", max_group, kGroupPasses * GMAX);
+        std::exit(1);
+    }
+    constexpr bool kWide = kGroupPasses > 1;
+    const bool second = kWide && max_group > GMAX;
+
     static sycl::queue default_queue{sycl::property::queue::in_order()};
     sycl::queue* cs = stream ? static_cast<sycl::queue*>(stream) : &default_queue;
     const uint64_t gu_bytes = ((uint64_t)cap_entries * (uint64_t)(2 * FF) * 4 + 15) & ~15ull;
@@ -1355,29 +1372,59 @@ void moe_grouped_s2(const unsigned long long* grp_ptr, const int32_t* grp_start,
     const bool fast = new_grouped(x_q8_0, scratch);
     {
         const sycl::range<3> grid_range(1, (size_t)cap_groups, (size_t)(2 * FF / GU_ROWS) * 256);
-        if (fast)
+        if (fast) {
             cs->submit([&](sycl::handler& cgh) {
                 sycl::local_accessor<int, 1> xs_w_acc_ct1(sycl::range<1>(5120), cgh);
                 sycl::local_accessor<sycl::int2, 1> xs_dh_acc_ct1(sycl::range<1>(640), cgh);
 
                 cgh.parallel_for(sycl::nd_range<3>(grid_range, sycl::range<3>(1, 1, 256)),
                                  [=](sycl::nd_item<3> /*item_ct1*/) [[sycl::reqd_sub_group_size(32)]] {
-                                     gu_grouped_t_kernel(grp_ptr, grp_start, n_groups, ent_tok, x_q8_0, x_scales,
-                                                         gate_up, (int)cap_entries, &xs_w_acc_ct1[0],
-                                                         &xs_dh_acc_ct1[0]);
+                                     gu_grouped_t_kernel<0>(grp_ptr, grp_start, n_groups, ent_tok, x_q8_0, x_scales,
+                                                            gate_up, (int)cap_entries, &xs_w_acc_ct1[0],
+                                                            &xs_dh_acc_ct1[0]);
                                  });
             });
-        else
+            if constexpr (kWide) {
+                if (second) {
+                    cs->submit([&](sycl::handler& cgh) {
+                        sycl::local_accessor<int, 1> xs_w_acc_ct1(sycl::range<1>(5120), cgh);
+                        sycl::local_accessor<sycl::int2, 1> xs_dh_acc_ct1(sycl::range<1>(640), cgh);
+
+                        cgh.parallel_for(sycl::nd_range<3>(grid_range, sycl::range<3>(1, 1, 256)),
+                                         [=](sycl::nd_item<3> /*item_ct1*/) [[sycl::reqd_sub_group_size(32)]] {
+                                             gu_grouped_t_kernel<GMAX>(grp_ptr, grp_start, n_groups, ent_tok, x_q8_0, x_scales,
+                                                                       gate_up, (int)cap_entries, &xs_w_acc_ct1[0],
+                                                                       &xs_dh_acc_ct1[0]);
+                                         });
+                    });
+                }
+            }
+        } else {
             cs->submit([&](sycl::handler& cgh) {
                 sycl::local_accessor<int[8][640], 0> xs_q_acc_ct1(cgh);
                 sycl::local_accessor<float[8][80], 0> xs_d_acc_ct1(cgh);
 
                 cgh.parallel_for(sycl::nd_range<3>(grid_range, sycl::range<3>(1, 1, 256)),
                                  [=](sycl::nd_item<3> /*item_ct1*/) [[sycl::reqd_sub_group_size(32)]] {
-                                     gu_grouped_kernel(grp_ptr, grp_start, n_groups, ent_tok, x_q8_0, x_scales, gate_up,
-                                                       (int)cap_entries, xs_q_acc_ct1, xs_d_acc_ct1);
+                                     gu_grouped_kernel<0>(grp_ptr, grp_start, n_groups, ent_tok, x_q8_0, x_scales, gate_up,
+                                                          (int)cap_entries, xs_q_acc_ct1, xs_d_acc_ct1);
                                  });
             });
+            if constexpr (kWide) {
+                if (second) {
+                    cs->submit([&](sycl::handler& cgh) {
+                        sycl::local_accessor<int[8][640], 0> xs_q_acc_ct1(cgh);
+                        sycl::local_accessor<float[8][80], 0> xs_d_acc_ct1(cgh);
+
+                        cgh.parallel_for(sycl::nd_range<3>(grid_range, sycl::range<3>(1, 1, 256)),
+                                         [=](sycl::nd_item<3> /*item_ct1*/) [[sycl::reqd_sub_group_size(32)]] {
+                                             gu_grouped_kernel<GMAX>(grp_ptr, grp_start, n_groups, ent_tok, x_q8_0, x_scales, gate_up,
+                                                                     (int)cap_entries, xs_q_acc_ct1, xs_d_acc_ct1);
+                                         });
+                    });
+                }
+            }
+        }
         check("moe_grouped_s2/gu", stream);
     }
     {
@@ -1396,32 +1443,78 @@ void moe_grouped_s2(const unsigned long long* grp_ptr, const int32_t* grp_start,
     {
         const sycl::range<3> grid_range_d(1, (size_t)cap_groups, (size_t)(H / D_ROWS) * 256);
         const float* hs = x_scales != nullptr ? h_scales : nullptr;
-        if (fast)
+        if (fast) {
             cs->submit([&](sycl::handler& cgh) {
                 sycl::local_accessor<int, 1> hs_w_acc_ct1(sycl::range<1>(1280), cgh);
                 sycl::local_accessor<sycl::int2, 1> hs_dh_acc_ct1(sycl::range<1>(160), cgh);
 
                 cgh.parallel_for(sycl::nd_range<3>(grid_range_d, sycl::range<3>(1, 1, 256)),
                                  [=](sycl::nd_item<3> /*item_ct1*/) [[sycl::reqd_sub_group_size(32)]] {
-                                     down_grouped_t_kernel(grp_ptr, grp_start, n_groups, ent_dst, h_q8_0, hs, out,
-                                                           &hs_w_acc_ct1[0], &hs_dh_acc_ct1[0]);
+                                     down_grouped_t_kernel<0>(grp_ptr, grp_start, n_groups, ent_dst, h_q8_0, hs, out,
+                                                              &hs_w_acc_ct1[0], &hs_dh_acc_ct1[0]);
                                  });
             });
-        else
+            if constexpr (kWide) {
+                if (second) {
+                    cs->submit([&](sycl::handler& cgh) {
+                        sycl::local_accessor<int, 1> hs_w_acc_ct1(sycl::range<1>(1280), cgh);
+                        sycl::local_accessor<sycl::int2, 1> hs_dh_acc_ct1(sycl::range<1>(160), cgh);
+
+                        cgh.parallel_for(sycl::nd_range<3>(grid_range_d, sycl::range<3>(1, 1, 256)),
+                                         [=](sycl::nd_item<3> /*item_ct1*/) [[sycl::reqd_sub_group_size(32)]] {
+                                             down_grouped_t_kernel<GMAX>(grp_ptr, grp_start, n_groups, ent_dst, h_q8_0, hs, out,
+                                                                         &hs_w_acc_ct1[0], &hs_dh_acc_ct1[0]);
+                                         });
+                    });
+                }
+            }
+        } else {
             cs->submit([&](sycl::handler& cgh) {
                 sycl::local_accessor<int[8][160], 0> hs_q_acc_ct1(cgh);
                 sycl::local_accessor<float[8][20], 0> hs_d_acc_ct1(cgh);
 
                 cgh.parallel_for(sycl::nd_range<3>(grid_range_d, sycl::range<3>(1, 1, 256)),
                                  [=](sycl::nd_item<3> /*item_ct1*/) [[sycl::reqd_sub_group_size(32)]] {
-                                     down_grouped_kernel(grp_ptr, grp_start, n_groups, ent_dst, h_q8_0, hs, out,
-                                                         hs_q_acc_ct1, hs_d_acc_ct1);
+                                     down_grouped_kernel<0>(grp_ptr, grp_start, n_groups, ent_dst, h_q8_0, hs, out,
+                                                            hs_q_acc_ct1, hs_d_acc_ct1);
                                  });
             });
+            if constexpr (kWide) {
+                if (second) {
+                    cs->submit([&](sycl::handler& cgh) {
+                        sycl::local_accessor<int[8][160], 0> hs_q_acc_ct1(cgh);
+                        sycl::local_accessor<float[8][20], 0> hs_d_acc_ct1(cgh);
+
+                        cgh.parallel_for(sycl::nd_range<3>(grid_range_d, sycl::range<3>(1, 1, 256)),
+                                         [=](sycl::nd_item<3> /*item_ct1*/) [[sycl::reqd_sub_group_size(32)]] {
+                                             down_grouped_kernel<GMAX>(grp_ptr, grp_start, n_groups, ent_dst, h_q8_0, hs, out,
+                                                                       hs_q_acc_ct1, hs_d_acc_ct1);
+                                         });
+                    });
+                }
+            }
+        }
         check("moe_grouped_s2/down", stream);
         if (!stream) default_queue.wait();
     }
 }
+
+void moe_grouped_s2(const unsigned long long* grp_ptr, const int32_t* grp_start, const int32_t* n_groups,
+                    const int32_t* ent_dst, const int32_t* ent_tok, int64_t cap_groups, int64_t cap_entries,
+                    const uint8_t* x_q8_0, const float* x_scales, void* scratch, float* out, void* stream) {
+    grouped_s2_impl(grp_ptr, grp_start, n_groups, ent_dst, ent_tok, cap_groups, cap_entries, x_q8_0, x_scales, scratch, out, stream,
+                    GMAX);
+}
+
+#if STRATA_VERIFY_MAX_T > 8
+void moe_grouped_s2_wide(const unsigned long long* grp_ptr, const int32_t* grp_start, const int32_t* n_groups,
+                         const int32_t* ent_dst, const int32_t* ent_tok, int64_t cap_groups, int64_t cap_entries,
+                         const uint8_t* x_q8_0, const float* x_scales, void* scratch, float* out, void* stream,
+                         int max_group) {
+    grouped_s2_impl(grp_ptr, grp_start, n_groups, ent_dst, ent_tok, cap_groups, cap_entries, x_q8_0, x_scales, scratch, out, stream,
+                    max_group);
+}
+#endif
 
 void moe_hit_add(float* parts, const float* hit_out, const int32_t* dst, const int32_t* count, int64_t cap,
                  int64_t n_embd, void* stream) {

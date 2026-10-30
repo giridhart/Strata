@@ -2890,6 +2890,15 @@ std::size_t native_mmvq_weight_bytes(int ggml_type, int n_in, int n_out) {
 
 void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, int ncols,
                  void* stream) {
+    if (ncols > MAX_NCOLS) {
+        const std::size_t col_blocks = std::size_t(n_in / Q8K);
+        for (int j = 0; j < ncols; j += MAX_NCOLS) {
+            const int nj = (ncols - j < MAX_NCOLS) ? (ncols - j) : MAX_NCOLS;
+            native_mmvq(ggml_type, weights, static_cast<const Q81Block*>(x_q8_1) + std::size_t(j) * col_blocks,
+                        y + std::size_t(j) * std::size_t(n_out), n_in, n_out, nj, stream);
+        }
+        return;
+    }
     switch (ggml_type) {
         case 2:
             native_q4_0_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream);

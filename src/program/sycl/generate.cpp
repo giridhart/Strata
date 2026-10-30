@@ -16,6 +16,9 @@
 
 #include <sycl/sycl.hpp>
 #include "strata/core/device.hpp"
+#include "strata/core/emulate.hpp"
+#include "strata/core/sycl_doorbell.hpp"
+#include "strata/pipeline_auto.hpp"
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/conversation_snapshot.hpp"
 #include "strata/core/conversation_memory.hpp"
@@ -216,6 +219,17 @@ struct device_wrapper {
             sycl::default_selector_v,
             sycl::property_list{sycl::property::queue::in_order{}, sycl::property::queue::enable_profiling{}});
     }
+    sycl::device get_sycl_device() const {
+        try {
+            auto devs = sycl::device::get_devices(sycl::info::device_type::gpu);
+            if (dev_id >= 0 && dev_id < static_cast<int>(devs.size())) {
+                return devs[dev_id];
+            }
+        } catch (...) {
+        }
+        return sycl::device();
+    }
+    operator sycl::device() const { return get_sycl_device(); }
     int queues_wait_and_throw() const {
         try {
             get_default_queue().wait_and_throw();
@@ -587,6 +601,9 @@ struct Options {
     /// the batched path)
     int64_t short_read = 64;
     bool prefill_head_alias = false;   // lend the native output head's VRAM to prompt buffers between request phases
+    /// --pipeline-windows N (--serve with a layer split on two Battlemage GPUs; opt-in):
+    /// 1 = the prompt's short reads, 2 = decode as well (stage 0 runs the next window while stage 1 verifies this one)
+    int pipeline_windows = -1;
     /// The suffix drafter (prompt lookup): when the text being written repeats an earlier stretch of the context (code
     /// edits, quoted input, tool-call JSON) by at least this many tokens, the window may be filled with what followed
     /// it there instead of the MTP's drafts, where the MTP's own first guess agrees and the draft policy expects it to
@@ -692,6 +709,10 @@ void usage() {
         "                       of the batched prompt path (default 64, 0 = off)\n"
         "  --prefill-head-alias --serve: unload the native output head while each fresh prompt is read,\n"
         "                       then release prompt buffers and reload it before decode\n"
+        "  --pipeline-windows N --serve with a layer split on two GPUs (on by default for 2 stages on Intel Battlemage;\n"
+        "                       STRATA_PIPELINE_AUTO=0 or N=0 turns it off): one conversation's verify windows\n"
+        "                       with the GPUs overlapped - 1 = the prompt's short reads, 2 = decode as well\n"
+        "                       (stage 0 runs the next window while stage 1 verifies this one); docs/MULTI_GPU.md\n"
         "  --suffix-draft N     prompt lookup: draft from an earlier repeat of the last N+ tokens of context\n"
         "                       when it pays (default 3; 0 = MTP only)\n"
         "  --mtp-max-t M        cap the MTP's windows at M tokens (0 = --spec; longer ones come from suffixes)\n"
@@ -1546,6 +1567,8 @@ int main(int argc, char** argv) try {
                 o.short_read = std::max(0LL, std::atoll(next("--short-read")));
             else if (a == "--prefill-head-alias")
                 o.prefill_head_alias = true;
+            else if (a == "--pipeline-windows")
+                o.pipeline_windows = std::max(0, std::min(2, std::atoi(next("--pipeline-windows"))));
             else if (a == "--suffix-draft")
                 o.suffix_draft = std::max(0, std::atoi(next("--suffix-draft")));
             else if (a == "--mtp-max-t")
@@ -1770,6 +1793,49 @@ int main(int argc, char** argv) try {
         std::fprintf(stderr,
                      "strata generate: --resident-cpu-experts does not support layer splits or remote expert caches\n");
         return 2;
+    }
+    const bool pw_auto = o.pipeline_windows < 0;
+    if (pw_auto) {
+        strata::PipelineAutoInputs in;
+        in.serve = o.serve;
+        in.multi_gpu = multi_gpu;
+        in.split_same = split_same;
+        in.later_stages = (int)split_devs.size();
+        in.has_mtp = !o.mtp.empty();
+        in.spec = o.spec;
+        in.batch = 0;
+        in.peer_device = false;
+        in.helper_caches = remote_caches;
+        const char* ae = std::getenv("STRATA_PIPELINE_AUTO");
+        in.auto_off = (ae != nullptr && std::atoi(ae) == 0);
+
+        try {
+            in.first_is_battlemage = (strata::intel_gpu_gen(dpct::get_device(0)) == strata::IntelGpuGen::Battlemage);
+            if (split_devs.size() == 1) {
+                in.later_is_battlemage = (strata::intel_gpu_gen(dpct::get_device(split_devs[0])) == strata::IntelGpuGen::Battlemage);
+            }
+        } catch (...) {}
+
+        const bool on = strata::pipeline_auto_on(in);
+        o.pipeline_windows = on ? 2 : 0;
+        if (on) {
+            std::fprintf(stderr, "strata generate: --pipeline-windows 2 is on by default for a layer split of %zu stages "
+                                 "(--pipeline-windows 0 or STRATA_PIPELINE_AUTO=0 turns it off)\n", split_devs.size() + 1);
+        }
+    }
+    if (o.pipeline_windows > 0) {
+        const char* off = !o.serve ? "it needs --serve"
+                        : split_same ? "it needs each stage of the layer split on its own GPU"
+                        : !multi_gpu ? "it needs a layer split on two GPUs"
+                        : split_devs.empty() ? "it needs a layer split into two or more stages"
+                        : split_devs.size() > 1 && o.pipeline_windows == 1 ? "--pipeline-windows 1 needs exactly two stages"
+                        : o.mtp.empty() || o.spec < 2 ? "it needs the MTP drafter (--mtp, --spec)"
+                        : remote_caches ? "not with the helper caches (--expert-cache-remote)"
+                        : nullptr;
+        if (off != nullptr) {
+            std::fprintf(stderr, "strata generate: --pipeline-windows %d is off: %s\n", o.pipeline_windows, off);
+            o.pipeline_windows = 0;
+        }
     }
     // the helper-GPU expert caches (--expert-cache-remote, docs/SECOND_GPU.md): CUDA1..3 on one GPU; with a layer
     // split, the visible GPUs no stage runs on, in order
