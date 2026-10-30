@@ -1120,8 +1120,8 @@ std::atomic<int> g_variant[64];
 
 }  // namespace
 
-bool fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, void* stream,
-                         unsigned long long* stamp_buf, int stamp_i0) {
+static bool fused_gr_read_multi_slice(const FusedGrArgs* a, int n_tok, float* xn_scratch, void* stream,
+                                      unsigned long long* stamp_buf, int stamp_i0) {
     if (n_tok < 1 || n_tok > kFusedGrMaxT || xn_scratch == nullptr) {
         std::fprintf(stderr, "fused_gr_read_multi: invalid arguments\n");
         std::exit(1);
@@ -1303,6 +1303,24 @@ bool fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
     // the default read (STRATA_GR_V3 unset): v1, or the bitwise-equal v2 / v3 this card's check accepted
     launch_multi(m, fused_gr_variant(), st, stamp_buf, stamp_i0);
     return false;
+}
+
+bool fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, void* stream, unsigned long long* stamp_buf,
+                         int stamp_i0) {
+    if (n_tok <= kFusedGrMaxT) return fused_gr_read_multi_slice(a, n_tok, xn_scratch, stream, stamp_buf, stamp_i0);
+    if (n_tok > kFusedGrWideT || a == nullptr || xn_scratch == nullptr) {
+        std::fprintf(stderr, "fused_gr_read_multi: invalid arguments (%d tokens)\n", n_tok);
+        std::exit(1);
+    }
+    bool q8 = false;
+    for (int c0 = 0; c0 < n_tok; c0 += kFusedGrMaxT) {
+        const int ct = n_tok - c0 < kFusedGrMaxT ? n_tok - c0 : kFusedGrMaxT;
+        FusedGrArgs s[kFusedGrMaxT];
+        for (int k = 0; k < ct; ++k) s[k] = a[c0 + k];
+        s[0].q8_cnt = a[0].q8_cnt;
+        q8 = fused_gr_read_multi_slice(s, ct, xn_scratch + (size_t)c0 * D, stream, c0 == 0 ? stamp_buf : nullptr, stamp_i0);
+    }
+    return q8;
 }
 
 bool fused_gr_supported(int64_t n_embd, int64_t hc, int64_t hc_lr) { return n_embd == N && hc == HC && hc_lr == LR; }

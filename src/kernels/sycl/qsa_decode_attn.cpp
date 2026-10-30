@@ -3,6 +3,7 @@
 #include "strata/kernels/qsa_decode_attn.hpp"
 #include "strata/kernels/kv_q8.hpp"
 #include "strata/kernels/kv_q4.hpp"
+#include "strata/core/sycl_doorbell.hpp"
 
 #include <cfloat>
 #include <cstdio>
@@ -615,12 +616,14 @@ bool pre75_attn() {
     return daily_attn();
 }
 
-bool lane_cell_attn() {
-    static const bool on = [] {
+inline bool lane_cell_attn(int64_t n_q, sycl::queue* st) {
+    static const int lane_cell_env = [] {
         const char* v = std::getenv("STRATA_ATTN_LANECELL");
-        return v && v[0] == '1';
+        return v != nullptr && v[0] != '\0' ? std::atoi(v) : -1;
     }();
-    return on;
+    if (lane_cell_env >= 0) return lane_cell_env != 0;
+    if (n_q < 16 || st == nullptr) return false;
+    return strata::intel_gpu_gen(st->get_device()) == strata::IntelGpuGen::Battlemage;
 }
 
 int attn_kv_mode(const QsaAttnPools& p) {
@@ -661,7 +664,7 @@ void launch_chunks_batch(const float* q, const QsaAttnPools& pools, const int32_
     float* part_l = part_m + (size_t)n_chunks * s.n_head;
     const float scale = 1.0f / sqrtf((float)HD);
     const bool pre = kernel < 0 ? pre75_attn() : kernel == 1;
-    const bool lane_cell = kernel < 0 && lane_cell_attn();
+    const bool lane_cell = kernel < 0 && lane_cell_attn(n_q, st);
 
     if (lane_cell) {
         if (kv_mode == 3) launch_attn_chunk<3, true>(st, q, pools, ids, steps, (int)s.n_head_kv, (int)s.page_size, scale, part_acc, part_m, part_l, n_chunks, (int)cap, stride, (int)n_q);
@@ -723,14 +726,14 @@ bool qsa_decode_attn_slots(const float* q, const QsaAttnSlotPools& pools, const 
         }
         if (attn_kv_mode(pools.p[z]) != kv_mode) return false;
     }
-    const bool lane_cell = lane_cell_attn();
+    sycl::queue* st = stream ? static_cast<sycl::queue*>(stream) : &get_default_in_order_queue();
+    const bool lane_cell = lane_cell_attn(n_q, st);
     const int n_chunks = (int)((cap + CHUNK - 1) / CHUNK);
     const long long stride = (long long)qsa_decode_attn_scratch_floats(cap, s);
     float* part_acc = scratch;
     float* part_m = scratch + (size_t)n_chunks * s.n_head * HD;
     float* part_l = part_m + (size_t)n_chunks * s.n_head;
     const float scale = 1.0f / sqrtf((float)HD);
-    sycl::queue* st = stream ? static_cast<sycl::queue*>(stream) : &get_default_in_order_queue();
 
     if (lane_cell) {
         if (kv_mode == 3) launch_attn_chunk_slots<3, true>(st, q, pools, ids, steps, (int)s.n_head_kv, (int)s.page_size, scale, part_acc, part_m, part_l, n_chunks, (int)cap, stride, (int)n_q);
@@ -768,7 +771,7 @@ void qsa_decode_attn_batch_rows(const float* q, const QsaAttnPoolsRows& rows, co
     const float scale = 1.0f / sqrtf((float)HD);
     sycl::queue* st = stream ? static_cast<sycl::queue*>(stream) : &get_default_in_order_queue();
 
-    static const bool lane_cell_rows = [] { const char* v = std::getenv("STRATA_ATTN_LANECELL"); return v && v[0] == '1'; }();
+    const bool lane_cell_rows = lane_cell_attn(n_q, st);
     if (lane_cell_rows) {
         for (int64_t r = 0; r < n_q; ++r)
             qsa_decode_attn_batch(q + (size_t)r * s.n_head * HD, rows.p[r], ids + (size_t)r * cap,

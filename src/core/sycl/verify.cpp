@@ -1913,7 +1913,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     progress_at("verify window: waiting for the expert copies", (int64_t)T);
     copy_->wait();             // no host function of this window may raise flag B in the next one
     if (prof_on_ && G == 1) {  // the window's GPU stage stamps
-        get_default_queue().memcpy(prof_h_.data(), prof_, prof_h_.size() * 8).wait();
+        cs_->memcpy(prof_h_.data(), prof_, prof_h_.size() * 8).wait();
         const int64_t L = g.n_layers;
         auto at = [&](int64_t l, int i) { return prof_h_[(size_t)(l * kProfPer + i)]; };
         // D8: the derived columns below read stamps the hc-read kernels write themselves or the next

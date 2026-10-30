@@ -1,4 +1,5 @@
 #include "strata/kernels/bf16_gemv.hpp"
+#include "strata/kernels/window_limits.hpp"
 #include "strata/kernels/bf16_bits.hpp"
 #include "strata/core/sycl_arch.hpp"
 
@@ -336,13 +337,20 @@ void bf16_gemv_fp32_mmvf_multi(const float* x, int64_t ldx, const uint16_t* w, f
         bf16_gemv_fp32_mmvf(x, w, y, n_in, n_out, stream);
         return;
     }
-    if (n_tok < 1 || n_tok > 8 || n_in <= 0 || (n_in & 1) != 0 || n_out <= 0 || (ldx & 1) != 0 || x == nullptr ||
+    if (n_tok < 1 || n_tok > STRATA_VERIFY_MAX_T || n_in <= 0 || (n_in & 1) != 0 || n_out <= 0 || (ldx & 1) != 0 || x == nullptr ||
         w == nullptr || y == nullptr || (reinterpret_cast<uintptr_t>(x) & 7u) != 0)
-        throw std::invalid_argument("bf16_gemv_fp32_mmvf_multi: 1..8 rows, even n_in/ldx, aligned pointers");
+        throw std::invalid_argument("bf16_gemv_fp32_mmvf_multi: 1..8 rows (16 in a wide build), even n_in/ldx, aligned pointers");
+    if (n_tok > 8) {
+        for (int c0 = 0; c0 < n_tok; c0 += 8) {
+            const int nc = std::min(8, n_tok - c0);
+            bf16_gemv_fp32_mmvf_multi(x + (size_t)c0 * ldx, ldx, w, y + (size_t)c0 * ldy, ldy, n_in, n_out, nc, stream);
+        }
+        return;
+    }
     sycl::queue* q = stream ? static_cast<sycl::queue*>(stream) : &default_queue();
 
     static const bool rows = [] { const char* v = std::getenv("STRATA_MMVF_ROWS"); return v && v[0] == '1'; }();
-    if (rows && n_out >= 64) {
+    if (rows && n_out >= 64 && n_tok <= 8) {
         const int ni = (int)n_in, no = (int)n_out;
         switch (mmvf_block_size(n_in)) {
             case 32: launch_rows<32>(q, x, ldx, w, y, ldy, ni, no, n_tok); break;
