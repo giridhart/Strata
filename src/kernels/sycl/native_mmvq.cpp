@@ -1509,22 +1509,42 @@ bool b6_launch(const typename F::Block* w, const Q81Block* x, float* y, int n_in
     }
 }
 
+template <typename F, int NCOLS, int NW, int ROWS>
+struct NativeMmvqMultiGrf256Functor {
+    const typename F::Block* w;
+    const Q81Block* x;
+    float* y;
+    int n_in, n_out;
+    sycl::local_accessor<float[NW - 1 > 0 ? NW - 1 : 1][NCOLS][ROWS][32 /*WARP*/], 0> partial_acc;
+    auto get(sycl::ext::oneapi::experimental::properties_tag) const {
+        return sycl::ext::oneapi::experimental::properties{sycl::ext::intel::experimental::grf_size<256>,
+                                                           sycl::ext::oneapi::experimental::sub_group_size<32>};
+    }
+    void operator()(sycl::nd_item<3>) const {
+        native_mmvq_multi_kernel<F, NCOLS, NW, ROWS>(w, x, y, n_in, n_out, partial_acc);
+    }
+};
+
 template <typename F, int NCOLS>
 void launch_multi_n(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, sycl::queue* s) {
     const auto* w = static_cast<const typename F::Block*>(weights);
     const auto* x = static_cast<const Q81Block*>(x_q8_1);
     if (b6_launch<F, NCOLS>(w, x, y, n_in, n_out, s)) return;
+    const bool large_grf = mmvq_large_grf(s);
     if (!g_multi_exact) {
         constexpr int NW = NCOLS <= 4 ? 4 : 2;
         const unsigned blocks = unsigned((std::size_t(n_out) + 1) / 2);
         s->submit([&](sycl::handler& cgh) {
             sycl::local_accessor<float[NW - 1 > 0 ? NW - 1 : 1][NCOLS][2][32 /*WARP*/], 0> partial_acc_ct1(cgh);
-
-            cgh.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, blocks) * sycl::range<3>(1, NW, WARP),
-                                               sycl::range<3>(1, NW, WARP)),
-                             [=](sycl::nd_item<3> /*item_ct1*/) [[sycl::reqd_sub_group_size(32)]] {
-                                 native_mmvq_multi_kernel<F, NCOLS, NW, 2>(w, x, y, n_in, n_out, partial_acc_ct1);
-                             });
+            auto r = sycl::nd_range<3>(sycl::range<3>(1, 1, blocks) * sycl::range<3>(1, NW, WARP),
+                                       sycl::range<3>(1, NW, WARP));
+            if (large_grf) {
+                cgh.parallel_for(r, NativeMmvqMultiGrf256Functor<F, NCOLS, NW, 2>{w, x, y, n_in, n_out, partial_acc_ct1});
+            } else {
+                cgh.parallel_for(r, [=](sycl::nd_item<3> /*item_ct1*/) [[sycl::reqd_sub_group_size(32)]] {
+                    native_mmvq_multi_kernel<F, NCOLS, NW, 2>(w, x, y, n_in, n_out, partial_acc_ct1);
+                });
+            }
         });
         return;
     }
@@ -1538,11 +1558,14 @@ void launch_multi_n(const void* weights, const void* x_q8_1, float* y, int n_in,
     if ((rows1 || q8_0_rows1<F>(n_in, n_out)) && n_in / F::DIV >= F::BPI) {
         s->submit([&](sycl::handler& cgh) {
             sycl::local_accessor<float[WARPS - 1 > 0 ? WARPS - 1 : 1][NCOLS][1][32 /*WARP*/], 0> partial_acc_ct1(cgh);
-
-            cgh.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, unsigned(n_out)) * threads, threads),
-                             [=](sycl::nd_item<3> /*item_ct1*/) [[sycl::reqd_sub_group_size(32)]] {
-                                 native_mmvq_multi_kernel<F, NCOLS, WARPS, 1>(w, x, y, n_in, n_out, partial_acc_ct1);
-                             });
+            auto r = sycl::nd_range<3>(sycl::range<3>(1, 1, unsigned(n_out)) * threads, threads);
+            if (large_grf) {
+                cgh.parallel_for(r, NativeMmvqMultiGrf256Functor<F, NCOLS, WARPS, 1>{w, x, y, n_in, n_out, partial_acc_ct1});
+            } else {
+                cgh.parallel_for(r, [=](sycl::nd_item<3> /*item_ct1*/) [[sycl::reqd_sub_group_size(32)]] {
+                    native_mmvq_multi_kernel<F, NCOLS, WARPS, 1>(w, x, y, n_in, n_out, partial_acc_ct1);
+                });
+            }
         });
         return;
     }
@@ -1551,12 +1574,15 @@ void launch_multi_n(const void* weights, const void* x_q8_1, float* y, int n_in,
         s->submit([&](sycl::handler& cgh) {
             sycl::local_accessor<float[WARPS - 1 > 0 ? WARPS - 1 : 1][NCOLS][WARPS][32 /*WARP*/], 0> partial_acc_ct1(
                 cgh);
-
-            cgh.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, blocks) * threads, threads),
-                             [=](sycl::nd_item<3> /*item_ct1*/) [[sycl::reqd_sub_group_size(32)]] {
-                                 native_mmvq_multi_kernel<F, NCOLS, WARPS, WARPS>(w, x, y, n_in, n_out,
-                                                                                  partial_acc_ct1);
-                             });
+            auto r = sycl::nd_range<3>(sycl::range<3>(1, 1, blocks) * threads, threads);
+            if (large_grf) {
+                cgh.parallel_for(r, NativeMmvqMultiGrf256Functor<F, NCOLS, WARPS, WARPS>{w, x, y, n_in, n_out, partial_acc_ct1});
+            } else {
+                cgh.parallel_for(r, [=](sycl::nd_item<3> /*item_ct1*/) [[sycl::reqd_sub_group_size(32)]] {
+                    native_mmvq_multi_kernel<F, NCOLS, WARPS, WARPS>(w, x, y, n_in, n_out,
+                                                                     partial_acc_ct1);
+                });
+            }
         });
         return;
     }
@@ -1564,11 +1590,14 @@ void launch_multi_n(const void* weights, const void* x_q8_1, float* y, int n_in,
     const unsigned blocks = unsigned((std::size_t(n_out) + ROWS - 1) / ROWS);
     s->submit([&](sycl::handler& cgh) {
         sycl::local_accessor<float[WARPS - 1 > 0 ? WARPS - 1 : 1][NCOLS][ROWS][32 /*WARP*/], 0> partial_acc_ct1(cgh);
-
-        cgh.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, blocks) * threads, threads),
-                         [=](sycl::nd_item<3> /*item_ct1*/) [[sycl::reqd_sub_group_size(32)]] {
-                             native_mmvq_multi_kernel<F, NCOLS, WARPS, ROWS>(w, x, y, n_in, n_out, partial_acc_ct1);
-                         });
+        auto r = sycl::nd_range<3>(sycl::range<3>(1, 1, blocks) * threads, threads);
+        if (large_grf) {
+            cgh.parallel_for(r, NativeMmvqMultiGrf256Functor<F, NCOLS, WARPS, ROWS>{w, x, y, n_in, n_out, partial_acc_ct1});
+        } else {
+            cgh.parallel_for(r, [=](sycl::nd_item<3> /*item_ct1*/) [[sycl::reqd_sub_group_size(32)]] {
+                native_mmvq_multi_kernel<F, NCOLS, WARPS, ROWS>(w, x, y, n_in, n_out, partial_acc_ct1);
+            });
+        }
     });
 }
 

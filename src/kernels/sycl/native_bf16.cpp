@@ -2,8 +2,10 @@
 #include "strata/kernels/window_limits.hpp"
 #include "strata/kernels/bf16_bits.hpp"
 #include "strata/core/sycl_arch.hpp"
+#include "strata/core/sycl_doorbell.hpp"
 
 #include <sycl/sycl.hpp>
+#include <sycl/ext/intel/experimental/grf_size_properties.hpp>
 #include <cstdlib>
 #include <limits>
 #include <stdexcept>
@@ -254,6 +256,50 @@ void bf16_f32_mmvf_rows_kernel(sycl::nd_item<1> item, const float* __restrict__ 
     }
 }
 
+template <int BLOCK_SIZE, int NT>
+struct Bf16MmvfMultiGrf256Functor {
+    const float* x;
+    int64_t ldx;
+    const uint16_t* w;
+    float* y;
+    int64_t ldy;
+    int n_in, n_tok;
+    sycl::local_accessor<float, 2> partials;
+    auto get(sycl::ext::oneapi::experimental::properties_tag) const {
+        return sycl::ext::oneapi::experimental::properties{
+            sycl::ext::intel::experimental::grf_size<256>,
+            sycl::ext::oneapi::experimental::sub_group_size<SG_SZ>
+        };
+    }
+    void operator()(sycl::nd_item<1> item) const {
+        bf16_f32_mmvf_multi_kernel<BLOCK_SIZE, NT>(item, x, ldx, w, y, ldy, n_in, n_tok, partials);
+    }
+};
+
+template <int BLOCK_SIZE, int NT, int RPB, bool AUX>
+struct Bf16MmvfRowsGrf256Functor {
+    const float* x;
+    int64_t ldx;
+    const uint16_t* w;
+    float* y;
+    int64_t ldy;
+    int n_in, n_out, n_tok;
+    sycl::local_accessor<float, 3> partials;
+    const uint16_t* w_aux = nullptr;
+    float* y_aux = nullptr;
+    int64_t ldy_aux = 0;
+    auto get(sycl::ext::oneapi::experimental::properties_tag) const {
+        return sycl::ext::oneapi::experimental::properties{
+            sycl::ext::intel::experimental::grf_size<256>,
+            sycl::ext::oneapi::experimental::sub_group_size<SG_SZ>
+        };
+    }
+    void operator()(sycl::nd_item<1> item) const {
+        bf16_f32_mmvf_rows_kernel<BLOCK_SIZE, NT, RPB, AUX>(
+            item, x, ldx, w, y, ldy, n_in, n_out, n_tok, partials, w_aux, y_aux, ldy_aux);
+    }
+};
+
 template <int B>
 void launch_rows(sycl::queue* q, const float* x, int64_t ldx, const uint16_t* w, float* y, int64_t ldy,
                  int n_in, int n_out, int n_tok, const uint16_t* w_aux = nullptr, float* y_aux = nullptr,
@@ -262,45 +308,69 @@ void launch_rows(sycl::queue* q, const float* x, int64_t ldx, const uint16_t* w,
     const unsigned nb = (unsigned)((n_out + RPB - 1) / RPB);
     const unsigned total_blocks = w_aux != nullptr ? (nb + 1) : nb;
     constexpr int num_sgs = (B + SG_SZ - 1) / SG_SZ;
+    const bool large_grf = [q] {
+        const auto gen = strata::intel_gpu_gen(q->get_device());
+        return gen == strata::IntelGpuGen::Alchemist || gen == strata::IntelGpuGen::Battlemage;
+    }();
 
     if (w_aux != nullptr) {
         if (n_tok <= 4) {
             q->submit([&](sycl::handler& cgh) {
                 sycl::local_accessor<float, 3> partials(sycl::range<3>(RPB, 4, num_sgs), cgh);
-                cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t)total_blocks * B), sycl::range<1>(B)),
-                                 [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(SG_SZ)]] {
-                                     bf16_f32_mmvf_rows_kernel<B, 4, RPB, true>(
-                                         item, x, ldx, w, y, ldy, n_in, n_out, n_tok, partials, w_aux, y_aux, ldy_aux);
-                                 });
+                auto r = sycl::nd_range<1>(sycl::range<1>((size_t)total_blocks * B), sycl::range<1>(B));
+                if (large_grf) {
+                    cgh.parallel_for(r, Bf16MmvfRowsGrf256Functor<B, 4, RPB, true>{
+                        x, ldx, w, y, ldy, n_in, n_out, n_tok, partials, w_aux, y_aux, ldy_aux});
+                } else {
+                    cgh.parallel_for(r, [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(SG_SZ)]] {
+                        bf16_f32_mmvf_rows_kernel<B, 4, RPB, true>(
+                            item, x, ldx, w, y, ldy, n_in, n_out, n_tok, partials, w_aux, y_aux, ldy_aux);
+                    });
+                }
             });
         } else {
             q->submit([&](sycl::handler& cgh) {
                 sycl::local_accessor<float, 3> partials(sycl::range<3>(RPB, 8, num_sgs), cgh);
-                cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t)total_blocks * B), sycl::range<1>(B)),
-                                 [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(SG_SZ)]] {
-                                     bf16_f32_mmvf_rows_kernel<B, 8, RPB, true>(
-                                         item, x, ldx, w, y, ldy, n_in, n_out, n_tok, partials, w_aux, y_aux, ldy_aux);
-                                 });
+                auto r = sycl::nd_range<1>(sycl::range<1>((size_t)total_blocks * B), sycl::range<1>(B));
+                if (large_grf) {
+                    cgh.parallel_for(r, Bf16MmvfRowsGrf256Functor<B, 8, RPB, true>{
+                        x, ldx, w, y, ldy, n_in, n_out, n_tok, partials, w_aux, y_aux, ldy_aux});
+                } else {
+                    cgh.parallel_for(r, [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(SG_SZ)]] {
+                        bf16_f32_mmvf_rows_kernel<B, 8, RPB, true>(
+                            item, x, ldx, w, y, ldy, n_in, n_out, n_tok, partials, w_aux, y_aux, ldy_aux);
+                    });
+                }
             });
         }
     } else {
         if (n_tok <= 4) {
             q->submit([&](sycl::handler& cgh) {
                 sycl::local_accessor<float, 3> partials(sycl::range<3>(RPB, 4, num_sgs), cgh);
-                cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t)total_blocks * B), sycl::range<1>(B)),
-                                 [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(SG_SZ)]] {
-                                     bf16_f32_mmvf_rows_kernel<B, 4, RPB, false>(
-                                         item, x, ldx, w, y, ldy, n_in, n_out, n_tok, partials);
-                                 });
+                auto r = sycl::nd_range<1>(sycl::range<1>((size_t)total_blocks * B), sycl::range<1>(B));
+                if (large_grf) {
+                    cgh.parallel_for(r, Bf16MmvfRowsGrf256Functor<B, 4, RPB, false>{
+                        x, ldx, w, y, ldy, n_in, n_out, n_tok, partials});
+                } else {
+                    cgh.parallel_for(r, [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(SG_SZ)]] {
+                        bf16_f32_mmvf_rows_kernel<B, 4, RPB, false>(
+                            item, x, ldx, w, y, ldy, n_in, n_out, n_tok, partials);
+                    });
+                }
             });
         } else {
             q->submit([&](sycl::handler& cgh) {
                 sycl::local_accessor<float, 3> partials(sycl::range<3>(RPB, 8, num_sgs), cgh);
-                cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t)total_blocks * B), sycl::range<1>(B)),
-                                 [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(SG_SZ)]] {
-                                     bf16_f32_mmvf_rows_kernel<B, 8, RPB, false>(
-                                         item, x, ldx, w, y, ldy, n_in, n_out, n_tok, partials);
-                                 });
+                auto r = sycl::nd_range<1>(sycl::range<1>((size_t)total_blocks * B), sycl::range<1>(B));
+                if (large_grf) {
+                    cgh.parallel_for(r, Bf16MmvfRowsGrf256Functor<B, 8, RPB, false>{
+                        x, ldx, w, y, ldy, n_in, n_out, n_tok, partials});
+                } else {
+                    cgh.parallel_for(r, [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(SG_SZ)]] {
+                        bf16_f32_mmvf_rows_kernel<B, 8, RPB, false>(
+                            item, x, ldx, w, y, ldy, n_in, n_out, n_tok, partials);
+                    });
+                }
             });
         }
     }
@@ -317,6 +387,10 @@ bool bf16_gemv_fp32_mmvf_multi_aux(const float* x, int64_t ldx, const uint16_t* 
         (reinterpret_cast<uintptr_t>(x) & 7u) != 0)
         return false;
     sycl::queue* q = stream ? static_cast<sycl::queue*>(stream) : &default_queue();
+    const bool large_grf = [q] {
+        const auto gen = strata::intel_gpu_gen(q->get_device());
+        return gen == strata::IntelGpuGen::Alchemist || gen == strata::IntelGpuGen::Battlemage;
+    }();
     const int ni = (int)n_in, no = (int)n_out;
     switch (mmvf_block_size(n_in)) {
         case 32: launch_rows<32>(q, x, ldx, w, y, ldy, ni, no, n_tok, w_aux, y_aux, ldy_aux); break;
@@ -348,6 +422,10 @@ void bf16_gemv_fp32_mmvf_multi(const float* x, int64_t ldx, const uint16_t* w, f
         return;
     }
     sycl::queue* q = stream ? static_cast<sycl::queue*>(stream) : &default_queue();
+    const bool large_grf = [q] {
+        const auto gen = strata::intel_gpu_gen(q->get_device());
+        return gen == strata::IntelGpuGen::Alchemist || gen == strata::IntelGpuGen::Battlemage;
+    }();
 
     static const bool rows = [] { const char* v = std::getenv("STRATA_MMVF_ROWS"); return v && v[0] == '1'; }();
     if (rows && n_out >= 64 && n_tok <= 8) {
@@ -370,20 +448,26 @@ void bf16_gemv_fp32_mmvf_multi(const float* x, int64_t ldx, const uint16_t* w, f
         if (n_tok <= 4) {                                                                                        \
             q->submit([&](sycl::handler& cgh) {                                                                  \
                 sycl::local_accessor<float, 2> partials(sycl::range<2>(4, 32), cgh);                             \
-                cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t)n_out * (N)), sycl::range<1>(N)),      \
-                                 [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(SG_SZ)]] {               \
-                                     bf16_f32_mmvf_multi_kernel<N, 4>(item, x, ldx, w, y, ldy, (int)n_in, n_tok, \
-                                                                      partials);                                 \
-                                 });                                                                             \
+                auto r = sycl::nd_range<1>(sycl::range<1>((size_t)n_out * (N)), sycl::range<1>(N));              \
+                if (large_grf) {                                                                                 \
+                    cgh.parallel_for(r, Bf16MmvfMultiGrf256Functor<N, 4>{x, ldx, w, y, ldy, (int)n_in, n_tok, partials}); \
+                } else {                                                                                         \
+                    cgh.parallel_for(r, [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(SG_SZ)]] {       \
+                        bf16_f32_mmvf_multi_kernel<N, 4>(item, x, ldx, w, y, ldy, (int)n_in, n_tok, partials);   \
+                    });                                                                                          \
+                }                                                                                                \
             });                                                                                                  \
         } else {                                                                                                 \
             q->submit([&](sycl::handler& cgh) {                                                                  \
                 sycl::local_accessor<float, 2> partials(sycl::range<2>(8, 32), cgh);                             \
-                cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t)n_out * (N)), sycl::range<1>(N)),      \
-                                 [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(SG_SZ)]] {               \
-                                     bf16_f32_mmvf_multi_kernel<N, 8>(item, x, ldx, w, y, ldy, (int)n_in, n_tok, \
-                                                                      partials);                                 \
-                                 });                                                                             \
+                auto r = sycl::nd_range<1>(sycl::range<1>((size_t)n_out * (N)), sycl::range<1>(N));              \
+                if (large_grf) {                                                                                 \
+                    cgh.parallel_for(r, Bf16MmvfMultiGrf256Functor<N, 8>{x, ldx, w, y, ldy, (int)n_in, n_tok, partials}); \
+                } else {                                                                                         \
+                    cgh.parallel_for(r, [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(SG_SZ)]] {       \
+                        bf16_f32_mmvf_multi_kernel<N, 8>(item, x, ldx, w, y, ldy, (int)n_in, n_tok, partials);   \
+                    });                                                                                          \
+                }                                                                                                \
             });                                                                                                  \
         }                                                                                                        \
         break
@@ -409,6 +493,10 @@ void bf16_gemv_fp32_mmvf(const float* x, const uint16_t* w, float* y, int64_t n_
         (reinterpret_cast<uintptr_t>(w) & 3u) != 0 || (reinterpret_cast<uintptr_t>(y) & 3u) != 0)
         throw std::invalid_argument("bf16_gemv_fp32_mmvf: null or misaligned pointer");
     sycl::queue* q = stream ? static_cast<sycl::queue*>(stream) : &default_queue();
+    const bool large_grf = [q] {
+        const auto gen = strata::intel_gpu_gen(q->get_device());
+        return gen == strata::IntelGpuGen::Alchemist || gen == strata::IntelGpuGen::Battlemage;
+    }();
 
 #define STRATA_MMVF_CASE(N)                                                                             \
     case N:                                                                                             \
