@@ -8,6 +8,7 @@
 #include <sycl/ext/intel/experimental/grf_size_properties.hpp>
 #include <sycl/ext/oneapi/matrix/matrix-unified.hpp>
 #include "strata/core/sycl_arch.hpp"
+#include "strata/core/sycl_doorbell.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/dp4a.hpp"
 #include "strata/kernels/q8_1_finite.hpp"
@@ -3081,22 +3082,57 @@ int expdec_rows_per_block(int nrow, int rpp, int64_t cap_groups, int knob) {
 }
 
 template <int TG, int R, int MINB>
+struct ExpdecGuGrf256Functor {
+    const unsigned long long* grp_ptr;
+    const int32_t* grp_start;
+    const int32_t* n_groups;
+    const int32_t* ent_tok;
+    const block_q8_1* X;
+    NativeExpertLayout L;
+    float* gate;
+    float* up;
+    int rb;
+    sycl::local_accessor<sycl::int4, 1> s_u;
+    sycl::local_accessor<float, 1> s_ds;
+    sycl::local_accessor<uint32_t, 1> s_grid;
+    auto get(sycl::ext::oneapi::experimental::properties_tag) const {
+        return sycl::ext::oneapi::experimental::properties{
+            sycl::ext::intel::experimental::grf_size<256>,
+            sycl::ext::oneapi::experimental::sub_group_size<32>
+        };
+    }
+    void operator()(sycl::nd_item<3>) const {
+        expdec_gu_kernel<TG, R, MINB>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, rb,
+                                      &s_u[0], &s_ds[0], &s_grid[0]);
+    }
+};
+
+template <int TG, int R, int MINB>
 void expdec_gu_r(int64_t gy, int64_t cap_groups, sycl::queue* s, const unsigned long long* grp_ptr,
                  const int32_t* grp_start, const int32_t* n_groups, const int32_t* ent_tok, const block_q8_1* X,
                  const NativeExpertLayout& L, float* gate, float* up) {
     const int nrow = 2 * (int)L.n_ff;
     const int rb = expdec_rows_per_block(nrow, 16 * R, cap_groups, g_expdec_rb);
     const sycl::range<3> grid(1, (size_t)gy, (size_t)((nrow + rb - 1) / rb));
+    const bool large_grf = [s] {
+        const auto gen = strata::intel_gpu_gen(s->get_device());
+        return gen == strata::IntelGpuGen::Alchemist || gen == strata::IntelGpuGen::Battlemage;
+    }();
     s->submit([&](sycl::handler& cgh) {
         sycl::local_accessor<sycl::int4, 1> s_u(sycl::range<1>(ED_NC * ED_XB * 2), cgh);
         sycl::local_accessor<float, 1> s_ds(sycl::range<1>(ED_NC * ED_XB), cgh);
         sycl::local_accessor<uint32_t, 1> s_grid(sycl::range<1>(EdGrid<TG>::words), cgh);
-        cgh.parallel_for(
-            sycl::nd_range<3>(grid * sycl::range<3>(1, 1, 256), sycl::range<3>(1, 1, 256)),
-            [=](sycl::nd_item<3> /*item_ct1*/) [[sycl::reqd_sub_group_size(32)]] {
-                expdec_gu_kernel<TG, R, MINB>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, rb,
-                                              &s_u[0], &s_ds[0], &s_grid[0]);
-            });
+        auto r = sycl::nd_range<3>(grid * sycl::range<3>(1, 1, 256), sycl::range<3>(1, 1, 256));
+        if (large_grf) {
+            cgh.parallel_for(r, ExpdecGuGrf256Functor<TG, R, MINB>{grp_ptr, grp_start, n_groups, ent_tok, X, L,
+                                                                   gate, up, rb, s_u, s_ds, s_grid});
+        } else {
+            cgh.parallel_for(
+                r, [=](sycl::nd_item<3> /*item_ct1*/) [[sycl::reqd_sub_group_size(32)]] {
+                    expdec_gu_kernel<TG, R, MINB>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, rb,
+                                                  &s_u[0], &s_ds[0], &s_grid[0]);
+                });
+        }
     });
 }
 template <int TG>
@@ -3149,6 +3185,30 @@ bool expdec_gu(const NativeExpertLayout& L, int64_t gy, int64_t cap_groups, sycl
     return true;
 }
 template <int TD, int R>
+struct ExpdecDownGrf256Functor {
+    const unsigned long long* grp_ptr;
+    const int32_t* grp_start;
+    const int32_t* n_groups;
+    const int32_t* ent_dst;
+    const block_q8_1* hq;
+    NativeExpertLayout L;
+    float* out;
+    int rb;
+    sycl::local_accessor<sycl::int4, 1> s_u;
+    sycl::local_accessor<float, 1> s_ds;
+    auto get(sycl::ext::oneapi::experimental::properties_tag) const {
+        return sycl::ext::oneapi::experimental::properties{
+            sycl::ext::intel::experimental::grf_size<256>,
+            sycl::ext::oneapi::experimental::sub_group_size<32>
+        };
+    }
+    void operator()(sycl::nd_item<3>) const {
+        expdec_down_kernel<TD, R>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out, rb,
+                                  &s_u[0], &s_ds[0]);
+    }
+};
+
+template <int TD, int R>
 void expdec_down_r(int64_t gy, int64_t cap_groups, sycl::queue* s, const unsigned long long* grp_ptr,
                    const int32_t* grp_start, const int32_t* n_groups, const int32_t* ent_dst, const block_q8_1* hq,
                    const NativeExpertLayout& L, float* out) {
@@ -3156,15 +3216,24 @@ void expdec_down_r(int64_t gy, int64_t cap_groups, sycl::queue* s, const unsigne
     const int nrow = (int)L.n_embd;
     const int rb = expdec_rows_per_block(nrow, (256 / LANES) * R, cap_groups, g_expdec_drb);
     const sycl::range<3> grid(1, (size_t)gy, (size_t)((nrow + rb - 1) / rb));
+    const bool large_grf = [s] {
+        const auto gen = strata::intel_gpu_gen(s->get_device());
+        return gen == strata::IntelGpuGen::Alchemist || gen == strata::IntelGpuGen::Battlemage;
+    }();
     s->submit([&](sycl::handler& cgh) {
         sycl::local_accessor<sycl::int4, 1> s_u(sycl::range<1>(ED_NC * ED_HB * 2), cgh);
         sycl::local_accessor<float, 1> s_ds(sycl::range<1>(ED_NC * ED_HB), cgh);
-        cgh.parallel_for(
-            sycl::nd_range<3>(grid * sycl::range<3>(1, 1, 256), sycl::range<3>(1, 1, 256)),
-            [=](sycl::nd_item<3> /*item_ct1*/) [[sycl::reqd_sub_group_size(32)]] {
-                expdec_down_kernel<TD, R>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out, rb,
-                                          &s_u[0], &s_ds[0]);
-            });
+        auto r = sycl::nd_range<3>(grid * sycl::range<3>(1, 1, 256), sycl::range<3>(1, 1, 256));
+        if (large_grf) {
+            cgh.parallel_for(r, ExpdecDownGrf256Functor<TD, R>{grp_ptr, grp_start, n_groups, ent_dst, hq, L,
+                                                               out, rb, s_u, s_ds});
+        } else {
+            cgh.parallel_for(
+                r, [=](sycl::nd_item<3> /*item_ct1*/) [[sycl::reqd_sub_group_size(32)]] {
+                    expdec_down_kernel<TD, R>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out, rb,
+                                              &s_u[0], &s_ds[0]);
+                });
+        }
     });
 }
 template <int TD>
