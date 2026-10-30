@@ -3814,13 +3814,16 @@ void launch(sycl::queue& q, int ty, bool gu, const sycl::half* X, float* Y, cons
     });
 }
 
+class k_xg_micro;
 class k_xg_small;
 class k_xg_big;
 
 #if defined(STRATA_TARGET_BMG) || defined(STRATA_TARGET_XE2) || defined(__INTEL_XE2__) || defined(STRATA_XMX_SG16)
+using Micro = Cfg<2, 4, 2, 2>;   // 32 x 128 (8 sub-groups of 16)
 using Small = Cfg<2, 4, 4, 2>;   // 64 x 128 (8 sub-groups of 16)
 using Big = Cfg<4, 2, 4, 4>;     // 128 x 128
 #else
+using Micro = Cfg<2, 8, 2, 2>;   // 32 x 128
 using Small = Cfg<2, 8, 4, 2>;   // 64 x 128
 using Big = Cfg<4, 4, 4, 4>;     // 128 x 128
 #endif
@@ -3857,18 +3860,33 @@ void iq_xmx_grouped(int ty, const uint8_t* const* a, const uint8_t* const* b, co
         return (e1 && std::atoi(e1) != 0) || (e2 && std::atoi(e2) != 0);
     }();
 
-    if (tot / n < 96) {
+    const char* force_tile = std::getenv("STRATA_XMXG_TILE");
+    const int tile_mode = force_tile ? (std::strcmp(force_tile, "micro") == 0 ? 0 :
+                                        (std::strcmp(force_tile, "small") == 0 ? 1 :
+                                        (std::strcmp(force_tile, "big") == 0 ? 2 : -1))) : -1;
+
+    if (tile_mode == 0 || (tile_mode < 0 && tot / n <= 16)) {
+        const int nt = xmxg::fill<xmxg::Micro>(gp, cnt, n);
+        if (debug) {
+            std::fprintf(stderr, "[iq_xmx_grouped] ty=%d (%s), n=%d, rows=%lld (mean %.1f/exp), N=%d, K=%d -> Micro (ntiles=%d)%s\n",
+                         ty, gu ? "gate/up" : "down", n, (long long)tot, (double)tot / n, N, K, nt,
+                         tile_mode == 0 ? " [forced]" : "");
+        }
+        xmxg::launch<xmxg::Micro, xmxg::k_xg_micro>(q, ty, gu, Xh, Y, gp, nt, N, K);
+    } else if (tile_mode == 1 || (tile_mode < 0 && tot / n < 96)) {
         const int nt = xmxg::fill<xmxg::Small>(gp, cnt, n);
         if (debug) {
-            std::fprintf(stderr, "[iq_xmx_grouped] ty=%d (%s), n=%d, rows=%lld (mean %.1f/exp), N=%d, K=%d -> Small (ntiles=%d)\n",
-                         ty, gu ? "gate/up" : "down", n, (long long)tot, (double)tot / n, N, K, nt);
+            std::fprintf(stderr, "[iq_xmx_grouped] ty=%d (%s), n=%d, rows=%lld (mean %.1f/exp), N=%d, K=%d -> Small (ntiles=%d)%s\n",
+                         ty, gu ? "gate/up" : "down", n, (long long)tot, (double)tot / n, N, K, nt,
+                         tile_mode == 1 ? " [forced]" : "");
         }
         xmxg::launch<xmxg::Small, xmxg::k_xg_small>(q, ty, gu, Xh, Y, gp, nt, N, K);
     } else {
         const int nt = xmxg::fill<xmxg::Big>(gp, cnt, n);
         if (debug) {
-            std::fprintf(stderr, "[iq_xmx_grouped] ty=%d (%s), n=%d, rows=%lld (mean %.1f/exp), N=%d, K=%d -> Big (ntiles=%d)\n",
-                         ty, gu ? "gate/up" : "down", n, (long long)tot, (double)tot / n, N, K, nt);
+            std::fprintf(stderr, "[iq_xmx_grouped] ty=%d (%s), n=%d, rows=%lld (mean %.1f/exp), N=%d, K=%d -> Big (ntiles=%d)%s\n",
+                         ty, gu ? "gate/up" : "down", n, (long long)tot, (double)tot / n, N, K, nt,
+                         tile_mode == 2 ? " [forced]" : "");
         }
         xmxg::launch<xmxg::Big, xmxg::k_xg_big>(q, ty, gu, Xh, Y, gp, nt, N, K);
     }

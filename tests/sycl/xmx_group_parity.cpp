@@ -39,26 +39,8 @@ static void ref_gemm(sycl::queue& q, const uint16_t* X, const uint16_t* W, float
     });
 }
 
-int main(int argc, char** argv) {
-    const int mean_rows = argc > 1 ? std::atoi(argv[1]) : 128;
-    const int n = argc > 2 ? std::atoi(argv[2]) : 8;
-
-    sycl::queue q{sycl::default_selector_v, sycl::property::queue::in_order()};
-    sycl::device dev = q.get_device();
-    std::printf("Running xmx_group_parity on: %s\n", dev.get_info<sycl::info::device::name>().c_str());
-
-    bool has_xmx = false;
-    try {
-        auto combos = dev.get_info<sycl::ext::oneapi::experimental::info::device::matrix_combinations>();
-        if (!combos.empty()) has_xmx = true;
-    } catch (...) {}
-
-    if (!has_xmx) {
-        std::printf("  Device does not report hardware matrix support; skipping.\n");
-        return 0;
-    }
-
-    std::mt19937 rng(42);
+static int test_config(sycl::queue& q, int mean_rows, int n) {
+    std::mt19937 rng(42 + mean_rows);
     std::vector<int32_t> cnt(n);
     std::gamma_distribution<double> gd(1.5, mean_rows / 1.5);
     int64_t tot = 0;
@@ -66,6 +48,10 @@ int main(int argc, char** argv) {
         c = std::max(1, (int)gd(rng));
         tot += c;
     }
+
+    const char* expected_tile = (tot / n <= 16) ? "Micro (BM=32)" : (tot / n < 96 ? "Small (BM=64)" : "Big (BM=128)");
+    std::printf("\n--- Test Config: mean_rows=%d, n=%d, tot=%lld (mean %.1f/exp) -> Expected Tile: %s ---\n",
+                mean_rows, n, (long long)tot, (double)tot / n, expected_tile);
 
     int fails = 0;
     struct Case {
@@ -213,6 +199,39 @@ int main(int argc, char** argv) {
         sycl::free(dw, q);
         sycl::free(yr, q);
         sycl::free(yx, q);
+    }
+    return fails;
+}
+
+int main(int argc, char** argv) {
+    sycl::queue q{sycl::default_selector_v, sycl::property::queue::in_order()};
+    sycl::device dev = q.get_device();
+    std::printf("Running xmx_group_parity on: %s\n", dev.get_info<sycl::info::device::name>().c_str());
+
+    bool has_xmx = false;
+    try {
+        auto combos = dev.get_info<sycl::ext::oneapi::experimental::info::device::matrix_combinations>();
+        if (!combos.empty()) has_xmx = true;
+    } catch (...) {}
+
+    if (!has_xmx) {
+        std::printf("  Device does not report hardware matrix support; skipping.\n");
+        return 0;
+    }
+
+    int fails = 0;
+    if (argc > 1) {
+        const int mean_rows = std::atoi(argv[1]);
+        const int n = argc > 2 ? std::atoi(argv[2]) : 8;
+        fails += test_config(q, mean_rows, n);
+    } else {
+        // Test all three adaptive tile regimes:
+        // 1. Micro (BM=32) for mean_rows <= 16
+        // 2. Small (BM=64) for 16 < mean_rows < 96
+        // 3. Big (BM=128) for mean_rows >= 96
+        fails += test_config(q, 10, 8);   // Micro
+        fails += test_config(q, 60, 8);   // Small
+        fails += test_config(q, 150, 8);  // Big
     }
 
     std::printf("\nxmx_group_parity summary: %d failures\n", fails);

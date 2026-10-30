@@ -842,6 +842,40 @@ void moe_combine_kernel(const float* __restrict__ Dm, const int32_t* __restrict_
     }
     bo[i] = s + shared[i] * sigm(sg[t]);
 }
+// Four columns per thread, 128-bit vector loads per slot (bitwise equal to moe_combine_kernel).
+// Requires 16-byte aligned Dm / shared / bo (N is a multiple of 4, N * 4 bytes per row is a multiple of 16).
+void moe_combine4_kernel(const float* __restrict__ Dm, const int32_t* __restrict__ slot,
+                         const float* __restrict__ w, const sycl::float4* __restrict__ shared,
+                         const float* __restrict__ sg, sycl::float4* __restrict__ bo,
+                         int64_t T, const float* __restrict__ row_sd = nullptr) {
+    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    const int64_t i = (int64_t)item_ct1.get_group(2) * item_ct1.get_local_range(2) + item_ct1.get_local_id(2);
+    if (i >= T * (N / 4)) return;
+    const int64_t t = i / (N / 4), d = (i % (N / 4)) * 4;
+    sycl::float4 s(0.0f, 0.0f, 0.0f, 0.0f);
+    sycl::float4 v[10];
+    float ww[10];
+#pragma unroll
+    for (int k = 0; k < 10; ++k) {
+        ww[k] = w[t * 10 + k];
+        const int64_t r = slot[t * 10 + k];
+        v[k] = *reinterpret_cast<const sycl::float4*>(Dm + r * N + d);
+        if (row_sd) {
+            const float sd = row_sd[r];
+            v[k] = sycl::float4(v[k].x() * sd, v[k].y() * sd, v[k].z() * sd, v[k].w() * sd);
+        }
+    }
+#pragma unroll
+    for (int k = 0; k < 10; ++k) {
+        s.x() = sycl::fma(ww[k], v[k].x(), s.x());
+        s.y() = sycl::fma(ww[k], v[k].y(), s.y());
+        s.z() = sycl::fma(ww[k], v[k].z(), s.z());
+        s.w() = sycl::fma(ww[k], v[k].w(), s.w());
+    }
+    const float g = sigm(sg[t]);
+    const sycl::float4 sh = shared[i];
+    bo[i] = sycl::float4(s.x() + sh.x() * g, s.y() + sh.y() * g, s.z() + sh.z() * g, s.w() + sh.w() * g);
+}
 void moe_shared_init_kernel(const float* __restrict__ shared, const float* __restrict__ sg,
                             float* __restrict__ acc, int64_t T) {
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
@@ -1408,11 +1442,31 @@ void gather_rows16(const uint16_t* x16, const int32_t* src, uint16_t* dst16, int
 }
 void moe_combine(const float* Dm, const int32_t* slot, const float* w, const float* shared, const float* sg, float* bo,
                  int64_t T, void* stream, const float* row_sd) {
-    static_cast<sycl::queue*>(stream)->parallel_for(
+    if (T <= 0) return;
+    auto* q = stream ? static_cast<sycl::queue*>(stream) : &get_default_queue();
+    const bool no_comb4 = [] {
+        const char* e = std::getenv("STRATA_NO_COMB4");
+        return e && std::atoi(e) != 0;
+    }();
+    if (!no_comb4 && (N % 4 == 0) &&
+        (((reinterpret_cast<uintptr_t>(Dm) | reinterpret_cast<uintptr_t>(shared) | reinterpret_cast<uintptr_t>(bo)) & 15) == 0)) {
+        q->parallel_for(
+            sycl::nd_range<3>(sycl::range<3>(1, 1, blocks_for(T * (N / 4))) * sycl::range<3>(1, 1, 256),
+                              sycl::range<3>(1, 1, 256)),
+            [=](sycl::nd_item<3> /*item_ct1*/) {
+                moe_combine4_kernel(Dm, slot, w, reinterpret_cast<const sycl::float4*>(shared),
+                                    sg, reinterpret_cast<sycl::float4*>(bo), T, row_sd);
+            });
+        check("moe_combine");
+        if (!stream) q->wait();
+        return;
+    }
+    q->parallel_for(
         sycl::nd_range<3>(sycl::range<3>(1, 1, blocks_for(T * N)) * sycl::range<3>(1, 1, 256),
                           sycl::range<3>(1, 1, 256)),
         [=](sycl::nd_item<3> /*item_ct1*/) { moe_combine_kernel(Dm, slot, w, shared, sg, bo, T, row_sd); });
     check("moe_combine");
+    if (!stream) q->wait();
 }
 void moe_shared_init(const float* shared, const float* sg, float* acc, int64_t T, void* stream) {
     if (T <= 0) return;
