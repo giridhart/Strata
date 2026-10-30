@@ -155,6 +155,110 @@ void check_scatter(sycl::queue& q, int64_t tokens, int64_t rows, int max_per_tok
     sycl::free(d_ur, q);
 }
 
+void check_combine(sycl::queue& q, int64_t tokens, int64_t rows, bool with_row_sd, uint32_t seed) {
+    std::mt19937 g(seed);
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    std::uniform_int_distribution<int32_t> pick_row(0, (int32_t)rows - 1);
+
+    std::vector<int32_t> slot((size_t)tokens * 10);
+    for (auto& s : slot) s = pick_row(g);
+
+    std::vector<float> w((size_t)tokens * 10);
+    for (auto& x : w) x = std::fabs(nd(g)) * 0.1f;
+
+    std::vector<float> shared((size_t)tokens * N), sg((size_t)tokens);
+    for (auto& x : shared) x = nd(g);
+    for (auto& x : sg) x = nd(g) * 2.0f;
+
+    std::vector<float> Dm((size_t)rows * N);
+    for (auto& x : Dm) x = nd(g);
+
+    std::vector<float> row_sd(with_row_sd ? rows : 0);
+    if (with_row_sd) {
+        for (auto& x : row_sd) x = std::fabs(nd(g)) + 0.1f;
+    }
+
+    // Host reference calculation
+    std::vector<float> ref((size_t)tokens * N);
+    for (int64_t t = 0; t < tokens; ++t) {
+        const float g_val = 1.0f / (1.0f + std::exp(-sg[(size_t)t]));
+        for (int d = 0; d < N; ++d) {
+            float s = 0.0f;
+            for (int k = 0; k < 10; ++k) {
+                const int64_t r = slot[(size_t)t * 10 + k];
+                const float v = with_row_sd ? Dm[(size_t)r * N + d] * row_sd[(size_t)r] : Dm[(size_t)r * N + d];
+                s = std::fma(w[(size_t)t * 10 + k], v, s);
+            }
+            ref[(size_t)t * N + d] = s + shared[(size_t)t * N + d] * g_val;
+        }
+    }
+
+    float* d_Dm = sycl::malloc_device<float>(Dm.size(), q);
+    int32_t* d_slot = sycl::malloc_device<int32_t>(slot.size(), q);
+    float* d_w = sycl::malloc_device<float>(w.size(), q);
+    float* d_shared = sycl::malloc_device<float>(shared.size(), q);
+    float* d_sg = sycl::malloc_device<float>(sg.size(), q);
+    float* d_bo = sycl::malloc_device<float>(ref.size(), q);
+    float* d_row_sd = with_row_sd ? sycl::malloc_device<float>(row_sd.size(), q) : nullptr;
+
+    q.memcpy(d_Dm, Dm.data(), Dm.size() * sizeof(float));
+    q.memcpy(d_slot, slot.data(), slot.size() * sizeof(int32_t));
+    q.memcpy(d_w, w.data(), w.size() * sizeof(float));
+    q.memcpy(d_shared, shared.data(), shared.size() * sizeof(float));
+    q.memcpy(d_sg, sg.data(), sg.size() * sizeof(float));
+    if (with_row_sd) {
+        q.memcpy(d_row_sd, row_sd.data(), row_sd.size() * sizeof(float));
+    }
+    q.wait();
+
+    // 1. Run default (vectorized 128-bit moe_combine4)
+    unsetenv("STRATA_NO_COMB4");
+    q.memset(d_bo, 0, ref.size() * sizeof(float)).wait();
+    strata::prefill::moe_combine(d_Dm, d_slot, d_w, d_shared, d_sg, d_bo, tokens, &q, d_row_sd);
+    q.wait();
+    std::vector<float> got_vec(ref.size());
+    q.memcpy(got_vec.data(), d_bo, got_vec.size() * sizeof(float)).wait();
+
+    // 2. Run scalar fallback kernel
+    setenv("STRATA_NO_COMB4", "1", 1);
+    q.memset(d_bo, 0, ref.size() * sizeof(float)).wait();
+    strata::prefill::moe_combine(d_Dm, d_slot, d_w, d_shared, d_sg, d_bo, tokens, &q, d_row_sd);
+    q.wait();
+    std::vector<float> got_scalar(ref.size());
+    q.memcpy(got_scalar.data(), d_bo, got_scalar.size() * sizeof(float)).wait();
+    unsetenv("STRATA_NO_COMB4");
+
+    // Check accuracy against host reference and check bitwise parity between vector & scalar
+    double max_err_vec = 0.0, max_err_scalar = 0.0, max_val = 0.0;
+    size_t diff_vec_scalar = 0;
+    for (size_t i = 0; i < ref.size(); ++i) {
+        const double diff_v = std::fabs((double)got_vec[i] - ref[i]);
+        const double diff_s = std::fabs((double)got_scalar[i] - ref[i]);
+        max_err_vec = std::fmax(max_err_vec, diff_v);
+        max_err_scalar = std::fmax(max_err_scalar, diff_s);
+        max_val = std::fmax(max_val, std::fabs((double)ref[i]));
+        if (std::memcmp(&got_vec[i], &got_scalar[i], sizeof(float)) != 0) {
+            ++diff_vec_scalar;
+        }
+    }
+
+    const double rel_vec = max_err_vec / (max_val > 0.0 ? max_val : 1.0);
+    const double rel_scalar = max_err_scalar / (max_val > 0.0 ? max_val : 1.0);
+    const bool ok = (rel_vec < 1e-4) && (rel_scalar < 1e-4) && (diff_vec_scalar == 0);
+    std::printf("moe_combine tokens=%lld rows=%lld row_sd=%d: rel_vec=%.2e rel_scalar=%.2e diff_vec_scalar=%zu %s\n",
+                (long long)tokens, (long long)rows, with_row_sd ? 1 : 0,
+                rel_vec, rel_scalar, diff_vec_scalar, ok ? "ok" : "FAIL");
+    fails += ok ? 0 : 1;
+
+    sycl::free(d_Dm, q);
+    sycl::free(d_slot, q);
+    sycl::free(d_w, q);
+    sycl::free(d_shared, q);
+    sycl::free(d_sg, q);
+    sycl::free(d_bo, q);
+    if (d_row_sd) sycl::free(d_row_sd, q);
+}
+
 }  // namespace
 
 int main() {
@@ -181,6 +285,11 @@ int main() {
     check_scatter(q, 4096, 5000, 8, 3);    // several sub-chunks of a super-chunk
     check_scatter(q, 8192, 8192, 1, 4);    // every token once
     check_scatter(q, 300, 2400, 8, 5);     // every token at its limit
+    check_combine(q, 1, 100, false, 10);   // single token
+    check_combine(q, 16, 200, false, 11);  // small batch
+    check_combine(q, 512, 1000, false, 12); // chunk
+    check_combine(q, 512, 1000, true, 13);  // chunk with row_sd (NVFP4 scale)
+    check_combine(q, 2049, 2000, false, 14); // super-chunk length
     std::printf(fails == 0 ? "PASS\n" : "FAIL (%d)\n", fails);
     return fails == 0 ? 0 : 1;
 }
