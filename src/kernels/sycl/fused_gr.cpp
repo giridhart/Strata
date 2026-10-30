@@ -49,6 +49,20 @@ inline float dot8(const sycl::uint4 w, const float* x) {
     return acc;
 }
 
+// `dot8` with its 8 activations as two float4: the same eight fmaf in the same order
+inline float dot8v(const sycl::uint4 w, const sycl::float4 x0, const sycl::float4 x1) {
+    float acc = 0.0f;
+    acc = sycl::fma(sycl::bit_cast<float>(w.x() << 16), (float)(x0.x()), acc);
+    acc = sycl::fma(sycl::bit_cast<float>(w.x() & 0xffff0000u), (float)(x0.y()), acc);
+    acc = sycl::fma(sycl::bit_cast<float>(w.y() << 16), (float)(x0.z()), acc);
+    acc = sycl::fma(sycl::bit_cast<float>(w.y() & 0xffff0000u), (float)(x0.w()), acc);
+    acc = sycl::fma(sycl::bit_cast<float>(w.z() << 16), (float)(x1.x()), acc);
+    acc = sycl::fma(sycl::bit_cast<float>(w.z() & 0xffff0000u), (float)(x1.y()), acc);
+    acc = sycl::fma(sycl::bit_cast<float>(w.w() << 16), (float)(x1.z()), acc);
+    acc = sycl::fma(sycl::bit_cast<float>(w.w() & 0xffff0000u), (float)(x1.w()), acc);
+    return acc;
+}
+
 // STRATA_HC_Q8: a weight chunk of 8 values in one uint4 register either way - bf16 (4 words), or Q8 (8 int8 codes in
 // .x/.y and the chunk's 32-value block scale in .z), so the kernels keep their register budget.
 inline float dot8q(const uint32_t a, const uint32_t b, const float* x) {
@@ -203,6 +217,16 @@ struct GrMulti {
     int T;
 };
 
+struct GrDownArgs {
+    const uint16_t* w_down = nullptr;
+    const uint16_t* w_inject = nullptr;
+    const float* s_down = nullptr;   // STRATA_HC_REQ8
+    const float* xn = nullptr;
+    float* lo[kFusedGrMaxT] = {};
+    float* inject_out[kFusedGrMaxT] = {};
+    int T = 0;
+};
+
 template <class F, std::size_t... J>
 inline auto gr_pick_impl(const GrMulti& m, int k, F f, std::index_sequence<J...>) {
     auto v = f(m.a[0]);
@@ -288,64 +312,129 @@ void gr_norm_multi_kernel(GrMulti m, float part[8 /*WARPS*/][4 /*HC*/], float* s
 // which fits all eight tokens in one 40 KiB launch and stages 160 chunks of 8 (5 per lane, half the registers held
 // for the weight prefetch); smaller tiles raise how many blocks share an SM (the 41-block grid), e.g. three blocks
 // of four tokens instead of one on sm_75.
-template <int TILEV, int MAX_T = kFusedGrMaxT, bool Q8 = false>
-void gr_down_multi_kernel(GrMulti m, uint8_t* smem_raw) {
+template <int TILEV, int T_VAL = 0, bool Q8 = false>
+void gr_down_multi_kernel(GrDownArgs args, uint8_t* smem_raw) {
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
     constexpr int TQ = TILEV / 8 / 32;  // uint4 weight chunks per lane per tile
-    auto tile = (float*)smem_raw;       // [T][TILEV]
+    auto tile = reinterpret_cast<float*>(smem_raw);       // [T][TILEV]
     const int t = item_ct1.get_local_id(2), lane = t & 31, warp = t >> 5;
-    const int T = m.T;
+    const int T = (T_VAL > 0) ? T_VAL : args.T;
     const bool inject_block = item_ct1.get_group(2) == DOWN_BLOCKS;
     const int row = inject_block ? warp : item_ct1.get_group(2) * WARPS + warp;
-    const bool active = !(inject_block && (m.a[0].w_inject == nullptr || warp >= HC));
-    const uint16_t* wmat = inject_block ? m.a[0].w_inject : m.a[0].w_down;
-    const float* sq = (Q8 && !inject_block) ? m.a[0].s_down : nullptr;   // the inject rows stay bf16
+    const bool active = !(inject_block && (args.w_inject == nullptr || warp >= HC));
+    const uint16_t* wmat = inject_block ? args.w_inject : args.w_down;
+    const float* sq = (Q8 && !inject_block) ? args.s_down : nullptr;   // the inject rows stay bf16
     const bool q8 = Q8 && !inject_block;
     const size_t row0 = (size_t)(active ? row : 0) * D;
-    float acc[MAX_T];
+
+    float acc[T_VAL > 0 ? T_VAL : kFusedGrMaxT];
 #pragma unroll
-    for (int k = 0; k < MAX_T; ++k)
+    for (int k = 0; k < (T_VAL > 0 ? T_VAL : kFusedGrMaxT); ++k)
         acc[k] = 0.0f;
+
+    const sycl::float4* src4 = reinterpret_cast<const sycl::float4*>(args.xn);
+    sycl::float4* tile4 = reinterpret_cast<sycl::float4*>(tile);
+
     for (int base = 0; base < D; base += TILEV) {
-        sycl::uint4 wv[TQ];
-        if (active) {
-#pragma unroll
-            for (int q = 0; q < TQ; ++q)
-                wv[q] = ldw<Q8>(wmat, sq, row0 + (size_t)base + (size_t)(lane + 32 * q) * 8);
-        }
-        item_ct1.barrier();  // the previous tile is consumed
-        const sycl::float4* src4 = reinterpret_cast<const sycl::float4*>(m.xn);
-        sycl::float4* tile4 = reinterpret_cast<sycl::float4*>(tile);
-        for (int i = t; i < T * (TILEV / 4); i += THREADS) {
-            const int k = i / (TILEV / 4), off = i - k * (TILEV / 4);
-            tile4[i] = src4[((size_t)k * D + base) / 4 + off];
-        }
-        item_ct1.barrier();
-        if (!active) continue;
-#pragma unroll
-        for (int q = 0; q < TQ; ++q) {
-            const int j = lane + 32 * q;
-#pragma unroll
-            for (int k = 0; k < MAX_T; ++k)
-                if (k < T) acc[k] += dotw<Q8>(q8, wv[q], tile + k * TILEV + j * 8);
-        }
-    }
-    if (!active) return;
-    float s[MAX_T];
-#pragma unroll
-    for (int k = 0; k < MAX_T; ++k)
-        s[k] = k < T ? warp_sum(acc[k]) : 0.0f;
-    // lane k writes token k (every lane holds every sum after the xor reduction)
-#pragma unroll
-    for (int k = 0; k < MAX_T; ++k) {
-        if (k >= T || lane != k) continue;
-        if (inject_block) {
-            GR_PICK(m, k, inject_out)[row] = s[k];
+        if constexpr (T_VAL == 1) {
+            const size_t base_f4 = (size_t)base / 4;
+            for (int i = t; i < (TILEV / 4); i += THREADS) {
+                tile4[i] = src4[base_f4 + i];
+            }
         } else {
-            const float x = s[k] / (float)HC;
-            GR_PICK(m, k, lo)[row] = x / (1.0f + sycl::native::exp(-x));
+            for (int i = t; i < T * (TILEV / 4); i += THREADS) {
+                const int k = i / (TILEV / 4);
+                const int off = i - k * (TILEV / 4);
+                tile4[i] = src4[((size_t)k * D + base) / 4 + off];
+            }
+        }
+        item_ct1.barrier(sycl::access::fence_space::local_space);
+
+        if (active) {
+            const sycl::float4* t4 = reinterpret_cast<const sycl::float4*>(tile);
+#pragma unroll
+            for (int q = 0; q < TQ; ++q) {
+                const sycl::uint4 w = ldw<Q8>(wmat, sq, row0 + (size_t)base + (size_t)(lane + 32 * q) * 8);
+                const int j = lane + 32 * q;
+
+                if constexpr (T_VAL == 1) {
+                    if constexpr (Q8) {
+                        acc[0] += dotw<true>(q8, w, tile + j * 8);
+                    } else {
+                        const sycl::float4 x0 = t4[j * 2];
+                        const sycl::float4 x1 = t4[j * 2 + 1];
+                        acc[0] += dot8v(w, x0, x1);
+                    }
+                } else {
+#pragma unroll
+                    for (int k = 0; k < (T_VAL > 0 ? T_VAL : kFusedGrMaxT); ++k) {
+                        if (T_VAL > 0 || k < T) {
+                            if constexpr (Q8) {
+                                acc[k] += dotw<true>(q8, w, tile + k * TILEV + j * 8);
+                            } else {
+                                const sycl::float4* t4k = t4 + k * (TILEV / 4);
+                                acc[k] += dot8v(w, t4k[j * 2], t4k[j * 2 + 1]);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        item_ct1.barrier(sycl::access::fence_space::local_space);
+    }
+
+    if (!active) return;
+
+    if constexpr (T_VAL == 1) {
+        const float s = warp_sum(acc[0]);
+        if (lane == 0) {
+            if (inject_block) {
+                args.inject_out[0][row] = s;
+            } else {
+                const float x = s / (float)HC;
+                args.lo[0][row] = x / (1.0f + sycl::native::exp(-x));
+            }
+        }
+    } else {
+        float s[T_VAL > 0 ? T_VAL : kFusedGrMaxT];
+#pragma unroll
+        for (int k = 0; k < (T_VAL > 0 ? T_VAL : kFusedGrMaxT); ++k)
+            s[k] = (T_VAL > 0 || k < T) ? warp_sum(acc[k]) : 0.0f;
+#pragma unroll
+        for (int k = 0; k < (T_VAL > 0 ? T_VAL : kFusedGrMaxT); ++k) {
+            if ((T_VAL == 0 && k >= T) || lane != k) continue;
+            if (inject_block) {
+                args.inject_out[k][row] = s[k];
+            } else {
+                const float x = s[k] / (float)HC;
+                args.lo[k][row] = x / (1.0f + sycl::native::exp(-x));
+            }
         }
     }
+}
+
+template <int TILEV, int MAX_T = kFusedGrMaxT, bool Q8 = false>
+void gr_down_multi_kernel(GrMulti m, uint8_t* smem_raw) {
+    GrDownArgs da{};
+    da.w_down = m.a[0].w_down;
+    da.w_inject = m.a[0].w_inject;
+    da.s_down = m.a[0].s_down;
+    da.xn = m.xn;
+    da.T = m.T;
+    for (int k = 0; k < m.T; ++k) {
+        da.lo[k] = m.a[k].lo;
+        da.inject_out[k] = m.a[k].inject_out;
+    }
+    if (m.T == 1)
+        gr_down_multi_kernel<TILEV, 1, Q8>(da, smem_raw);
+    else if (m.T == 2)
+        gr_down_multi_kernel<TILEV, 2, Q8>(da, smem_raw);
+    else if (m.T == 3)
+        gr_down_multi_kernel<TILEV, 3, Q8>(da, smem_raw);
+    else if (m.T == 4)
+        gr_down_multi_kernel<TILEV, 4, Q8>(da, smem_raw);
+    else
+        gr_down_multi_kernel<TILEV, 0, Q8>(da, smem_raw);
 }
 
 constexpr int UPM_COLS = 16;              // columns per block (x 4 streams = 64 rows, 8 per warp)
@@ -827,140 +916,27 @@ inline void cp_async_commit() {}
 inline void cp_async_wait1() {}
 inline void cp_async_wait0() {}
 
-// `dot8` with its 8 activations as two float4: the same eight fmaf in the same order
-inline float dot8v(const sycl::uint4 w, const sycl::float4 x0, const sycl::float4 x1) {
-    float acc = 0.0f;
-    acc = sycl::fma(sycl::bit_cast<float>(w.x() << 16), (float)(x0.x()), acc);
-    acc = sycl::fma(sycl::bit_cast<float>(w.x() & 0xffff0000u), (float)(x0.y()), acc);
-    acc = sycl::fma(sycl::bit_cast<float>(w.y() << 16), (float)(x0.z()), acc);
-    acc = sycl::fma(sycl::bit_cast<float>(w.y() & 0xffff0000u), (float)(x0.w()), acc);
-    acc = sycl::fma(sycl::bit_cast<float>(w.z() << 16), (float)(x1.x()), acc);
-    acc = sycl::fma(sycl::bit_cast<float>(w.z() & 0xffff0000u), (float)(x1.y()), acc);
-    acc = sycl::fma(sycl::bit_cast<float>(w.w() << 16), (float)(x1.z()), acc);
-    acc = sycl::fma(sycl::bit_cast<float>(w.w() & 0xffff0000u), (float)(x1.w()), acc);
-    return acc;
-}
-
-// Stage tile `h` of every token into `buf`: [T][2 planes][160 chunks] float4, plane 0 = floats 0-3 of a chunk.
-inline void stage_htile(const GrMulti& m, int T, int h, sycl::float4* buf, int t) {
-    for (int i = t; i < T * (H_TILE / 4); i += THREADS) {
-        const int k = i / (H_TILE / 4), s4 = i - k * (H_TILE / 4);  // s4: float4 of the tile, chunk s4/2, half s4&1
-        const float* src = m.xn + (size_t)k * D + (size_t)h * H_TILE + (size_t)s4 * 4;
-        cp_async16(buf + (size_t)k * (H_TILE / 4) + (s4 & 1) * (H_TILE / 8) + (s4 >> 1), src);
-    }
-}
-
-/*
-DPCT1110:27: The total declared local variable size in device function
-gr_down_staged_kernel exceeds 128 bytes and may cause high register pressure.
-Consult with your hardware vendor to find the total register size available and
-adjust the code, or use smaller sub-group size to avoid high register pressure.
-*/
 void gr_down_staged_kernel(GrMulti m, uint8_t* smem_raw) {
-    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
-    auto hbuf = (sycl::float4*)smem_raw;  // 2 buffers x [T][2][160] float4
-    const int t = item_ct1.get_local_id(2), lane = t & 31, warp = t >> 5;
-    const int T = m.T;
-    const bool inject_block = item_ct1.get_group(2) == DOWN_BLOCKS;
-    const int row = inject_block ? warp : item_ct1.get_group(2) * WARPS + warp;
-    const bool active = !(inject_block && (m.a[0].w_inject == nullptr || warp >= HC));
-    const uint16_t* wrow = (inject_block ? m.a[0].w_inject : m.a[0].w_down) + (size_t)(active ? row : 0) * D;
-    const sycl::uint4* w4 = reinterpret_cast<const sycl::uint4*>(wrow);
-    const size_t buf_f4 = (size_t)T * (H_TILE / 4);  // float4 per buffer (the second one follows the first)
-    float acc[kFusedGrMaxT];
-#pragma unroll
-    for (int k = 0; k < kFusedGrMaxT; ++k)
-        acc[k] = 0.0f;
-    sycl::uint4 wv[HQ], wnext[HQ];
-    if (active) {
-#pragma unroll
-        /*
-        DPCT1098:272: The '*' expression is used instead of the __ldg call.
-        These two expressions do not provide the exact same functionality. Check
-        the generated code for potential precision and/or performance issues.
-        */
-        for (int q = 0; q < HQ; ++q)
-            wv[q] = *(w4 + lane + 32 * q);
+    GrDownArgs da{};
+    da.w_down = m.a[0].w_down;
+    da.w_inject = m.a[0].w_inject;
+    da.s_down = m.a[0].s_down;
+    da.xn = m.xn;
+    da.T = m.T;
+    for (int k = 0; k < m.T; ++k) {
+        da.lo[k] = m.a[k].lo;
+        da.inject_out[k] = m.a[k].inject_out;
     }
-    stage_htile(m, T, 0, hbuf, t);
-    cp_async_commit();
-    stage_htile(m, T, 1, hbuf + buf_f4, t);
-    cp_async_commit();
-#pragma unroll 1
-    for (int h = 0; h < N_HTILES; ++h) {
-        if (active && h + 1 < N_HTILES) {
-#pragma unroll
-            /*
-            DPCT1098:275: The '*' expression is used instead of the __ldg call.
-            These two expressions do not provide the exact same functionality.
-            Check the generated code for potential precision and/or performance
-            issues.
-            */
-            for (int q = 0; q < HQ; ++q)
-                wnext[q] = *(w4 + (h + 1) * (H_TILE / 8) + lane + 32 * q);
-        }
-        if (h + 1 < N_HTILES)
-            cp_async_wait1();  // tile h has landed (h + 1 may still be on its way)
-        else
-            cp_async_wait0();
-        /*
-        DPCT1118:28: SYCL group functions and algorithms must be encountered in
-        converged control flow. You may need to adjust the code.
-        */
-        /*
-        DPCT1065:273: Consider replacing sycl::nd_item::barrier() with
-        sycl::nd_item::barrier(sycl::access::fence_space::local_space) for
-        better performance if there is no access to global memory.
-        */
-        item_ct1.barrier();
-        const sycl::float4* cur = hbuf + (h & 1) * buf_f4;
-        if (active) {
-#pragma unroll
-            for (int q = 0; q < HQ; ++q) {
-                const int j = lane + 32 * q;
-#pragma unroll
-                for (int k = 0; k < kFusedGrMaxT; ++k) {
-                    if (k < T) {
-                        const sycl::float4* pk = cur + (size_t)k * (H_TILE / 4);
-                        acc[k] += dot8v(wv[q], pk[j], pk[H_TILE / 8 + j]);
-                    }
-                }
-            }
-        }
-        /*
-        DPCT1118:29: SYCL group functions and algorithms must be encountered in
-        converged control flow. You may need to adjust the code.
-        */
-        /*
-        DPCT1065:274: Consider replacing sycl::nd_item::barrier() with
-        sycl::nd_item::barrier(sycl::access::fence_space::local_space) for
-        better performance if there is no access to global memory.
-        */
-        item_ct1.barrier();  // every warp is done with buffer h & 1
-        if (h + 2 < N_HTILES) stage_htile(m, T, h + 2, hbuf + (h & 1) * buf_f4, t);
-        cp_async_commit();  // an empty group at the end keeps the wait counts simple
-        if (h + 1 < N_HTILES) {
-#pragma unroll
-            for (int q = 0; q < HQ; ++q)
-                wv[q] = wnext[q];
-        }
-    }
-    if (!active) return;
-    float s[kFusedGrMaxT];
-#pragma unroll
-    for (int k = 0; k < kFusedGrMaxT; ++k)
-        s[k] = k < T ? warp_sum(acc[k]) : 0.0f;
-    // lane k writes token k (every lane holds every sum after the xor reduction)
-#pragma unroll
-    for (int k = 0; k < kFusedGrMaxT; ++k) {
-        if (k >= T || lane != k) continue;
-        if (inject_block) {
-            GR_PICK(m, k, inject_out)[row] = s[k];
-        } else {
-            const float x = s[k] / (float)HC;
-            GR_PICK(m, k, lo)[row] = x / (1.0f + sycl::native::exp(-x));
-        }
-    }
+    if (m.T == 1)
+        gr_down_multi_kernel<2560, 1, false>(da, smem_raw);
+    else if (m.T == 2)
+        gr_down_multi_kernel<2560, 2, false>(da, smem_raw);
+    else if (m.T == 3)
+        gr_down_multi_kernel<2560, 3, false>(da, smem_raw);
+    else if (m.T == 4)
+        gr_down_multi_kernel<2560, 4, false>(da, smem_raw);
+    else
+        gr_down_multi_kernel<2560, 0, false>(da, smem_raw);
 }
 
 // The tokens a down kernel may carry in one launch on the current card, and the plain read's tile: the plain read
@@ -1036,58 +1012,60 @@ void launch_multi(const GrMulti& m, int variant, sycl::queue* st, unsigned long 
     const bool staged = variant >= kHcStaged && m.a[0].s_down == nullptr;
     int tv = 2560;
     const int chunk_tok = down_chunk(staged, &tv);
-    const size_t per_tok = (staged ? (size_t)2 * H_TILE : (size_t)tv) * sizeof(float);
+    const size_t per_tok = (size_t)tv * sizeof(float);
     for (int c0 = 0; c0 < n_tok; c0 += chunk_tok) {
         const int ct = n_tok - c0 < chunk_tok ? n_tok - c0 : chunk_tok;
-        GrMulti c{};
-        if (ct == n_tok) {
-            c = m;
-        } else {
-            c.xn = m.xn + (size_t)c0 * D;
-            c.T = ct;
-            for (int k = 0; k < ct; ++k)
-                c.a[k] = m.a[c0 + k];
+        GrDownArgs da{};
+        da.w_down = m.a[0].w_down;
+        da.w_inject = m.a[0].w_inject;
+        da.s_down = m.a[0].s_down;
+        da.xn = m.xn + (size_t)c0 * D;
+        da.T = ct;
+        for (int k = 0; k < ct; ++k) {
+            da.lo[k] = m.a[c0 + k].lo;
+            da.inject_out[k] = m.a[c0 + k].inject_out;
         }
         const size_t smem = (size_t)ct * per_tok;
-        if (staged)
+        auto launch_down = [&](auto k_fn) {
             st->submit([&](sycl::handler& cgh) {
                 sycl::local_accessor<uint8_t, 1> smem_acc(sycl::range<1>(smem), cgh);
-
                 cgh.parallel_for(
                     sycl::nd_range<3>(sycl::range<3>(1, 1, DOWN_BLOCKS + 1) * sycl::range<3>(1, 1, THREADS),
                                       sycl::range<3>(1, 1, THREADS)),
                     [=](sycl::nd_item<3> /*item_ct1*/) [[sycl::reqd_sub_group_size(32)]] {
-                        gr_down_staged_kernel(c, smem_acc.get_multi_ptr<sycl::access::decorated::no>().get());
+                        k_fn(da, smem_acc.get_multi_ptr<sycl::access::decorated::no>().get());
                     });
             });
-        else if (tv == 1280)
-            st->submit([&](sycl::handler& cgh) {
-                sycl::local_accessor<uint8_t, 1> smem_acc(sycl::range<1>(smem), cgh);
-
-                cgh.parallel_for(
-                    sycl::nd_range<3>(sycl::range<3>(1, 1, DOWN_BLOCKS + 1) * sycl::range<3>(1, 1, THREADS),
-                                      sycl::range<3>(1, 1, THREADS)),
-                    [=](sycl::nd_item<3> /*item_ct1*/) [[sycl::reqd_sub_group_size(32)]] {
-                        if (q8w)
-                            gr_down_multi_kernel<1280, kFusedGrMaxT, true>(c, smem_acc.get_multi_ptr<sycl::access::decorated::no>().get());
-                        else
-                            gr_down_multi_kernel<1280, kFusedGrMaxT, false>(c, smem_acc.get_multi_ptr<sycl::access::decorated::no>().get());
-                    });
-            });
-        else
-            st->submit([&](sycl::handler& cgh) {
-                sycl::local_accessor<uint8_t, 1> smem_acc(sycl::range<1>(smem), cgh);
-
-                cgh.parallel_for(
-                    sycl::nd_range<3>(sycl::range<3>(1, 1, DOWN_BLOCKS + 1) * sycl::range<3>(1, 1, THREADS),
-                                      sycl::range<3>(1, 1, THREADS)),
-                    [=](sycl::nd_item<3> /*item_ct1*/) [[sycl::reqd_sub_group_size(32)]] {
-                        if (q8w)
-                            gr_down_multi_kernel<2560, kFusedGrMaxT, true>(c, smem_acc.get_multi_ptr<sycl::access::decorated::no>().get());
-                        else
-                            gr_down_multi_kernel<2560, kFusedGrMaxT, false>(c, smem_acc.get_multi_ptr<sycl::access::decorated::no>().get());
-                    });
-            });
+        };
+        if (tv == 1280) {
+            if (q8w) {
+                if (ct == 1) launch_down([](auto a, auto s) { gr_down_multi_kernel<1280, 1, true>(a, s); });
+                else if (ct == 2) launch_down([](auto a, auto s) { gr_down_multi_kernel<1280, 2, true>(a, s); });
+                else if (ct == 3) launch_down([](auto a, auto s) { gr_down_multi_kernel<1280, 3, true>(a, s); });
+                else if (ct == 4) launch_down([](auto a, auto s) { gr_down_multi_kernel<1280, 4, true>(a, s); });
+                else launch_down([](auto a, auto s) { gr_down_multi_kernel<1280, 0, true>(a, s); });
+            } else {
+                if (ct == 1) launch_down([](auto a, auto s) { gr_down_multi_kernel<1280, 1, false>(a, s); });
+                else if (ct == 2) launch_down([](auto a, auto s) { gr_down_multi_kernel<1280, 2, false>(a, s); });
+                else if (ct == 3) launch_down([](auto a, auto s) { gr_down_multi_kernel<1280, 3, false>(a, s); });
+                else if (ct == 4) launch_down([](auto a, auto s) { gr_down_multi_kernel<1280, 4, false>(a, s); });
+                else launch_down([](auto a, auto s) { gr_down_multi_kernel<1280, 0, false>(a, s); });
+            }
+        } else {
+            if (q8w) {
+                if (ct == 1) launch_down([](auto a, auto s) { gr_down_multi_kernel<2560, 1, true>(a, s); });
+                else if (ct == 2) launch_down([](auto a, auto s) { gr_down_multi_kernel<2560, 2, true>(a, s); });
+                else if (ct == 3) launch_down([](auto a, auto s) { gr_down_multi_kernel<2560, 3, true>(a, s); });
+                else if (ct == 4) launch_down([](auto a, auto s) { gr_down_multi_kernel<2560, 4, true>(a, s); });
+                else launch_down([](auto a, auto s) { gr_down_multi_kernel<2560, 0, true>(a, s); });
+            } else {
+                if (ct == 1) launch_down([](auto a, auto s) { gr_down_multi_kernel<2560, 1, false>(a, s); });
+                else if (ct == 2) launch_down([](auto a, auto s) { gr_down_multi_kernel<2560, 2, false>(a, s); });
+                else if (ct == 3) launch_down([](auto a, auto s) { gr_down_multi_kernel<2560, 3, false>(a, s); });
+                else if (ct == 4) launch_down([](auto a, auto s) { gr_down_multi_kernel<2560, 4, false>(a, s); });
+                else launch_down([](auto a, auto s) { gr_down_multi_kernel<2560, 0, false>(a, s); });
+            }
+        }
     }
     if (stamp_buf) gpu_stamp(stamp_buf, stamp_i0 + 1, (void*)st);
     st->submit([&](sycl::handler& cgh) {

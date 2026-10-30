@@ -73,10 +73,18 @@ int main() {
 
     // Part 1: Verify architectural defaults for Intel Arc B580 and other SYCL GPUs
     {
-        // Arc B580: Discrete GPU with 12.0 GiB global memory -> should default to 1.5f
+        // route_prior_default() is 0.0f on all architectures by default (off by default per upstream #4402)
         float b580_default = strata::route_prior_default(false, false, 12.0 * GiB, false);
-        if (b580_default != 1.5f) {
-            std::printf("FAIL: Arc B580 12GB route_prior_default expected 1.5f, got %.2f\n", b580_default);
+        if (b580_default != 0.0f) {
+            std::printf("FAIL: Arc B580 12GB route_prior_default expected 0.0f, got %.2f\n", b580_default);
+            ++bad;
+        }
+
+        // Opt-in resolution (STRATA_ROUTE_PRIOR=1.5) provides kRoutePriorSmallCard (1.5f)
+        float b580_opt_in = strata::route_prior_resolve("1.5", false, false, 12.0 * GiB, false);
+        if (b580_opt_in != strata::kRoutePriorSmallCard) {
+            std::printf("FAIL: Arc B580 12GB route_prior_resolve expected %.2f, got %.2f\n",
+                        strata::kRoutePriorSmallCard, b580_opt_in);
             ++bad;
         }
 
