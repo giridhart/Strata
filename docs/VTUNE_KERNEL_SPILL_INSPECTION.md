@@ -234,3 +234,51 @@ Use this quick-reference table to toggle or isolate specific kernel optimization
 | `STRATA_MMVQ_EXACT` | `1` | Enforces exact bitwise reduction matching single-column execution. |
 | `IGC_ShaderDumpEnable` | `0` | Set to `1` to generate offline `.zeinfo` and `.asm` compiler dumps. |
 | `IGC_DumpToCustomDir` | None | Destination path for IGC shader dumps. |
+
+---
+
+## 5. Empirical Verification of Proposed Kernel Opportunities
+
+An analysis of five prospective optimizations was evaluated against the actual hardware compiler (Intel Graphics Compiler for Xe2 Battlemage `[0x64a0]`):
+
+### Opportunity 1: Force 256 GRF on `ncols == 1` Decode MMVQ
+* **Proposal**: Extend 256-GRF functors to single-column (`ncols == 1`) decode paths in `native_mmvq.cpp` (e.g. lines 1687, 1712, 2327, 2352).
+* **Empirical Finding**: **COUNTER-PRODUCTIVE (Do Not Apply)**.
+* **Evidence from IGC Dump**:
+  - Scanning `.zeinfo` compiler artifacts on Battlemage B580 shows that all `ncols == 1` kernels (`native_q5_k_mmvq`, `native_q4_k_mmvq`, `native_q6_k_mmvq`, `native_small_mmvq`, `native_iq4_xs_mmvq`) have **0 bytes of spill** (`HasSpill: False`) in 128-GRF mode because they maintain only a single column accumulator (`float sum = 0.0f`).
+  - In 128-GRF mode, Execution Unit thread occupancy is **`eu_thread_count: 8`** (100% full hardware thread occupancy).
+  - Forcing 256 GRFs cuts EU thread occupancy in half (`eu_thread_count: 4`) with zero spill reduction, degrading memory latency hiding during single-token autoregressive decode.
+  - **Verdict**: Retain 128 GRFs for `ncols == 1` and 256 GRFs for `ncols > 1`.
+
+### Opportunity 2: Stale `sycl/src/kernels/cuda/*.dp.cpp` Mirror
+* **Proposal**: Delete and regenerate supposedly stale `.dp.cpp` files in a CUDA mirror directory.
+* **Empirical Finding**: **INCORRECT / NON-EXISTENT**.
+* **Evidence**:
+  - There is no `sycl/src/kernels/cuda/*.dp.cpp` directory.
+  - Active device kernels are maintained and compiled directly from `src/kernels/sycl/*.cpp`.
+  - Legacy output `src/sycl_out/` from early porting phases is unreferenced by `CMakeLists.txt` and has no bearing on device compilation or runtime execution.
+
+### Opportunity 3: GRF Handling in `s2_expert_grouped.cpp`, `fused_gr.cpp`, `qsa_select.cpp`, `native_moe.cpp`
+* **Proposal**: Check for spills in MoE, residual, and attention kernels.
+* **Empirical Finding**: **CONFIRMED SPILL IN `s2_expert_grouped.cpp`**.
+* **Evidence from IGC Dump**:
+  - `fused_gr.cpp`: **0 spills** (resolved in commit `11b1922` with token unrolling and direct streaming; 24/24 configs pass).
+  - `qsa_select.cpp`: **0 spills** in 128-GRF mode.
+  - `s2_expert_grouped.cpp`: **Spills 1,024 bytes** in `grouped_s2_impl` under 128 GRFs.
+  - **Action**: Implementing 256-GRF support for `grouped_s2_impl` on Battlemage is a validated high-priority opportunity to eliminate this 1 KB scratch spill during MoE decode.
+
+### Opportunity 4: Streaming Cache Hints (`cache_mode::streaming`) for MMVQ & MoE
+* **Proposal**: Extend `sycl::ext::intel::experimental::cache_control<cache_mode::streaming, cache_level::L3>` (currently used in `bf16_gemv.cpp`) to MMVQ and MoE weight streaming.
+* **Empirical Finding**: **VALID & HIGH VALUE**.
+* **Evidence**:
+  - In MoE and batched MMVQ, multi-gigabyte weight tensors are read once per token without temporal reuse within the decode step.
+  - Without streaming cache hints, reading weights pollutes the 16 MB L3 cache, evicting frequently accessed KV cache heads and activation buffers.
+  - Applying `cache_mode::streaming` to weight loads preserves L3 cache residency for activations and the KV cache.
+
+### Opportunity 5: SIMD16 + 256 GRF Exploration
+* **Proposal**: Evaluate compiling kernels in SIMD16 with 256 GRFs instead of SIMD32.
+* **Empirical Finding**: **BENCHMARK-ONLY (Breaks Bit-Exact Parity)**.
+* **Evidence**:
+  - SIMD16 doubles effective register capacity per lane, which can prevent spills in extreme unrolling.
+  - However, sub-group tree reductions across 16 lanes group floating-point additions differently than 32-lane warps, causing numerical divergence (`bitwise ok ok ok` fails against single-column or CUDA oracles).
+  - **Verdict**: Reserved strictly for offline throughput experiments; ineligible for main branch production where bit-exact parity is required.
