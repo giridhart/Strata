@@ -37,7 +37,17 @@ inline sycl::half2 q8_1_ds(const float d, const float sum) {
         sycl::vec<float, 1>(q8_1_finite(d)).convert<sycl::half, sycl::rounding_mode::automatic>()[0],
         sycl::vec<float, 1>(q8_1_finite(sum)).convert<sycl::half, sycl::rounding_mode::automatic>()[0]);
 }
+
+struct Q81Block {
+    sycl::half2 ds;
+    int8_t qs[32];
+};
 #else
+struct Q81Block {
+    half2 ds;
+    int8_t qs[32];
+};
+
 __device__ __forceinline__ float q8_1_finite(const float v) {
     return fabsf(v) > kHalfMax ? copysignf(kHalfMax, v) : v;
 }

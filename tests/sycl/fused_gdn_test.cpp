@@ -1,5 +1,7 @@
 #include <sycl/sycl.hpp>
 #include "strata/kernels/fused_gdn.hpp"
+#include "strata/kernels/native_mmvq.hpp"
+#include "strata/kernels/q8_1_finite.hpp"
 
 #include <chrono>
 #include <cmath>
@@ -314,11 +316,19 @@ int main(int argc, char** argv) {
         q.memcpy(d_gamma, h_gamma.data(), h_gamma.size() * sizeof(float));
         q.wait();
 
-        fused_gdn_step_norm(d_state, d_q, d_k, d_v, d_gate, d_beta, d_z, d_gamma, eps, d_y, h_k, h_v, &q);
+        const size_t q81_bytes = strata::kernels::native_q8_1_bytes(ref_y.size(), 1);
+        void* d_y_q81 = sycl::malloc_device(q81_bytes, q);
+        void* d_ref_q81 = sycl::malloc_device(q81_bytes, q);
+
+        fused_gdn_step_norm(d_state, d_q, d_k, d_v, d_gate, d_beta, d_z, d_gamma, eps, d_y, h_k, h_v, &q, d_y_q81);
+        strata::kernels::native_quantize_q8_1(d_y, d_ref_q81, ref_y.size(), 1, &q);
 
         std::vector<float> dev_y(ref_y.size()), dev_state(h_state.size());
+        std::vector<uint8_t> dev_q81(q81_bytes), ref_q81(q81_bytes);
         q.memcpy(dev_y.data(), d_y, ref_y.size() * sizeof(float));
         q.memcpy(dev_state.data(), d_state, h_state.size() * sizeof(float));
+        q.memcpy(dev_q81.data(), d_y_q81, q81_bytes);
+        q.memcpy(ref_q81.data(), d_ref_q81, q81_bytes);
         q.wait();
 
         int bad_step = 0;
@@ -332,9 +342,18 @@ int main(int argc, char** argv) {
             float denom = std::max(std::fabs(ref_state[i]), 1e-4f);
             if (diff / denom > 2e-3f && diff > 1e-3f) bad_step++;
         }
+        int bad_q81 = 0;
+        if (std::memcmp(dev_q81.data(), ref_q81.data(), q81_bytes) != 0) {
+            bad_q81 = 1;
+            printf("  fused_gdn_step_norm: Q8_1 epilogue mismatch against native_quantize_q8_1!\n");
+        } else {
+            printf("  fused_gdn_step_norm: Q8_1 epilogue bit-exact match with native_quantize_q8_1 (memcmp OK)\n");
+        }
         printf("  fused_gdn_step_norm: bad = %d / %zu\n", bad_step, ref_y.size());
-        total_bad += bad_step;
+        total_bad += bad_step + bad_q81;
 
+        sycl::free(d_y_q81, q);
+        sycl::free(d_ref_q81, q);
         sycl::free(d_state, q);
         sycl::free(d_q, q);
         sycl::free(d_k, q);
@@ -444,11 +463,19 @@ int main(int argc, char** argv) {
         q.memcpy(d_gamma, h_gamma.data(), h_gamma.size() * sizeof(float));
         q.wait();
 
-        fused_gdn_step_norm_silu(d_state, d_q, d_k, d_v, d_gate, d_beta, d_z, d_gamma, eps, d_y, h_k, h_v, &q);
+        const size_t q81_bytes = strata::kernels::native_q8_1_bytes(ref_y.size(), 1);
+        void* d_y_q81 = sycl::malloc_device(q81_bytes, q);
+        void* d_ref_q81 = sycl::malloc_device(q81_bytes, q);
+
+        fused_gdn_step_norm_silu(d_state, d_q, d_k, d_v, d_gate, d_beta, d_z, d_gamma, eps, d_y, h_k, h_v, &q, d_y_q81);
+        strata::kernels::native_quantize_q8_1(d_y, d_ref_q81, ref_y.size(), 1, &q);
 
         std::vector<float> dev_y(ref_y.size()), dev_state(h_state.size());
+        std::vector<uint8_t> dev_q81(q81_bytes), ref_q81(q81_bytes);
         q.memcpy(dev_y.data(), d_y, ref_y.size() * sizeof(float));
         q.memcpy(dev_state.data(), d_state, h_state.size() * sizeof(float));
+        q.memcpy(dev_q81.data(), d_y_q81, q81_bytes);
+        q.memcpy(ref_q81.data(), d_ref_q81, q81_bytes);
         q.wait();
 
         int bad_step = 0;
@@ -462,9 +489,18 @@ int main(int argc, char** argv) {
             float denom = std::max(std::fabs(ref_state[i]), 1e-4f);
             if (diff / denom > 2e-3f && diff > 1e-3f) bad_step++;
         }
+        int bad_q81 = 0;
+        if (std::memcmp(dev_q81.data(), ref_q81.data(), q81_bytes) != 0) {
+            bad_q81 = 1;
+            printf("  fused_gdn_step_norm_silu: Q8_1 epilogue mismatch against native_quantize_q8_1!\n");
+        } else {
+            printf("  fused_gdn_step_norm_silu: Q8_1 epilogue bit-exact match with native_quantize_q8_1 (memcmp OK)\n");
+        }
         printf("  fused_gdn_step_norm_silu: bad = %d / %zu\n", bad_step, ref_y.size());
-        total_bad += bad_step;
+        total_bad += bad_step + bad_q81;
 
+        sycl::free(d_y_q81, q);
+        sycl::free(d_ref_q81, q);
         sycl::free(d_state, q);
         sycl::free(d_q, q);
         sycl::free(d_k, q);

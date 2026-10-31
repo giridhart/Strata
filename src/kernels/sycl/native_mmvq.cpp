@@ -162,10 +162,6 @@ struct Q5KBlock {
     uint8_t qh[32];
     uint8_t qs[128];
 };
-struct Q81Block {
-    sycl::half2 ds;
-    int8_t qs[32];
-};
 struct Q20Block {
     sycl::half d;
     uint8_t qs[16];

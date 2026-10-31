@@ -4,6 +4,7 @@
 #include "strata/core/sycl_arch.hpp"
 #include "strata/core/sycl_tuning.hpp"
 #include "strata/kernels/fused_gdn.hpp"
+#include "strata/kernels/q8_1_finite.hpp"
 
 #include <cstdio>
 #include <cstdlib>
@@ -20,12 +21,13 @@ static sycl::queue& default_queue() {
     return q;
 }
 
-template <bool SILU = false>
+template <bool SILU = false, bool QUANT_Q8_1 = false>
 void gdn_step_norm_kernel(float* __restrict__ state, const float* __restrict__ q, const float* __restrict__ k,
                           const float* __restrict__ v, const float* __restrict__ gate, const float* __restrict__ beta,
                           const float* __restrict__ z, const float* __restrict__ gamma, float eps,
                           float* __restrict__ y, int h_k, int h_v, sycl::nd_item<2> item_ct1, float* sk, float* sq,
-                          sycl::local_accessor<float, 2> red, float* wsum) {
+                          sycl::local_accessor<float, 2> red, float* wsum,
+                          Q81Block* __restrict__ y_q8_1 = nullptr) {
     const int head = item_ct1.get_group(0);
     const int rg = item_ct1.get_local_id(0);   // 0..3
     const int col = item_ct1.get_local_id(1);  // 0..127
@@ -75,10 +77,23 @@ void gdn_step_norm_kernel(float* __restrict__ state, const float* __restrict__ q
         const float ss = wsum[0] + wsum[1] + wsum[2] + wsum[3];
         const float scale = sycl::rsqrt(ss / (float)S + eps);
         const float zz = z[head * S + col];
+        float val;
         if constexpr (SILU) {
-            y[head * S + col] = oc * scale * gamma[col] * (zz / (1.0f + sycl::native::exp(-zz)));
+            val = oc * scale * gamma[col] * (zz / (1.0f + sycl::native::exp(-zz)));
         } else {
-            y[head * S + col] = oc * scale * gamma[col] * (1.0f / (1.0f + sycl::native::exp(-zz)));
+            val = oc * scale * gamma[col] * (1.0f / (1.0f + sycl::native::exp(-zz)));
+        }
+        y[head * S + col] = val;
+        if constexpr (QUANT_Q8_1) {
+            const float amax = sycl::reduce_over_group(sg, sycl::fabs(val), sycl::maximum<float>());
+            const float sum = sycl::reduce_over_group(sg, val, sycl::plus<float>());
+            const float d = strata::kernels::q8_1_finite(amax / 127.0f);
+            const int8_t qval = strata::kernels::q8_1_quant(val, d, amax);
+            const int block_idx = head * (S / 32) + (col >> 5);
+            y_q8_1[block_idx].qs[col & 31] = qval;
+            if ((col & 31) == 0) {
+                y_q8_1[block_idx].ds = strata::kernels::q8_1_ds(d, sum);
+            }
         }
     }
 }
@@ -144,7 +159,7 @@ void gdn_ab_kernel(const float* __restrict__ x, const uint16_t* __restrict__ wa,
 template <bool SILU>
 void step_norm_impl(float* state, const float* q, const float* k, const float* v, const float* gate,
                     const float* beta, const float* z, const float* gamma, float eps, float* y, int h_k, int h_v,
-                    void* stream) {
+                    void* stream, void* y_q8_1 = nullptr) {
     if (!state || !q || !k || !v || !gate || !beta || !z || !gamma || !y || h_k <= 0 || h_v <= 0 || h_v % h_k) {
         std::fprintf(stderr, "fused_gdn_step_norm: invalid arguments\n");
         std::exit(1);
@@ -152,52 +167,37 @@ void step_norm_impl(float* state, const float* q, const float* k, const float* v
     sycl::queue* s_queue = stream ? static_cast<sycl::queue*>(stream) : &default_queue();
     const auto prof = strata::sycl_arch::get_xe2_tuning_profile(s_queue->get_device());
     const int pad = prof.slm_pad_elements;
+    auto* q81 = static_cast<Q81Block*>(y_q8_1);
 
-    if (pad == 8) {
+    auto dispatch = [&](auto silu_c, auto quant_c, int pad_elems) {
+        constexpr bool kSilu = decltype(silu_c)::value;
+        constexpr bool kQuant = decltype(quant_c)::value;
         s_queue->submit([&](sycl::handler& cgh) {
             sycl::local_accessor<float, 1> sk_acc(sycl::range<1>(S), cgh);
             sycl::local_accessor<float, 1> sq_acc(sycl::range<1>(S), cgh);
-            sycl::local_accessor<float, 2> red_acc(sycl::range<2>(RG, S + 8), cgh);
+            sycl::local_accessor<float, 2> red_acc(sycl::range<2>(RG, S + pad_elems), cgh);
             sycl::local_accessor<float, 1> wsum_acc(sycl::range<1>(S * RG / 32), cgh);
 
             cgh.parallel_for(sycl::nd_range<2>(sycl::range<2>(h_v * RG, S), sycl::range<2>(RG, S)),
                              [=](sycl::nd_item<2> item_ct1) [[sycl::reqd_sub_group_size(32)]] {
-                                 gdn_step_norm_kernel<SILU>(state, q, k, v, gate, beta, z, gamma, eps, y, h_k, h_v, item_ct1,
-                                                            sk_acc.get_multi_ptr<sycl::access::decorated::no>().get(),
-                                                            sq_acc.get_multi_ptr<sycl::access::decorated::no>().get(), red_acc,
-                                                            wsum_acc.get_multi_ptr<sycl::access::decorated::no>().get());
+                                 gdn_step_norm_kernel<kSilu, kQuant>(
+                                     state, q, k, v, gate, beta, z, gamma, eps, y, h_k, h_v, item_ct1,
+                                     sk_acc.get_multi_ptr<sycl::access::decorated::no>().get(),
+                                     sq_acc.get_multi_ptr<sycl::access::decorated::no>().get(), red_acc,
+                                     wsum_acc.get_multi_ptr<sycl::access::decorated::no>().get(),
+                                     q81);
                              });
         });
-    } else if (pad == 4) {
-        s_queue->submit([&](sycl::handler& cgh) {
-            sycl::local_accessor<float, 1> sk_acc(sycl::range<1>(S), cgh);
-            sycl::local_accessor<float, 1> sq_acc(sycl::range<1>(S), cgh);
-            sycl::local_accessor<float, 2> red_acc(sycl::range<2>(RG, S + 4), cgh);
-            sycl::local_accessor<float, 1> wsum_acc(sycl::range<1>(S * RG / 32), cgh);
+    };
 
-            cgh.parallel_for(sycl::nd_range<2>(sycl::range<2>(h_v * RG, S), sycl::range<2>(RG, S)),
-                             [=](sycl::nd_item<2> item_ct1) [[sycl::reqd_sub_group_size(32)]] {
-                                 gdn_step_norm_kernel<SILU>(state, q, k, v, gate, beta, z, gamma, eps, y, h_k, h_v, item_ct1,
-                                                            sk_acc.get_multi_ptr<sycl::access::decorated::no>().get(),
-                                                            sq_acc.get_multi_ptr<sycl::access::decorated::no>().get(), red_acc,
-                                                            wsum_acc.get_multi_ptr<sycl::access::decorated::no>().get());
-                             });
-        });
+    if (q81 != nullptr) {
+        if (pad == 8) dispatch(std::integral_constant<bool, SILU>{}, std::true_type{}, 8);
+        else if (pad == 4) dispatch(std::integral_constant<bool, SILU>{}, std::true_type{}, 4);
+        else dispatch(std::integral_constant<bool, SILU>{}, std::true_type{}, 0);
     } else {
-        s_queue->submit([&](sycl::handler& cgh) {
-            sycl::local_accessor<float, 1> sk_acc(sycl::range<1>(S), cgh);
-            sycl::local_accessor<float, 1> sq_acc(sycl::range<1>(S), cgh);
-            sycl::local_accessor<float, 2> red_acc(sycl::range<2>(RG, S), cgh);
-            sycl::local_accessor<float, 1> wsum_acc(sycl::range<1>(S * RG / 32), cgh);
-
-            cgh.parallel_for(sycl::nd_range<2>(sycl::range<2>(h_v * RG, S), sycl::range<2>(RG, S)),
-                             [=](sycl::nd_item<2> item_ct1) [[sycl::reqd_sub_group_size(32)]] {
-                                 gdn_step_norm_kernel<SILU>(state, q, k, v, gate, beta, z, gamma, eps, y, h_k, h_v, item_ct1,
-                                                            sk_acc.get_multi_ptr<sycl::access::decorated::no>().get(),
-                                                            sq_acc.get_multi_ptr<sycl::access::decorated::no>().get(), red_acc,
-                                                            wsum_acc.get_multi_ptr<sycl::access::decorated::no>().get());
-                             });
-        });
+        if (pad == 8) dispatch(std::integral_constant<bool, SILU>{}, std::false_type{}, 8);
+        else if (pad == 4) dispatch(std::integral_constant<bool, SILU>{}, std::false_type{}, 4);
+        else dispatch(std::integral_constant<bool, SILU>{}, std::false_type{}, 0);
     }
 }
 
@@ -254,7 +254,7 @@ void fused_gdn_ab(const float* x, const uint16_t* w_alpha, const uint16_t* w_bet
 
 void fused_gdn_step_norm(float* state, const float* q, const float* k, const float* v, const float* gate,
                          const float* beta, const float* z, const float* gamma, float eps, float* y, int h_k, int h_v,
-                         void* stream) {
+                         void* stream, void* y_q8_1) {
     sycl::queue* q_ptr = stream ? static_cast<sycl::queue*>(stream) : &default_queue();
 
     STRATA_SYCL_RECORD_SHAPE(strata::sycl_tuning::KernelType::GDN, S, h_v, 32, h_k, 0);
@@ -265,12 +265,12 @@ void fused_gdn_step_norm(float* state, const float* q, const float* k, const flo
     const auto tuned = reg.get_or_fallback(key, {S, 0, 0, strata::sycl_tuning::CachePolicy::Default});
     (void)tuned;
 
-    step_norm_impl<false>(state, q, k, v, gate, beta, z, gamma, eps, y, h_k, h_v, stream);
+    step_norm_impl<false>(state, q, k, v, gate, beta, z, gamma, eps, y, h_k, h_v, stream, y_q8_1);
 }
 
 void fused_gdn_step_norm_silu(float* state, const float* q, const float* k, const float* v, const float* gate,
                               const float* beta, const float* z, const float* gamma, float eps, float* y, int h_k,
-                              int h_v, void* stream) {
+                              int h_v, void* stream, void* y_q8_1) {
     sycl::queue* q_ptr = stream ? static_cast<sycl::queue*>(stream) : &default_queue();
 
     STRATA_SYCL_RECORD_SHAPE(strata::sycl_tuning::KernelType::GDN, S, h_v, 32, h_k, 1);
@@ -281,7 +281,7 @@ void fused_gdn_step_norm_silu(float* state, const float* q, const float* k, cons
     const auto tuned = reg.get_or_fallback(key, {S, 0, 0, strata::sycl_tuning::CachePolicy::Default});
     (void)tuned;
 
-    step_norm_impl<true>(state, q, k, v, gate, beta, z, gamma, eps, y, h_k, h_v, stream);
+    step_norm_impl<true>(state, q, k, v, gate, beta, z, gamma, eps, y, h_k, h_v, stream, y_q8_1);
 }
 
 }  // namespace strata::kernels

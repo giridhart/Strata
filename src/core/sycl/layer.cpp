@@ -592,7 +592,8 @@ bool gdn_layer(const WeightTable& tables, const ModelGeometry& g, int64_t layer,
     try {
         if (fused_gdn)
             fused_gdn_step_norm(b.state, b.h, b.h + qk, b.h + 2 * qk, b.gate, b.beta, b.z, ssm_norm, RMS_EPS, b.y,
-                                (int)g.ssm_k_heads, (int)g.ssm_v_heads, stream);
+                                (int)g.ssm_k_heads, (int)g.ssm_v_heads, stream,
+                                w_out->native_data ? w_out->native_q8_1 : nullptr);
         else if (native_gdn_enabled())
             native_gdn_out_norm(b.o, b.z, ssm_norm, b.y, g.ssm_v_heads, g.ssm_state_size, RMS_EPS, stream);
         else
@@ -610,7 +611,8 @@ bool gdn_layer(const WeightTable& tables, const ModelGeometry& g, int64_t layer,
         quantize_act_images(b.y, g.ssm_value_dim, b.y_q8_0, b.y_q8k, nullptr, stream);
     }
     if (!gemv_quantized(*w_out, p_out, f_out, b.y_q8_0, b.y_q8k, out, g.ssm_value_dim, g.n_embd,
-                        v.name("ssm_out.weight"), stream, err, b.y))
+                        v.name("ssm_out.weight"), stream, err, b.y,
+                        /*x_q8_1_ready=*/w_out->native_data != nullptr && fused_gdn))
         return false;
     if (!vfo_check_nan("Stage 5: GDN Dense Projection (ssm_out -> out)", layer, out, (size_t)g.n_embd, stream, err))
         return false;

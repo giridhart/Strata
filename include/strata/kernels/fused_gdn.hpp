@@ -30,12 +30,12 @@ void fused_gdn_ab(const float* x, const uint16_t* w_alpha, const uint16_t* w_bet
 
 void fused_gdn_step_norm(float* state, const float* q, const float* k, const float* v, const float* gate,
                          const float* beta, const float* z, const float* gamma, float eps, float* y, int h_k, int h_v,
-                         void* stream);
+                         void* stream, void* y_q8_1 = nullptr);
 
 /// The same step with the SiLU output gate, y = rmsnorm(o) * gamma * silu(z): Qwen3.6-35B-A3B's (qwen35moe) GDN
 
 void fused_gdn_step_norm_silu(float* state, const float* q, const float* k, const float* v, const float* gate,
                               const float* beta, const float* z, const float* gamma, float eps, float* y, int h_k,
-                              int h_v, void* stream);
+                              int h_v, void* stream, void* y_q8_1 = nullptr);
 
 }  // namespace strata::kernels
