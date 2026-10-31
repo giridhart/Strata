@@ -24,8 +24,8 @@ This document tracks all identified kernel bottlenecks, register spills, compile
 | **`[DONE]`** | **Offline IGC Dump Infrastructure** | Need to check spills without running full Strata server | Created automated IGC dump scanner script parsing `.zeinfo` for spills, GRF, and EU thread counts. |
 | **`[DONE]`** | **Failure Recovery & Troubleshooting Guide** | DPC++ functor syntax, resource limits, fallback flags | Documented all failure modes, DPC++ functor rules, and environment switches in Section 3. |
 | **`[DONE]`** | **Command Graph Replay vs. Fusion Analysis** | Understand small kernel counts (~300–500/token) and fusion | Documented that SYCL Command Graphs eliminate launch overhead (1 dispatch/token); analyzed fusion trade-offs. |
-| **`[TODO]`** | **`s2_expert_grouped.cpp` 1 KB Spill Elimination** | Confirmed 1,024 B spill in `grouped_s2_impl` under 128 GRFs | **Priority 1 for next session**: Implement `GroupedS2Grf256Functor` (256 GRF) in `s2_expert_grouped.cpp`. |
-| **`[TODO]`** | **Extend L3 Streaming Cache Hints** | `cache_mode::streaming` exists only in `bf16_gemv.cpp` | **Priority 2 for next session**: Plumb streaming hints to MMVQ and MoE weight loads to protect 16 MB L3 cache. |
+| **`[DONE]`** | **`s2_expert_grouped.cpp` 1 KB Spill Elimination** | Confirmed 1,024 B spill in `grouped_s2_impl` under 128 GRFs | Implemented 256-GRF functors (`GuGroupedTGrf256Functor`, `DownGroupedTGrf256Functor`, etc.); verified 0 B spill in IGC and 100% bitwise parity (`d5e2f58f`). |
+| **`[DONE]`** | **Extend L3 Streaming Cache Hints** | Protect 16 MB L3 cache from weight stream thrashing | Added `cache_mode::streaming` on L3 to MoE and MMVQ weight loads; verified bit-exact parity across all formats in `b6_mmvq_bench` (`35472981`). |
 | **`[TODO]`** | **GDN Epilogue Quantization Fusion** | `fused_gdn_step_norm` writes FP32 $b.y$, then calls `quantize_act` | Add direct Q8_1/Q8_0 epilogue output inside `fused_gdn_step_norm` to save ~20 KB DRAM roundtrip per GDN layer. |
 | **`[TODO]`** | **Fused MoE Hit Accumulate + Residual Add** | `moe_hit_add` and `gr_write` run as separate back-to-back adds | Combine into a single vector FMA pass: $\text{res} += \text{gpu\_hits} + \text{cpu\_misses}$. |
 | **`[TODO]`** | **End-to-End VTune Re-Profile on B580** | Validate global wall-clock speedup and stall reduction | Run full `vtune -collect gpu-hotspots` on decode pass; verify EU active % increase and zero spills. |
@@ -139,6 +139,22 @@ for fn in glob.glob('/tmp/sycl_igc_dump/*.zeinfo'):
   - Routed through `NativeMmvqMultiGrf256Functor` (256 GRFs).
   - Verification: `shexp down IQ4_NL` passes all columns with bitwise equality in `b6_mmvq_bench`.
 
+### G. `s2_expert_grouped.cpp` 1 KB Register Spill Elimination `[DONE]`
+- **File**: [`src/kernels/sycl/s2_expert_grouped.cpp`](../src/kernels/sycl/s2_expert_grouped.cpp)
+- **VTune Issue**: 1,024 byte register spill per thread in `grouped_s2_impl` during MoE decode under 128 GRFs.
+- **Optimization Applied**:
+  - Implemented 256-GRF functors (`GuGroupedTGrf256Functor`, `GuGroupedGrf256Functor`, `DownGroupedTGrf256Functor`, `DownGroupedGrf256Functor`, `GuPairGrf256Functor`, `DownPairGrf256Functor`).
+  - Passed SLM local accessors by value into functors to prevent host-side pointer evaluation crashes.
+  - Verification: IGC compiler dumps confirmed `grf_count: 256`, `spill_size: 0 B`; `./build_sycl/s2_expert_grouped_parity` achieved 10/10 bitwise identical results (`d5e2f58f`).
+
+### H. Extend L3 Streaming Cache Hints to MMVQ and MoE Weights `[DONE]`
+- **Files**: [`src/kernels/sycl/s2_expert_grouped.cpp`](../src/kernels/sycl/s2_expert_grouped.cpp) and [`src/kernels/sycl/native_mmvq.cpp`](../src/kernels/sycl/native_mmvq.cpp)
+- **VTune Issue**: Uncached streaming reads of multi-gigabyte weight tensors thrashing the 16 MB L3 cache on Battlemage Xe2.
+- **Optimization Applied**:
+  - Plumbed `annotated_ptr` with `read_hint<cache_control<cache_mode::streaming, cache_level::L3>>` to MoE weights (`load_code_u2`, `load_scale_f16`) and MMVQ weights (`SmallTraits`, `Q5KTraits`, `Q4KTraits`, `Q20Traits`, `Q3KTraits`, `Q6KTraits`, `IQ4XSTraits`, `B6XK`, `b6_mmvq_rows_kernel`, `native_mmvq_multi_kernel`).
+  - Connected streaming flags into `B6RowsGrf256Functor` and `NativeMmvqMultiGrf256Functor`.
+  - Verification: `./build_sycl/b6_mmvq_bench 20` passed 100% bitwise parity (`ok ok ok` across all formats and column widths) with up to 31% latency speedups (e.g., Q6_K cols=8 3.87 ms $\rightarrow$ 2.65 ms) (`35472981`).
+
 ---
 
 ## 3. Small Kernels: Fusion vs. SYCL Command Graph Replay (`[DONE]`)
@@ -163,31 +179,7 @@ During token decode, models execute **~280 to 550 small kernels per token** (e.g
 
 The following items are verified and ready for engineering implementation:
 
-### Item 1: Eliminate 1,024 B Register Spill in `s2_expert_grouped.cpp` `[TODO]`
-* **Location**: [`src/kernels/sycl/s2_expert_grouped.cpp`](../src/kernels/sycl/s2_expert_grouped.cpp)
-* **Problem**: In IGC compiler dumps, `grouped_s2_impl` exhibits a **1,024 byte register spill** per thread when running in 128-GRF mode during MoE expert decode.
-* **Implementation Plan**:
-  1. Define a `GroupedS2Grf256Functor` wrapper implementing `get(sycl::ext::oneapi::experimental::properties_tag) const` returning `properties{grf_size<256>, sub_group_size<32>}`.
-  2. Check `intel_gpu_gen(q->get_device())` for `Alchemist` and `Battlemage`.
-  3. Dispatch through the 256-GRF functor when supported.
-  4. Verify with `./build_sycl/s2_expert_grouped_parity` and scan IGC dump to confirm 0 B spill.
-
-### Item 2: Extend L3 Streaming Cache Hints to MMVQ and MoE Weight Reads `[TODO]`
-* **Location**: [`src/kernels/sycl/native_mmvq.cpp`](../src/kernels/sycl/native_mmvq.cpp) and [`src/kernels/sycl/s2_expert_grouped.cpp`](../src/kernels/sycl/s2_expert_grouped.cpp)
-* **Problem**: Multi-gigabyte MMVQ and MoE weight matrices are read once per token with zero intra-token temporal reuse. Reading them without cache control pollutes Intel Xe2's 16 MB L3 cache, evicting the KV cache and hot activations.
-* **Implementation Plan**:
-  1. Follow the reference implementation in [`src/kernels/sycl/bf16_gemv.cpp#L464`](../src/kernels/sycl/bf16_gemv.cpp#L464):
-     ```cpp
-     #include <sycl/ext/intel/experimental/cache_control_properties.hpp>
-     // Apply:
-     sycl::ext::intel::experimental::cache_control<
-         sycl::ext::intel::experimental::cache_mode::streaming,
-         sycl::ext::oneapi::experimental::cache_level::L3>
-     ```
-  2. Apply streaming hints to the global weight buffer accessors or pointers.
-  3. Validate that KV cache hit rates and throughput increase during multi-layer inference.
-
-### Item 3: GDN Epilogue Quantization Fusion `[TODO]`
+### Item 1: GDN Epilogue Quantization Fusion `[TODO]`
 * **Location**: [`src/kernels/sycl/fused_gdn.cpp`](../src/kernels/sycl/fused_gdn.cpp)
 * **Problem**: `fused_gdn_step_norm` writes output vector $y$ as FP32 to `b.y`, followed immediately by `quantize_act` / `quantize_row_q8_1` to convert it to Q8 blocks for down-projection.
 * **Implementation Plan**:
@@ -195,7 +187,7 @@ The following items are verified and ready for engineering implementation:
   2. Compute group max/min scales directly across sub-group registers after RMSNorm + gate.
   3. Write 34-byte Q8_1 blocks directly to device memory, eliminating the standalone `quantize_act` kernel launch across all GDN layers.
 
-### Item 4: Fused MoE Hit Accumulate + Residual Add `[TODO]`
+### Item 2: Fused MoE Hit Accumulate + Residual Add `[TODO]`
 * **Location**: [`src/core/sycl/layer.cpp`](../src/core/sycl/layer.cpp) and [`src/kernels/sycl/elementwise.cpp`](../src/kernels/sycl/elementwise.cpp)
 * **Problem**: After CPU experts complete, the pipeline executes `moe_hit_add` (combining GPU hits and CPU expert outputs) followed shortly by `gr_write` (adding to the hidden state residual).
 * **Implementation Plan**:
@@ -203,7 +195,7 @@ The following items are verified and ready for engineering implementation:
      $$\mathbf{res}[i] \leftarrow \mathbf{res}[i] + \mathbf{gpu\_hits}[i] + \mathbf{cpu\_misses}[i]$$
   2. Eliminates 1 intermediate global memory read and write per MoE layer.
 
-### Item 5: End-to-End VTune Re-Profile on Battlemage B580 `[TODO]`
+### Item 3: End-to-End VTune Re-Profile on Battlemage B580 `[TODO]`
 * **Plan**:
   1. Launch full inference session with VTune GPU hotspot collection:
      ```bash
