@@ -1265,7 +1265,7 @@ bool Verifier::record_layer_post(int T, int64_t l, int grp, sycl::queue* cs, std
             else
                 copy_from_mapped(parts_ + (size_t)tb * K * N, m_ymiss_ + (size_t)tb * K * N, (int64_t)n * K * N, cs);
         }
-        const bool hits_in_combine = dec_batch && n > 1 &&
+        const bool hits_in_combine = dec_batch && n >= 1 &&
             native_moe_combine_hits_supported(parts_ + (size_t)tb * K * N, shared_ + tb * N, bo_ + tb * N, N, K, n) &&
             ((uintptr_t)hit_out & 15u) == 0;
         VDBG("layer_post (l=%lld, grp=%d): moe_combine start (hits_in_combine=%d)\n", (long long)l, grp, (int)hits_in_combine);
@@ -1279,7 +1279,7 @@ bool Verifier::record_layer_post(int T, int64_t l, int grp, sycl::queue* cs, std
                 err = "verify combine: " + std::string(e.what());
                 return false;
             }
-        } else if (dec_batch && n > 1 && native_moe_combine_enabled()) {
+        } else if (dec_batch && n >= 1 && native_moe_combine_enabled()) {
             try {
                 native_moe_combine_multi(parts_ + (size_t)tb * K * N, w_ + tb * K, shared_ + tb * N, bo_ + tb * N, N, K,
                                          n, cs);
