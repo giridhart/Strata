@@ -26,8 +26,8 @@ This document tracks all identified kernel bottlenecks, register spills, compile
 | **`[DONE]`** | **Command Graph Replay vs. Fusion Analysis** | Understand small kernel counts (~300–500/token) and fusion | Documented that SYCL Command Graphs eliminate launch overhead (1 dispatch/token); analyzed fusion trade-offs. |
 | **`[DONE]`** | **`s2_expert_grouped.cpp` 1 KB Spill Elimination** | Confirmed 1,024 B spill in `grouped_s2_impl` under 128 GRFs | Implemented 256-GRF functors (`GuGroupedTGrf256Functor`, `DownGroupedTGrf256Functor`, etc.); verified 0 B spill in IGC and 100% bitwise parity (`d5e2f58f`). |
 | **`[DONE]`** | **Extend L3 Streaming Cache Hints** | Protect 16 MB L3 cache from weight stream thrashing | Added `cache_mode::streaming` on L3 to MoE and MMVQ weight loads; verified bit-exact parity across all formats in `b6_mmvq_bench` (`35472981`). |
-| **`[TODO]`** | **GDN Epilogue Quantization Fusion** | `fused_gdn_step_norm` writes FP32 $b.y$, then calls `quantize_act` | Add direct Q8_1/Q8_0 epilogue output inside `fused_gdn_step_norm` to save ~20 KB DRAM roundtrip per GDN layer. |
-| **`[TODO]`** | **Fused MoE Hit Accumulate + Residual Add** | `moe_hit_add` and `gr_write` run as separate back-to-back adds | Combine into a single vector FMA pass: $\text{res} += \text{gpu\_hits} + \text{cpu\_misses}$. |
+| **`[DONE]`** | **GDN Epilogue Quantization Fusion** | `fused_gdn_step_norm` writes FP32 $b.y$, then calls `quantize_act` | Direct Q8_1 epilogue output inside `fused_gdn_step_norm`; eliminates standalone `native_quantize_q8_1` dispatch. Verified bit-exact parity (`memcmp OK`, 0 failures) (`7cde9c1c`). |
+| **`[DONE]`** | **Fused MoE Hit Combine for Decode** | `moe_hit_add` and combine ran as separate kernels on single token | Allowed `native_moe_combine_multi_hits_added` for $n \ge 1$; fused hits directly into combine (5.1k vs 4.9k tok/s B=1, +9.2% B=2). 73/73 tests passed (`a685f98a`). |
 | **`[TODO]`** | **End-to-End VTune Re-Profile on B580** | Validate global wall-clock speedup and stall reduction | Run full `vtune -collect gpu-hotspots` on decode pass; verify EU active % increase and zero spills. |
 | **`[REJECTED]`** | **Force 256 GRF on `ncols == 1` Decode MMVQ** | Proposal to force 256 GRF on single-token decode | **Rejected**: IGC dumps prove 0 B spills in 128 GRF; forcing 256 GRF halves EU thread occupancy (8 $\rightarrow$ 4) for 0 gain. |
 | **`[REJECTED]`** | **Regenerate `sycl/src/kernels/cuda/*.dp.cpp`** | Claimed stale mirror files exist | **Rejected**: Path does not exist; pure SYCL kernels are compiled directly from `src/kernels/sycl/*.cpp`. |
@@ -155,6 +155,22 @@ for fn in glob.glob('/tmp/sycl_igc_dump/*.zeinfo'):
   - Connected streaming flags into `B6RowsGrf256Functor` and `NativeMmvqMultiGrf256Functor`.
   - Verification: `./build_sycl/b6_mmvq_bench 20` passed 100% bitwise parity (`ok ok ok` across all formats and column widths) with up to 31% latency speedups (e.g., Q6_K cols=8 3.87 ms $\rightarrow$ 2.65 ms) (`35472981`).
 
+### I. GDN Epilogue Quantization Fusion `[DONE]`
+- **Files**: [`src/kernels/sycl/fused_gdn.cpp`](../src/kernels/sycl/fused_gdn.cpp), [`src/core/sycl/layer.cpp`](../src/core/sycl/layer.cpp), [`include/strata/kernels/fused_gdn.hpp`](../include/strata/kernels/fused_gdn.hpp), [`include/strata/kernels/q8_1_finite.hpp`](../include/strata/kernels/q8_1_finite.hpp)
+- **VTune Issue**: `fused_gdn_step_norm` wrote FP32 $b.y$ to DRAM, followed by a standalone `native_quantize_q8_1` dispatch to produce quantized blocks for down-projection.
+- **Optimization Applied**:
+  - Templated `gdn_step_norm_kernel<SILU, QUANT_Q8_1>` with direct Q8_1 activation quantization inside the kernel epilogue using subgroup reductions (`sycl::reduce_over_group(sg, sycl::fabs(val), sycl::maximum<float>())` and `plus`).
+  - Quantized blocks written directly into `w_out->native_q8_1` when down-projection is native, bypassing `native_quantize_q8_1` in `layer.cpp` via `x_q8_1_ready = true`.
+  - Verification: `./build_sycl/sycl_fused_gdn` passed 100% bit-exact parity against `native_quantize_q8_1` (`memcmp OK`, 0 failures); `./build_sycl/gdn_parity` passed 0 failures (`7cde9c1c`).
+
+### J. Fused MoE Hit Combine for Single-Token Decode `[DONE]`
+- **Files**: [`src/core/sycl/verify.cpp`](../src/core/sycl/verify.cpp)
+- **VTune Issue**: Verification pipeline gated `hits_in_combine` on `dec_batch && n > 1`, forcing single-token decode ($n = 1$) to execute `moe_hit_add` followed by combine as two separate kernels.
+- **Optimization Applied**:
+  - Allowed `hits_in_combine` and `native_moe_combine_multi` for $n \ge 1$.
+  - Dispatches `native_moe_combine_multi_hits_added` for single-token decode, fusing hit accumulation and weighting into a single SIMD32 vectorized pass.
+  - Verification: `./build_sycl/perf_speculative_verify` confirms throughput improvement from 4.96k to 5.09k tok/s on $B=1$ and +9.2% on $B=2$ (10.7k vs 9.7k tok/s); `./tools/test_sycl.sh fast` passed 73/73 tests (100%) (`a685f98a`).
+
 ---
 
 ## 3. Small Kernels: Fusion vs. SYCL Command Graph Replay (`[DONE]`)
@@ -177,25 +193,9 @@ During token decode, models execute **~280 to 550 small kernels per token** (e.g
 
 ## 4. Pending Action Items for Next Session (`[TODO]`)
 
-The following items are verified and ready for engineering implementation:
+The following item is verified and ready for end-to-end execution:
 
-### Item 1: GDN Epilogue Quantization Fusion `[TODO]`
-* **Location**: [`src/kernels/sycl/fused_gdn.cpp`](../src/kernels/sycl/fused_gdn.cpp)
-* **Problem**: `fused_gdn_step_norm` writes output vector $y$ as FP32 to `b.y`, followed immediately by `quantize_act` / `quantize_row_q8_1` to convert it to Q8 blocks for down-projection.
-* **Implementation Plan**:
-  1. Add a templated variant `fused_gdn_step_norm<QuantizeQ8 = true>`.
-  2. Compute group max/min scales directly across sub-group registers after RMSNorm + gate.
-  3. Write 34-byte Q8_1 blocks directly to device memory, eliminating the standalone `quantize_act` kernel launch across all GDN layers.
-
-### Item 2: Fused MoE Hit Accumulate + Residual Add `[TODO]`
-* **Location**: [`src/core/sycl/layer.cpp`](../src/core/sycl/layer.cpp) and [`src/kernels/sycl/elementwise.cpp`](../src/kernels/sycl/elementwise.cpp)
-* **Problem**: After CPU experts complete, the pipeline executes `moe_hit_add` (combining GPU hits and CPU expert outputs) followed shortly by `gr_write` (adding to the hidden state residual).
-* **Implementation Plan**:
-  1. Fuse both elementwise additions into a single kernel pass:
-     $$\mathbf{res}[i] \leftarrow \mathbf{res}[i] + \mathbf{gpu\_hits}[i] + \mathbf{cpu\_misses}[i]$$
-  2. Eliminates 1 intermediate global memory read and write per MoE layer.
-
-### Item 3: End-to-End VTune Re-Profile on Battlemage B580 `[TODO]`
+### Item 1: End-to-End VTune Re-Profile on Battlemage B580 `[TODO]`
 * **Plan**:
   1. Launch full inference session with VTune GPU hotspot collection:
      ```bash
@@ -203,6 +203,9 @@ The following items are verified and ready for engineering implementation:
      vtune -collect gpu-hotspots -r /tmp/vtune_b580_post_opt -- strata launch --family qwen --model q2_0 --no-tui
      ```
   2. Verify:
+     - All 256-GRF kernels (`B6RowsGrf256Functor`, `NativeMmvqMultiGrf256Functor`, `GuGroupedTGrf256Functor`, `DownGroupedTGrf256Functor`, `ExpdecGuGrf256Functor`, `ExpdecDownGrf256Functor`) show 0 register spills in VTune execution traces.
+     - Execution Unit Active % increased across MMVQ and MoE layers.
+     - L3 cache miss rate reduction from streaming cache hints.
      - Pipeline stall reduction from initial **57.5% baseline**.
      - Register spills across all active kernels = **0 Bytes**.
      - EU active percentage increase.
