@@ -14,7 +14,9 @@
 // The two agree to float rounding and not to the bit, which is the same contract `s_gemv_parity` carries for
 // the same reason.  `bench/micro/moe_hit_parity.cu` is the check.
 #include <sycl/sycl.hpp>
+#include <sycl/ext/intel/experimental/grf_size_properties.hpp>
 #include "strata/core/sycl_arch.hpp"
+#include "strata/core/sycl_doorbell.hpp"
 #include "strata/core/sycl_tuning.hpp"
 #include "strata/kernels/s2_expert_grouped.hpp"
 #include "strata/kernels/dp4a.hpp"
@@ -610,20 +612,76 @@ bool new_hit(const void* blob_base, long long blob_bytes, const void* x_q8_0, co
     return fast;
 }
 
+struct GuPairGrf256Functor {
+    const uint8_t* blob_base;
+    const int32_t* slot_index;
+    long long blob_bytes;
+    const uint8_t* x_q8_0;
+    const float* x_scales;
+    float* gate_up;
+    int cap;
+    const int32_t* d_count;
+    const int32_t* dst_index;
+    int tok_div;
+
+    auto get(sycl::ext::oneapi::experimental::properties_tag) const {
+        return sycl::ext::oneapi::experimental::properties{
+            sycl::ext::intel::experimental::grf_size<256>,
+            sycl::ext::oneapi::experimental::sub_group_size<32>
+        };
+    }
+    void operator()(sycl::nd_item<3> /*item_ct1*/) const {
+        gu_pair_kernel(blob_base, slot_index, blob_bytes, x_q8_0, x_scales, gate_up, cap,
+                       d_count, dst_index, tok_div);
+    }
+};
+
+struct DownPairGrf256Functor {
+    const uint8_t* blob_base;
+    const int32_t* slot_index;
+    const int32_t* dst_index;
+    long long blob_bytes;
+    const uint8_t* h_q8_0;
+    const float* h_scales;
+    float* out;
+    int cap;
+    const int32_t* d_count;
+
+    auto get(sycl::ext::oneapi::experimental::properties_tag) const {
+        return sycl::ext::oneapi::experimental::properties{
+            sycl::ext::intel::experimental::grf_size<256>,
+            sycl::ext::oneapi::experimental::sub_group_size<32>
+        };
+    }
+    void operator()(sycl::nd_item<3> /*item_ct1*/) const {
+        down_pair_kernel(blob_base, slot_index, dst_index, blob_bytes, h_q8_0, h_scales, out,
+                         cap, d_count);
+    }
+};
+
 // The per-hit path's two projections, previous or new kernels (one warp per row, or per pair of rows).
 void launch_hit_gu(bool fast, const uint8_t* blob_base, const int32_t* slot_index, long long blob_bytes,
                    const uint8_t* x_q8_0, const float* x_scales, float* gate_up, long long cap, const int32_t* d_count,
                    const int32_t* dst_index, int tok_div, sycl::queue* cs) {
     const int warps = THREADS / 32;
+    const bool large_grf = [cs] {
+        const auto gen = strata::intel_gpu_gen(cs->get_device());
+        return gen == strata::IntelGpuGen::Alchemist || gen == strata::IntelGpuGen::Battlemage;
+    }();
     if (fast) {
         const long long pairs = cap * (long long)FF;
-        cs->parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, (unsigned)((pairs + warps - 1) / warps)) *
-                                               sycl::range<3>(1, 1, THREADS),
-                                           sycl::range<3>(1, 1, THREADS)),
-                         [=](sycl::nd_item<3> /*item_ct1*/) [[sycl::reqd_sub_group_size(32)]] {
-                             gu_pair_kernel(blob_base, slot_index, blob_bytes, x_q8_0, x_scales, gate_up, (int)cap,
-                                            d_count, dst_index, tok_div);
-                         });
+        auto r = sycl::nd_range<3>(sycl::range<3>(1, 1, (unsigned)((pairs + warps - 1) / warps)) *
+                                       sycl::range<3>(1, 1, THREADS),
+                                   sycl::range<3>(1, 1, THREADS));
+        if (large_grf) {
+            cs->parallel_for(r, GuPairGrf256Functor{blob_base, slot_index, blob_bytes, x_q8_0, x_scales, gate_up,
+                                                   (int)cap, d_count, dst_index, tok_div});
+        } else {
+            cs->parallel_for(r, [=](sycl::nd_item<3> /*item_ct1*/) [[sycl::reqd_sub_group_size(32)]] {
+                gu_pair_kernel(blob_base, slot_index, blob_bytes, x_q8_0, x_scales, gate_up, (int)cap,
+                               d_count, dst_index, tok_div);
+            });
+        }
     } else {
         const long long rows = cap * 2LL * FF;
         cs->parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, (unsigned)((rows + warps - 1) / warps)) *
@@ -640,15 +698,24 @@ void launch_hit_down(bool fast, const uint8_t* blob_base, const int32_t* slot_in
                      long long blob_bytes, const uint8_t* h_q8_0, const float* h_scales, float* out, long long cap,
                      const int32_t* d_count, sycl::queue* cs) {
     const int warps = THREADS / 32;
+    const bool large_grf = [cs] {
+        const auto gen = strata::intel_gpu_gen(cs->get_device());
+        return gen == strata::IntelGpuGen::Alchemist || gen == strata::IntelGpuGen::Battlemage;
+    }();
     if (fast) {
         const long long pairs = cap * (long long)(H / 2);
-        cs->parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, (unsigned)((pairs + warps - 1) / warps)) *
-                                               sycl::range<3>(1, 1, THREADS),
-                                           sycl::range<3>(1, 1, THREADS)),
-                         [=](sycl::nd_item<3> /*item_ct1*/) [[sycl::reqd_sub_group_size(32)]] {
-                             down_pair_kernel(blob_base, slot_index, dst_index, blob_bytes, h_q8_0, h_scales, out,
-                                              (int)cap, d_count);
-                         });
+        auto r = sycl::nd_range<3>(sycl::range<3>(1, 1, (unsigned)((pairs + warps - 1) / warps)) *
+                                       sycl::range<3>(1, 1, THREADS),
+                                   sycl::range<3>(1, 1, THREADS));
+        if (large_grf) {
+            cs->parallel_for(r, DownPairGrf256Functor{blob_base, slot_index, dst_index, blob_bytes,
+                                                     h_q8_0, h_scales, out, (int)cap, d_count});
+        } else {
+            cs->parallel_for(r, [=](sycl::nd_item<3> /*item_ct1*/) [[sycl::reqd_sub_group_size(32)]] {
+                down_pair_kernel(blob_base, slot_index, dst_index, blob_bytes, h_q8_0, h_scales, out,
+                                 (int)cap, d_count);
+            });
+        }
     } else {
         const long long rows = cap * (long long)H;
         cs->parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, (unsigned)((rows + warps - 1) / warps)) *
@@ -1349,6 +1416,104 @@ void moe_group_resident(const int32_t* ids, int n, int k_per_tok, const uint8_t*
     check("moe_group_resident", stream);
 }
 
+template <int SKIP = 0>
+struct GuGroupedTGrf256Functor {
+    const unsigned long long* grp_ptr;
+    const int32_t* grp_start;
+    const int32_t* n_groups;
+    const int32_t* ent_tok;
+    const uint8_t* x_q8_0;
+    const float* x_scales;
+    float* gate_up;
+    int cap_entries;
+    sycl::local_accessor<int, 1> xs_w;
+    sycl::local_accessor<sycl::int2, 1> xs_dh;
+
+    auto get(sycl::ext::oneapi::experimental::properties_tag) const {
+        return sycl::ext::oneapi::experimental::properties{
+            sycl::ext::intel::experimental::grf_size<256>,
+            sycl::ext::oneapi::experimental::sub_group_size<32>
+        };
+    }
+    void operator()(sycl::nd_item<3> /*item*/) const {
+        gu_grouped_t_kernel<SKIP>(grp_ptr, grp_start, n_groups, ent_tok, x_q8_0, x_scales, gate_up,
+                                 cap_entries, &xs_w[0], &xs_dh[0]);
+    }
+};
+
+template <int SKIP = 0>
+struct GuGroupedGrf256Functor {
+    const unsigned long long* grp_ptr;
+    const int32_t* grp_start;
+    const int32_t* n_groups;
+    const int32_t* ent_tok;
+    const uint8_t* x_q8_0;
+    const float* x_scales;
+    float* gate_up;
+    int cap_entries;
+    sycl::local_accessor<int[8][640], 0> xs_q;
+    sycl::local_accessor<float[8][80], 0> xs_d;
+
+    auto get(sycl::ext::oneapi::experimental::properties_tag) const {
+        return sycl::ext::oneapi::experimental::properties{
+            sycl::ext::intel::experimental::grf_size<256>,
+            sycl::ext::oneapi::experimental::sub_group_size<32>
+        };
+    }
+    void operator()(sycl::nd_item<3> /*item*/) const {
+        gu_grouped_kernel<SKIP>(grp_ptr, grp_start, n_groups, ent_tok, x_q8_0, x_scales, gate_up,
+                                cap_entries, xs_q, xs_d);
+    }
+};
+
+template <int SKIP = 0>
+struct DownGroupedTGrf256Functor {
+    const unsigned long long* grp_ptr;
+    const int32_t* grp_start;
+    const int32_t* n_groups;
+    const int32_t* ent_dst;
+    const uint8_t* h_q8_0;
+    const float* hs;
+    float* out;
+    sycl::local_accessor<int, 1> hs_w;
+    sycl::local_accessor<sycl::int2, 1> hs_dh;
+
+    auto get(sycl::ext::oneapi::experimental::properties_tag) const {
+        return sycl::ext::oneapi::experimental::properties{
+            sycl::ext::intel::experimental::grf_size<256>,
+            sycl::ext::oneapi::experimental::sub_group_size<32>
+        };
+    }
+    void operator()(sycl::nd_item<3> /*item*/) const {
+        down_grouped_t_kernel<SKIP>(grp_ptr, grp_start, n_groups, ent_dst, h_q8_0, hs, out,
+                                    &hs_w[0], &hs_dh[0]);
+    }
+};
+
+template <int SKIP = 0>
+struct DownGroupedGrf256Functor {
+    const unsigned long long* grp_ptr;
+    const int32_t* grp_start;
+    const int32_t* n_groups;
+    const int32_t* ent_dst;
+    const uint8_t* h_q8_0;
+    const float* hs;
+    float* out;
+    sycl::local_accessor<int[8][160], 0> hs_q;
+    sycl::local_accessor<float[8][20], 0> hs_d;
+
+    auto get(sycl::ext::oneapi::experimental::properties_tag) const {
+        return sycl::ext::oneapi::experimental::properties{
+            sycl::ext::intel::experimental::grf_size<256>,
+            sycl::ext::oneapi::experimental::sub_group_size<32>
+        };
+    }
+    void operator()(sycl::nd_item<3> /*item*/) const {
+        down_grouped_kernel<SKIP>(grp_ptr, grp_start, n_groups, ent_dst, h_q8_0, hs, out,
+                                  hs_q, hs_d);
+    }
+};
+
 static void grouped_s2_impl(const unsigned long long* grp_ptr, const int32_t* grp_start, const int32_t* n_groups,
                             const int32_t* ent_dst, const int32_t* ent_tok, int64_t cap_groups, int64_t cap_entries,
                             const uint8_t* x_q8_0, const float* x_scales, void* scratch, float* out, void* stream,
@@ -1370,6 +1535,10 @@ static void grouped_s2_impl(const unsigned long long* grp_ptr, const int32_t* gr
     uint8_t* h_q8_0 = (uint8_t*)scratch + gu_bytes;
     float* h_scales = (float*)((uint8_t*)scratch + gu_bytes + q8_bytes);
     const bool fast = new_grouped(x_q8_0, scratch);
+    const bool large_grf = [cs] {
+        const auto gen = strata::intel_gpu_gen(cs->get_device());
+        return gen == strata::IntelGpuGen::Alchemist || gen == strata::IntelGpuGen::Battlemage;
+    }();
     {
         const sycl::range<3> grid_range(1, (size_t)cap_groups, (size_t)(2 * FF / GU_ROWS) * 256);
         if (fast) {
@@ -1377,12 +1546,17 @@ static void grouped_s2_impl(const unsigned long long* grp_ptr, const int32_t* gr
                 sycl::local_accessor<int, 1> xs_w_acc_ct1(sycl::range<1>(5120), cgh);
                 sycl::local_accessor<sycl::int2, 1> xs_dh_acc_ct1(sycl::range<1>(640), cgh);
 
-                cgh.parallel_for(sycl::nd_range<3>(grid_range, sycl::range<3>(1, 1, 256)),
-                                 [=](sycl::nd_item<3> /*item_ct1*/) [[sycl::reqd_sub_group_size(32)]] {
-                                     gu_grouped_t_kernel<0>(grp_ptr, grp_start, n_groups, ent_tok, x_q8_0, x_scales,
-                                                            gate_up, (int)cap_entries, &xs_w_acc_ct1[0],
-                                                            &xs_dh_acc_ct1[0]);
-                                 });
+                auto r = sycl::nd_range<3>(grid_range, sycl::range<3>(1, 1, 256));
+                if (large_grf) {
+                    cgh.parallel_for(r, GuGroupedTGrf256Functor<0>{
+                        grp_ptr, grp_start, n_groups, ent_tok, x_q8_0, x_scales,
+                        gate_up, (int)cap_entries, xs_w_acc_ct1, xs_dh_acc_ct1});
+                } else {
+                    cgh.parallel_for(r, [=](sycl::nd_item<3> /*item_ct1*/) [[sycl::reqd_sub_group_size(32)]] {
+                        gu_grouped_t_kernel<0>(grp_ptr, grp_start, n_groups, ent_tok, x_q8_0, x_scales,
+                                               gate_up, (int)cap_entries, &xs_w_acc_ct1[0], &xs_dh_acc_ct1[0]);
+                    });
+                }
             });
             if constexpr (kWide) {
                 if (second) {
@@ -1390,12 +1564,17 @@ static void grouped_s2_impl(const unsigned long long* grp_ptr, const int32_t* gr
                         sycl::local_accessor<int, 1> xs_w_acc_ct1(sycl::range<1>(5120), cgh);
                         sycl::local_accessor<sycl::int2, 1> xs_dh_acc_ct1(sycl::range<1>(640), cgh);
 
-                        cgh.parallel_for(sycl::nd_range<3>(grid_range, sycl::range<3>(1, 1, 256)),
-                                         [=](sycl::nd_item<3> /*item_ct1*/) [[sycl::reqd_sub_group_size(32)]] {
-                                             gu_grouped_t_kernel<GMAX>(grp_ptr, grp_start, n_groups, ent_tok, x_q8_0, x_scales,
-                                                                       gate_up, (int)cap_entries, &xs_w_acc_ct1[0],
-                                                                       &xs_dh_acc_ct1[0]);
-                                         });
+                        auto r = sycl::nd_range<3>(grid_range, sycl::range<3>(1, 1, 256));
+                        if (large_grf) {
+                            cgh.parallel_for(r, GuGroupedTGrf256Functor<GMAX>{
+                                grp_ptr, grp_start, n_groups, ent_tok, x_q8_0, x_scales,
+                                gate_up, (int)cap_entries, xs_w_acc_ct1, xs_dh_acc_ct1});
+                        } else {
+                            cgh.parallel_for(r, [=](sycl::nd_item<3> /*item_ct1*/) [[sycl::reqd_sub_group_size(32)]] {
+                                gu_grouped_t_kernel<GMAX>(grp_ptr, grp_start, n_groups, ent_tok, x_q8_0, x_scales,
+                                                          gate_up, (int)cap_entries, &xs_w_acc_ct1[0], &xs_dh_acc_ct1[0]);
+                            });
+                        }
                     });
                 }
             }
@@ -1404,11 +1583,17 @@ static void grouped_s2_impl(const unsigned long long* grp_ptr, const int32_t* gr
                 sycl::local_accessor<int[8][640], 0> xs_q_acc_ct1(cgh);
                 sycl::local_accessor<float[8][80], 0> xs_d_acc_ct1(cgh);
 
-                cgh.parallel_for(sycl::nd_range<3>(grid_range, sycl::range<3>(1, 1, 256)),
-                                 [=](sycl::nd_item<3> /*item_ct1*/) [[sycl::reqd_sub_group_size(32)]] {
-                                     gu_grouped_kernel<0>(grp_ptr, grp_start, n_groups, ent_tok, x_q8_0, x_scales, gate_up,
-                                                          (int)cap_entries, xs_q_acc_ct1, xs_d_acc_ct1);
-                                 });
+                auto r = sycl::nd_range<3>(grid_range, sycl::range<3>(1, 1, 256));
+                if (large_grf) {
+                    cgh.parallel_for(r, GuGroupedGrf256Functor<0>{
+                        grp_ptr, grp_start, n_groups, ent_tok, x_q8_0, x_scales, gate_up,
+                        (int)cap_entries, xs_q_acc_ct1, xs_d_acc_ct1});
+                } else {
+                    cgh.parallel_for(r, [=](sycl::nd_item<3> /*item_ct1*/) [[sycl::reqd_sub_group_size(32)]] {
+                        gu_grouped_kernel<0>(grp_ptr, grp_start, n_groups, ent_tok, x_q8_0, x_scales, gate_up,
+                                             (int)cap_entries, xs_q_acc_ct1, xs_d_acc_ct1);
+                    });
+                }
             });
             if constexpr (kWide) {
                 if (second) {
@@ -1416,11 +1601,17 @@ static void grouped_s2_impl(const unsigned long long* grp_ptr, const int32_t* gr
                         sycl::local_accessor<int[8][640], 0> xs_q_acc_ct1(cgh);
                         sycl::local_accessor<float[8][80], 0> xs_d_acc_ct1(cgh);
 
-                        cgh.parallel_for(sycl::nd_range<3>(grid_range, sycl::range<3>(1, 1, 256)),
-                                         [=](sycl::nd_item<3> /*item_ct1*/) [[sycl::reqd_sub_group_size(32)]] {
-                                             gu_grouped_kernel<GMAX>(grp_ptr, grp_start, n_groups, ent_tok, x_q8_0, x_scales, gate_up,
-                                                                     (int)cap_entries, xs_q_acc_ct1, xs_d_acc_ct1);
-                                         });
+                        auto r = sycl::nd_range<3>(grid_range, sycl::range<3>(1, 1, 256));
+                        if (large_grf) {
+                            cgh.parallel_for(r, GuGroupedGrf256Functor<GMAX>{
+                                grp_ptr, grp_start, n_groups, ent_tok, x_q8_0, x_scales, gate_up,
+                                (int)cap_entries, xs_q_acc_ct1, xs_d_acc_ct1});
+                        } else {
+                            cgh.parallel_for(r, [=](sycl::nd_item<3> /*item_ct1*/) [[sycl::reqd_sub_group_size(32)]] {
+                                gu_grouped_kernel<GMAX>(grp_ptr, grp_start, n_groups, ent_tok, x_q8_0, x_scales, gate_up,
+                                                        (int)cap_entries, xs_q_acc_ct1, xs_d_acc_ct1);
+                            });
+                        }
                     });
                 }
             }
@@ -1448,11 +1639,17 @@ static void grouped_s2_impl(const unsigned long long* grp_ptr, const int32_t* gr
                 sycl::local_accessor<int, 1> hs_w_acc_ct1(sycl::range<1>(1280), cgh);
                 sycl::local_accessor<sycl::int2, 1> hs_dh_acc_ct1(sycl::range<1>(160), cgh);
 
-                cgh.parallel_for(sycl::nd_range<3>(grid_range_d, sycl::range<3>(1, 1, 256)),
-                                 [=](sycl::nd_item<3> /*item_ct1*/) [[sycl::reqd_sub_group_size(32)]] {
-                                     down_grouped_t_kernel<0>(grp_ptr, grp_start, n_groups, ent_dst, h_q8_0, hs, out,
-                                                              &hs_w_acc_ct1[0], &hs_dh_acc_ct1[0]);
-                                 });
+                auto r = sycl::nd_range<3>(grid_range_d, sycl::range<3>(1, 1, 256));
+                if (large_grf) {
+                    cgh.parallel_for(r, DownGroupedTGrf256Functor<0>{
+                        grp_ptr, grp_start, n_groups, ent_dst, h_q8_0, hs, out,
+                        hs_w_acc_ct1, hs_dh_acc_ct1});
+                } else {
+                    cgh.parallel_for(r, [=](sycl::nd_item<3> /*item_ct1*/) [[sycl::reqd_sub_group_size(32)]] {
+                        down_grouped_t_kernel<0>(grp_ptr, grp_start, n_groups, ent_dst, h_q8_0, hs, out,
+                                                 &hs_w_acc_ct1[0], &hs_dh_acc_ct1[0]);
+                    });
+                }
             });
             if constexpr (kWide) {
                 if (second) {
@@ -1460,11 +1657,17 @@ static void grouped_s2_impl(const unsigned long long* grp_ptr, const int32_t* gr
                         sycl::local_accessor<int, 1> hs_w_acc_ct1(sycl::range<1>(1280), cgh);
                         sycl::local_accessor<sycl::int2, 1> hs_dh_acc_ct1(sycl::range<1>(160), cgh);
 
-                        cgh.parallel_for(sycl::nd_range<3>(grid_range_d, sycl::range<3>(1, 1, 256)),
-                                         [=](sycl::nd_item<3> /*item_ct1*/) [[sycl::reqd_sub_group_size(32)]] {
-                                             down_grouped_t_kernel<GMAX>(grp_ptr, grp_start, n_groups, ent_dst, h_q8_0, hs, out,
-                                                                         &hs_w_acc_ct1[0], &hs_dh_acc_ct1[0]);
-                                         });
+                        auto r = sycl::nd_range<3>(grid_range_d, sycl::range<3>(1, 1, 256));
+                        if (large_grf) {
+                            cgh.parallel_for(r, DownGroupedTGrf256Functor<GMAX>{
+                                grp_ptr, grp_start, n_groups, ent_dst, h_q8_0, hs, out,
+                                hs_w_acc_ct1, hs_dh_acc_ct1});
+                        } else {
+                            cgh.parallel_for(r, [=](sycl::nd_item<3> /*item_ct1*/) [[sycl::reqd_sub_group_size(32)]] {
+                                down_grouped_t_kernel<GMAX>(grp_ptr, grp_start, n_groups, ent_dst, h_q8_0, hs, out,
+                                                            &hs_w_acc_ct1[0], &hs_dh_acc_ct1[0]);
+                            });
+                        }
                     });
                 }
             }
@@ -1473,11 +1676,17 @@ static void grouped_s2_impl(const unsigned long long* grp_ptr, const int32_t* gr
                 sycl::local_accessor<int[8][160], 0> hs_q_acc_ct1(cgh);
                 sycl::local_accessor<float[8][20], 0> hs_d_acc_ct1(cgh);
 
-                cgh.parallel_for(sycl::nd_range<3>(grid_range_d, sycl::range<3>(1, 1, 256)),
-                                 [=](sycl::nd_item<3> /*item_ct1*/) [[sycl::reqd_sub_group_size(32)]] {
-                                     down_grouped_kernel<0>(grp_ptr, grp_start, n_groups, ent_dst, h_q8_0, hs, out,
-                                                            hs_q_acc_ct1, hs_d_acc_ct1);
-                                 });
+                auto r = sycl::nd_range<3>(grid_range_d, sycl::range<3>(1, 1, 256));
+                if (large_grf) {
+                    cgh.parallel_for(r, DownGroupedGrf256Functor<0>{
+                        grp_ptr, grp_start, n_groups, ent_dst, h_q8_0, hs, out,
+                        hs_q_acc_ct1, hs_d_acc_ct1});
+                } else {
+                    cgh.parallel_for(r, [=](sycl::nd_item<3> /*item_ct1*/) [[sycl::reqd_sub_group_size(32)]] {
+                        down_grouped_kernel<0>(grp_ptr, grp_start, n_groups, ent_dst, h_q8_0, hs, out,
+                                               hs_q_acc_ct1, hs_d_acc_ct1);
+                    });
+                }
             });
             if constexpr (kWide) {
                 if (second) {
@@ -1485,11 +1694,17 @@ static void grouped_s2_impl(const unsigned long long* grp_ptr, const int32_t* gr
                         sycl::local_accessor<int[8][160], 0> hs_q_acc_ct1(cgh);
                         sycl::local_accessor<float[8][20], 0> hs_d_acc_ct1(cgh);
 
-                        cgh.parallel_for(sycl::nd_range<3>(grid_range_d, sycl::range<3>(1, 1, 256)),
-                                         [=](sycl::nd_item<3> /*item_ct1*/) [[sycl::reqd_sub_group_size(32)]] {
-                                             down_grouped_kernel<GMAX>(grp_ptr, grp_start, n_groups, ent_dst, h_q8_0, hs, out,
-                                                                       hs_q_acc_ct1, hs_d_acc_ct1);
-                                         });
+                        auto r = sycl::nd_range<3>(grid_range_d, sycl::range<3>(1, 1, 256));
+                        if (large_grf) {
+                            cgh.parallel_for(r, DownGroupedGrf256Functor<GMAX>{
+                                grp_ptr, grp_start, n_groups, ent_dst, h_q8_0, hs, out,
+                                hs_q_acc_ct1, hs_d_acc_ct1});
+                        } else {
+                            cgh.parallel_for(r, [=](sycl::nd_item<3> /*item_ct1*/) [[sycl::reqd_sub_group_size(32)]] {
+                                down_grouped_kernel<GMAX>(grp_ptr, grp_start, n_groups, ent_dst, h_q8_0, hs, out,
+                                                          hs_q_acc_ct1, hs_d_acc_ct1);
+                            });
+                        }
                     });
                 }
             }
