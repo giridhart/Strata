@@ -15,6 +15,7 @@
 // the same reason.  `bench/micro/moe_hit_parity.cu` is the check.
 #include <sycl/sycl.hpp>
 #include <sycl/ext/intel/experimental/grf_size_properties.hpp>
+#include <sycl/ext/intel/experimental/cache_control_properties.hpp>
 #include "strata/core/sycl_arch.hpp"
 #include "strata/core/sycl_doorbell.hpp"
 #include "strata/core/sycl_tuning.hpp"
@@ -242,6 +243,39 @@ inline float f16_ld(const uint8_t* p) {
         .convert<float, sycl::rounding_mode::automatic>()[0];
 }
 
+template <bool STREAMING = false>
+inline sycl::uint2 load_code_u2(const uint8_t* p) {
+    if constexpr (STREAMING) {
+        auto props = sycl::ext::oneapi::experimental::properties{
+            sycl::ext::intel::experimental::read_hint<
+                sycl::ext::intel::experimental::cache_control<
+                    sycl::ext::intel::experimental::cache_mode::streaming,
+                    sycl::ext::oneapi::experimental::cache_level::L3>>};
+        sycl::ext::oneapi::experimental::annotated_ptr<const sycl::uint2, decltype(props)> ap(
+            reinterpret_cast<const sycl::uint2*>(p), props);
+        return *ap;
+    } else {
+        return *reinterpret_cast<const sycl::uint2*>(p);
+    }
+}
+
+template <bool STREAMING = false>
+inline float load_scale_f16(const uint8_t* p) {
+    if constexpr (STREAMING) {
+        auto props = sycl::ext::oneapi::experimental::properties{
+            sycl::ext::intel::experimental::read_hint<
+                sycl::ext::intel::experimental::cache_control<
+                    sycl::ext::intel::experimental::cache_mode::streaming,
+                    sycl::ext::oneapi::experimental::cache_level::L3>>};
+        sycl::ext::oneapi::experimental::annotated_ptr<const unsigned short, decltype(props)> ap(
+            reinterpret_cast<const unsigned short*>(p), props);
+        return sycl::vec<sycl::half, 1>(sycl::bit_cast<sycl::half, unsigned short>(*ap))
+            .convert<float, sycl::rounding_mode::automatic>()[0];
+    } else {
+        return f16_ld(p);
+    }
+}
+
 // A chunk's two code words as the eight `dp4a` operands that pair with `X[0..7]`: `m[4h + f]` byte `b` is the
 // code of element `16h + 4b + f`.
 inline void expand_codes(sycl::uint2 cb, int m[8]) {
@@ -313,6 +347,7 @@ inline int chunk_s(const int m[8], const int X[8]) {
 /// activation chunk is loaded and regrouped once for both rows.  Per row, the lane's chunks, their order, the float
 /// expression and the shuffle reduction are `row_dot_s2_q8`'s; the outputs land where `gu_kernel` puts them.
 
+template <bool STREAMING = false>
 void gu_pair_kernel(const uint8_t* __restrict__ blob_base, const int32_t* __restrict__ slot_index, long long blob_bytes,
                     const uint8_t* __restrict__ x_q8_0, const float* __restrict__ x_scales, float* __restrict__ gate_up,
                     int n_hits, const int32_t* __restrict__ d_count, const int32_t* __restrict__ dst_index,
@@ -341,11 +376,11 @@ void gu_pair_kernel(const uint8_t* __restrict__ blob_base, const int32_t* __rest
         const float dx = x_scales ? x_scales[c] : f16_ld(xb);
         int X[8], m[8];
         const int hx = load_x_chunk(xb, X);
-        expand_codes(*(const sycl::uint2*)(codes + (size_t)c * 8), m);
-        const float dw_g = f16_ld(scales + (size_t)(c >> 1) * 2);
+        expand_codes(load_code_u2<STREAMING>(codes + (size_t)c * 8), m);
+        const float dw_g = load_scale_f16<STREAMING>(scales + (size_t)(c >> 1) * 2);
         acc_g += dw_g * dx * (float)(chunk_s(m, X) - hx);
-        expand_codes(*(const sycl::uint2*)(codes + ROW_GU + (size_t)c * 8), m);
-        const float dw_u = f16_ld(scales + SC_GU * 2 + (size_t)(c >> 1) * 2);
+        expand_codes(load_code_u2<STREAMING>(codes + ROW_GU + (size_t)c * 8), m);
+        const float dw_u = load_scale_f16<STREAMING>(scales + SC_GU * 2 + (size_t)(c >> 1) * 2);
         acc_u += dw_u * dx * (float)(chunk_s(m, X) - hx);
     }
     const float sg = warp_sum(acc_g);
@@ -356,6 +391,7 @@ void gu_pair_kernel(const uint8_t* __restrict__ blob_base, const int32_t* __rest
 }
 
 /// Fused Dual-Column Gate + Up with in-register SwiGLU activation
+template <bool STREAMING = false>
 void gu_pair_swiglu_kernel(const uint8_t* __restrict__ blob_base, const int32_t* __restrict__ slot_index, long long blob_bytes,
                            const uint8_t* __restrict__ x_q8_0, const float* __restrict__ x_scales, float* __restrict__ gate_up,
                            int n_hits, const int32_t* __restrict__ d_count, const int32_t* __restrict__ dst_index,
@@ -384,11 +420,11 @@ void gu_pair_swiglu_kernel(const uint8_t* __restrict__ blob_base, const int32_t*
         const float dx = x_scales ? x_scales[c] : f16_ld(xb);
         int X[8], m[8];
         const int hx = load_x_chunk(xb, X);
-        expand_codes(*(const sycl::uint2*)(codes + (size_t)c * 8), m);
-        const float dw_g = f16_ld(scales + (size_t)(c >> 1) * 2);
+        expand_codes(load_code_u2<STREAMING>(codes + (size_t)c * 8), m);
+        const float dw_g = load_scale_f16<STREAMING>(scales + (size_t)(c >> 1) * 2);
         acc_g += dw_g * dx * (float)(chunk_s(m, X) - hx);
-        expand_codes(*(const sycl::uint2*)(codes + ROW_GU + (size_t)c * 8), m);
-        const float dw_u = f16_ld(scales + SC_GU * 2 + (size_t)(c >> 1) * 2);
+        expand_codes(load_code_u2<STREAMING>(codes + ROW_GU + (size_t)c * 8), m);
+        const float dw_u = load_scale_f16<STREAMING>(scales + SC_GU * 2 + (size_t)(c >> 1) * 2);
         acc_u += dw_u * dx * (float)(chunk_s(m, X) - hx);
     }
     const float sg = warp_sum(acc_g);
@@ -401,6 +437,7 @@ void gu_pair_swiglu_kernel(const uint8_t* __restrict__ blob_base, const int32_t*
 
 /// `down_kernel`, new: ONE WARP PER PAIR OF ROWS `r, r + 1` of one hit, the intermediate's chunk loaded once for both.
 
+template <bool STREAMING = false>
 void down_pair_kernel(const uint8_t* __restrict__ blob_base, const int32_t* __restrict__ slot_index,
                       const int32_t* __restrict__ dst_index, long long blob_bytes, const uint8_t* __restrict__ h_q8_0,
                       const float* __restrict__ h_scales, float* __restrict__ out, int n_hits,
@@ -426,11 +463,11 @@ void down_pair_kernel(const uint8_t* __restrict__ blob_base, const int32_t* __re
         const float dx = xs ? xs[c] : f16_ld(xb);
         int X[8], m[8];
         const int hx = load_x_chunk(xb, X);
-        expand_codes(*(const sycl::uint2*)(codes + (size_t)c * 8), m);
-        const float dw0 = f16_ld(scales + (size_t)(c >> 1) * 2);
+        expand_codes(load_code_u2<STREAMING>(codes + (size_t)c * 8), m);
+        const float dw0 = load_scale_f16<STREAMING>(scales + (size_t)(c >> 1) * 2);
         acc0 += dw0 * dx * (float)(chunk_s(m, X) - hx);
-        expand_codes(*(const sycl::uint2*)(codes + ROW_D + (size_t)c * 8), m);
-        const float dw1 = f16_ld(scales + SC_D * 2 + (size_t)(c >> 1) * 2);
+        expand_codes(load_code_u2<STREAMING>(codes + ROW_D + (size_t)c * 8), m);
+        const float dw1 = load_scale_f16<STREAMING>(scales + SC_D * 2 + (size_t)(c >> 1) * 2);
         acc1 += dw1 * dx * (float)(chunk_s(m, X) - hx);
     }
     const float s0 = warp_sum(acc0);
@@ -631,8 +668,8 @@ struct GuPairGrf256Functor {
         };
     }
     void operator()(sycl::nd_item<3> /*item_ct1*/) const {
-        gu_pair_kernel(blob_base, slot_index, blob_bytes, x_q8_0, x_scales, gate_up, cap,
-                       d_count, dst_index, tok_div);
+        gu_pair_kernel<true>(blob_base, slot_index, blob_bytes, x_q8_0, x_scales, gate_up, cap,
+                             d_count, dst_index, tok_div);
     }
 };
 
@@ -654,8 +691,8 @@ struct DownPairGrf256Functor {
         };
     }
     void operator()(sycl::nd_item<3> /*item_ct1*/) const {
-        down_pair_kernel(blob_base, slot_index, dst_index, blob_bytes, h_q8_0, h_scales, out,
-                         cap, d_count);
+        down_pair_kernel<true>(blob_base, slot_index, dst_index, blob_bytes, h_q8_0, h_scales, out,
+                              cap, d_count);
     }
 };
 
@@ -1074,7 +1111,7 @@ inline int chunk_int_diff(sycl::uint2 cb, const int* xw) {
 // its fp32 scales) are staged once into shared memory as aligned words; each warp then walks its rows, loading
 // each lane's code chunks once and dotting them with every entry.
 
-template <int SKIP = 0>
+template <int SKIP = 0, bool STREAMING = false>
 void gu_grouped_kernel(const unsigned long long* __restrict__ grp_ptr, const int32_t* __restrict__ grp_start,
                        const int32_t* __restrict__ n_groups, const int32_t* __restrict__ ent_tok,
                        const uint8_t* __restrict__ x_q8_0, const float* __restrict__ x_scales,
@@ -1113,8 +1150,8 @@ void gu_grouped_kernel(const unsigned long long* __restrict__ grp_ptr, const int
         for (int q = 0; q < GU_CHUNKS; ++q) {
             const int c = lane + 32 * q;
             if (c < H / 32) {
-                cb[q] = *(const sycl::uint2*)(codes + (size_t)c * 8);
-                dw[q] = f16_at(scales + (size_t)(c >> 1) * 2);
+                cb[q] = load_code_u2<STREAMING>(codes + (size_t)c * 8);
+                dw[q] = load_scale_f16<STREAMING>(scales + (size_t)(c >> 1) * 2);
             }
         }
         for (int k = 0; k < ne; ++k) {
@@ -1137,7 +1174,7 @@ void gu_grouped_kernel(const unsigned long long* __restrict__ grp_ptr, const int
 
 // Down: a block = D_ROWS rows of ONE group; the entries' quantized intermediates staged once.  A down row is 20
 // chunks, so lanes 0..19 each hold one chunk, as in the per-entry kernel.
-template <int SKIP = 0>
+template <int SKIP = 0, bool STREAMING = false>
 void down_grouped_kernel(const unsigned long long* __restrict__ grp_ptr, const int32_t* __restrict__ grp_start,
                          const int32_t* __restrict__ n_groups, const int32_t* __restrict__ ent_dst,
                          const uint8_t* __restrict__ h_q8_0, const float* __restrict__ h_scales,
@@ -1173,8 +1210,8 @@ void down_grouped_kernel(const unsigned long long* __restrict__ grp_ptr, const i
         sycl::uint2 cb = sycl::uint2(0, 0);
         float dw = 0.0f;
         if (c < FF / 32) {
-            cb = *(const sycl::uint2*)(codes + (size_t)c * 8);
-            dw = f16_at(scales + (size_t)(c >> 1) * 2);
+            cb = load_code_u2<STREAMING>(codes + (size_t)c * 8);
+            dw = load_scale_f16<STREAMING>(scales + (size_t)(c >> 1) * 2);
         }
         for (int k = 0; k < ne; ++k) {
             float acc = 0.0f;
@@ -1211,7 +1248,7 @@ inline void stage_chunk(const uint8_t* __restrict__ xb, float dx, int* xs_w, syc
     xs_dh[i] = sycl::int2(sycl::bit_cast<int>(dx), hx);
 }
 
-template <int SKIP = 0>
+template <int SKIP = 0, bool STREAMING = false>
 void gu_grouped_t_kernel(const unsigned long long* __restrict__ grp_ptr, const int32_t* __restrict__ grp_start,
                          const int32_t* __restrict__ n_groups, const int32_t* __restrict__ ent_tok,
                          const uint8_t* __restrict__ x_q8_0, const float* __restrict__ x_scales,
@@ -1245,10 +1282,10 @@ void gu_grouped_t_kernel(const unsigned long long* __restrict__ grp_ptr, const i
         for (int q = 0; q < GU_CHUNKS; ++q) {
             const int c = lane + 32 * q;
             if (c < NC) {
-                expand_codes(*(const sycl::uint2*)(codes + (size_t)c * 8), m0[q]);
-                expand_codes(*(const sycl::uint2*)(codes + ROW_GU + (size_t)c * 8), m1[q]);
-                dw0[q] = f16_ld(scales + (size_t)(c >> 1) * 2);
-                dw1[q] = f16_ld(scales + SC_GU * 2 + (size_t)(c >> 1) * 2);
+                expand_codes(load_code_u2<STREAMING>(codes + (size_t)c * 8), m0[q]);
+                expand_codes(load_code_u2<STREAMING>(codes + ROW_GU + (size_t)c * 8), m1[q]);
+                dw0[q] = load_scale_f16<STREAMING>(scales + (size_t)(c >> 1) * 2);
+                dw1[q] = load_scale_f16<STREAMING>(scales + SC_GU * 2 + (size_t)(c >> 1) * 2);
             }
         }
         for (int k = 0; k < ne; ++k) {
@@ -1278,7 +1315,7 @@ void gu_grouped_t_kernel(const unsigned long long* __restrict__ grp_ptr, const i
     }
 }
 
-template <int SKIP = 0>
+template <int SKIP = 0, bool STREAMING = false>
 void down_grouped_t_kernel(const unsigned long long* __restrict__ grp_ptr, const int32_t* __restrict__ grp_start,
                            const int32_t* __restrict__ n_groups, const int32_t* __restrict__ ent_dst,
                            const uint8_t* __restrict__ h_q8_0, const float* __restrict__ h_scales,
@@ -1308,10 +1345,10 @@ void down_grouped_t_kernel(const unsigned long long* __restrict__ grp_ptr, const
         int m0[8], m1[8];
         float dw0 = 0.0f, dw1 = 0.0f;
         if (c < NC) {
-            expand_codes(*(const sycl::uint2*)(codes + (size_t)c * 8), m0);
-            expand_codes(*(const sycl::uint2*)(codes + ROW_D + (size_t)c * 8), m1);
-            dw0 = f16_ld(scales + (size_t)(c >> 1) * 2);
-            dw1 = f16_ld(scales + SC_D * 2 + (size_t)(c >> 1) * 2);
+            expand_codes(load_code_u2<STREAMING>(codes + (size_t)c * 8), m0);
+            expand_codes(load_code_u2<STREAMING>(codes + ROW_D + (size_t)c * 8), m1);
+            dw0 = load_scale_f16<STREAMING>(scales + (size_t)(c >> 1) * 2);
+            dw1 = load_scale_f16<STREAMING>(scales + SC_D * 2 + (size_t)(c >> 1) * 2);
         }
         for (int k = 0; k < ne; ++k) {
             float acc0 = 0.0f, acc1 = 0.0f;
@@ -1436,8 +1473,8 @@ struct GuGroupedTGrf256Functor {
         };
     }
     void operator()(sycl::nd_item<3> /*item*/) const {
-        gu_grouped_t_kernel<SKIP>(grp_ptr, grp_start, n_groups, ent_tok, x_q8_0, x_scales, gate_up,
-                                 cap_entries, &xs_w[0], &xs_dh[0]);
+        gu_grouped_t_kernel<SKIP, true>(grp_ptr, grp_start, n_groups, ent_tok, x_q8_0, x_scales, gate_up,
+                                       cap_entries, &xs_w[0], &xs_dh[0]);
     }
 };
 
@@ -1461,8 +1498,8 @@ struct GuGroupedGrf256Functor {
         };
     }
     void operator()(sycl::nd_item<3> /*item*/) const {
-        gu_grouped_kernel<SKIP>(grp_ptr, grp_start, n_groups, ent_tok, x_q8_0, x_scales, gate_up,
-                                cap_entries, xs_q, xs_d);
+        gu_grouped_kernel<SKIP, true>(grp_ptr, grp_start, n_groups, ent_tok, x_q8_0, x_scales, gate_up,
+                                      cap_entries, xs_q, xs_d);
     }
 };
 
@@ -1485,8 +1522,8 @@ struct DownGroupedTGrf256Functor {
         };
     }
     void operator()(sycl::nd_item<3> /*item*/) const {
-        down_grouped_t_kernel<SKIP>(grp_ptr, grp_start, n_groups, ent_dst, h_q8_0, hs, out,
-                                    &hs_w[0], &hs_dh[0]);
+        down_grouped_t_kernel<SKIP, true>(grp_ptr, grp_start, n_groups, ent_dst, h_q8_0, hs, out,
+                                          &hs_w[0], &hs_dh[0]);
     }
 };
 
@@ -1509,8 +1546,8 @@ struct DownGroupedGrf256Functor {
         };
     }
     void operator()(sycl::nd_item<3> /*item*/) const {
-        down_grouped_kernel<SKIP>(grp_ptr, grp_start, n_groups, ent_dst, h_q8_0, hs, out,
-                                  hs_q, hs_d);
+        down_grouped_kernel<SKIP, true>(grp_ptr, grp_start, n_groups, ent_dst, h_q8_0, hs, out,
+                                        hs_q, hs_d);
     }
 };
 

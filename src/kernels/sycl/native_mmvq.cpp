@@ -25,6 +25,7 @@
 
 #include <sycl/sycl.hpp>
 #include <sycl/ext/intel/experimental/grf_size_properties.hpp>
+#include <sycl/ext/intel/experimental/cache_control_properties.hpp>
 #include "strata/kernels/native_mmvq.hpp"
 #include "strata/kernels/dp4a.hpp"
 #include "strata/kernels/iq_kernels.hpp"
@@ -55,12 +56,57 @@ inline int dp4a(int a, int b, int c) {
     return c + va[0] * vb[0] + va[1] * vb[1] + va[2] * vb[2] + va[3] * vb[3];
 }
 
+// Q3_K's 110-byte stride gives alternate blocks only two-byte alignment.
+// Preserve the pinned helper's pair of 16-bit loads and little-endian combine.
+template <bool STREAMING = false>
+inline int load_int_b2(const void* ptr, int i32) {
+    const auto* x = static_cast<const uint16_t*>(ptr);
+    if constexpr (STREAMING) {
+        auto props = sycl::ext::oneapi::experimental::properties{
+            sycl::ext::intel::experimental::read_hint<
+                sycl::ext::intel::experimental::cache_control<
+                    sycl::ext::intel::experimental::cache_mode::streaming,
+                    sycl::ext::oneapi::experimental::cache_level::L3>>};
+        sycl::ext::oneapi::experimental::annotated_ptr<const uint16_t, decltype(props)> ax(x, props);
+        int value = ax[2 * i32] << 0;
+        value |= ax[2 * i32 + 1] << 16;
+        return value;
+    } else {
+        int value = x[2 * i32] << 0;
+        value |= x[2 * i32 + 1] << 16;
+        return value;
+    }
+}
+
+template <bool STREAMING = false>
+inline int load_int_stream(const int* ptr) {
+    if constexpr (STREAMING) {
+        auto props = sycl::ext::oneapi::experimental::properties{
+            sycl::ext::intel::experimental::read_hint<
+                sycl::ext::intel::experimental::cache_control<
+                    sycl::ext::intel::experimental::cache_mode::streaming,
+                    sycl::ext::oneapi::experimental::cache_level::L3>>};
+        sycl::ext::oneapi::experimental::annotated_ptr<const int, decltype(props)> ap(ptr, props);
+        return *ap;
+    } else {
+        return *ptr;
+    }
+}
+
 // SYCL port: a 4-int vector load from a 4-byte aligned address (a Q8_1 block is 36 bytes, its qs sit at offset 4): one dword-vector
 // message instead of four scalar loads.
+template <bool STREAMING = false>
 inline sycl::int4 ld_i4_a4(const int* p) {
-    sycl::int4 v;
-    v.load(0, sycl::address_space_cast<sycl::access::address_space::global_space, sycl::access::decorated::no>(p));
-    return v;
+    if constexpr (STREAMING) {
+        return sycl::int4{load_int_stream<true>(p + 0),
+                          load_int_stream<true>(p + 1),
+                          load_int_stream<true>(p + 2),
+                          load_int_stream<true>(p + 3)};
+    } else {
+        sycl::int4 v;
+        v.load(0, sycl::address_space_cast<sycl::access::address_space::global_space, sycl::access::decorated::no>(p));
+        return v;
+    }
 }
 
 // Q6_K: per-byte (v - 32) of four 6-bit values (bytes 0..63): no byte can saturate, so this is the saturating char4 subtract's
@@ -421,15 +467,6 @@ void native_q2_0_mmvq_kernel(const Q20Block* __restrict__ w, const Q81Block* __r
         tmp[i] = warp_sum(tmp[i]);
         if (int(item_ct1.get_local_id(2)) == i && row0 + i < n_out) y[row0 + i] = tmp[i];
     }
-}
-
-// Q3_K's 110-byte stride gives alternate blocks only two-byte alignment.
-// Preserve the pinned helper's pair of 16-bit loads and little-endian combine.
-inline int load_int_b2(const void* ptr, int i32) {
-    const auto* x = static_cast<const uint16_t*>(ptr);
-    int value = x[2 * i32] << 0;
-    value |= x[2 * i32 + 1] << 16;
-    return value;
 }
 
 inline float q3_q8_dot_impl(int vl, int vh, const int* __restrict__ u, const uint8_t* __restrict__ scales,
@@ -795,11 +832,12 @@ void native_q6_k_mmvq_kernel(const Q6KBlock* __restrict__ w, const Q81Block* __r
 // The four 32-element formats use native two-byte loads and VDR=2. The affine
 // Q4_0/Q5_0 correction consumes the original-input sum stored in Q8_1, exactly
 // as the pinned CUDA dot does; a signed-integer code substitution would differ.
+template <bool STREAMING = false>
 inline float small_q8_dot(const Q40Block* __restrict__ w, const Q81Block* __restrict__ x, int iqs) {
     int sumi = 0;
 #pragma unroll
     for (int i = 0; i < 2; ++i) {
-        const int v = load_int_b2(w->qs, iqs + i);
+        const int v = load_int_b2<STREAMING>(w->qs, iqs + i);
         const int vi0 = (v >> 0) & 0x0f0f0f0f;
         const int vi1 = (v >> 4) & 0x0f0f0f0f;
         sumi = dp4a(vi0, reinterpret_cast<const int*>(x->qs)[iqs + i], sumi);
@@ -810,12 +848,13 @@ inline float small_q8_dot(const Q40Block* __restrict__ w, const Q81Block* __rest
     return d * (sumi * ds.x() - 4 * ds.y());
 }
 
+template <bool STREAMING = false>
 inline float small_q8_dot(const Q50Block* __restrict__ w, const Q81Block* __restrict__ x, int iqs) {
     int sumi = 0;
 #pragma unroll
     for (int i = 0; i < 2; ++i) {
-        const int vl = load_int_b2(w->qs, iqs + i);
-        const int vh = load_int_b2(w->qh, 0) >> (4 * (iqs + i));
+        const int vl = load_int_b2<STREAMING>(w->qs, iqs + i);
+        const int vh = load_int_b2<STREAMING>(w->qh, 0) >> (4 * (iqs + i));
         int vi0 = (vl >> 0) & 0x0f0f0f0f;
         vi0 |= (vh << 4) & 0x00000010;
         vi0 |= (vh << 11) & 0x00001000;
@@ -834,11 +873,12 @@ inline float small_q8_dot(const Q50Block* __restrict__ w, const Q81Block* __rest
     return d * (sumi * ds.x() - 8 * ds.y());
 }
 
+template <bool STREAMING = false>
 inline float small_q8_dot(const Q80Block* __restrict__ w, const Q81Block* __restrict__ x, int iqs) {
     int sumi = 0;
 #pragma unroll
     for (int i = 0; i < 2; ++i) {
-        const int v = load_int_b2(w->qs, iqs + i);
+        const int v = load_int_b2<STREAMING>(w->qs, iqs + i);
         const int u = reinterpret_cast<const int*>(x->qs)[iqs + i];
         sumi = dp4a(v, u, sumi);
     }
@@ -847,12 +887,13 @@ inline float small_q8_dot(const Q80Block* __restrict__ w, const Q81Block* __rest
     return d0 * d1 * float(sumi);
 }
 
+template <bool STREAMING = false>
 inline float small_q8_dot(const IQ4NLBlock* __restrict__ w, const Q81Block* __restrict__ x, int iqs) {
     const int* q8 = reinterpret_cast<const int*>(x->qs) + iqs;
     int sumi = 0;
 #pragma unroll
     for (int i = 0; i < 2; ++i) {
-        const sycl::int2 v = iq4_table_lookup(load_int_b2(w->qs, iqs + i));
+        const sycl::int2 v = iq4_table_lookup(load_int_b2<STREAMING>(w->qs, iqs + i));
         sumi = dp4a(v.x(), q8[i], sumi);
         sumi = dp4a(v.y(), q8[i + 4], sumi);
     }
@@ -934,15 +975,16 @@ struct Q5KTraits {
         sycl::half2 dm;
         int bq8_offset;
     };
+    template <bool STREAMING = false>
     static W load(const Block* __restrict__ bq5, int iqs) {
         W r;
         r.bq8_offset = 2 * ((iqs / 2) / 4);
         const int* ql = reinterpret_cast<const int*>(bq5->qs + 16 * r.bq8_offset + 4 * ((iqs / 2) % 4));
         const int* qh = reinterpret_cast<const int*>(bq5->qh + 4 * ((iqs / 2) % 4));
-        r.vl[0] = ql[0];
-        r.vl[1] = ql[4];
-        r.vh[0] = qh[0] >> r.bq8_offset;
-        r.vh[1] = qh[4] >> r.bq8_offset;
+        r.vl[0] = load_int_stream<STREAMING>(ql + 0);
+        r.vl[1] = load_int_stream<STREAMING>(ql + 4);
+        r.vh[0] = load_int_stream<STREAMING>(qh + 0) >> r.bq8_offset;
+        r.vh[1] = load_int_stream<STREAMING>(qh + 4) >> r.bq8_offset;
         const uint16_t* scales = reinterpret_cast<const uint16_t*>(bq5->scales);
         const int j = r.bq8_offset / 2;
         const int jm = j & 1;
@@ -955,6 +997,7 @@ struct Q5KTraits {
         r.dm = bq5->dm;
         return r;
     }
+    template <bool STREAMING = false>
     static float apply(const W& r, const Q81Block* __restrict__ bq8, int iqs) {
         int u[4];
         float d8[2];
@@ -980,12 +1023,13 @@ struct Q4KTraits {
         sycl::half2 dm;
         int bq8_offset;
     };
+    template <bool STREAMING = false>
     static W load(const Block* __restrict__ bq4, int iqs) {
         W r;
         r.bq8_offset = 2 * ((iqs / 2) / 4);
         const int* ql = reinterpret_cast<const int*>(bq4->qs + 16 * r.bq8_offset + 4 * ((iqs / 2) % 4));
-        r.v[0] = ql[0];
-        r.v[1] = ql[4];
+        r.v[0] = load_int_stream<STREAMING>(ql + 0);
+        r.v[1] = load_int_stream<STREAMING>(ql + 4);
         const uint16_t* scales = reinterpret_cast<const uint16_t*>(bq4->scales);
         const int j = r.bq8_offset / 2;
         const int jm = j & 1;
@@ -998,6 +1042,7 @@ struct Q4KTraits {
         r.dm = bq4->dm;
         return r;
     }
+    template <bool STREAMING = false>
     static float apply(const W& r, const Q81Block* __restrict__ bq8, int iqs) {
         int u[4];
         float d8[2];
@@ -1021,13 +1066,25 @@ struct Q20Traits {
         int qx[4], qy[4];
         float d2;
     };
+    template <bool STREAMING = false>
     static W load(const Block* __restrict__ w, int iqs) {
         W r;
         r.d2 = w->d;
         const int16_t* qs = reinterpret_cast<const int16_t*>(w->qs) + iqs * 4;
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
-            const int q = qs[j];
+            int q;
+            if constexpr (STREAMING) {
+                auto props = sycl::ext::oneapi::experimental::properties{
+                    sycl::ext::intel::experimental::read_hint<
+                        sycl::ext::intel::experimental::cache_control<
+                            sycl::ext::intel::experimental::cache_mode::streaming,
+                            sycl::ext::oneapi::experimental::cache_level::L3>>};
+                sycl::ext::oneapi::experimental::annotated_ptr<const int16_t, decltype(props)> aqs(qs, props);
+                q = aqs[j];
+            } else {
+                q = qs[j];
+            }
             const int qe = byte_permute(0x020100ff, 0x020100ff, q >> 0);
             const int qo = byte_permute(0x020100ff, 0x020100ff, q >> 2);
             r.qx[j] = byte_permute(qe, qo, 0x5140);
@@ -1035,6 +1092,7 @@ struct Q20Traits {
         }
         return r;
     }
+    template <bool STREAMING = false>
     static float apply(const W& r, const Q81Block* __restrict__ x, int iqs) {
         const Q81Block* chunk = x + iqs;
         const int* q8 = reinterpret_cast<const int*>(chunk->qs);
@@ -1058,16 +1116,18 @@ struct Q3KTraits {
         const uint8_t* scales;
         int scale_offset, bq8_offset;
     };
+    template <bool STREAMING = false>
     static W load(const Block* __restrict__ w, int iqs) {
         W r;
         r.bq8_offset = 4 * (iqs / 8);
         r.scale_offset = iqs - iqs % 8 + (iqs % 8) / 4;
         r.d = w->d;
-        r.vl = load_int_b2(w->qs, iqs);
-        r.vh = ~load_int_b2(w->hmask, iqs % 8) >> r.bq8_offset;
+        r.vl = load_int_b2<STREAMING>(w->qs, iqs);
+        r.vh = ~load_int_b2<STREAMING>(w->hmask, iqs % 8) >> r.bq8_offset;
         r.scales = w->scales;
         return r;
     }
+    template <bool STREAMING = false>
     static float apply(const W& r, const Q81Block* __restrict__ x, int iqs) {
         int u[4];
         float d8[4];
@@ -1089,17 +1149,19 @@ struct Q6KTraits {
         const int8_t* scales;
         int bq8_offset;
     };
+    template <bool STREAMING = false>
     static W load(const Block* __restrict__ w, int iqs) {
         W r;
         r.bq8_offset = 4 * (iqs / 16) + (iqs % 16) / 8;
         const int scale_offset = 8 * (iqs / 16) + (iqs % 16) / 4;
         const int vh_shift = 2 * ((iqs % 16) / 8);
-        r.vl = load_int_b2(w->ql, iqs);
-        r.vh = load_int_b2(w->qh, 8 * (iqs / 16) + iqs % 8) >> vh_shift;
+        r.vl = load_int_b2<STREAMING>(w->ql, iqs);
+        r.vh = load_int_b2<STREAMING>(w->qh, 8 * (iqs / 16) + iqs % 8) >> vh_shift;
         r.scales = w->scales + scale_offset;
         r.d = w->d;
         return r;
     }
+    template <bool STREAMING = false>
     static float apply(const W& r, const Q81Block* __restrict__ x, int iqs) {
         int u[2];
         float d8[2];
@@ -1120,9 +1182,10 @@ struct IQ4XSTraits {
         int ls;
         float dw;
     };
+    template <bool STREAMING = false>
     static W load(const Block* __restrict__ w, int iqs) {
         W r;
-        const sycl::int4 q4 = ld_i4_a4(reinterpret_cast<const int*>(w->qs) + iqs);
+        const sycl::int4 q4 = ld_i4_a4<STREAMING>(reinterpret_cast<const int*>(w->qs) + iqs);
         const int qv[4] = {q4.x(), q4.y(), q4.z(), q4.w()};
 #pragma unroll
         for (int j = 0; j < 4; ++j) r.v[j] = iq4_table_lookup(qv[j]);
@@ -1130,6 +1193,7 @@ struct IQ4XSTraits {
         r.dw = sycl::vec<sycl::half, 1>(w->d).convert<float, sycl::rounding_mode::automatic>()[0];
         return r;
     }
+    template <bool STREAMING = false>
     static float apply(const W& r, const Q81Block* __restrict__ x, int iqs) {
         const sycl::int4 u0 = ld_i4_a4(reinterpret_cast<const int*>(x[iqs / 4].qs));
         const sycl::int4 u1 = ld_i4_a4(reinterpret_cast<const int*>(x[iqs / 4].qs) + 4);
@@ -1156,8 +1220,10 @@ struct SmallTraits {
     struct W {
         const Weight* w;
     };
+    template <bool STREAMING = false>
     static W load(const Block* __restrict__ w, int) { return W{w}; }
-    static float apply(const W& r, const Q81Block* __restrict__ x, int k) { return small_q8_dot(r.w, x, k); }
+    template <bool STREAMING = false>
+    static float apply(const W& r, const Q81Block* __restrict__ x, int k) { return small_q8_dot<STREAMING>(r.w, x, k); }
 };
 
 // NW warps per block and ROWS rows per block. The EXACT layout (NW = 4, ROWS = 1, or 4 for small K) is the
@@ -1172,7 +1238,7 @@ int g_b6_rows = [] {
     return v ? std::atoi(v) : 0;
 }();
 
-template <typename F, int NCOLS, int NW, int ROWS>
+template <typename F, int NCOLS, int NW, int ROWS, bool STREAMING = false>
 /*
 DPCT1110:51: The total declared local variable size in device function
 native_mmvq_multi_kernel exceeds 128 bytes and may cause high register pressure.
@@ -1202,7 +1268,7 @@ void native_mmvq_multi_kernel(const typename F::Block* __restrict__ w, const Q81
                 migration results in different template instantiations that
                 could not be unified. You may need to adjust the code.
                 */
-                const typename F::W wv = F::load(w + block, kqs);  // once per (row, block)
+                const typename F::W wv = F::template load<STREAMING>(w + block, kqs);  // once per (row, block)
 #pragma unroll
                 for (int j = 0; j < NCOLS; ++j)  // then per column
                     /*
@@ -1211,7 +1277,7 @@ void native_mmvq_multi_kernel(const typename F::Block* __restrict__ w, const Q81
                     instantiations that could not be unified. You may need to
                     adjust the code.
                     */
-                    tmp[j][i] += F::apply(wv, x + std::size_t(j) * x_stride + kby, kqs);
+                    tmp[j][i] += F::template apply<STREAMING>(wv, x + std::size_t(j) * x_stride + kby, kqs);
             }
         }
     }
@@ -1291,8 +1357,9 @@ struct B6X<Q6KTraits> {
         }
         return r;
     }
+    template <bool STREAMING = false>
     static W wload(const Q6KBlock* __restrict__ w, int iqs) {
-        const Q6KTraits::W t = Q6KTraits::load(w, iqs);
+        const Q6KTraits::W t = Q6KTraits::load<STREAMING>(w, iqs);
         W r;
         r.vl = t.vl;
         r.vh = t.vh;
@@ -1334,7 +1401,8 @@ struct B6XK {
         }
         return r;
     }
-    static W wload(const typename T::Block* __restrict__ w, int iqs) { return T::load(w, iqs); }
+    template <bool STREAMING = false>
+    static W wload(const typename T::Block* __restrict__ w, int iqs) { return T::template load<STREAMING>(w, iqs); }
     static float dot(const W& w, const X& x) {
         const uint8_t* sc = reinterpret_cast<const uint8_t*>(w.aux);
         if constexpr (KIND == 4)
@@ -1370,7 +1438,8 @@ struct B6X<IQ4XSTraits> {
         r.dx = x[iqs / 4].ds[0];
         return r;
     }
-    static W wload(const IQ4XSBlock* __restrict__ w, int iqs) { return IQ4XSTraits::load(w, iqs); }
+    template <bool STREAMING = false>
+    static W wload(const IQ4XSBlock* __restrict__ w, int iqs) { return IQ4XSTraits::load<STREAMING>(w, iqs); }
     static float dot(const W& w, const X& x) {
         int sumi = 0;
 #pragma unroll
@@ -1384,7 +1453,7 @@ struct B6X<IQ4XSTraits> {
     }
 };
 
-template <typename F, int NCOLS, int ROWS>
+template <typename F, int NCOLS, int ROWS, bool STREAMING = false>
 void b6_mmvq_rows_kernel(const typename F::Block* __restrict__ w, const Q81Block* __restrict__ x, float* __restrict__ y,
                          int n_in, int n_out, float partial[WARPS - 1][NCOLS][ROWS][WARP]) {
     using XB = B6X<F>;
@@ -1403,7 +1472,7 @@ void b6_mmvq_rows_kernel(const typename F::Block* __restrict__ w, const Q81Block
 #pragma unroll
         for (int i = 0; i < ROWS; ++i) {
             if (row0 + i < n_out) {
-                const typename XB::W wv = XB::wload(w + std::size_t(row0 + i) * blocks_per_row + kbx, kqs);
+                const typename XB::W wv = XB::template wload<STREAMING>(w + std::size_t(row0 + i) * blocks_per_row + kbx, kqs);
 #pragma unroll
                 for (int j = 0; j < NCOLS; ++j) tmp[j][i] += XB::dot(wv, xv[j]);
             }
@@ -1452,7 +1521,7 @@ struct B6RowsGrf256Functor {
                                                            sycl::ext::oneapi::experimental::sub_group_size<32>};
     }
     void operator()(sycl::nd_item<3>) const {
-        b6_mmvq_rows_kernel<F, NCOLS, ROWS>(w, x, y, n_in, n_out, partial_acc);
+        b6_mmvq_rows_kernel<F, NCOLS, ROWS, true>(w, x, y, n_in, n_out, partial_acc);
     }
 };
 
@@ -1521,7 +1590,7 @@ struct NativeMmvqMultiGrf256Functor {
                                                            sycl::ext::oneapi::experimental::sub_group_size<32>};
     }
     void operator()(sycl::nd_item<3>) const {
-        native_mmvq_multi_kernel<F, NCOLS, NW, ROWS>(w, x, y, n_in, n_out, partial_acc);
+        native_mmvq_multi_kernel<F, NCOLS, NW, ROWS, true>(w, x, y, n_in, n_out, partial_acc);
     }
 };
 
