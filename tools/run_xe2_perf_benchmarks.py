@@ -12,7 +12,7 @@ Capabilities:
 3. Environment Sensitivity & Tuning Sweep (--tune-env):
    Directly benchmarks critical kernel environment variable toggles (STRATA_PROMPT_ATTN_ESIMD,
    STRATA_ESIMD_LV, STRATA_MMVQ_DECODE_256GRF, STRATA_B6_MMVQ_ROWS, STRATA_MMVQ_SG, STRATA_MMVF_ROWS,
-   STRATA_FUSED_SWIGLU_Q81, STRATA_FUSED_GDN), measures latency and delta%, determines the winning
+   STRATA_FUSED_SWIGLU_Q81, STRATA_FUSED_GDN, STRATA_ATTN_LANECELL), measures latency and delta%, determines the winning
    configuration for the active GPU, and generates a ready-to-source optimal environment shell script.
 4. Structured Output: Captures individual and consolidated JSON files.
 5. Professional Markdown Report: Generates detailed tables, bandwidth metrics, speedup calculations,
@@ -570,7 +570,7 @@ def run_env_tuning_sweep(build_path: Path, base_env: dict[str, str], quick: bool
     # 6. STRATA_FUSED_GDN Sweep (Fused GDN Linear Attention)
     fused_gdn_bin = build_path / "perf_fused_gdn"
     if fused_gdn_bin.exists():
-        print("\n[6/6] Evaluating Fused GDN Linear Attention (STRATA_FUSED_GDN)...")
+        print("\n[6/7] Evaluating Fused GDN Linear Attention (STRATA_FUSED_GDN)...")
         proc = subprocess.run(
             [str(fused_gdn_bin), "--benchmark_filter=16/16", "--benchmark_min_time=0.05s"],
             stdout=subprocess.PIPE,
@@ -594,6 +594,55 @@ def run_env_tuning_sweep(build_path: Path, base_env: dict[str, str], quick: bool
                 "comment": f"{sp:.2f}x faster via fused SLM step + norm",
             }
             results["recommended_env"]["STRATA_FUSED_GDN"] = win
+
+    # 7. STRATA_ATTN_LANECELL Sweep (Decode Attention Register Spill vs Subgroup Reductions)
+    perf_qsa_bin = build_path / "perf_qsa_attention"
+    if perf_qsa_bin.exists():
+        print("\n[7/7] Evaluating Decode Attention Scoring (STRATA_ATTN_LANECELL=0 vs 1)...")
+        # Test A: STRATA_ATTN_LANECELL=0 (Subgroup Reductions, Zero Spills)
+        env_lane0 = base_env.copy()
+        env_lane0["STRATA_ATTN_LANECELL"] = "0"
+        proc0 = subprocess.run(
+            [str(perf_qsa_bin), "--benchmark_filter=BM_Xe2_QSA_DecodeAttention_BatchRows/1", "--benchmark_min_time=0.05s"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=env_lane0,
+        )
+        m0 = re.search(r"BM_Xe2_QSA_DecodeAttention_BatchRows/1/manual_time\s+([\d\.]+)\s+ns", proc0.stdout)
+        us0 = float(m0.group(1)) / 1000.0 if m0 else 0.0
+
+        # Test B: STRATA_ATTN_LANECELL=1 (LaneCell 96-Register Array, 7KB Spill)
+        env_lane1 = base_env.copy()
+        env_lane1["STRATA_ATTN_LANECELL"] = "1"
+        proc1 = subprocess.run(
+            [str(perf_qsa_bin), "--benchmark_filter=BM_Xe2_QSA_DecodeAttention_BatchRows/1", "--benchmark_min_time=0.05s"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=env_lane1,
+        )
+        m1 = re.search(r"BM_Xe2_QSA_DecodeAttention_BatchRows/1/manual_time\s+([\d\.]+)\s+ns", proc1.stdout)
+        us1 = float(m1.group(1)) / 1000.0 if m1 else 0.0
+
+        if us0 > 0 and us1 > 0:
+            sp = (us1 / us0) if us0 <= us1 else (us0 / us1)
+            win = "0" if us0 <= us1 else "1"
+            if win == "0":
+                print(f"  LANECELL=0: {us0:.1f} µs vs LANECELL=1: {us1:.1f} µs ({sp:.2f}x faster via zero-spill warp reductions)")
+                comm = f"{sp:.2f}x faster via zero-spill warp reductions (eliminates 7KB scratch spill)"
+            else:
+                print(f"  LANECELL=1: {us1:.1f} µs vs LANECELL=0: {us0:.1f} µs ({sp:.2f}x faster)")
+                comm = f"{sp:.2f}x faster on current hardware"
+
+            results["toggles"]["STRATA_ATTN_LANECELL"] = {
+                "lane_0_us": us0,
+                "lane_1_us": us1,
+                "speedup": sp,
+                "winner": win,
+                "comment": comm,
+            }
+            results["recommended_env"]["STRATA_ATTN_LANECELL"] = win
 
     return results
 
@@ -815,6 +864,10 @@ def generate_markdown_report(
         if "STRATA_FUSED_GDN" in toggles:
             t = toggles["STRATA_FUSED_GDN"]
             md.append(f"| `STRATA_FUSED_GDN` | Unfused vs Fused SLM Recurrence | Unfused: {t['unfused_us']:.1f} µs vs Fused: {t['fused_us']:.1f} µs | {t['speedup']:.2f}x faster | **✅ OPTIMAL ({t['winner']})** |\n")
+
+        if "STRATA_ATTN_LANECELL" in toggles:
+            t = toggles["STRATA_ATTN_LANECELL"]
+            md.append(f"| `STRATA_ATTN_LANECELL` | Subgroup Reductions (0) vs LaneCell (1) | 0: {t['lane_0_us']:.1f} µs vs 1: {t['lane_1_us']:.1f} µs | {t['speedup']:.2f}x faster | **✅ OPTIMAL ({t['winner']})** |\n")
 
         md.append("\n### Recommended Environment Export Script\n\n")
         md.append("```sh\n")
