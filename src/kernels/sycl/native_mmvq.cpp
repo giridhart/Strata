@@ -1505,6 +1505,15 @@ inline bool mmvq_large_grf(sycl::queue* s) {
     return v;
 }
 
+inline int mmvq_sg() {
+    static const int v = std::getenv("STRATA_MMVQ_SG") ? std::atoi(std::getenv("STRATA_MMVQ_SG")) : 32;
+    return v;
+}
+inline bool mmvq_sg16(bool iq4xs, int n_out) {
+    const int v = mmvq_sg();
+    return v == 16 || ((v & 1) && v < 4 && iq4xs) || ((v & 2) && v < 4 && n_out <= 1024);
+}
+
 template <typename F, int NCOLS, int ROWS>
 struct B6RowsGrf256Functor {
     const typename F::Block* w;
@@ -1925,6 +1934,16 @@ void launch_q6k_wide(const void* weights, const void* x_q8_1, float* y, int n_in
                                 Q6kWideA2Grf256Functor<NCOLS>{w, x, y, n_in, n_out});
                 return;
             }
+        }
+        if (mmvq_sg16(false, n_out)) {
+            constexpr int NWG = WARPS * WARP / 16;
+            const unsigned blocks16 = unsigned((std::size_t(n_out) + NWG - 1) / NWG);
+            s->parallel_for(
+                sycl::nd_range<3>(sycl::range<3>(1, 1, blocks16) * sycl::range<3>(1, NWG, 16), sycl::range<3>(1, NWG, 16)),
+                [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(16)]] {
+                    native_mmvq_q6k_wide_kernel<NCOLS, 1, 16, (int)sizeof(Q6KBlock), true>(w, x, y, n_in, n_out);
+                });
+            return;
         }
         s->parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, blocks) * sycl::range<3>(1, WARPS, WARP),
                                           sycl::range<3>(1, WARPS, WARP)),

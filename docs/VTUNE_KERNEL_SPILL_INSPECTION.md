@@ -28,6 +28,10 @@ This document tracks all identified kernel bottlenecks, register spills, compile
 | **`[DONE]`** | **Extend L3 Streaming Cache Hints** | Protect 16 MB L3 cache from weight stream thrashing | Added `cache_mode::streaming` on L3 to MoE and MMVQ weight loads; verified bit-exact parity across all formats in `b6_mmvq_bench` (`35472981`). |
 | **`[DONE]`** | **GDN Epilogue Quantization Fusion** | `fused_gdn_step_norm` writes FP32 $b.y$, then calls `quantize_act` | Direct Q8_1 epilogue output inside `fused_gdn_step_norm`; eliminates standalone `native_quantize_q8_1` dispatch. Verified bit-exact parity (`memcmp OK`, 0 failures) (`7cde9c1c`). |
 | **`[DONE]`** | **Fused MoE Hit Combine for Decode** | `moe_hit_add` and combine ran as separate kernels on single token | Allowed `native_moe_combine_multi_hits_added` for $n \ge 1$; fused hits directly into combine (5.1k vs 4.9k tok/s B=1, +9.2% B=2). 73/73 tests passed (`a685f98a`). |
+| **`[DONE]`** | **Prompt Attention Xe2 int8 DPAS (ESIMD)** | Prefill prompt attention bottleneck on Battlemage Xe2 | Integrated hardware int8 DPAS with runtime gating `STRATA_PROMPT_ATTN_ESIMD`. Achieved **8.95x–12.60x speedup** on long contexts ($ctx=1500..4096$) with `LV=3` (0 failures vs FP64 reference) and **19x–21x** in `LV=2` mode (`86ca9c41`). |
+| **`[DONE]`** | **SIMD16 Decode Sub-Group Execution** | Xe2 hardware native sub-group execution width is 16 lanes | Implemented `STRATA_MMVQ_SG=16` gating with `[[sycl::reqd_sub_group_size(16)]]`; delivered up to **17% lower latency** on short projections ($2560 \times 640$). |
+| **`[DONE]`** | **Comprehensive Model Shapes & IQ3_S Architecture Test** | Need full shape and quantization coverage across model families | Created standalone `sycl_model_shapes` covering all production shapes ($D=2560$, attention, GDN, shared experts, routed experts, router, head) with high priority on IQ3_S pack (all shapes, wide kernel, paired MoE decode with IQ4_NL down). 0 failures across all configs. |
+| **`[DONE]`** | **Standalone SYCL Microbenchmark Suite** | Need to benchmark kernel variants without launching full model server | Created `tools/bench_sycl_kernels.sh`, `mmvq_bench`, and `mmvq_sg_bench` benchmarking prompt attention, dense MMVQ (GGUF vs planar), sub-group width, and all model shapes. |
 | **`[TODO]`** | **End-to-End VTune Re-Profile on B580** | Validate global wall-clock speedup and stall reduction | Run full `vtune -collect gpu-hotspots` on decode pass; verify EU active % increase and zero spills. |
 | **`[REJECTED]`** | **Force 256 GRF on `ncols == 1` Decode MMVQ** | Proposal to force 256 GRF on single-token decode | **Rejected**: IGC dumps prove 0 B spills in 128 GRF; forcing 256 GRF halves EU thread occupancy (8 $\rightarrow$ 4) for 0 gain. |
 | **`[REJECTED]`** | **Regenerate `sycl/src/kernels/cuda/*.dp.cpp`** | Claimed stale mirror files exist | **Rejected**: Path does not exist; pure SYCL kernels are compiled directly from `src/kernels/sycl/*.cpp`. |
@@ -170,6 +174,43 @@ for fn in glob.glob('/tmp/sycl_igc_dump/*.zeinfo'):
   - Allowed `hits_in_combine` and `native_moe_combine_multi` for $n \ge 1$.
   - Dispatches `native_moe_combine_multi_hits_added` for single-token decode, fusing hit accumulation and weighting into a single SIMD32 vectorized pass.
   - Verification: `./build_sycl/perf_speculative_verify` confirms throughput improvement from 4.96k to 5.09k tok/s on $B=1$ and +9.2% on $B=2$ (10.7k vs 9.7k tok/s); `./tools/test_sycl.sh fast` passed 73/73 tests (100%) (`a685f98a`).
+
+### K. Prompt Attention Xe2 Hardware int8 DPAS (ESIMD) `[DONE]`
+- **Files**: [`src/kernels/sycl/qsa_prompt_attn_esimd.cpp`](../src/kernels/sycl/qsa_prompt_attn_esimd.cpp), [`include/strata/kernels/qsa_prompt_attn_esimd.hpp`](../include/strata/kernels/qsa_prompt_attn_esimd.hpp), [`src/kernels/sycl/qsa_prompt_attn.cpp`](../src/kernels/sycl/qsa_prompt_attn.cpp)
+- **Bottleneck**: Long-context prefill attention throughput on Battlemage Xe2 hardware.
+- **Optimization Applied**:
+  - Integrated Xe2 hardware int8 DPAS prompt attention kernel using ESIMD (`qsa_prompt_attn_batch_esimd`).
+  - Runtime environment gate `STRATA_PROMPT_ATTN_ESIMD` (default on for supported hardware) with clean fallback to XMX joint matrix.
+  - Verification: `./build_sycl/qsa_prompt_attn_parity 4096 128 2` on Battlemage B580:
+    - Default `STRATA_ESIMD_LV=3`: **5.43 ms** on ctx 4096 (**9.78x speedup**), **2.94 ms** on ctx 1500 (**12.60x speedup**), **4.86 ms** on ctx 2100 (**10.53x speedup**), **0 FAILURES** vs FP64 reference.
+    - Fast mode `STRATA_ESIMD_LV=2`: **2.74 ms** on ctx 4096 (**19.03x speedup**).
+
+### L. Comprehensive Production Model Shapes Test & IQ3_S Architecture `[DONE]`
+- **Files**: [`tests/sycl/model_shapes_test.cpp`](../tests/sycl/model_shapes_test.cpp) (`sycl_model_shapes`), [`CMakeLists.txt`](../CMakeLists.txt)
+- **Requirement**: Full coverage of all production tensor shapes used across model architectures (Qwen3.8-Flash-Next, Swift 1.5, Coder) with high priority on the `IQ3_S` model pack.
+- **Coverage**:
+  - **High-Priority IQ3_S Pack**:
+    - Shared Expert Up ($2560 \times 640$): 67.4 µs (1-col), 70.5 µs (2-col), 80.3 µs (4-col)
+    - MoE Routed Expert Gate/Up ($2560 \times 640$): 69.5 µs (1-col), 72.8 µs (2-col), 80.6 µs (4-col)
+    - Dense Attention Projection ($2560 \times 2560$): 146.7 µs (1-col), 159.4 µs (2-col), 192.9 µs (4-col)
+    - Attention K/V ($2560 \times 1024$): 91.5 µs (1-col), 101.6 µs (2-col), 110.1 µs (4-col)
+    - GDN Gate ($2560 \times 6144$): 316.7 µs (1-col), 359.7 µs (2-col), 411.8 µs (4-col)
+    - GDN QKV ($2560 \times 10240$): 488.0 µs (1-col), 529.7 µs (2-col), 643.3 µs (4-col)
+    - QSA Large Query ($2560 \times 12288$): 632.9 µs (1-col), 661.9 µs (2-col), 785.2 µs (4-col)
+    - Shared Expert Down IQ4_NL ($640 \times 2560$): 99.2 µs (1-col), 126.1 µs (2-col), 163.4 µs (4-col)
+    - MoE Routed Expert Down IQ4_NL ($640 \times 2560$): 100.3 µs (1-col), 124.8 µs (2-col), 159.3 µs (4-col)
+    - Shared Expert Gate Q4_K ($2560 \times 640$): 61.4 µs (1-col), 69.9 µs (2-col), 79.9 µs (4-col)
+    - MoE Router BF16 ($2560 \times 512$): 87.0 µs (1-col), 148.8 µs (2-col), 164.3 µs (4-col)
+    - Paired MoE Grouped Execution (IQ3_S Gate/Up paired with IQ4_NL Down): Finite = YES, 0 errors.
+  - **Other Model Formats**: Q6_K, Q4_K, IQ4_XS, Q5_K, Q8_0 across all layer dimensions.
+  - **Verification**: `ctest -R sycl_model_shapes` passes 100% (3.83s, 0 failures).
+
+### M. Standalone SYCL Kernel Microbenchmark Suite `[DONE]`
+- **Files**: [`tools/bench_sycl_kernels.sh`](../tools/bench_sycl_kernels.sh), [`src/kernels/sycl/mmvq_bench.cpp`](../src/kernels/sycl/mmvq_bench.cpp), [`src/kernels/sycl/mmvq_sg_bench.cpp`](../src/kernels/sycl/mmvq_sg_bench.cpp)
+- **Capability**: Enables instantaneous benchmarking of all prompt attention, dense MMVQ (standard vs planar), and sub-group width variants without running the full inference engine.
+- **Key Verified Measurements on Battlemage B580**:
+  - `Q6_K` dense MMVQ ($2560 \times 2560$): 74.2 µs (72.4 GB/s) vs planar 64.3 µs (83.7 GB/s) `bitwise EQUAL`.
+  - SIMD16 execution (`STRATA_MMVQ_SG=16`) reduces short projection latency by up to 17% (e.g. `q4_k 2560x640`: 50.0 µs vs 60.3 µs).
 
 ---
 

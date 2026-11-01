@@ -1624,6 +1624,10 @@ endif()
   if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_SYCL)
     if(STRATA_ENABLE_SYCL)
       add_executable(b6_mmvq_bench src/kernels/sycl/b6_mmvq_bench.cpp)
+      add_executable(mmvq_bench src/kernels/sycl/mmvq_bench.cpp)
+      target_link_libraries(mmvq_bench PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+      add_executable(mmvq_sg_bench src/kernels/sycl/mmvq_sg_bench.cpp)
+      target_link_libraries(mmvq_sg_bench PRIVATE strata_kernels ${_strata_gpu_runtime_target})
     else()
       add_executable(b6_mmvq_bench src/kernels/b6_mmvq_bench.cpp)
     endif()
@@ -1951,6 +1955,14 @@ endif()
     target_include_directories(sycl_native_mmvq PRIVATE ${_strata_gpu_include_directories})
     target_link_libraries(sycl_native_mmvq PRIVATE strata_kernels ${_strata_gpu_runtime_target})
     add_test(NAME sycl_native_mmvq COMMAND sycl_native_mmvq)
+  endif()
+
+  if(STRATA_ENABLE_SYCL AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/sycl/model_shapes_test.cpp")
+    add_executable(sycl_model_shapes tests/sycl/model_shapes_test.cpp)
+    target_include_directories(sycl_model_shapes PRIVATE ${_strata_gpu_include_directories})
+    target_link_libraries(sycl_model_shapes PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+    add_test(NAME sycl_model_shapes COMMAND sycl_model_shapes)
+    set_tests_properties(sycl_model_shapes PROPERTIES TIMEOUT 180 SKIP_RETURN_CODE 77)
   endif()
 
   if(STRATA_ENABLE_SYCL AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/sycl/fused_gdn_test.cpp")
@@ -3553,7 +3565,7 @@ if(STRATA_ENABLE_SYCL)
     COMMAND ${CMAKE_CTEST_COMMAND} -R sycl_ --output-on-failure
     DEPENDS sycl_native_qsa_score sycl_native_router sycl_native_ple_postops
             sycl_native_bf16 sycl_native_gdn sycl_native_gdn_preprocess
-            sycl_native_flash_attn sycl_native_mmvq sycl_fused_gdn
+            sycl_native_flash_attn sycl_native_mmvq sycl_model_shapes sycl_fused_gdn
             sycl_dequant_bf16 sycl_verify_kernels sycl_graph strata-device
             sycl_native_gr_norm sycl_xe2_subgroup_gemv sycl_xmx_joint_matrix
             sycl_qsa_negative_cell_guard sycl_queue_sync_test sycl_subgroup_divergence_test
