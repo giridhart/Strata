@@ -536,6 +536,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP OR STRATA_ENABLE_SYCL)
                           src/kernels/sycl/cvec.cpp
                           src/kernels/sycl/qsa_decode_attn.cpp
                           src/kernels/sycl/qsa_prompt_attn.cpp
+                          src/kernels/sycl/qsa_prompt_attn_esimd.cpp
                           src/kernels/sycl/fused_gdn.cpp
                           src/kernels/sycl/dequant_bf16.cpp
                           src/kernels/sycl/qsa_select.cpp

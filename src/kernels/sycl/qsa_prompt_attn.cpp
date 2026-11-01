@@ -4,6 +4,7 @@
 #include "strata/core/emulate.hpp"
 #include "strata/core/sycl_arch.hpp"
 #include "strata/kernels/qsa_prompt_attn.hpp"
+#include "strata/kernels/qsa_prompt_attn_esimd.hpp"
 #include "strata/kernels/kv_q8.hpp"
 #include "strata/kernels/kv_q4.hpp"
 
@@ -755,6 +756,11 @@ bool qsa_prompt_attn_batch(const float* q, const QsaAttnPools& pools, const int3
         return launch_wmma(q, pools, ids, steps, cap, s, attn, n_q, (cudaStream_t)stream);
     return false;
 #endif
+
+    // Fast-path: Intel Battlemage Xe2 int8 DPAS (ESIMD) prompt attention
+    if (qsa_prompt_attn_esimd(q, pools, ids, steps, cap, s, attn, n_q, stream)) {
+        return true;
+    }
 
     if (pools.k_q4 != nullptr || s.head_dim != HD || s.n_head != (int64_t)G * s.n_head_kv || cap <= 0 || !ids ||
         !steps || !pools.page_table)
