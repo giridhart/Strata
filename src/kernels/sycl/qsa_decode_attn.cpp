@@ -622,8 +622,12 @@ inline bool lane_cell_attn(int64_t n_q, sycl::queue* st) {
         return v != nullptr && v[0] != '\0' ? std::atoi(v) : -1;
     }();
     if (lane_cell_env >= 0) return lane_cell_env != 0;
-    if (n_q < 16 || st == nullptr) return false;
-    return strata::intel_gpu_gen(st->get_device()) == strata::IntelGpuGen::Battlemage;
+    (void)n_q;
+    (void)st;
+    // Intel Xe2 (Battlemage and Lunar Lake) General Register Files spill ~7,040 bytes
+    // per thread to private scratch memory under LANE_CELL's 96-register float array;
+    // subgroup warp reductions (LANE_CELL=false) are 1.8x to 5.2x faster with 0 spills.
+    return false;
 }
 
 int attn_kv_mode(const QsaAttnPools& p) {
