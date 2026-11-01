@@ -1505,6 +1505,15 @@ inline bool mmvq_large_grf(sycl::queue* s) {
     return v;
 }
 
+static bool g_mmvq_decode_256grf = [] {
+    const char* d = std::getenv("STRATA_MMVQ_DECODE_256GRF");
+    return d != nullptr && std::atoi(d) != 0;
+}();
+
+inline bool mmvq_decode_large_grf(sycl::queue* /*s*/) {
+    return g_mmvq_decode_256grf;
+}
+
 inline int mmvq_sg() {
     static const int v = std::getenv("STRATA_MMVQ_SG") ? std::atoi(std::getenv("STRATA_MMVQ_SG")) : 32;
     return v;
@@ -1538,7 +1547,7 @@ bool b6_launch(const typename F::Block* w, const Q81Block* x, float* y, int n_in
         if (g_b6_rows <= 0 || !g_multi_exact || n_in / F::DIV < 1) return false;
         const int rows = g_b6_rows == 1 ? 2 : g_b6_rows;
         const sycl::range<3> threads(1, WARPS, WARP);
-        const bool large_grf = mmvq_large_grf(s);
+        const bool large_grf = (NCOLS > 1) ? mmvq_large_grf(s) : mmvq_decode_large_grf(s);
         if (rows == 2) {
             const unsigned blocks = unsigned((n_out + 1) / 2);
             s->submit([&](sycl::handler& cgh) {
@@ -1604,7 +1613,7 @@ void launch_multi_n(const void* weights, const void* x_q8_1, float* y, int n_in,
     const auto* w = static_cast<const typename F::Block*>(weights);
     const auto* x = static_cast<const Q81Block*>(x_q8_1);
     if (b6_launch<F, NCOLS>(w, x, y, n_in, n_out, s)) return;
-    const bool large_grf = mmvq_large_grf(s);
+    const bool large_grf = (NCOLS > 1) ? mmvq_large_grf(s) : mmvq_decode_large_grf(s);
     if (!g_multi_exact) {
         constexpr int NW = NCOLS <= 4 ? 4 : 2;
         const unsigned blocks = unsigned((std::size_t(n_out) + 1) / 2);
@@ -1927,13 +1936,12 @@ void launch_q6k_wide(const void* weights, const void* x_q8_1, float* y, int n_in
     const int rpw = q6k_wide_rpw();
     if (rpw == 1 && q6k_a2()) {
         const unsigned blocks = unsigned((std::size_t(n_out) + WARPS - 1) / WARPS);
-        if constexpr (NCOLS > 1) {
-            if (mmvq_large_grf(s)) {
-                s->parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, blocks) * sycl::range<3>(1, WARPS, WARP),
-                                                  sycl::range<3>(1, WARPS, WARP)),
-                                Q6kWideA2Grf256Functor<NCOLS>{w, x, y, n_in, n_out});
-                return;
-            }
+        const bool use_256 = (NCOLS > 1) ? mmvq_large_grf(s) : mmvq_decode_large_grf(s);
+        if (use_256) {
+            s->parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, blocks) * sycl::range<3>(1, WARPS, WARP),
+                                              sycl::range<3>(1, WARPS, WARP)),
+                            Q6kWideA2Grf256Functor<NCOLS>{w, x, y, n_in, n_out});
+            return;
         }
         if (mmvq_sg16(false, n_out)) {
             constexpr int NWG = WARPS * WARP / 16;
@@ -2099,13 +2107,12 @@ void q6_planar_launch(const Q6Planar& w, const Q81Block* x, float* y, sycl::queu
     const uint8_t *ql = w.ql, *qh = w.qh, *sc = w.sc;
     const sycl::half* d = w.d;
     const int n_in = w.n_in, n_out = w.n_out;
-    if constexpr (NCOLS > 1) {
-        if (mmvq_large_grf(s)) {
-            s->parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, blocks) * sycl::range<3>(1, WARPS, WARP),
-                                              sycl::range<3>(1, WARPS, WARP)),
-                            Q6kPlanarGrf256Functor<NCOLS>{ql, qh, sc, d, x, y, n_in, n_out});
-            return;
-        }
+    const bool use_256 = (NCOLS > 1) ? mmvq_large_grf(s) : mmvq_decode_large_grf(s);
+    if (use_256) {
+        s->parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, blocks) * sycl::range<3>(1, WARPS, WARP),
+                                          sycl::range<3>(1, WARPS, WARP)),
+                        Q6kPlanarGrf256Functor<NCOLS>{ql, qh, sc, d, x, y, n_in, n_out});
+        return;
     }
     s->parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, blocks) * sycl::range<3>(1, WARPS, WARP),
                                       sycl::range<3>(1, WARPS, WARP)),
@@ -2309,6 +2316,8 @@ bool native_mmvq_multi_exact() { return g_multi_exact; }
 void native_mmvq_set_b6_rows(int mode) { g_b6_rows = mode; }
 int native_mmvq_b6_rows() { return g_b6_rows; }
 void native_mmvq_set_q6k_wide(bool on) { g_q6k_wide = on; }
+void native_mmvq_set_decode_256grf(bool on) { g_mmvq_decode_256grf = on; }
+bool native_mmvq_decode_256grf() { return g_mmvq_decode_256grf; }
 void native_q6_k_mmvq_stride224(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, int ncols,
                                 void* stream) {
     sycl::queue* s = stream ? static_cast<sycl::queue*>(stream) : &default_queue();

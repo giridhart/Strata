@@ -1,7 +1,9 @@
 // src/kernels/sycl/mmvq_sg_bench.cpp - SYCL MMVQ sub-group and GRF benchmarking on model shapes.
-// Tests all dense quantization formats with configurable STRATA_MMVQ_SG and STRATA_MMVQ_LARGE_GRF.
+// Tests all dense quantization formats with configurable STRATA_MMVQ_SG, STRATA_MMVQ_LARGE_GRF,
+// and side-by-side 128-GRF vs 256-GRF single-token decode comparisons.
 // Usage: mmvq_sg_bench [reps=200]
 #include "strata/kernels/native_mmvq.hpp"
+#include "strata/kernels/iq_kernels.hpp"
 #include <sycl/sycl.hpp>
 #include <chrono>
 #include <cmath>
@@ -17,15 +19,22 @@ int main(int argc, char** argv) {
 
     const char* sg_env = std::getenv("STRATA_MMVQ_SG");
     const char* grf_env = std::getenv("STRATA_MMVQ_LARGE_GRF");
+    const char* dec_grf_env = std::getenv("STRATA_MMVQ_DECODE_256GRF");
     std::printf("Device: %s\n", s->get_device().get_info<sycl::info::device::name>().c_str());
-    std::printf("Configuration: STRATA_MMVQ_SG=%s, STRATA_MMVQ_LARGE_GRF=%s\n",
-                sg_env ? sg_env : "default(32)", grf_env ? grf_env : "default(auto)");
+    std::printf("Configuration: STRATA_MMVQ_SG=%s, STRATA_MMVQ_LARGE_GRF=%s, STRATA_MMVQ_DECODE_256GRF=%s\n",
+                sg_env ? sg_env : "default(32)", grf_env ? grf_env : "default(auto)",
+                dec_grf_env ? dec_grf_env : "default(0/128-GRF)");
+
+    // Enable wide kernels for Q6_K and IQ3_S
+    strata::kernels::native_mmvq_set_q6k_wide(true);
+    setenv("STRATA_IQ3S_WIDE", "1", 0);
 
     struct T {
         const char* name;
         int type, bytes, elems;
     };  // ggml type, bytes per block of `elems` weights
     const T types[] = {
+        {"iq3_s", 21, 110, 256},
         {"q6_k", 14, 210, 256},
         {"q5_k", 13, 176, 256},
         {"q4_k", 12, 144, 256},
@@ -64,26 +73,36 @@ int main(int argc, char** argv) {
 
                 auto run = [&] { strata::kernels::native_mmvq(t.type, w, xq, y, n_in, n_out, nc, s); };
 
-                // Warm up
-                const auto w0 = std::chrono::steady_clock::now();
-                while (std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - w0).count() < 100) {
-                    for (int i = 0; i < 10; ++i) run();
+                auto bench = [&](bool large_grf) -> double {
+                    strata::kernels::native_mmvq_set_decode_256grf(large_grf);
+                    strata::kernels::iq_set_decode_256grf(large_grf);
+                    // Warm up
+                    const auto w0 = std::chrono::steady_clock::now();
+                    while (std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - w0).count() < 80) {
+                        for (int i = 0; i < 10; ++i) run();
+                        s->wait();
+                    }
+                    const int it = it_user;
+                    const auto t0 = std::chrono::steady_clock::now();
+                    for (int i = 0; i < it; ++i) run();
                     s->wait();
+                    return std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / it;
+                };
+
+                if (nc == 1) {
+                    const double us_128 = bench(false);
+                    const double us_256 = bench(true);
+                    const double delta = ((us_128 - us_256) / us_128) * 100.0;
+                    std::printf("%-7s %5d x %5d  cols 1 [128-GRF]  %7.1f us  %6.1f GB/s\n",
+                                t.name, n_in, n_out, us_128, wbytes / us_128 / 1e3);
+                    std::printf("%-7s %5d x %5d  cols 1 [256-GRF]  %7.1f us  %6.1f GB/s  (delta: %+.1f%% %s)\n",
+                                t.name, n_in, n_out, us_256, wbytes / us_256 / 1e3,
+                                delta, delta > 0 ? "faster" : "slower");
+                } else {
+                    const double us = bench(false);
+                    std::printf("%-7s %5d x %5d  cols %d            %7.1f us  %6.1f GB/s\n",
+                                t.name, n_in, n_out, nc, us, wbytes / us / 1e3);
                 }
-
-                const int it = it_user;
-                const auto t0 = std::chrono::steady_clock::now();
-                for (int i = 0; i < it; ++i) run();
-                s->wait();
-                const double us =
-                    std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / it;
-                std::vector<float> hy((size_t)nc * n_out);
-                s->memcpy(hy.data(), y, hy.size() * 4).wait();
-                double cs = 0;
-                for (float v : hy) cs += std::isfinite(v) ? std::fabs((double)v) : 1e30;
-
-                std::printf("%-7s %5d x %5d  cols %d  %7.1f us  %6.1f GB/s  sum %.5e\n",
-                            t.name, n_in, n_out, nc, us, wbytes / us / 1e3, cs);
 
                 sycl::free(x, *s);
                 sycl::free(xq, *s);

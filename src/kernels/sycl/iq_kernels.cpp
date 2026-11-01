@@ -3417,10 +3417,49 @@ bool iq3s_wide_on() {
     }();
     return v;
 }
+
+template <int NCOLS>
+struct Iq3sWideGrf256Functor {
+    const uint8_t* w;
+    size_t rb;
+    const block_q8_1* x;
+    float* y;
+    int n_in, n_out;
+    auto get(sycl::ext::oneapi::experimental::properties_tag) const {
+        return sycl::ext::oneapi::experimental::properties{sycl::ext::intel::experimental::grf_size<256>,
+                                                           sycl::ext::oneapi::experimental::sub_group_size<32>};
+    }
+    void operator()(sycl::nd_item<3>) const {
+        iq3s_wide_kernel<NCOLS>(w, rb, x, y, n_in, n_out);
+    }
+};
+
+static bool g_iq_decode_256grf = [] {
+    const char* d = std::getenv("STRATA_MMVQ_DECODE_256GRF");
+    return d != nullptr && std::atoi(d) != 0;
+}();
+
+inline bool iq3s_large_grf(sycl::queue* s) {
+    static const bool v = [s] {
+        const char* e = std::getenv("STRATA_MMVQ_LARGE_GRF");
+        if (e != nullptr) return std::atoi(e) != 0;
+        const auto gen = strata::intel_gpu_gen(s->get_device());
+        return gen == strata::IntelGpuGen::Alchemist || gen == strata::IntelGpuGen::Battlemage;
+    }();
+    return v;
+}
+
 template <int NCOLS>
 void launch_iq3s_wide_t(const uint8_t* W, size_t rb, const block_q8_1* X, float* y, int n_in, int n_out, sycl::queue* s) {
     constexpr int WPG = 4;  // sub-groups per work-group
     const unsigned groups = unsigned((n_out + WPG - 1) / WPG);
+    const bool use_256 = (NCOLS > 1) ? iq3s_large_grf(s) : g_iq_decode_256grf;
+    if (use_256) {
+        s->parallel_for(
+            sycl::nd_range<3>(sycl::range<3>(1, WPG, groups * 32), sycl::range<3>(1, WPG, 32)),
+            Iq3sWideGrf256Functor<NCOLS>{W, rb, X, y, n_in, n_out});
+        return;
+    }
     s->parallel_for(
         sycl::nd_range<3>(sycl::range<3>(1, WPG, groups * 32), sycl::range<3>(1, WPG, 32)),
         [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(32)]] { iq3s_wide_kernel<NCOLS>(W, rb, X, y, n_in, n_out); });
@@ -3445,6 +3484,8 @@ bool launch_iq3s_wide(const uint8_t* W, size_t rb, const block_q8_1* X, float* y
 
 void iq_set_old_kernels(bool old) { g_old_kernels = old; }
 bool iq_old_kernels() { return g_old_kernels; }
+void iq_set_decode_256grf(bool on) { g_iq_decode_256grf = on; }
+bool iq_decode_256grf() { return g_iq_decode_256grf; }
 void native_expert_set_kq_split(bool on) { g_kq_split = on; }
 
 bool iq_supported(int t) noexcept { return is_iq(t); }

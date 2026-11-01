@@ -141,6 +141,8 @@ bool gemm_iq_f16_grouped(int ty, const void* W, size_t expert_bytes, int n_out, 
                          const int32_t* bounds, int n_experts, int max_rows, float* Y, int ldy, void* stream);
 void iq_set_old_kernels(bool old);
 bool iq_old_kernels();
+void iq_set_decode_256grf(bool on);
+bool iq_decode_256grf();
 void native_expert_set_kq_split(bool on);
 
 }  // namespace strata::kernels
