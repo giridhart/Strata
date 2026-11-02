@@ -1,0 +1,19 @@
+{
+  "mcp_servers": {
+    "math": {
+      "command": "python3",
+      "args": ["tools/mcp_math.py"]
+    }
+  },
+  "mcpServers": {
+    "math": {
+      "command": "python3",
+      "args": ["tools/mcp_math.py"]
+    }
+  },
+  "mcp": {
+    "timeout_s": 30.0,
+    "max_result_chars": 10000,
+    "max_rounds": 8
+  }
+}
