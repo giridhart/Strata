@@ -2246,6 +2246,14 @@ endif()
     set_tests_properties(q8_quant_multi_test PROPERTIES RESOURCE_LOCK gpu TIMEOUT 60)
   endif()
 
+  if(STRATA_ENABLE_SYCL AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/core/sycl/mock_graph_test.cpp")
+    add_executable(mock_graph_test tests/core/sycl/mock_graph_test.cpp)
+    target_include_directories(mock_graph_test PRIVATE ${_strata_gpu_include_directories})
+    target_link_libraries(mock_graph_test PRIVATE strata_engine strata_prefill strata_spec strata_kernels ${_strata_gpu_runtime_target})
+    add_test(NAME mock_graph_test COMMAND mock_graph_test)
+    set_tests_properties(mock_graph_test PROPERTIES RESOURCE_LOCK gpu TIMEOUT 180)
+  endif()
+
 
 
 
