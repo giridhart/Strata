@@ -264,6 +264,11 @@ Verifier::~Verifier() {
     }
     for (auto& e : exec_)
         if (e) cudaGraphExecDestroy_mock(e);
+    for (auto& chunks : exec_chunks_) {
+        for (void* e : chunks)
+            if (e) cudaGraphExecDestroy_mock(e);
+        chunks.clear();
+    }
     if (commit_exec_) cudaGraphExecDestroy_mock(commit_exec_);
     if (cs_) {
         cs_->wait();
@@ -1399,20 +1404,126 @@ bool Verifier::record_window_epilogue(int T, sycl::queue* cs, std::string& err) 
 }
 
 
-bool Verifier::record_window(int T, sycl::queue* cs, std::string& err) try {
+namespace {
+struct ChunkRecorder {
+    sycl::queue* q = nullptr;
+    std::vector<void*>* out_execs = nullptr;
+    bool capturing = false;
+
+    ChunkRecorder(sycl::queue* queue, std::vector<void*>* execs)
+        : q(queue), out_execs(execs) {}
+
+    ~ChunkRecorder() {
+        if (capturing && q) {
+            cudaGraph_t graph = nullptr;
+            cudaStreamEndCapture(q, &graph);
+            if (graph) cudaGraphDestroy(graph);
+            capturing = false;
+        }
+    }
+
+    bool start() {
+        if (!out_execs) return true;
+        if (cudaStreamBeginCapture(q, cudaStreamCaptureModeThreadLocal) != 0) {
+            return false;
+        }
+        capturing = true;
+        return true;
+    }
+
+    bool finish(std::string& err) {
+        if (!out_execs || !capturing) return true;
+        capturing = false;
+        cudaGraph_t graph = nullptr;
+        const int ce = cudaStreamEndCapture(q, &graph);
+        if (ce != 0 || !graph) {
+            err = "end chunk capture failed: " + std::to_string(ce);
+            return false;
+        }
+        void* exec = nullptr;
+        const int ie = cudaGraphInstantiate(&exec, graph, 0);
+        cudaGraphDestroy(graph);
+        if (ie != 0 || !exec) {
+            err = "instantiate chunk failed: " + std::to_string(ie);
+            return false;
+        }
+        out_execs->push_back(exec);
+        return true;
+    }
+};
+
+enum class VerifyGraphMode {
+    Direct = 0,
+    Split = 1,
+    Whole = 2
+};
+
+inline VerifyGraphMode verify_graph_mode() {
+    static const VerifyGraphMode mode = [] {
+        const char* v = std::getenv("STRATA_VERIFY_GRAPH");
+        if (!v || v[0] == '\0' || std::strcmp(v, "0") == 0 || std::strcmp(v, "direct") == 0 || std::strcmp(v, "off") == 0) {
+            return VerifyGraphMode::Direct;
+        }
+        if (std::strcmp(v, "whole") == 0 || std::strcmp(v, "monolithic") == 0 || std::strcmp(v, "2") == 0) {
+            return VerifyGraphMode::Whole;
+        }
+        return VerifyGraphMode::Split;
+    }();
+    return mode;
+}
+
+inline int verify_graph_chunk_layers() {
+    static const int n = [] {
+        const char* v = std::getenv("STRATA_VERIFY_GRAPH_CHUNK");
+        if (!v || v[0] == '\0') {
+            const char* v2 = std::getenv("STRATA_GRAPH_CHUNK_LAYERS");
+            if (v2 && v2[0] != '\0') return std::max(1, std::atoi(v2));
+            return 1;
+        }
+        return std::max(1, std::atoi(v));
+    }();
+    return n;
+}
+}  // namespace
+
+bool Verifier::record_window(int T, sycl::queue* cs, std::string& err, void* chunk_rec) try {
+    ChunkRecorder* rec = static_cast<ChunkRecorder*>(chunk_rec);
+    if (rec && !rec->start()) {
+        err = "verify: begin prologue capture failed";
+        return false;
+    }
     groups_[T] = (split_ && T >= 2) ? 2 : 1;
     if (!record_window_prologue(T, cs, err)) return false;
     const int G = groups_[T];
     for (int grp = 0; grp < G; ++grp) {
         if (!record_layer_pre(T, lb_, grp, cs, err)) return false;
     }
+    if (rec && !rec->finish(err)) return false;
+
+    const int chunk_layers = verify_graph_chunk_layers();
+    int layers_in_chunk = 0;
+
     for (int64_t l = lb_; l < le_; ++l) {
+        if (rec && layers_in_chunk == 0 && !rec->start()) {
+            err = "verify: begin layer " + std::to_string(l) + " chunk capture failed";
+            return false;
+        }
         for (int grp = 0; grp < G; ++grp) {
             if (!record_layer_post(T, l, grp, cs, err)) return false;
             if (l + 1 < le_ && !record_layer_pre(T, l + 1, grp, cs, err)) return false;
         }
+        layers_in_chunk++;
+        if (rec && (layers_in_chunk >= chunk_layers || l + 1 == le_)) {
+            if (!rec->finish(err)) return false;
+            layers_in_chunk = 0;
+        }
+    }
+    if (rec && !rec->start()) {
+        err = "verify: begin epilogue capture failed";
+        return false;
     }
     if (!record_window_epilogue(T, cs, err)) return false;
+    if (rec && !rec->finish(err)) return false;
     return true;
 } catch (const std::exception& exc) {
     std::cerr << "Verifier::record_window exception: " << exc.what() << std::endl;
@@ -1479,42 +1590,49 @@ std::string Verifier::profile_report() {
     return out;
 }
 
-inline bool verify_use_graph() {
-    // SYCL experimental command_graph on Level Zero runtime can hang or stall during g.finalize()
-    // on large monolithic verify graphs (1000+ nodes) on Intel Arc GPUs.
-    // Direct execution submits the exact same kernels to the in-order queue cs_ without graph compilation overhead.
-    // Graph capture can be opted into with STRATA_VERIFY_GRAPH=1.
-    static const bool enabled = [] {
-        const char* v = std::getenv("STRATA_VERIFY_GRAPH");
-        return v != nullptr && std::atoi(v) != 0;
-    }();
-    return enabled;
-}
-
 bool Verifier::capture(int T, std::string& err) try {
-    if (exec_[T] != nullptr) return true;
-    if (!verify_use_graph()) {
-        VDBG("capture bypassed: direct execution mode active for T=%d (STRATA_VERIFY_GRAPH=0)\n", T);
+    if (exec_[T] != nullptr || !exec_chunks_[T].empty()) return true;
+    const VerifyGraphMode mode = verify_graph_mode();
+    if (mode == VerifyGraphMode::Direct) {
+        VDBG("capture bypassed: direct execution mode active for T=%d (STRATA_VERIFY_GRAPH=direct)\n", T);
         return true;
     }
-    strata::core::progress_at("verify window: capturing graph", (int64_t)T);
-    strata::core::progress_beat();
-    VDBG("capture start: T=%d\n", T);
     const Clock::time_point t_start = Clock::now();
-    /*
-    DPCT1119:389: Migration of cudaStreamBeginCapture is not supported, please
-    try to remigrate with option: --use-experimental-features=graph.
-    */
+
+    if (mode == VerifyGraphMode::Split) {
+        const int chunk_layers = verify_graph_chunk_layers();
+        VDBG("capture start (split mode, chunk_layers=%d): T=%d\n", chunk_layers, T);
+        strata::core::progress_at("verify window: capturing graph chunks", (int64_t)T);
+        strata::core::progress_beat();
+        ChunkRecorder rec(cs_, &exec_chunks_[T]);
+        std::string rerr;
+        const bool ok = record_window(T, cs_, rerr, &rec);
+        if (!ok || exec_chunks_[T].empty()) {
+            for (void* e : exec_chunks_[T]) {
+                if (e) cudaGraphExecDestroy_mock(e);
+            }
+            exec_chunks_[T].clear();
+            std::fprintf(stderr, "strata verify: split graph chunk capture failed (%s), falling back to direct execution\n",
+                         rerr.c_str());
+            return true;
+        }
+        VDBG("capture complete: T=%d in %.2f ms total (%zu chunks)\n", T, ms_since(t_start), exec_chunks_[T].size());
+        strata::core::progress_beat();
+        std::fprintf(stderr, "strata verify: captured %zu graph chunks for the %d-token window (chunk_layers=%d)\n",
+                     exec_chunks_[T].size(), T, chunk_layers);
+        return true;
+    }
+
+    // mode == VerifyGraphMode::Whole
+    strata::core::progress_at("verify window: capturing whole graph", (int64_t)T);
+    strata::core::progress_beat();
+    VDBG("capture start (whole mode): T=%d\n", T);
     if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != 0) {
         err = "verify: begin capture failed";
         return false;
     }
     std::string rerr;
-    const bool ok = record_window(T, cs_, rerr);
-    /*
-    DPCT1119:390: Migration of cudaGraph_t is not supported, please try to
-    remigrate with option: --use-experimental-features=graph.
-    */
+    const bool ok = record_window(T, cs_, rerr, nullptr);
     cudaGraph_t graph = nullptr;
     const int ce = cudaStreamEndCapture(cs_, &graph);
     if (!ok) {
@@ -1531,16 +1649,16 @@ bool Verifier::capture(int T, std::string& err) try {
     const int ie = cudaGraphInstantiate(&exec_[T], graph, 0);
     cudaGraphDestroy(graph);
     if (ie != 0) {
-        std::fprintf(stderr, "strata verify: graph instantiation failed (code %d), falling back to direct execution\n", ie);
+        std::fprintf(stderr, "strata verify: whole graph instantiation failed (code %d), falling back to direct execution\n", ie);
         exec_[T] = nullptr;
         return true;
     }
     VDBG("capture complete: T=%d in %.2f ms total\n", T, ms_since(t_start));
     strata::core::progress_beat();
-    std::fprintf(stderr, "strata verify: captured the %d-token window\n", T);
+    std::fprintf(stderr, "strata verify: captured whole graph for the %d-token window\n", T);
     return true;
 } catch (const std::exception& exc) {
-    std::cerr << "Verifier::copy_logits exception: " << exc.what() << std::endl;
+    std::cerr << "Verifier::capture exception: " << exc.what() << std::endl;
     return false;
 } catch (...) {
     return false;
@@ -1603,8 +1721,8 @@ bool Verifier::record_commit(sycl::queue* cs, std::string& err) {
 
 bool Verifier::capture_commit(std::string& err) try {
     if (commit_exec_ != nullptr) return true;
-    if (!verify_use_graph()) {
-        VDBG("capture_commit bypassed: direct execution mode active (STRATA_VERIFY_GRAPH=0)\n");
+    if (verify_graph_mode() == VerifyGraphMode::Direct) {
+        VDBG("capture_commit bypassed: direct execution mode active (STRATA_VERIFY_GRAPH=direct)\n");
         return true;
     }
     VDBG("capture_commit start\n");
@@ -1701,20 +1819,30 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     ms_host += ms_since(t0);
     const int G = (split_ && T >= 2) ? 2 : 1;
     groups_[T] = G;
-    const bool progressive = (exec_[T] == nullptr);
-    VDBG("staged in %.2f ms; launching (exec=%p, progressive=%d, G=%d)\n", ms_since(t0), exec_[T], (int)progressive, G);
+    const bool progressive = (exec_[T] == nullptr && exec_chunks_[T].empty());
+    VDBG("staged in %.2f ms; launching (exec=%p, chunks=%zu, progressive=%d, G=%d)\n",
+         ms_since(t0), exec_[T], exec_chunks_[T].size(), (int)progressive, G);
     progress_at("verify window: launching", (int64_t)T);
     struct AllowScope {
         explicit AllowScope(int64_t seconds) { progress_allow(seconds); }
         ~AllowScope() { progress_allow(0); }
     } allow_scope(300);  // Allow up to 300 s for cold JIT compilation of SPIR-V modules on Intel Arc
     progress_beat();
-    if (!progressive) {
-        VDBG("launching graph exec=%p\n", exec_[T]);
+    if (exec_[T] != nullptr) {
+        VDBG("launching whole graph exec=%p\n", exec_[T]);
         const int le = cudaGraphLaunch_mock(exec_[T], cs_);
         if (le != 0) {
             err = std::string("verify: launch: error ") + std::to_string(le);
             return false;
+        }
+    } else if (!exec_chunks_[T].empty()) {
+        VDBG("launching %zu graph chunks for T=%d\n", exec_chunks_[T].size(), T);
+        for (void* ch : exec_chunks_[T]) {
+            const int le = cudaGraphLaunch_mock(ch, cs_);
+            if (le != 0) {
+                err = std::string("verify: launch chunk: error ") + std::to_string(le);
+                return false;
+            }
         }
     } else {
         std::string rerr;

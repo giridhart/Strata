@@ -194,7 +194,7 @@ private:
     bool ple_stage() const { return lb_ <= 1 && 1 < le_; }   ///< holds layer 1, where the PLE block runs
     bool capture_commit(std::string& err);
     bool record_commit(sycl::queue* cs, std::string& err);
-    bool record_window(int T, sycl::queue* cs, std::string &err);
+    bool record_window(int T, sycl::queue* cs, std::string &err, void* chunk_rec = nullptr);
     bool record_window_prologue(int T, sycl::queue* cs, std::string& err);
     bool record_layer_pre(int T, int64_t l, int grp, sycl::queue* cs, std::string& err);
     bool record_layer_post(int T, int64_t l, int grp, sycl::queue* cs, std::string& err);
@@ -223,6 +223,7 @@ private:
     int64_t n_vocab_ = 0;
     sycl::queue* cs_ = nullptr;
     void* exec_[9] = {};
+    std::vector<void*> exec_chunks_[9] = {};
     void* commit_exec_ = nullptr;
 
     // mapped staging (host pointer, device alias)
