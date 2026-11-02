@@ -9,6 +9,7 @@
 "use strict";
 (function (root) {
   const OPTIONS = {output: "htmlAndMathml", trust: false, throwOnError: true, strict: "ignore", maxExpand: 1000, maxSize: 20};
+  const MACROS = {"\\aprox": "\\approx"};
   const adapter = {
     OPTIONS,
     async initialize() {
@@ -24,7 +25,7 @@
       if (signal.aborted) return {ok: false, reason: "unavailable"};
       const element = document.createElement("span");
       try {
-        root.katex.render(source, element, {...OPTIONS, displayMode: display, macros: {}});
+        root.katex.render(source, element, {...OPTIONS, displayMode: display, macros: {...MACROS}});
         return {ok: true, element: element.firstElementChild};
       } catch (_) { return {ok: false, reason: "invalid"}; }
     },

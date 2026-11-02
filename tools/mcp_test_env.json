@@ -3,12 +3,28 @@
     "math": {
       "command": "python3",
       "args": ["tools/mcp_math.py"]
+    },
+    "clock": {
+      "command": "python3",
+      "args": ["tools/mcp_datetime.py"]
+    },
+    "plot": {
+      "command": "python3",
+      "args": ["tools/mcp_plot.py"]
     }
   },
   "mcpServers": {
     "math": {
       "command": "python3",
       "args": ["tools/mcp_math.py"]
+    },
+    "clock": {
+      "command": "python3",
+      "args": ["tools/mcp_datetime.py"]
+    },
+    "plot": {
+      "command": "python3",
+      "args": ["tools/mcp_plot.py"]
     }
   },
   "mcp": {

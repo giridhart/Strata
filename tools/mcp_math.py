@@ -203,20 +203,26 @@ TOOLS = [
     {
         "name": "calculate",
         "description": (
-            "Evaluate a mathematical expression with precision. Supports standard operators "
+            "Evaluate one or more mathematical expressions with precision. Supports standard operators "
             "(+, -, *, /, //, %, **, ^), comparisons, math functions (sqrt, cbrt, exp, log, "
             "log2, log10, sin, cos, tan, asin, acos, atan, ceil, floor, round, abs, factorial, "
-            "gcd, lcm, comb, perm), and constants (pi, e, tau)."
+            "gcd, lcm, comb, perm), and constants (pi, e, tau). "
+            "To evaluate multiple independent expressions at once in a single round, pass a list under "
+            "'expressions' rather than making multiple separate tool calls."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "expression": {
                     "type": "string",
-                    "description": "The math expression to evaluate, e.g. 'sqrt(144) + 2.5 * 10' or 'factorial(10) / (2^5)'",
-                }
+                    "description": "A single math expression to evaluate, e.g. 'sqrt(144) + 2.5 * 10' or 'factorial(10) / (2^5)'",
+                },
+                "expressions": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "A list of multiple math expressions to evaluate all at once, e.g. ['sqrt(1025)', '2^10', '5 * sqrt(41)']",
+                },
             },
-            "required": ["expression"],
         },
     }
 ]
@@ -254,12 +260,36 @@ def handle_request(msg: dict) -> dict | None:
         name = params.get("name")
         args = params.get("arguments") or {}
         if name == "calculate":
-            expr = str(args.get("expression") or "")
-            try:
-                ans = evaluate_expression(expr)
-                return {"jsonrpc": "2.0", "id": rid, "result": text_response(ans, error=False)}
-            except Exception as e:
-                return {"jsonrpc": "2.0", "id": rid, "result": text_response(f"error: {e}", error=True)}
+            exprs = args.get("expressions")
+            expr = args.get("expression")
+            if exprs is not None and isinstance(exprs, list):
+                out_lines = []
+                for e in exprs:
+                    e_str = str(e).strip()
+                    if not e_str:
+                        continue
+                    try:
+                        ans = evaluate_expression(e_str)
+                        out_lines.append(f"{e_str} = {ans}")
+                        print(f"eval: {e_str} = {ans}", file=sys.stderr, flush=True)
+                    except Exception as err:
+                        out_lines.append(f"{e_str} = error: {err}")
+                        print(f"eval error: {e_str}: {err}", file=sys.stderr, flush=True)
+                ans_text = "\n".join(out_lines) if out_lines else "error: empty expressions list"
+                return {"jsonrpc": "2.0", "id": rid, "result": text_response(ans_text, error=False)}
+
+            if expr is not None:
+                expr_str = str(expr).strip()
+                try:
+                    ans = evaluate_expression(expr_str)
+                    print(f"eval: {expr_str} = {ans}", file=sys.stderr, flush=True)
+                    return {"jsonrpc": "2.0", "id": rid, "result": text_response(ans, error=False)}
+                except Exception as e:
+                    print(f"eval error: {expr_str}: {e}", file=sys.stderr, flush=True)
+                    return {"jsonrpc": "2.0", "id": rid, "result": text_response(f"error: {e}", error=True)}
+
+            return {"jsonrpc": "2.0", "id": rid, "result": text_response("error: provide 'expression' or 'expressions'", error=True)}
+
         return {
             "jsonrpc": "2.0",
             "id": rid,

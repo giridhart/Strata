@@ -133,6 +133,44 @@ class TestJsonRpcProtocol(unittest.TestCase):
         self.assertIn("division by zero", ans["result"]["content"][0]["text"])
 
 
+    def test_tools_call_batch(self):
+        req = {
+            "jsonrpc": "2.0",
+            "id": 5,
+            "method": "tools/call",
+            "params": {"name": "calculate", "arguments": {"expressions": ["sqrt(1025)", "2^10", "14389.25 * 38.2"]}},
+        }
+        ans = mcp_math.handle_request(req)
+        self.assertFalse(ans["result"]["isError"])
+        text = ans["result"]["content"][0]["text"]
+        self.assertIn("sqrt(1025) = 32.015621187164", text)
+        self.assertIn("2^10 = 1024", text)
+        self.assertIn("14389.25 * 38.2 = 549669.35", text)
+
+    def test_tools_call_batch_partial_error(self):
+        req = {
+            "jsonrpc": "2.0",
+            "id": 6,
+            "method": "tools/call",
+            "params": {"name": "calculate", "arguments": {"expressions": ["10 + 2", "1 / 0"]}},
+        }
+        ans = mcp_math.handle_request(req)
+        text = ans["result"]["content"][0]["text"]
+        self.assertIn("10 + 2 = 12", text)
+        self.assertIn("1 / 0 = error: division by zero", text)
+
+    def test_tools_call_missing_args(self):
+        req = {
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "tools/call",
+            "params": {"name": "calculate", "arguments": {}},
+        }
+        ans = mcp_math.handle_request(req)
+        self.assertTrue(ans["result"]["isError"])
+        self.assertIn("provide 'expression' or 'expressions'", ans["result"]["content"][0]["text"])
+
+
 class TestStrataHubIntegration(unittest.TestCase):
     """Test loading and calling tools/mcp_math.py via Strata's McpHub."""
 
@@ -145,6 +183,12 @@ class TestStrataHubIntegration(unittest.TestCase):
             res = hub.call("math__calculate", {"expression": "sqrt(256) + 10 * 3"})
             self.assertTrue(res["ok"])
             self.assertEqual(res["text"], "46")
+
+            # Batch call via hub
+            b_res = hub.call("math__calculate", {"expressions": ["2^8", "sqrt(100)"]})
+            self.assertTrue(b_res["ok"])
+            self.assertIn("2^8 = 256", b_res["text"])
+            self.assertIn("sqrt(100) = 10", b_res["text"])
         finally:
             hub.close()
 

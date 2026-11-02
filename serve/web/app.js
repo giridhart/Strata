@@ -3,8 +3,29 @@
 "use strict";
 
 const $ = (id) => document.getElementById(id);
-const SPRITE = "web/sprite.svg";
+let SPRITE = "web/sprite.svg";
 const icon = (name, cls = "st-icon") => `<svg class="${cls}" aria-hidden="true"><use href="${SPRITE}#i-${name}"/></svg>`;
+
+// Load and inline sprite.svg into document.body so <use href="#id"> resolves synchronously in-memory,
+// eliminating asynchronous SVG external-fragment layout/paint glitches during continuous streaming updates.
+(async function inlineSprite() {
+  try {
+    const res = await fetch("web/sprite.svg");
+    if (!res.ok) return;
+    const text = await res.text();
+    const div = document.createElement("div");
+    div.id = "st-sprite-cache";
+    div.style.display = "none";
+    div.innerHTML = text;
+    document.body.prepend(div);
+    SPRITE = "";
+    for (const u of document.querySelectorAll('use[href*="sprite.svg#"]')) {
+      u.setAttribute("href", u.getAttribute("href").replace(/^.*sprite\.svg/, ""));
+    }
+  } catch (e) {
+    /* keep external sprite fallback */
+  }
+})();
 const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c]));
 const fmt = (n, d = 0) => (n == null || Number.isNaN(n) ? "–" : Number(n).toLocaleString(undefined, {maximumFractionDigits: d, minimumFractionDigits: d}));
 const kfmt = (n) => (n == null ? "–" : n >= 1000 ? `${fmt(n / 1000, n >= 10000 ? 0 : 1)}k` : fmt(n));
