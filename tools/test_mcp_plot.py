@@ -41,6 +41,20 @@ class TestPlotGenerator(unittest.TestCase):
         self.assertIn("<circle", svg)
         self.assertIn("Generated scatter chart", summary)
 
+    def test_area_chart(self):
+        series = [{"name": "Loss", "values": [2.5, 1.8, 1.2, 0.9]}]
+        svg, summary = mcp_plot.generate_svg_chart(series, chart_type="area", title="Training Loss")
+        self.assertIn("area_grad_", svg)
+        self.assertIn("<path", svg)
+        self.assertIn("Generated area chart", summary)
+
+    def test_label_anticollision_rotation(self):
+        series = [{"name": "Throughput", "values": [100, 110, 105, 95, 90, 85, 80, 75]}]
+        labels = [f"Context-{i}k" for i in (4, 8, 16, 32, 64, 128, 256, 512)]
+        svg, _ = mcp_plot.generate_svg_chart(series, chart_type="line", x_labels=labels)
+        self.assertIn("rotate(-35", svg)
+        self.assertIn("<title>", svg)
+
     def test_empty_series_error(self):
         with self.assertRaises(ValueError):
             mcp_plot.generate_svg_chart([])
@@ -77,7 +91,7 @@ class TestJsonRpcProtocol(unittest.TestCase):
         ans = mcp_plot.handle_request(req)
         self.assertFalse(ans["result"]["isError"])
         content = ans["result"]["content"][0]["text"]
-        self.assertIn("```xml", content)
+        self.assertIn("```svg", content)
         self.assertIn("<svg", content)
         self.assertIn("Throughput", content)
 

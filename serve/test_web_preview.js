@@ -13,6 +13,7 @@ const noImage = {DOMParser: undefined};          // no DOMParser: the inline svg
 const cases = {
   can_preview() {
     assert.ok(P.canPreview("svg", "<svg></svg>") && P.canPreview("SVG", "  <svg xmlns='x'/>"));
+    assert.ok(P.canPreview("xml", "<svg></svg>") && !P.canPreview("xml", "<root></root>"));
     assert.ok(P.canPreview("html", "<p>x</p>") && P.canPreview("htm", "<!doctype html>") && P.canPreview("HTML", "</p>"));
     assert.ok(!P.canPreview("python", "<svg></svg>") && !P.canPreview("html", "plain words") && !P.canPreview("svg", "<p>not svg</p>"));
     assert.ok(!P.canPreview("", "<p>x</p>") && !P.canPreview("svgx", "<svg>"), "the fence's language decides");

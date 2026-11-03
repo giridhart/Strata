@@ -43,7 +43,7 @@
   // the document for a block, or null when the block is not a previewable svg or html (lang is the fence's language)
   function previewDoc(lang, code, scripts, theme, env) {
     let s = String(code).trim();
-    if (/^svg\b/i.test(lang) && /^<svg[\s>]/i.test(s)) {
+    if ((/^svg\b/i.test(lang) || (/^xml\b/i.test(lang) && /^<svg[\s>]/i.test(s))) && /^<svg[\s>]/i.test(s)) {
       const img = scripts ? null : svgImage(s, theme, env);
       return frameHead("body{display:flex;align-items:center;justify-content:center}" + (img ? "img" : "svg") + "{max-width:100%;max-height:100%}", scripts, theme) +
              (img || s) + "</body></html>";
@@ -57,11 +57,11 @@
     }
     return null;
   }
-  const kindOf = (lang) => (/^svg\b/i.test(lang) ? "svg" : "page");
+  const kindOf = (lang, code) => (/^svg\b/i.test(lang) || (/^xml\b/i.test(lang) && /^<svg[\s>]/i.test(String(code || "").trim())) ? "svg" : "page");
   // cheap: can this block be previewed at all (the same test as previewDoc, without building anything)
   const canPreview = (lang, code) => {
     const s = String(code).trim();
-    return (/^svg\b/i.test(lang) && /^<svg[\s>]/i.test(s)) || (/^html?$/i.test(lang) && /^<[/a-z!]/i.test(s));
+    return ((/^svg\b/i.test(lang) || /^xml\b/i.test(lang)) && /^<svg[\s>]/i.test(s)) || (/^html?$/i.test(lang) && /^<[/a-z!]/i.test(s));
   };
 
   // a new frame holding the document (the sandbox attribute only counts when a frame is created, so a frame is never reused)

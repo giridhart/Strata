@@ -740,16 +740,24 @@ function fillPreview(fr, scripts, blank) {
   }
 }
 function refreshPreviews() { for (const fr of document.querySelectorAll("iframe[data-opened]")) fillPreview(fr, fr.dataset.scripts === "1"); }
+function hydratePreviews(root) {
+  for (const box of (root || document).querySelectorAll('.st-code[data-preview="true"]')) {
+    const fr = box.querySelector("iframe");
+    if (fr && !fr.dataset.opened) fillPreview(fr, false);
+  }
+}
 function codeBlock(lang, code, complete) {
   const ok = complete && StrataPreview.canPreview(lang || "", code);
-  const kind = ok ? StrataPreview.kindOf(lang) : null;
-  const label = kind === "svg" ? tr("preview.showSvg", "Preview the picture") : tr("preview.showPage", "Preview the page");
+  const kind = ok ? StrataPreview.kindOf(lang, code) : null;
+  const isSvg = kind === "svg";
+  const label = isSvg ? tr("preview.showSvg", "Preview the picture") : tr("preview.showPage", "Preview the page");
   const head = `<div class="st-code__head"><span>${esc(lang || tr("code.label", "code"))}</span><span class="st-code__btns">` +
     (kind === "page" ? `<button class="st-btn st-btn--icon" data-preview-scripts aria-label="${esc(tr("preview.runScripts", "Run scripts"))}" aria-pressed="false" title="${esc(tr("preview.runScripts", "Run scripts"))}">${icon("warning")}</button>` : "") +
-    (ok ? `<button class="st-btn st-btn--icon" data-preview-toggle data-preview-label="${esc(label)}" aria-label="${esc(label)}" title="${esc(label)}" aria-pressed="false">${icon("image")}</button>` : "") +
+    (ok ? `<button class="st-btn st-btn--icon" data-preview-toggle data-preview-label="${esc(label)}" aria-label="${esc(isSvg ? tr("preview.showCode", "Show the code") : label)}" title="${esc(isSvg ? tr("preview.showCode", "Show the code") : label)}" aria-pressed="${isSvg ? "true" : "false"}">${icon("image")}</button>` : "") +
     `<button class="st-btn st-btn--icon" data-code-copy aria-label="${esc(tr("code.copy", "Copy code"))}">${icon("copy")}</button></span></div>`;
-  const prev = ok ? `<div class="st-code__preview"><iframe sandbox="" title="${esc(kind === "svg" ? tr("preview.titleSvg", "Picture preview") : tr("preview.titlePage", "Page preview"))}" data-lang="${esc(lang)}"></iframe></div>` : "";
-  return `<div class="st-code">${head}<pre><code>${esc(code)}</code></pre>${prev}</div>`;
+  const prev = ok ? `<div class="st-code__preview"><iframe sandbox="" title="${esc(isSvg ? tr("preview.titleSvg", "Picture preview") : tr("preview.titlePage", "Page preview"))}" data-lang="${esc(lang)}"></iframe></div>` : "";
+  const attrs = isSvg ? ' class="st-code" data-preview="true"' : ' class="st-code"';
+  return `<div${attrs}>${head}<pre><code>${esc(code)}</code></pre>${prev}</div>`;
 }
 function blocks(text) {
   const out = [], lines = text.split("\n");
@@ -977,6 +985,7 @@ function updateAssistant(el, m, streaming) {
     bubble.innerHTML = answerHtml(m);
     hydrateToolImages(bubble);
     if (settings.math) StrataMath.hydrate(bubble);
+    hydratePreviews(bubble);
     if (streaming) bubble.classList.add("cursor"); else bubble.classList.remove("cursor");
   }
   el.querySelector(".meta-text").textContent = m.meta || (streaming ? "" : m.stopped ? tr("chat.stopped", "Stopped") : "");

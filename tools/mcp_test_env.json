@@ -11,6 +11,10 @@
     "plot": {
       "command": "python3",
       "args": ["tools/mcp_plot.py"]
+    },
+    "linter": {
+      "command": "python3",
+      "args": ["tools/mcp_linter.py"]
     }
   },
   "mcpServers": {
@@ -25,6 +29,10 @@
     "plot": {
       "command": "python3",
       "args": ["tools/mcp_plot.py"]
+    },
+    "linter": {
+      "command": "python3",
+      "args": ["tools/mcp_linter.py"]
     }
   },
   "mcp": {
