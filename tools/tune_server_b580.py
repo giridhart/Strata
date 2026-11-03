@@ -42,12 +42,15 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import atexit
 import datetime
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -476,12 +479,111 @@ def wait_for_server_ready(url: str, timeout_s: float = 180.0) -> bool:
     return False
 
 
+ACTIVE_EPHEMERAL_FILES: set[str] = set()
+
+
+def _cleanup_all_ephemerals():
+    """Ensure no temporary configuration files linger on disk."""
+    for f in list(ACTIVE_EPHEMERAL_FILES):
+        if os.path.exists(f):
+            try:
+                os.remove(f)
+            except OSError:
+                pass
+            ACTIVE_EPHEMERAL_FILES.discard(f)
+
+
+atexit.register(_cleanup_all_ephemerals)
+
+
+def apply_winning_env_to_config(config_path: str, winning_env: dict[str, str]) -> str | None:
+    """Permanently apply winning environment variables to the target JSON configuration file.
+
+    Creates a timestamped backup before modifying the file.
+    """
+    cfg_p = Path(config_path)
+    if not cfg_p.exists():
+        print(f"[Config] Error: Target config file '{config_path}' not found.")
+        return None
+
+    try:
+        raw_text = cfg_p.read_text(encoding="utf-8-sig")
+        cfg_data = json.loads(raw_text)
+    except Exception as e:
+        print(f"[Config] Error reading '{config_path}': {e}")
+        return None
+
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    backup_p = cfg_p.with_suffix(f".json.bak.{timestamp}")
+    shutil.copy2(cfg_p, backup_p)
+
+    target_env = cfg_data.setdefault("env", {})
+    overridden_keys = []
+    new_keys = []
+    for k, v in winning_env.items():
+        if k in target_env and str(target_env[k]) != str(v):
+            overridden_keys.append((k, target_env[k], v))
+        elif k not in target_env:
+            new_keys.append((k, v))
+        target_env[k] = str(v)
+
+    cfg_p.write_text(json.dumps(cfg_data, indent=2) + "\n", encoding="utf-8")
+
+    print(f"\n[Config] Applied winning environment settings to {cfg_p.name}:")
+    print(f"  Backup preserved at: {backup_p}")
+    if overridden_keys:
+        print("  Overridden existing JSON variables:")
+        for k, old_v, new_v in overridden_keys:
+            print(f"    * {k}: {old_v} -> {new_v}")
+    if new_keys:
+        print("  Added new environment variables:")
+        for k, v in new_keys:
+            print(f"    * {k}: {v}")
+
+    return str(backup_p)
+
+
 def launch_server_process(config_path: str, port: int, env_vars: dict[str, str], engine_bin: str = "strata") -> subprocess.Popen:
-    """Launch sycl/serve/server_intel.py subprocess with specified environment overrides."""
+    """Launch sycl/serve/server_intel.py subprocess with specified environment overrides.
+
+    If `config_path` contains pre-existing "env" keys (from setup or earlier runs),
+    serve/server.py's child_env() will overwrite process os.environ with those JSON values.
+    To ensure our test candidate's environment variables take absolute precedence, we construct
+    an ephemeral configuration JSON where cfg["env"] is explicitly updated with env_vars,
+    and pass that temporary config to server_intel.py.
+    """
     full_env = os.environ.copy()
     full_env.update(env_vars)
     full_env["ONEAPI_DEVICE_SELECTOR"] = full_env.get("ONEAPI_DEVICE_SELECTOR", "level_zero:0")
     full_env["ZES_ENABLE_SYSMAN"] = "1"
+
+    effective_config_path = config_path
+    ephemeral_path = None
+
+    if config_path and os.path.exists(config_path):
+        try:
+            with open(config_path, "r", encoding="utf-8-sig") as f:
+                base_cfg = json.load(f)
+
+            overlaid_cfg = dict(base_cfg)
+            cfg_env = dict(overlaid_cfg.get("env") or {})
+
+            overridden_from_json = [k for k in env_vars if k in cfg_env and str(cfg_env[k]) != str(env_vars[k])]
+            cfg_env.update(env_vars)
+            overlaid_cfg["env"] = cfg_env
+
+            with tempfile.NamedTemporaryFile(mode="w", prefix="strata_tune_cfg_", suffix=".json", delete=False, encoding="utf-8") as tf:
+                json.dump(overlaid_cfg, tf, indent=2)
+                ephemeral_path = tf.name
+
+            ACTIVE_EPHEMERAL_FILES.add(ephemeral_path)
+            effective_config_path = ephemeral_path
+
+            if overridden_from_json:
+                print(f"[Manager] Overriding {len(overridden_from_json)} base JSON env vars: {', '.join(overridden_from_json)}")
+
+        except Exception as e:
+            print(f"[Manager] Warning: Failed to create ephemeral config overlay ({e}); falling back to base config.")
 
     cmd = [
         sys.executable,
@@ -489,28 +591,36 @@ def launch_server_process(config_path: str, port: int, env_vars: dict[str, str],
         "--engine",
         engine_bin,
         "--config",
-        config_path,
+        effective_config_path,
         "--port",
         str(port),
     ]
 
-    print(f"\n[Manager] Spawning server_intel.py on port {port}...")
+    print(f"\n[Manager] Spawning server_intel.py on port {port} (effective config: {Path(effective_config_path).name})...")
     proc = subprocess.Popen(cmd, env=full_env, cwd=str(ROOT))
+    setattr(proc, "ephemeral_config", ephemeral_path)
     return proc
 
 
 def stop_server_process(proc: subprocess.Popen, timeout_s: float = 15.0):
-    """Gracefully terminate server subprocess."""
-    if proc.poll() is not None:
-        return
-    print("[Manager] Terminating server subprocess...")
-    proc.terminate()
-    try:
-        proc.wait(timeout=timeout_s)
-    except subprocess.TimeoutExpired:
-        print("[Manager] Force killing server subprocess (SIGKILL)...")
-        proc.kill()
-        proc.wait()
+    """Gracefully terminate server subprocess and remove any ephemeral config file."""
+    if proc.poll() is None:
+        print("[Manager] Terminating server subprocess...")
+        proc.terminate()
+        try:
+            proc.wait(timeout=timeout_s)
+        except subprocess.TimeoutExpired:
+            print("[Manager] Force killing server subprocess (SIGKILL)...")
+            proc.kill()
+            proc.wait()
+
+    ephemeral_cfg = getattr(proc, "ephemeral_config", None)
+    if ephemeral_cfg and os.path.exists(ephemeral_cfg):
+        try:
+            os.remove(ephemeral_cfg)
+        except OSError:
+            pass
+        ACTIVE_EPHEMERAL_FILES.discard(ephemeral_cfg)
 
 
 def interactive_tweak_prompt(title: str, env_dict: dict[str, str]) -> tuple[bool, dict[str, str]]:
@@ -678,6 +788,8 @@ def main():
     parser.add_argument("--sets", default="", help="Custom prompt/output lengths format: 'P1/O1,P2/O2,P3/O3'")
     parser.add_argument("--out-dir", default="bench_results/tuning", help="Directory to save JSON & Markdown reports")
     parser.add_argument("--no-warmup", action="store_true", help="Skip discardable warmup request")
+    parser.add_argument("--apply-to-config", action="store_true",
+                        help="Automatically update the base model config JSON's 'env' block with winning tournament parameters")
     args = parser.parse_args()
 
     # Determine evaluation sets
@@ -865,6 +977,16 @@ def main():
         print(f" Detailed Decision Report:   {md_path}")
         print("=" * 80)
         print("\n" + md_report)
+
+        if args.apply_to_config and args.config:
+            apply_winning_env_to_config(args.config, winning_env)
+        elif interactive and args.config:
+            try:
+                ans = input(f"\nApply winning environment variables directly to '{args.config}'? [y/N]: ").strip().lower()
+                if ans in ("y", "yes"):
+                    apply_winning_env_to_config(args.config, winning_env)
+            except EOFError:
+                pass
 
     elif args.mode == "stack":
         print("\nRunning Progressive Cumulative Stacks...")

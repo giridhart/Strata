@@ -37,7 +37,8 @@ import urllib.request
 from serve import lifeline
 
 PROTOCOL = "2025-06-18"               # the MCP revision Strata asks for; the server's answer is used as given
-DEFAULTS = {"timeout_s": 60.0, "max_result_chars": 20000, "max_rounds": 8, "start_timeout_s": 120.0, "image_results": False}
+DEFAULTS = {"timeout_s": 60.0, "max_result_chars": 20000, "max_rounds": 8, "start_timeout_s": 120.0, "image_results": False,
+            "codemode": False}
 
 
 class McpError(RuntimeError):
@@ -587,9 +588,81 @@ class McpHub:
     def openai_tools(self) -> list[dict]:
         return [{"type": "function", "function": t} for t in self.template_tools()]
 
+    def codemode_tools(self, exclude=()) -> list[dict]:
+        """A single execution tool for Code Mode with compact Python signatures of all MCP tools."""
+        if "run_python" in exclude:
+            return []
+        sigs = []
+        for name, (s, tool) in self.routes().items():
+            t = next((x for x in s.tools if x["name"] == tool), None)
+            if not t:
+                continue
+            schema = t.get("inputSchema") if isinstance(t.get("inputSchema"), dict) else {}
+            props = schema.get("properties") or {}
+            args_str = ", ".join(f"{k}: {v.get('type', 'any')}" for k, v in props.items())
+            desc = str(t.get("description") or t.get("title") or "").strip().replace("\n", " ")
+            if desc:
+                desc = f": {desc[:120]}"
+            sigs.append(f"  - mcp.{_clean(s.name)}.{_clean(tool)}({args_str}){desc}")
+
+        tools_list_text = "\n".join(sigs) if sigs else "  (no MCP tools currently registered)"
+        desc = (
+            "Execute Python code to interact with MCP tools and process data locally.\n"
+            "Tools are called via `mcp.<server>.<tool>(...)` or `mcp.call('<server>__<tool>', ...)`. "
+            "Positional and keyword arguments are supported.\n"
+            "Intermediate outputs stay in memory; only stdout (`print()`) or the `result` variable enters context.\n"
+            "Helpers: `mcp.search(query)` searches tools, `mcp.list_tools()` lists all tools.\n\n"
+            f"Available tools:\n{tools_list_text}"
+        )
+        return [{
+            "name": "run_python",
+            "description": desc,
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "code": {
+                        "type": "string",
+                        "description": "Self-contained Python code to execute."
+                    },
+                    "dependencies": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional PyPI packages needed for execution (e.g. ['tabulate', 'pandas']). Installed dynamically by uv in milliseconds."
+                    }
+                },
+                "required": ["code"]
+            }
+        }]
+
+    def call_codemode(self, arguments: dict, cancel: threading.Event | None = None) -> dict:
+        from serve import mcp_runner
+        code = ""
+        deps = None
+        if isinstance(arguments, dict):
+            code = arguments.get("code") or arguments.get("script") or arguments.get("python") or ""
+            if isinstance(arguments.get("dependencies"), list):
+                deps = [str(d) for d in arguments["dependencies"]]
+        if not isinstance(code, str) or not code.strip():
+            return {"server": "codemode", "tool": "run_python", "ok": False,
+                    "text": "error: run_python requires a 'code' string argument", "chars": 52,
+                    "truncated": False, "ms": 0}
+        timeout = float(self.settings.get("timeout_s", 60.0))
+        r = mcp_runner.execute_in_runner(code, self, timeout_s=timeout, cancel=cancel, dependencies=deps)
+        text, ok = r["text"], r["ok"]
+        cap = int(self.settings["max_result_chars"])
+        full = len(text)
+        truncated = cap > 0 and full > cap
+        if truncated:
+            text = text[:cap] + (f"\n\n[... truncated: the tool returned {full:,} characters; only the first "
+                                 f"{cap:,} are shown]")
+        return {"server": "codemode", "tool": "run_python", "ok": ok, "text": text, "chars": full,
+                "truncated": truncated, "ms": r["ms"]}
+
     def call(self, name: str, arguments: dict, cancel: threading.Event | None = None) -> dict:
         """Run one tool -> {"ok", "text" (what the model reads, capped), "chars" (its full length), "truncated",
         "ms", "server", "tool"}.  Errors become text starting with "error:"; only McpCancelled is raised."""
+        if name == "run_python":
+            return self.call_codemode(arguments, cancel)
         t0 = time.monotonic()
         server, tool = self._routes.get(name) or self.routes().get(name, (None, name))
         out = {"server": server.name if server else None, "tool": tool}
@@ -638,7 +711,7 @@ class McpHub:
                             "tools": [{"name": names.get(t["name"], t["name"]), "tool": t["name"],
                                        "description": str(t.get("description") or "")[:300]} for t in s.tools]})
         return {"servers": servers, "tools": len(routes),
-                "settings": {k: self.settings[k] for k in ("timeout_s", "max_result_chars", "max_rounds")}}
+                "settings": {k: self.settings[k] for k in ("timeout_s", "max_result_chars", "max_rounds", "codemode")}}
 
     def close(self):
         for s in self.servers.values():
@@ -687,6 +760,10 @@ def settings_from(cfg: dict) -> dict:
             if not isinstance(value, bool):
                 raise SystemExit(f"[strata] config mcp.{key}={value!r}: expected a boolean")
             out[key] = value
+        elif key in ("codemode", "code_mode"):
+            if not isinstance(value, bool):
+                raise SystemExit(f"[strata] config mcp.{key}={value!r}: expected a boolean")
+            out["codemode"] = value
         elif key in ("timeout_s", "start_timeout_s"):
             if not number or value <= 0:
                 raise SystemExit(f"[strata] config mcp.{key}={value!r}: expected a number of seconds > 0")
@@ -706,6 +783,7 @@ def hub_from_config(cfg: dict, mcp_config_path: str | None = None) -> McpHub | N
     servers = {}
     servers.update(servers_from(cfg.get("mcp_servers"), "config mcp_servers"))
     servers.update(servers_from(cfg.get("mcpServers"), "config mcpServers"))
+    file_settings = {}
     if mcp_config_path:
         try:
             with open(mcp_config_path, encoding="utf-8-sig") as f:
@@ -716,9 +794,12 @@ def hub_from_config(cfg: dict, mcp_config_path: str | None = None) -> McpHub | N
         if block is None:
             raise SystemExit(f"[strata] --mcp-config {mcp_config_path}: expected {{\"mcpServers\": {{...}}}}")
         servers.update(servers_from(block, f"--mcp-config {mcp_config_path}"))
+        if isinstance(data, dict) and isinstance(data.get("mcp"), dict):
+            file_settings = settings_from({"mcp": data["mcp"]})
     if not servers:
         return None
-    return McpHub(servers, settings_from(cfg))
+    merged = {**file_settings, **settings_from(cfg)}
+    return McpHub(servers, merged)
 
 
 if __name__ == "__main__":                               # python -m serve.mcp config.json: list what a config offers

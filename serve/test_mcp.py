@@ -167,6 +167,40 @@ class Client(unittest.TestCase):
         seen = [json.loads(line) for line in Path(self.log.name).read_text().splitlines()]
         self.assertTrue(any("cancelled" in e for e in seen), seen)   # notifications/cancelled reached the server
 
+    def test_codemode_tool_definition(self):
+        tools = self.hub.codemode_tools()
+        self.assertEqual(len(tools), 1)
+        self.assertEqual(tools[0]["name"], "run_python")
+        self.assertIn("mcp.fake.echo", tools[0]["description"])
+        self.assertIn("mcp.fake.add", tools[0]["description"])
+        self.assertEqual(self.hub.codemode_tools(exclude={"run_python"}), [])
+
+    def test_call_codemode_execution(self):
+        r = self.hub.call("run_python", {"code": "s = mcp.fake.add(a=20, b=30)\nprint(f'sum={s}')"})
+        self.assertTrue(r["ok"])
+        self.assertIn("sum=50", r["text"])
+
+    def test_call_codemode_positional_args(self):
+        r = self.hub.call("run_python", {"code": "s = mcp.fake.add(100, 200)\nresult = s"})
+        self.assertTrue(r["ok"])
+        self.assertIn("300", r["text"])
+
+    def test_call_codemode_syntax_error(self):
+        r = self.hub.call("run_python", {"code": "def foo(: print(1)"})
+        self.assertFalse(r["ok"])
+        self.assertIn("SyntaxError", r["text"])
+
+    def test_call_codemode_dynamic_dependency(self):
+        import shutil
+        if not shutil.which("uv"):
+            self.skipTest("uv is not available on PATH")
+        r = self.hub.call("run_python", {
+            "code": "import tabulate\nprint(tabulate.tabulate([['codemode', 1]]))",
+            "dependencies": ["tabulate"]
+        })
+        self.assertTrue(r["ok"], r.get("text"))
+        self.assertIn("codemode", r["text"])
+
 
 class HttpClient(unittest.TestCase):
     """Streamable HTTP: JSON answers, an event-stream answer, the session id."""
@@ -209,12 +243,12 @@ class Config(unittest.TestCase):
                                   encoding="utf-8")
             hub = hub_from_config({"mcp_servers": {"a": {"command": "old"}},
                                    "mcpServers": {"c": stdio(), "off": {"command": "x", "disabled": True}},
-                                   "mcp": {"timeout_s": 5, "max_result_chars": 100, "max_rounds": 3}}, path)
+                                   "mcp": {"timeout_s": 5, "max_result_chars": 100, "max_rounds": 3, "codemode": True}}, path)
             self.assertEqual(sorted(hub.servers), ["a", "b", "c"])
             self.assertEqual(hub.servers["a"].cfg["command"], sys.executable)   # the file wins a name clash
             self.assertEqual(hub.servers["b"].kind, "http")
-            self.assertEqual((hub.settings["timeout_s"], hub.settings["max_result_chars"], hub.settings["max_rounds"]),
-                             (5.0, 100, 3))
+            self.assertEqual((hub.settings["timeout_s"], hub.settings["max_result_chars"], hub.settings["max_rounds"], hub.settings["codemode"]),
+                             (5.0, 100, 3, True))
         self.assertIsNone(hub_from_config({}))
         self.assertEqual(McpHub({}).settings["max_result_chars"], 20000)
 
@@ -318,6 +352,37 @@ class ToolLoop(unittest.TestCase):
         msg = json.loads(text)["choices"][0]["message"]
         self.assertEqual(msg["content"], "Let me check.5.")
         self.assertEqual(msg["strata_mcp"][-1]["text"], "5")
+
+    def test_codemode_e2e_request(self):
+        script = call_script("run_python", code="s = mcp.fake.add(a=15, b=25)\nprint(f'sum={s}')")
+        self.start(script, "</think>\n\nThe sum is 40.")
+        code, text = self.post({"strata_mcp": True, "codemode": True})
+        self.assertEqual(code, 200, text)
+        cs = self.chunks(text)
+        mcp = [c["strata_mcp"] for c in cs if "strata_mcp" in c]
+        self.assertEqual([m["event"] for m in mcp], ["start", "call", "result"])
+        self.assertEqual(mcp[1]["name"], "run_python")
+        self.assertTrue(mcp[2]["ok"])
+        self.assertIn("sum=40", mcp[2]["text"])
+        self.assertEqual(len(self.engine.prompts), 2)
+        first, second = self.engine.prompt_text(0), self.engine.prompt_text(1)
+        self.assertIn('"name": "run_python"', first)
+        self.assertNotIn('"name": "fake__echo"', first)
+        self.assertIn("<tool_response>\nsum=40\n</tool_response>", second)
+
+    def test_codemode_config_opt_in(self):
+        self.hub.settings["codemode"] = True
+        script = call_script("run_python", code="print(mcp.fake.echo(text='codemode from config'))")
+        self.start(script, "</think>\n\nDone.")
+        code, text = self.post({"strata_mcp": True})
+        self.assertEqual(code, 200, text)
+        cs = self.chunks(text)
+        mcp = [c["strata_mcp"] for c in cs if "strata_mcp" in c]
+        self.assertEqual([m["event"] for m in mcp], ["start", "call", "result"])
+        self.assertIn("codemode from config", mcp[2]["text"])
+        first = self.engine.prompt_text(0)
+        self.assertIn('"name": "run_python"', first)
+        self.assertNotIn('"name": "fake__echo"', first)
 
     def test_plain_requests_get_no_mcp_tools(self):
         self.start(call_script("fake__echo", text="x"), "</think>\n\nnever")

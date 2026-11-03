@@ -201,6 +201,7 @@ class TestStrataHubIntegration(unittest.TestCase):
         self.assertIsNotNone(hub)
         self.assertIn("math", hub.servers)
         self.assertEqual(hub.settings["max_rounds"], 8)
+        self.assertEqual(hub.settings["codemode"], True)
 
 
 if __name__ == "__main__":

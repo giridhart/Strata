@@ -956,6 +956,11 @@ after a change.
   cut with a note. Stop stops a running tool too.
 - Only the chat page uses them. API clients see the API exactly as before and keep their own tools. A request to
   `/v1/chat/completions` opts in with `"strata_mcp": true`.
+- **Code Mode** (`"codemode": true` in the `"mcp"` config block, or per request `"codemode": true`): instead of injecting
+  every tool's JSON schema into the prompt, Strata offers a single `run_python` tool with compact Python signatures. The
+  model writes Python to chain tools (e.g. `mcp.files.read(...)`), filters large intermediate data in memory, and returns only
+  the final output into the context. If `uv` is installed, dynamic PyPI packages (via `"dependencies": ["pandas"]`) are
+  resolved on the fly in milliseconds in an isolated environment.
 
 **Security.** MCP tools run on your PC with your user's rights, and the model decides when to call them, also because of what
 it reads (a web page or file can contain instructions). Give a filesystem server only the folders it needs, prefer read-only
