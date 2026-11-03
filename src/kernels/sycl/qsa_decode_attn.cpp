@@ -636,10 +636,9 @@ int attn_kv_mode(const QsaAttnPools& p) {
 
 int attn_merge_v2() {
     static const int on = [] {
-        int r = daily_attn() ? 1 : 0;
-        const char* v = std::getenv("STRATA_ATTN_MERGE_V2");
-        if (v != nullptr && *v != '\0') r = std::atoi(v) != 0 ? 1 : 0;
-        return r;
+        if (const char* v = std::getenv("STRATA_ATTN_MERGE_ACTIVE")) return std::atoi(v) != 0 ? 1 : 0;
+        if (const char* v = std::getenv("STRATA_ATTN_MERGE_V2")) return std::atoi(v) != 0 ? 1 : 0;
+        return 1; // Default ON on Battlemage Xe2 (active chunk bounding)
     }();
     return on;
 }

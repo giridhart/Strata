@@ -316,6 +316,8 @@ elseif(STRATA_ENABLE_SYCL)
   endif()
   if(STRATA_TARGET_XE2)
     add_compile_definitions(STRATA_TARGET_XE2)
+    add_compile_definitions(STRATA_Q2_WORD_FAST=1 STRATA_IQ4NL_LUT_SWAR=1 STRATA_IQ4XS_LUT_SWAR=1
+                           STRATA_IQ4_LUT_SWAR=1 STRATA_IQ3S_SIGN_FAST=1 STRATA_IQ3S_SIGN_APPLY_FAST=1)
     message(STATUS "Strata: Intel Xe2 (Battlemage B580 / Lunar Lake) optimizations ENABLED")
   endif()
   if(STRATA_AOT_BMG)

@@ -12,6 +12,7 @@
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/dp4a.hpp"
 #include "strata/kernels/q8_1_finite.hpp"
+#include "strata/kernels/iq4_lut.hpp"
 
 #define GGML_COMMON_DECL_SYCL
 #define GGML_COMMON_IMPL_SYCL
@@ -104,6 +105,68 @@ inline sycl::int2 get_int_from_table_16(const int& q4, const int8_t* table) {
 }
 #define ggml_cuda_dp4a(a, b, c) dp4a((a), (b), (c))
 
+#ifndef STRATA_Q2_WORD_FAST
+#define STRATA_Q2_WORD_FAST 1
+#endif
+inline sycl::int2 q2_decode8(uint16_t q) {
+#if STRATA_Q2_WORD_FAST
+    const auto decode4 = [](uint32_t c) {
+        c &= 0xFFu;
+        c = (c | (c << 12)) & 0x000F000Fu;
+        c = (c | (c << 6)) & 0x03030303u;
+        return (int) ((c + 0x7F7F7F7Fu) ^ 0x80808080u);
+    };
+    return sycl::int2(decode4(q), decode4(q >> 8));
+#else
+    const int qe = byte_permute(0x020100FF, 0x020100FF, q);
+    const int qo = byte_permute(0x020100FF, 0x020100FF, q >> 2);
+    return sycl::int2(byte_permute(qe, qo, 0x5140),
+                      byte_permute(qe, qo, 0x7362));
+#endif
+}
+
+#ifndef STRATA_IQ3S_SIGN_FAST
+#define STRATA_IQ3S_SIGN_FAST 1
+#endif
+#ifndef STRATA_IQ3S_SIGN_APPLY_FAST
+#define STRATA_IQ3S_SIGN_APPLY_FAST 1
+#endif
+inline int iq3s_sign_mask(unsigned nibble) {
+#if STRATA_IQ3S_SIGN_FAST
+    const unsigned bits = (nibble & 0x0Fu) * 0x00204081u & 0x01010101u;
+    return (int) ((bits << 8) - bits);
+#else
+    return swar_ne4((nibble & 1u) | ((nibble & 2u) << 8) |
+                    ((nibble & 4u) << 16) | ((nibble & 8u) << 24));
+#endif
+}
+inline int iq3s_apply_sign(unsigned grid, unsigned sign) {
+#if STRATA_IQ3S_SIGN_APPLY_FAST
+    return (int) ((grid ^ sign) + (sign & 0x01010101u));
+#else
+    return swar_sub4(grid ^ sign, sign);
+#endif
+}
+
+#ifndef STRATA_IQ4NL_LUT_SWAR
+#define STRATA_IQ4NL_LUT_SWAR 1
+#endif
+inline uint32_t iq4nl_lut4(uint32_t q4) {
+#if STRATA_IQ4NL_LUT_SWAR
+    return iq4_lut4_swar(q4);
+#else
+    constexpr uint32_t t0 = 0xBFAD9881u, t1 = 0xF6EADDCFu, t2 = 0x26190D01u, t3 = 0x71594535u;
+    uint32_t r = 0;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const uint32_t n = (q4 >> (8 * i)) & 0xF;
+        const uint32_t t = n < 4 ? t0 : n < 8 ? t1 : n < 12 ? t2 : t3;
+        r |= ((t >> (8 * (n & 3))) & 0xFF) << (8 * i);
+    }
+    return r;
+#endif
+}
+
 // ---------------------------------------------------------------- the dot products (vecdotq.cuh)
 inline float vec_dot_q2_0_q8_1(const void* __restrict__ vbq, const block_q8_1* __restrict__ bq8_1, const int& kbx,
                                const int& iqs) {
@@ -117,12 +180,9 @@ inline float vec_dot_q2_0_q8_1(const void* __restrict__ vbq, const block_q8_1* _
         const int q = qs[j];
         const int u = get_int_b4(bq8_1_chunk->qs, j * 2 + 0);
         const int v = get_int_b4(bq8_1_chunk->qs, j * 2 + 1);
-        const int qe = byte_permute(0x020100FF, 0x020100FF, q >> 0);
-        const int qo = byte_permute(0x020100FF, 0x020100FF, q >> 2);
-        const int qx = byte_permute(qe, qo, 0x5140);
-        const int qy = byte_permute(qe, qo, 0x7362);
-        sumi = ggml_cuda_dp4a(u, qx, sumi);
-        sumi = ggml_cuda_dp4a(v, qy, sumi);
+        const sycl::int2 w = q2_decode8((uint16_t) q);
+        sumi = ggml_cuda_dp4a(u, w.x(), sumi);
+        sumi = ggml_cuda_dp4a(v, w.y(), sumi);
     }
     const float d8 = (bq8_1_chunk->ds)[0];
     return d2 * d8 * sumi;
@@ -139,12 +199,17 @@ inline float vec_dot_iq2_xxs_q8_1(const void* __restrict__ vbq, const block_q8_1
     for (int k0 = 0; k0 < 8; k0 += 2) {
         const sycl::uint2 grid_pos = ((const sycl::uint2*)iq2xxs_grid)[aux8[k0 / 2]];
         const uint32_t signs = unpack_ksigns(aux32 >> (7 * k0 / 2));
+#if STRATA_IQ3S_SIGN_FAST
+        const int signs0 = iq3s_sign_mask(signs);
+        const int signs1 = iq3s_sign_mask(signs >> 4);
+#else
         const int signs0 = vectorized_binary<sycl::uchar4>(signs & 0x08040201, 0, std::not_equal_to<>());
-        const int grid0 = vectorized_binary<sycl::uchar4>(grid_pos.x() ^ signs0, signs0, std::minus<>());
+        const int signs1 = vectorized_binary<sycl::uchar4>(signs & 0x80402010, 0, std::not_equal_to<>());
+#endif
+        const int grid0 = iq3s_apply_sign(grid_pos.x(), signs0);
         const int u0 = get_int_b4(bq8_1[iqs / 2].qs, k0 + 0);
         sumi = ggml_cuda_dp4a(grid0, u0, sumi);
-        const int signs1 = vectorized_binary<sycl::uchar4>(signs & 0x80402010, 0, std::not_equal_to<>());
-        const int grid1 = vectorized_binary<sycl::uchar4>(grid_pos.y() ^ signs1, signs1, std::minus<>());
+        const int grid1 = iq3s_apply_sign(grid_pos.y(), signs1);
         const int u1 = get_int_b4(bq8_1[iqs / 2].qs, k0 + 1);
         sumi = ggml_cuda_dp4a(grid1, u1, sumi);
     }
@@ -166,11 +231,16 @@ inline float vec_dot_iq2_xs_q8_1(const void* __restrict__ vbq, const block_q8_1*
     for (int l0 = 0; l0 < 8; l0 += 2) {
         const sycl::uint2 grid_pos = ((const sycl::uint2*)iq2xs_grid)[q2[l0 / 2] & 0x1FF];
         const uint32_t signs = unpack_ksigns(q2[l0 / 2] >> 9);
+#if STRATA_IQ3S_SIGN_FAST
+        const int signs0 = iq3s_sign_mask(signs);
+        const int signs1 = iq3s_sign_mask(signs >> 4);
+#else
         const int signs0 = vectorized_binary<sycl::uchar4>(signs & 0x08040201, 0, std::not_equal_to<>());
-        const int grid_l = vectorized_binary<sycl::uchar4>(grid_pos.x() ^ signs0, signs0, std::minus<>());
-        const int u0 = get_int_b4(bq8_1[iqs / 2].qs, l0 + 0);
         const int signs1 = vectorized_binary<sycl::uchar4>(signs & 0x80402010, 0, std::not_equal_to<>());
-        const int grid_h = vectorized_binary<sycl::uchar4>(grid_pos.y() ^ signs1, signs1, std::minus<>());
+#endif
+        const int grid_l = iq3s_apply_sign(grid_pos.x(), signs0);
+        const int u0 = get_int_b4(bq8_1[iqs / 2].qs, l0 + 0);
+        const int grid_h = iq3s_apply_sign(grid_pos.y(), signs1);
         const int u1 = get_int_b4(bq8_1[iqs / 2].qs, l0 + 1);
         if (l0 < 4) {
             sumi0 = ggml_cuda_dp4a(grid_l, u0, sumi0);
@@ -200,14 +270,19 @@ inline float vec_dot_iq2_s_q8_1(const void* __restrict__ vbq, const block_q8_1* 
 #pragma unroll
     for (int l0 = 0; l0 < 8; l0 += 2) {
         const int* grid_pos = (const int*)(iq2s_grid + (qs[l0 / 2] | ((qh << (8 - l0)) & 0x300)));
+#if STRATA_IQ3S_SIGN_FAST
+        const int signs0 = iq3s_sign_mask(signs_packed_8[l0 / 2]);
+        const int signs1 = iq3s_sign_mask(signs_packed_8[l0 / 2] >> 4);
+#else
         const int signs0 = vectorized_binary<sycl::uchar4>(((signs_packed_8[l0 / 2] & 0x03) << 7) |
                                                                ((signs_packed_8[l0 / 2] & 0x0C) << 21),
                                                            0x00000000, std::not_equal_to<>());
         const int signs1 = vectorized_binary<sycl::uchar4>(((signs_packed_8[l0 / 2] & 0x30) << 3) |
                                                                ((signs_packed_8[l0 / 2] & 0xC0) << 17),
                                                            0x00000000, std::not_equal_to<>());
-        const int grid_l = vectorized_binary<sycl::uchar4>(grid_pos[0] ^ signs0, signs0, std::minus<>());
-        const int grid_h = vectorized_binary<sycl::uchar4>(grid_pos[1] ^ signs1, signs1, std::minus<>());
+#endif
+        const int grid_l = iq3s_apply_sign(grid_pos[0], signs0);
+        const int grid_h = iq3s_apply_sign(grid_pos[1], signs1);
         const int u0 = get_int_b4(bq8_1[iqs / 2].qs, l0 + 0);
         const int u1 = get_int_b4(bq8_1[iqs / 2].qs, l0 + 1);
         if (l0 < 4) {
@@ -235,11 +310,16 @@ inline float vec_dot_iq3_xxs_q8_1(const void* __restrict__ vbq, const block_q8_1
     for (int l0 = 0; l0 < 8; l0 += 2) {
         const sycl::int2 grid_pos = sycl::int2(iq3xxs_grid[q3[l0 + 0]], iq3xxs_grid[q3[l0 + 1]]);
         const uint32_t signs = unpack_ksigns(aux32 >> (7 * l0 / 2));
+#if STRATA_IQ3S_SIGN_FAST
+        const int signs0 = iq3s_sign_mask(signs);
+        const int signs1 = iq3s_sign_mask(signs >> 4);
+#else
         const int signs0 = vectorized_binary<sycl::uchar4>(signs & 0x08040201, 0, std::not_equal_to<>());
-        const int grid_l = vectorized_binary<sycl::uchar4>(grid_pos.x() ^ signs0, signs0, std::minus<>());
-        const int u0 = get_int_b4(bq8_1[iqs / 2].qs, l0 + 0);
         const int signs1 = vectorized_binary<sycl::uchar4>(signs & 0x80402010, 0, std::not_equal_to<>());
-        const int grid_h = vectorized_binary<sycl::uchar4>(grid_pos.y() ^ signs1, signs1, std::minus<>());
+#endif
+        const int grid_l = iq3s_apply_sign(grid_pos.x(), signs0);
+        const int grid_h = iq3s_apply_sign(grid_pos.y(), signs1);
+        const int u0 = get_int_b4(bq8_1[iqs / 2].qs, l0 + 0);
         const int u1 = get_int_b4(bq8_1[iqs / 2].qs, l0 + 1);
         sumi = ggml_cuda_dp4a(grid_l, u0, sumi);
         sumi = ggml_cuda_dp4a(grid_h, u1, sumi);
@@ -264,14 +344,19 @@ inline float vec_dot_iq3_s_q8_1(const void* __restrict__ vbq, const block_q8_1* 
     for (int l0 = 0; l0 < 8; l0 += 2) {
         const sycl::int2 grid_pos = sycl::int2(iq3s_grid[qs[l0 + 0] | ((qh << (8 - l0)) & 0x100)],
                                                iq3s_grid[qs[l0 + 1] | ((qh << (7 - l0)) & 0x100)]);
+#if STRATA_IQ3S_SIGN_FAST
+        const int signs0 = iq3s_sign_mask(signs_packed_8[l0 / 2]);
+        const int signs1 = iq3s_sign_mask(signs_packed_8[l0 / 2] >> 4);
+#else
         const int signs0 = vectorized_binary<sycl::uchar4>(((signs_packed_8[l0 / 2] & 0x03) << 7) |
                                                                ((signs_packed_8[l0 / 2] & 0x0C) << 21),
                                                            0x00000000, std::not_equal_to<>());
         const int signs1 = vectorized_binary<sycl::uchar4>(((signs_packed_8[l0 / 2] & 0x30) << 3) |
                                                                ((signs_packed_8[l0 / 2] & 0xC0) << 17),
                                                            0x00000000, std::not_equal_to<>());
-        const int grid_l = vectorized_binary<sycl::uchar4>(grid_pos.x() ^ signs0, signs0, std::minus<>());
-        const int grid_h = vectorized_binary<sycl::uchar4>(grid_pos.y() ^ signs1, signs1, std::minus<>());
+#endif
+        const int grid_l = iq3s_apply_sign(grid_pos.x(), signs0);
+        const int grid_h = iq3s_apply_sign(grid_pos.y(), signs1);
         const int u0 = get_int_b4(bq8_1[iqs / 2].qs, l0 + 0);
         const int u1 = get_int_b4(bq8_1[iqs / 2].qs, l0 + 1);
         sumi = ggml_cuda_dp4a(grid_l, u0, sumi);

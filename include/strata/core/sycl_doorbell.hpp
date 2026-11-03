@@ -138,4 +138,10 @@ inline IntelGpuGen intel_gpu_gen(const sycl::device& d) {
     return IntelGpuGen::Unknown;
 }
 
+inline bool bm_default_on(const char* name, const sycl::device& d, bool bm_default = true) {
+    const char* v = std::getenv(name);
+    if (v != nullptr && v[0] != '\0') return v[0] != '0';
+    return bm_default && intel_gpu_gen(d) == IntelGpuGen::Battlemage;
+}
+
 }  // namespace strata
