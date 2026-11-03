@@ -180,6 +180,12 @@ def evaluate_expression(expr: str) -> str:
     expr = expr.strip()
     if not expr:
         raise ValueError("empty expression")
+
+    # Convenience: replace caret (^) with Python power operator (**) before AST parsing.
+    # In Python grammar, BitXor (^) has lower precedence than addition (+), which would
+    # incorrectly parse '5 + 2^3' as '(5 + 2)^3' instead of '5 + (2**3)'.
+    expr = expr.replace("^", "**")
+
     try:
         parsed = ast.parse(expr, mode="eval")
     except SyntaxError as e:

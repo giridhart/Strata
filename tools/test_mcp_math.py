@@ -29,6 +29,8 @@ class TestMathEvaluator(unittest.TestCase):
             ("10 % 3", "1"),
             ("2 ** 8", "256"),
             ("2 ^ 8", "256"),  # convenient caret exponent
+            ("5 + 2^3", "13"),  # caret operator precedence over addition
+            ("sqrt(1025) + 2^10 + pow(20, 34)", "1.7179869184e+44"),
             ("-(5 + 3)", "-8"),
             ("+(5 + 3)", "8"),
         ]
