@@ -276,6 +276,10 @@
     <div class="toggle-row" id="mcp-row" hidden><span><span data-i18n="drawer.mcp">Use tools from MCP servers</span><br><span class="muted small"
       id="mcp-row-sub">the model may call them while it answers</span></span>
       <button class="st-toggle" id="s-mcp" role="switch" aria-checked="true" aria-label="Use tools from MCP servers" data-i18n-label="drawer.mcp"></button></div>
+    <div class="st-field" id="mcp-rounds-row" hidden>
+      <label class="st-label" for="s-rounds">Tool rounds limit <output id="o-rounds">8</output></label>
+      <input class="st-slider" type="range" id="s-rounds" min="1" max="32" step="1" value="8">
+    </div>
     <div class="toggle-row" id="esp-row" hidden><span>Experimental speed projection<br><span class="muted small">the
       engine's control vector; off = the stock model. Switching reads the chat again once</span></span>
       <button class="st-toggle" id="s-esp" role="switch" aria-checked="true" aria-label="Experimental speed projection"></button></div>

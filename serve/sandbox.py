@@ -219,6 +219,13 @@ def create_base_globals(custom_tools: dict[str, Any] | None = None) -> dict[str,
     except ImportError:
         pass
 
+    # Pre-import astropy if present
+    try:
+        import astropy
+        env["astropy"] = astropy
+    except ImportError:
+        pass
+
     # Injected interactive plotting helper
     env["render_interactive_plot"] = render_interactive_plot
 

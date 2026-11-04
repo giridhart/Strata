@@ -82,7 +82,7 @@ def extract_dependencies(code: str) -> list[str]:
         stdlib = getattr(sys, "stdlib_module_names", set())
         local_builtins = {
             "mcp", "serve", "strata", "__main__", "builtins", "json", "math", "cmath", "os", "sys",
-            "px", "go", "sp", "np", "pd", "numpy", "pandas", "sympy", "plotly", "pint", "z3", "ruff"
+            "px", "go", "sp", "np", "pd", "numpy", "pandas", "sympy", "plotly", "pint", "z3", "ruff", "astropy"
         }
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):

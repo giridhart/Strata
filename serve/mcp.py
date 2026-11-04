@@ -694,7 +694,7 @@ class McpHub:
             }
         }]
 
-    def call_codemode(self, arguments: dict | str, cancel: threading.Event | None = None) -> dict:
+    def call_codemode(self, arguments: dict | str, cancel: threading.Event | None = None, timeout_s: float | None = None) -> dict:
         from serve import mcp_runner
         code = ""
         deps = None
@@ -710,7 +710,7 @@ class McpHub:
             return {"server": "codemode", "tool": "run_python", "ok": False,
                     "text": "error: run_python requires a 'code' string argument", "chars": 52,
                     "truncated": False, "ms": 0}
-        timeout = float(self.settings.get("timeout_s", 60.0))
+        timeout = float(timeout_s if timeout_s is not None else self.settings.get("timeout_s", 60.0))
         session_id = str(arguments.get("session_id") or "default") if isinstance(arguments, dict) else "default"
         r = mcp_runner.execute_in_runner(code, self, timeout_s=timeout, cancel=cancel, dependencies=deps, session_id=session_id)
         text, ok = r["text"], r["ok"]
@@ -727,11 +727,11 @@ class McpHub:
             out["plot"] = res
         return out
 
-    def call(self, name: str, arguments: dict, cancel: threading.Event | None = None) -> dict:
+    def call(self, name: str, arguments: dict, cancel: threading.Event | None = None, timeout_s: float | None = None) -> dict:
         """Run one tool -> {"ok", "text" (what the model reads, capped), "chars" (its full length), "truncated",
         "ms", "server", "tool"}.  Errors become text starting with "error:"; only McpCancelled is raised."""
         if name in ("run_python", "python", "py", "run_code", "execute_code"):
-            return self.call_codemode(arguments, cancel)
+            return self.call_codemode(arguments, cancel, timeout_s=timeout_s)
         t0 = time.monotonic()
         server, tool = self.resolve_route(name)
         out = {"server": server.name if server else None, "tool": tool}
@@ -739,8 +739,9 @@ class McpHub:
             text, ok = f"error: there is no tool named {name!r}", False
         else:
             try:
+                effective_timeout = float(timeout_s if timeout_s is not None else self.settings["timeout_s"])
                 res = server.call(tool, arguments if isinstance(arguments, dict) else {},
-                                  float(self.settings["timeout_s"]), cancel)
+                                  effective_timeout, cancel)
                 text, ok = result_text(res), not res.get("isError")
                 if ok and self.settings["image_results"] and self.media_dir is not None:
                     try:

@@ -6545,7 +6545,11 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
     `mcp_names`: the MCP tools this request offered; any other call is one of the request's own tools and ends the
     turn as always (the client answers it).  MCP calls written in the same answer are then not run (their results
     could not reach the model before the client's)."""
-    max_rounds = int(hub.settings["max_rounds"])
+    req_rounds = sampling.get("max_rounds") or sampling.get("mcp_max_rounds") if isinstance(sampling, dict) else None
+    try:
+        max_rounds = int(req_rounds) if req_rounds and int(req_rounds) > 0 else int(hub.settings["max_rounds"])
+    except (ValueError, TypeError):
+        max_rounds = int(hub.settings["max_rounds"])
     total, rounds, done = 0, 0, None
     finalizing = False
     messages = list(messages)
@@ -6596,10 +6600,18 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
             # The call runs on a thread while this generator keeps yielding heartbeats: they reach the client as
             # keep-alives, which is how a client that went away (the web app's Stop) is noticed during a slow tool.
             box = {}
+            req_timeout = None
+            if isinstance(sampling, dict):
+                _t = sampling.get("tool_timeout_s") or sampling.get("timeout_s")
+                if _t is not None:
+                    try:
+                        req_timeout = float(_t)
+                    except (ValueError, TypeError):
+                        pass
 
             def work(c=c, box=box):
                 try:
-                    box["r"] = hub.call(c.name, c.arguments, cancel)
+                    box["r"] = hub.call(c.name, c.arguments, cancel, timeout_s=req_timeout)
                 except McpCancelled:
                     box["cancelled"] = True
             worker = threading.Thread(target=work, daemon=True)
