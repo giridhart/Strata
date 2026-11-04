@@ -32,4 +32,10 @@ def subtree_file(path: str, web: Path = WEB):
         ctype = VENDOR_TYPES.get(f.suffix)
         if ctype and f.is_relative_to(vendor) and f.is_file():
             return f, ctype
+    if path.startswith("/web/vendor/plotly/"):
+        vendor = (web / "vendor" / "plotly").resolve()
+        f = (vendor / path[len("/web/vendor/plotly/"): ]).resolve()
+        ctype = VENDOR_TYPES.get(f.suffix)
+        if ctype and f.is_relative_to(vendor) and f.is_file():
+            return f, ctype
     return None

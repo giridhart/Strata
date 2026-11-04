@@ -201,6 +201,92 @@ class Client(unittest.TestCase):
         self.assertTrue(r["ok"], r.get("text"))
         self.assertIn("codemode", r["text"])
 
+    def test_call_codemode_markdown_fences(self):
+        code_with_fences = "```python\nx = 100\ny = 250\nprint(f'result={x + y}')\n```"
+        r = self.hub.call("run_python", {"code": code_with_fences})
+        self.assertTrue(r["ok"], r.get("text"))
+        self.assertIn("result=350", r["text"])
+
+    def test_call_codemode_expression_auto_capture(self):
+        # Expression without print() or result= variable is captured Jupyter/REPL style
+        r = self.hub.call("run_python", {"code": "mcp.fake.add(a=12, b=34)"})
+        self.assertTrue(r["ok"], r.get("text"))
+        self.assertIn("46", r["text"])
+
+        # Multiple statements with expression at the end
+        r2 = self.hub.call("run_python", {"code": "a = 7\nb = 8\na * b"})
+        self.assertTrue(r2["ok"], r2.get("text"))
+        self.assertIn("56", r2["text"])
+
+    def test_call_codemode_auto_dependency_detection(self):
+        import shutil
+        if not shutil.which("uv"):
+            self.skipTest("uv is not available on PATH")
+        # Automatically detects 'tabulate' from import without explicit dependencies argument
+        r = self.hub.call("run_python", {
+            "code": "import tabulate\ntabulate.tabulate([['auto_detected', 99]])"
+        })
+        self.assertTrue(r["ok"], r.get("text"))
+        self.assertIn("auto_detected", r["text"])
+
+    def test_call_codemode_pep723_dependencies(self):
+        import shutil
+        if not shutil.which("uv"):
+            self.skipTest("uv is not available on PATH")
+        script = (
+            "# /// script\n"
+            "# dependencies = [\"tabulate\"]\n"
+            "# ///\n"
+            "import tabulate\n"
+            "tabulate.tabulate([['pep723', 42]])\n"
+        )
+        r = self.hub.call("run_python", {"code": script})
+        self.assertTrue(r["ok"], r.get("text"))
+        self.assertIn("pep723", r["text"])
+
+    def test_call_codemode_aliases_and_string_arg(self):
+        # Calling via alias 'python'
+        r1 = self.hub.call("python", {"code": "2 + 3"})
+        self.assertTrue(r1["ok"])
+        self.assertIn("5", r1["text"])
+
+        # Calling with raw string argument
+        r2 = self.hub.call("run_python", "40 + 2")
+        self.assertTrue(r2["ok"])
+        self.assertIn("42", r2["text"])
+
+    def test_call_codemode_state_persistence_and_injected_tools(self):
+        # Turn 1: define variables and symbols in session 'turn_test'
+        r1 = self.hub.call("run_python", {
+            "code": "x = sp.Symbol('x')\nstored_offset = 150",
+            "session_id": "turn_test"
+        })
+        self.assertTrue(r1["ok"], r1.get("text"))
+
+        # Turn 2: use stored_offset from Turn 1 without re-declaring it
+        r2 = self.hub.call("run_python", {
+            "code": "stored_offset + 50",
+            "session_id": "turn_test"
+        })
+        self.assertTrue(r2["ok"], r2.get("text"))
+        self.assertIn("200", r2["text"])
+
+        # Turn 3: use Symbol x from Turn 1 to compute derivative and verify equivalence
+        r3 = self.hub.call("run_python", {
+            "code": "verify_equivalence('sin(x)**2 + cos(x)**2', '1')",
+            "session_id": "turn_test"
+        })
+        self.assertTrue(r3["ok"], r3.get("text"))
+        self.assertIn("algebraic_simplification", r3["text"])
+
+        # Turn 4: solve constraints with Z3
+        r4 = self.hub.call("run_python", {
+            "code": "solve_constraints(['Alice', 'Bob'], ['Alice < Bob', 'Alice == 5', 'Bob <= 10'])",
+            "session_id": "turn_test"
+        })
+        self.assertTrue(r4["ok"], r4.get("text"))
+        self.assertIn('"Alice": 5', r4["text"])
+
     def test_resolve_route_and_aliases(self):
         s, tool = self.hub.resolve_route("fake__add")
         self.assertEqual((s.name, tool), ("fake", "add"))

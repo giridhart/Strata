@@ -6552,6 +6552,8 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
     run_tools = parser_tools if parser_tools is not None else tools
     while True:
         text, reasoning, calls, own_calls = [], [], [], 0
+        started_mcp_ids = set()
+        finished_mcp_ids = set()
         for kind, x in svc.run(ids, thinking, run_tools, max_new, sampling, cancel, declared_only=True):
             if kind == "done":
                 done = x
@@ -6560,11 +6562,15 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
                 ev: Event = x
                 is_mcp = (ev.call is not None and
                           (ev.call.name in mcp_names or
-                           (hub and hasattr(hub, "resolve_route") and hub.resolve_route(ev.call.name)[0] is not None)))
+                           (hub and hasattr(hub, "resolve_route") and
+                            (hub.resolve_route(ev.call.name)[0] is not None or
+                             hub.resolve_route(ev.call.name)[1] == "run_python"))))
                 if is_mcp:
                     if ev.kind == "tool_start":          # the model has started writing a call: say so at once
+                        started_mcp_ids.add(ev.call.id)
                         yield "mcp", {"event": "start", "id": ev.call.id, "name": ev.call.name}
                     elif ev.kind == "tool_call":
+                        started_mcp_ids.add(ev.call.id)
                         calls.append(ev.call)
                     continue                             # its argument pieces are not streamed to the client
                 if ev.kind == "tool_call":
@@ -6612,7 +6618,9 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
             print(f"[strata] tool {c.name}: {'ok' if r['ok'] else 'error'}, {r['chars']:,} characters in "
                   f"{r['ms'] / 1000:.1f} s{' (truncated for the model)' if r['truncated'] else ''}", flush=True)
             results.append(r.get("model_content", r["text"]) if svc.vision is not None else r["text"])
+            finished_mcp_ids.add(c.id)
             yield "mcp", {"event": "result", "id": c.id,
+                          **({"plot": r["plot"]} if r.get("plot") else {}),
                           **({"images": r["images"], "vision": svc.vision is not None} if r.get("images") else {}),
                           **{k: r[k] for k in ("ok", "text", "chars", "truncated", "ms")}}
         if cancel.is_set() or len(results) < len(calls):

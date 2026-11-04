@@ -580,6 +580,8 @@ class McpHub:
         - mcp prefix: 'mcp.math.calculate', 'mcp.math__calculate', 'mcp__math__calculate'
         - bare tool: 'calculate' (if unambiguous across servers)
         """
+        if name in ("run_python", "python", "py", "run_code", "execute_code") and self.settings.get("codemode"):
+            return None, "run_python"
         routes = self._routes or self.routes()
         if name in routes:
             return routes[name]
@@ -608,7 +610,7 @@ class McpHub:
         brought itself (those win)."""
         out = []
         for name, (s, tool) in self.routes().items():
-            if name in exclude:
+            if name in exclude or tool == "generate_plot":
                 continue
             t = next(x for x in s.tools if x["name"] == tool)
             schema = t.get("inputSchema") if isinstance(t.get("inputSchema"), dict) else {}
@@ -625,6 +627,8 @@ class McpHub:
             return []
         sigs = []
         for name, (s, tool) in self.routes().items():
+            if tool == "generate_plot" or name == "generate_plot" or name.endswith("__generate_plot"):
+                continue
             t = next((x for x in s.tools if x["name"] == tool), None)
             if not t:
                 continue
@@ -639,18 +643,36 @@ class McpHub:
 
         tools_list_text = "\n".join(sigs) if sigs else "  (no MCP tools currently registered)"
         desc = (
-            "Execute Python code to interact with MCP tools and process data locally.\n\n"
+            "Execute Python code to interact with MCP tools, run calculations, or process data locally.\n\n"
             "CRITICAL INSTRUCTIONS:\n"
             "1. `run_python` is the ONLY valid function name for tool calls. You MUST call `run_python`.\n"
             "2. NEVER emit `<function=mcp...>` or invoke MCP functions directly as tool names.\n"
-            "3. All tool calls must be written as Python code inside `run_python(code=...)` using `mcp.<server>.<tool>(...)`.\n"
-            "4. Only printed output (`print(...)`) or the `result` variable is returned to context.\n\n"
+            "3. Variables and symbols persist across turns within the same conversation session.\n"
+            "4. Expressions at the end of the script auto-return their value (Jupyter/REPL style). `print(...)` or `result = ...` is also supported.\n"
+            "5. Pre-imported in your environment (zero tokens needed):\n"
+            "   - sp / sympy (e.g. sp.Symbol, sp.solve, sp.diff, sp.simplify)\n"
+            "   - np / numpy, math, cmath, pint, z3\n"
+            "   - pd / pandas, px (plotly.express), go (plotly.graph_objects)\n"
+            "   - render_interactive_plot(fig) -> dict\n"
+            "   - verify_equivalence(expr1, expr2) -> dict\n"
+            "   - dimensional_analysis(lhs, rhs, variables) -> dict\n"
+            "   - solve_and_derive(equation, solve_for=None, derive_wrt=None) -> dict\n"
+            "   - compile_equation_to_code(expr, target_lang) -> dict (c, rust, py, js, julia)\n"
+            "   - solve_constraints(variables, constraints, types=None, maximize=None, minimize=None) -> dict\n"
+            "   - lint_python_code(code) -> dict\n"
+            "   - calculate_time_delta(start, end, timezone1, timezone2, business_days_only) -> dict\n"
+            "6. To generate charts, use the pre-imported `px` (Plotly Express) or `go` (Plotly Graph Objects) libraries. Pass your final figure to the `render_interactive_plot(fig)` function.\n"
+            "7. You may also import any PyPI package (resolved dynamically via uv in milliseconds).\n\n"
             "EXAMPLES:\n"
-            "# Clock / time:\n"
-            "run_python(code='print(mcp.clock.get_current_time(timezone=\"UTC\"))')\n\n"
-            "# Math calculation:\n"
-            "run_python(code='import math\\nprint(mcp.math.calculate(expression=\"sqrt(10230) + pow(32, 32) + exp(2)\"))')\n\n"
-            f"Python functions callable inside your script (via the `mcp` module):\n{tools_list_text}"
+            "# Interactive Plotting:\n"
+            "run_python(code='df = pd.DataFrame({\"Category\": [\"A\", \"B\", \"C\"], \"Values\": [10, 20, 15]})\\nfig = px.bar(df, x=\"Category\", y=\"Values\", title=\"Sample Chart\")\\nrender_interactive_plot(fig)')\n\n"
+            "# Symbolic derivation:\n"
+            "run_python(code='x = sp.Symbol(\"x\")\\nsp.diff(sp.sin(x) * sp.exp(x), x)')\n\n"
+            "# Dimensional analysis:\n"
+            "run_python(code='dimensional_analysis(\"T\", \"2*pi*sqrt(L/g)\", {\"T\": \"s\", \"L\": \"m\", \"g\": \"m/s^2\"})')\n\n"
+            "# Constraint solving:\n"
+            "run_python(code='solve_constraints([\"Alice\", \"Bob\"], [\"Alice < Bob\", \"Alice >= 9\", \"Bob <= 17\"])')\n\n"
+            f"MCP server tools callable via `mcp.<server>.<tool>(...)`:\n{tools_list_text}"
         )
         return [{
             "name": "run_python",
@@ -672,20 +694,25 @@ class McpHub:
             }
         }]
 
-    def call_codemode(self, arguments: dict, cancel: threading.Event | None = None) -> dict:
+    def call_codemode(self, arguments: dict | str, cancel: threading.Event | None = None) -> dict:
         from serve import mcp_runner
         code = ""
         deps = None
-        if isinstance(arguments, dict):
-            code = arguments.get("code") or arguments.get("script") or arguments.get("python") or ""
+        if isinstance(arguments, str):
+            code = arguments
+        elif isinstance(arguments, dict):
+            code = (arguments.get("code") or arguments.get("script") or arguments.get("python") or
+                    arguments.get("command") or arguments.get("input") or arguments.get("source") or "")
             if isinstance(arguments.get("dependencies"), list):
                 deps = [str(d) for d in arguments["dependencies"]]
+        code = mcp_runner.strip_markdown_fences(code)
         if not isinstance(code, str) or not code.strip():
             return {"server": "codemode", "tool": "run_python", "ok": False,
                     "text": "error: run_python requires a 'code' string argument", "chars": 52,
                     "truncated": False, "ms": 0}
         timeout = float(self.settings.get("timeout_s", 60.0))
-        r = mcp_runner.execute_in_runner(code, self, timeout_s=timeout, cancel=cancel, dependencies=deps)
+        session_id = str(arguments.get("session_id") or "default") if isinstance(arguments, dict) else "default"
+        r = mcp_runner.execute_in_runner(code, self, timeout_s=timeout, cancel=cancel, dependencies=deps, session_id=session_id)
         text, ok = r["text"], r["ok"]
         cap = int(self.settings["max_result_chars"])
         full = len(text)
@@ -693,13 +720,17 @@ class McpHub:
         if truncated:
             text = text[:cap] + (f"\n\n[... truncated: the tool returned {full:,} characters; only the first "
                                  f"{cap:,} are shown]")
-        return {"server": "codemode", "tool": "run_python", "ok": ok, "text": text, "chars": full,
+        out = {"server": "codemode", "tool": "run_python", "ok": ok, "text": text, "chars": full,
                 "truncated": truncated, "ms": r["ms"]}
+        res = r.get("result")
+        if isinstance(res, dict) and res.get("type") == "application/vnd.plotly.v1+json":
+            out["plot"] = res
+        return out
 
     def call(self, name: str, arguments: dict, cancel: threading.Event | None = None) -> dict:
         """Run one tool -> {"ok", "text" (what the model reads, capped), "chars" (its full length), "truncated",
         "ms", "server", "tool"}.  Errors become text starting with "error:"; only McpCancelled is raised."""
-        if name == "run_python":
+        if name in ("run_python", "python", "py", "run_code", "execute_code"):
             return self.call_codemode(arguments, cancel)
         t0 = time.monotonic()
         server, tool = self.resolve_route(name)
@@ -757,6 +788,11 @@ class McpHub:
                 s.close()
             except Exception:  # noqa: BLE001 - closing is best effort
                 pass
+        try:
+            from serve import mcp_runner
+            mcp_runner.close_all_runners()
+        except Exception:
+            pass
 
 
 # ------------------------------------------------------------------------------------------------ config

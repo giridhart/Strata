@@ -82,6 +82,7 @@ function setTheme(t, save) {
   $("theme-icon").setAttribute("href", `${SPRITE}#i-${t === "dark" ? "sun" : "moon"}`);
   $("dark-toggle").setAttribute("aria-checked", String(t === "dark"));
   refreshPreviews();                                  // the preview frames carry the page's colours
+  refreshPlots();
 }
 const flipTheme = () => setTheme(document.documentElement.dataset.theme === "dark" ? "light" : "dark", true);
 $("theme-btn").onclick = flipTheme;
@@ -937,6 +938,83 @@ function hydrateToolImages(root) {
     }).catch(() => { img.alt = "Image unavailable; try refreshing"; });
   });
 }
+const plotCache = new Map();
+function toolPlots(t) {
+  if (!t.plot || !t.plot.content) return "";
+  plotCache.set(t.id, t.plot.content);
+  return `<figure class="tool-plot" data-plot-tool-id="${esc(t.id)}">` +
+    `<div class="tool-plot__chart" id="plot-${esc(t.id)}"></div>` +
+    `<figcaption class="tool-plot__caption"><span class="muted small">Interactive Plot</span>` +
+    `<button type="button" class="st-btn st-btn--sm" data-plot-reset="${esc(t.id)}">Reset view</button></figcaption></figure>`;
+}
+let plotlyLoadingPromise = null;
+function loadPlotly() {
+  if (window.Plotly) return Promise.resolve(window.Plotly);
+  if (!plotlyLoadingPromise) {
+    plotlyLoadingPromise = new Promise((resolve, reject) => {
+      const script = document.createElement("script");
+      script.src = "web/vendor/plotly/plotly.min.js";
+      script.async = true;
+      script.onload = () => resolve(window.Plotly);
+      script.onerror = () => reject(new Error("Plotly library failed to load"));
+      document.head.appendChild(script);
+    });
+  }
+  return plotlyLoadingPromise;
+}
+function getPlotLayout(baseLayout, isDark) {
+  return Object.assign({}, baseLayout || {}, {
+    autosize: true,
+    paper_bgcolor: isDark ? "#1e293b" : (baseLayout && baseLayout.paper_bgcolor ? baseLayout.paper_bgcolor : "#ffffff"),
+    plot_bgcolor: isDark ? "#0f172a" : (baseLayout && baseLayout.plot_bgcolor ? baseLayout.plot_bgcolor : "#f8fafc"),
+    font: Object.assign({ color: isDark ? "#e2e8f0" : "#1e293b" }, (baseLayout && baseLayout.font) || {})
+  });
+}
+function refreshPlots() {
+  const isDark = document.documentElement.dataset.theme === "dark";
+  document.querySelectorAll("[data-plot-tool-id][data-rendered]").forEach((fig) => {
+    const id = fig.dataset.plotToolId;
+    const chartEl = fig.querySelector(".tool-plot__chart");
+    const toolData = plotCache.get(id);
+    if (chartEl && window.Plotly && toolData) {
+      window.Plotly.relayout(chartEl, getPlotLayout(toolData.layout, isDark));
+    }
+  });
+}
+function hydrateToolPlots(root) {
+  const plots = root.querySelectorAll("[data-plot-tool-id]:not([data-rendered])");
+  if (!plots.length) return;
+
+  loadPlotly().then((Plotly) => {
+    plots.forEach((fig) => {
+      fig.dataset.rendered = "1";
+      const id = fig.dataset.plotToolId;
+      const chartEl = fig.querySelector(".tool-plot__chart");
+      const toolData = plotCache.get(id);
+      if (!chartEl || !toolData) return;
+
+      const isDark = document.documentElement.dataset.theme === "dark";
+      const layout = getPlotLayout(toolData.layout, isDark);
+      const config = { responsive: true, displayModeBar: true, displaylogo: false };
+      Plotly.newPlot(chartEl, toolData.data || [], layout, config);
+
+      const resetBtn = fig.querySelector("[data-plot-reset]");
+      if (resetBtn) {
+        resetBtn.addEventListener("click", () => {
+          Plotly.relayout(chartEl, { "xaxis.autorange": true, "yaxis.autorange": true });
+        });
+      }
+    });
+  }).catch((err) => {
+    plots.forEach((fig) => {
+      fig.dataset.rendered = "1";
+      const chartEl = fig.querySelector(".tool-plot__chart");
+      if (chartEl) {
+        chartEl.innerHTML = `<p class="muted small">Interactive chart unavailable</p>`;
+      }
+    });
+  });
+}
 // the answer's text with the tool blocks where the model called them
 // math (opt-in, serve/web/math.js): formulas become placeholders before the Markdown runs and are drawn after it
 function answerMarkdown(text) {
@@ -949,7 +1027,7 @@ function answerHtml(m) {
     const at = Math.min(Math.max(t.at || 0, pos), m.text.length);
     if (at > pos) html += answerMarkdown(m.text.slice(pos, at));
     pos = at;
-    html += toolHtml(t, k) + toolImages(t);
+    html += toolHtml(t, k) + toolImages(t) + toolPlots(t);
   });
   return html + answerMarkdown(m.text.slice(pos));
 }
@@ -963,6 +1041,7 @@ function onTool(m, x) {
     Object.assign(t, {name: x.name, server: x.server, tool: x.tool, arguments: x.arguments, round: x.round, state: "running"});
   } else if (x.event === "result") {
     Object.assign(t, {result: x.text, ok: x.ok, chars: x.chars, truncated: x.truncated, ms: x.ms, images: x.images || [], vision: x.vision === true,
+                      plot: x.plot || null,
                       state: x.skipped ? "skipped" : x.ok ? "done" : "error"});
   }
 }
@@ -989,6 +1068,7 @@ function updateAssistant(el, m, streaming) {
   } else {
     bubble.innerHTML = answerHtml(m);
     hydrateToolImages(bubble);
+    hydrateToolPlots(bubble);
     if (settings.math) StrataMath.hydrate(bubble);
     hydratePreviews(bubble);
     if (streaming) bubble.classList.add("cursor"); else bubble.classList.remove("cursor");

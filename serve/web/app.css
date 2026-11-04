@@ -244,6 +244,11 @@ main { flex: 1; min-height: 0; display: flex; }
 .tool-image figcaption { margin-top: 10px; }
 .tool-image a:not([href]) { opacity: .5; pointer-events: none; }
 
+/* Interactive Plotly charts from code-mode */
+.tool-plot { margin: 16px 0; max-width: 100%; border: 1px solid var(--st-border, #e5e7eb); border-radius: var(--st-r-md, 8px); padding: 12px; background: var(--st-surface, #ffffff); }
+.tool-plot__chart { width: 100%; min-height: 420px; }
+.tool-plot figcaption { margin-top: 8px; display: flex; justify-content: space-between; align-items: center; }
+
 /* Math (serve/web/math.js): a formula never widens the chat; a long display formula scrolls inside its own box. */
 .chat-math { overflow-wrap: normal; }
 .chat-math--display { display: block; text-align: center; overflow-x: auto; max-width: 100%; margin: .6em 0; padding: .25em 0; }

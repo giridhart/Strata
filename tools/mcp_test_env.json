@@ -8,10 +8,6 @@
       "command": "python3",
       "args": ["tools/mcp_datetime.py"]
     },
-    "plot": {
-      "command": "python3",
-      "args": ["tools/mcp_plot.py"]
-    },
     "linter": {
       "command": "python3",
       "args": ["tools/mcp_linter.py"]
@@ -25,10 +21,6 @@
     "clock": {
       "command": "python3",
       "args": ["tools/mcp_datetime.py"]
-    },
-    "plot": {
-      "command": "python3",
-      "args": ["tools/mcp_plot.py"]
     },
     "linter": {
       "command": "python3",

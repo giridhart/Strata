@@ -89,6 +89,22 @@ export async function startMock({ port = 0, root = WEB, loaded = true, csp = tru
       await sleep(900);
       send({ strata_mcp: { event: "result", id, text: "The file says hello.", ok: true, chars: 20, ms: 900 } });
       await say("The file says hello.", 5);
+    } else if (text.includes("#plot")) {
+      await say("Here is the chart you requested:\n\n", 5);
+      const id = "call-plot-1";
+      send({ strata_mcp: { event: "call", id, name: "run_python", server: "codemode", tool: "run_python", arguments: { code: "fig = px.bar(df, x='cat', y='val')\nrender_interactive_plot(fig)" }, round: 0 } });
+      await sleep(200);
+      send({ strata_mcp: {
+        event: "result", id, text: "[Interactive Plotly chart generated: 1 trace]", ok: true, chars: 43, ms: 200,
+        plot: {
+          type: "application/vnd.plotly.v1+json",
+          content: {
+            data: [{ x: ["A", "B", "C"], y: [12, 28, 19], type: "bar", marker: { color: "#636efa" } }],
+            layout: { title: { text: "Interactive Bar Chart" }, autosize: true }
+          }
+        }
+      } });
+      await say("The interactive chart has been rendered above.", 5);
     } else await say(`Mock answer ${state.answers}.`, 5);
     if (!closed) {
       send({ choices: [{ delta: {}, finish_reason: "stop" }], usage: { completion_tokens: 12 } });
