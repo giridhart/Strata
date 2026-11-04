@@ -201,6 +201,46 @@ class Client(unittest.TestCase):
         self.assertTrue(r["ok"], r.get("text"))
         self.assertIn("codemode", r["text"])
 
+    def test_resolve_route_and_aliases(self):
+        s, tool = self.hub.resolve_route("fake__add")
+        self.assertEqual((s.name, tool), ("fake", "add"))
+        s, tool = self.hub.resolve_route("fake.add")
+        self.assertEqual((s.name, tool), ("fake", "add"))
+        s, tool = self.hub.resolve_route("mcp.fake.add")
+        self.assertEqual((s.name, tool), ("fake", "add"))
+        s, tool = self.hub.resolve_route("mcp.fake__add")
+        self.assertEqual((s.name, tool), ("fake", "add"))
+        s, tool = self.hub.resolve_route("mcp__fake__add")
+        self.assertEqual((s.name, tool), ("fake", "add"))
+        # 'add' exists on both 'fake' and 'paged', so bare 'add' is ambiguous and resolves to None
+        s, tool = self.hub.resolve_route("add")
+        self.assertIsNone(s)
+        s, tool = self.hub.resolve_route("nonexistent")
+        self.assertIsNone(s)
+
+    def test_output_parser_direct_mcp_aliases_and_loose_closer(self):
+        from serve.frontend import OutputParser
+        schemas = [
+            {"name": "run_python", "parameters": {"type": "object", "properties": {"code": {"type": "string"}}}},
+            {"name": "clock__get_current_time", "parameters": {"type": "object", "properties": {"timezone": {"type": "string"}}}},
+            {"name": "math__calculate", "parameters": {"type": "object", "properties": {"expression": {"type": "string"}}}}
+        ]
+        parser = OutputParser(thinking=False, tools=schemas, recover=True, declared_only=True)
+        raw_clock = "<tool_call><function=mcp.clock.get_current_time><parameter=timezone>UTC</parameter></functino></tool_call>"
+        evs = parser.feed(raw_clock) + parser.finish()
+        calls = [e.call for e in evs if e.kind == "tool_call"]
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].name, "clock__get_current_time")
+        self.assertEqual(calls[0].arguments, {"timezone": "UTC"})
+
+        parser = OutputParser(thinking=False, tools=schemas, recover=True, declared_only=True)
+        raw_math = "<tool_call><function=mcp.math.calculate><parameter=expression>sqrt(10230)+pow(32,32)+exp(2)</parameter></function></tool_call>"
+        evs = parser.feed(raw_math) + parser.finish()
+        calls = [e.call for e in evs if e.kind == "tool_call"]
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].name, "math__calculate")
+        self.assertEqual(calls[0].arguments, {"expression": "sqrt(10230)+pow(32,32)+exp(2)"})
+
 
 class HttpClient(unittest.TestCase):
     """Streamable HTTP: JSON answers, an event-stream answer, the session id."""
@@ -383,6 +423,23 @@ class ToolLoop(unittest.TestCase):
         first = self.engine.prompt_text(0)
         self.assertIn('"name": "run_python"', first)
         self.assertNotIn('"name": "fake__echo"', first)
+
+    def test_codemode_direct_tool_fallback_execution(self):
+        # When model emits <function=mcp.fake.add> directly in Code Mode (with or without loose closer),
+        # the fallback mechanism intercepts, executes fake__add, and returns the result.
+        script = "</think>\n<tool_call><function=mcp.fake.add><parameter=a>15</parameter><parameter=b>25</parameter></functino></tool_call>"
+        self.start(script, "</think>\n\nThe sum is 40.")
+        code, text = self.post({"strata_mcp": True, "codemode": True})
+        self.assertEqual(code, 200, text)
+        cs = self.chunks(text)
+        mcp = [c["strata_mcp"] for c in cs if "strata_mcp" in c]
+        self.assertEqual([m["event"] for m in mcp], ["start", "call", "result"])
+        self.assertEqual(mcp[1]["tool"], "add")
+        self.assertEqual(mcp[2]["text"], "40")
+        first, second = self.engine.prompt_text(0), self.engine.prompt_text(1)
+        self.assertIn('"name": "run_python"', first)
+        self.assertNotIn('"name": "fake__add"', first)
+        self.assertIn("<tool_response>\n40\n</tool_response>", second)
 
     def test_plain_requests_get_no_mcp_tools(self):
         self.start(call_script("fake__echo", text="x"), "</think>\n\nnever")

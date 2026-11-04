@@ -6535,7 +6535,7 @@ def _debug_req(api, req, messages, tools, max_new, thinking, prompt_tokens):
 
 # ------------------------------------------------------------------------------------------------ MCP tool loop
 def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new, max_req, sampling, cancel,
-                 mcp_names):
+                 mcp_names, parser_tools=None):
     """Service.run with the MCP tools executed here: the model writes a call to an MCP tool, the server runs it, adds
     the call and its result to the conversation and lets the model continue - up to `max_rounds` times.  Yields what
     Service.run yields (text, thinking, the request's own tool calls) plus ("mcp", {...}) for the tool activity, and
@@ -6549,15 +6549,19 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
     total, rounds, done = 0, 0, None
     finalizing = False
     messages = list(messages)
+    run_tools = parser_tools if parser_tools is not None else tools
     while True:
         text, reasoning, calls, own_calls = [], [], [], 0
-        for kind, x in svc.run(ids, thinking, tools, max_new, sampling, cancel, declared_only=True):
+        for kind, x in svc.run(ids, thinking, run_tools, max_new, sampling, cancel, declared_only=True):
             if kind == "done":
                 done = x
                 continue
             if kind == "event":
                 ev: Event = x
-                if ev.call is not None and ev.call.name in mcp_names:
+                is_mcp = (ev.call is not None and
+                          (ev.call.name in mcp_names or
+                           (hub and hasattr(hub, "resolve_route") and hub.resolve_route(ev.call.name)[0] is not None)))
+                if is_mcp:
                     if ev.kind == "tool_start":          # the model has started writing a call: say so at once
                         yield "mcp", {"event": "start", "id": ev.call.id, "name": ev.call.name}
                     elif ev.kind == "tool_call":
@@ -6580,7 +6584,7 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
         rounds += 1
         results = []
         for c in calls:
-            s, tool = hub.routes().get(c.name, (None, c.name))
+            s, tool = hub.resolve_route(c.name) if hasattr(hub, "resolve_route") else hub.routes().get(c.name, (None, c.name))
             yield "mcp", {"event": "call", "id": c.id, "name": c.name, "server": s.name if s else None,
                           "tool": tool, "arguments": c.arguments, "round": rounds}
             # The call runs on a thread while this generator keeps yielding heartbeats: they reach the client as
@@ -8295,8 +8299,14 @@ def make_handler(svc: Service):
             self._watch_client(cancel)                       # #430 #431 (#1999: before prepare, which can take long)
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, force=force, req=req, cancel=cancel)
             _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
-            run = run_with_mcp(svc, svc.mcp, messages, tools, kw, ids, thinking, max_new, max_req, req, cancel,
-                               {t["name"] for t in extra}) if use_mcp else None
+            if use_mcp:
+                all_mcp = set(svc.mcp.routes().keys())
+                mcp_names = {t["name"] for t in extra} | (all_mcp if use_codemode else set())
+                parser_tools = (tools or []) + (svc.mcp.template_tools(exclude=own) if use_codemode else [])
+                run = run_with_mcp(svc, svc.mcp, messages, tools, kw, ids, thinking, max_new, max_req, req, cancel,
+                                   mcp_names, parser_tools=parser_tools)
+            else:
+                run = None
             chunks = openai_chunks(svc, req, ids, thinking, tools, max_new, cancel, run=run, force=force)
             if validator is not None:
                 chunks = structured_chunks(chunks, validator)

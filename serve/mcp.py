@@ -572,6 +572,37 @@ class McpHub:
         self._routes = out
         return out
 
+    def resolve_route(self, name: str) -> tuple[McpServer | None, str]:
+        """Resolves a tool name or alias to (server, tool_name).
+        Supports:
+        - exact route: 'math__calculate'
+        - dot notation: 'math.calculate'
+        - mcp prefix: 'mcp.math.calculate', 'mcp.math__calculate', 'mcp__math__calculate'
+        - bare tool: 'calculate' (if unambiguous across servers)
+        """
+        routes = self._routes or self.routes()
+        if name in routes:
+            return routes[name]
+        norm = name
+        if norm.startswith("mcp."):
+            norm = norm[4:]
+        elif norm.startswith("mcp__"):
+            norm = norm[5:]
+        if norm in routes:
+            return routes[norm]
+        dot_as_route = norm.replace(".", "__")
+        if dot_as_route in routes:
+            return routes[dot_as_route]
+        for r_name, (s, tool) in routes.items():
+            clean_s = _clean(s.name)
+            clean_t = _clean(tool)
+            if norm in (f"{clean_s}.{clean_t}", f"{clean_s}_{clean_t}", f"{clean_s}__{clean_t}"):
+                return (s, tool)
+        matches = [(s, tool) for r_name, (s, tool) in routes.items() if _clean(tool) == norm or tool == norm]
+        if len(matches) == 1:
+            return matches[0]
+        return (None, name)
+
     def template_tools(self, exclude=()) -> list[dict]:
         """The tools in the chat template's form ({name, description, parameters}); `exclude`: names the request
         brought itself (those win)."""
@@ -602,17 +633,24 @@ class McpHub:
             args_str = ", ".join(f"{k}: {v.get('type', 'any')}" for k, v in props.items())
             desc = str(t.get("description") or t.get("title") or "").strip().replace("\n", " ")
             if desc:
-                desc = f": {desc[:120]}"
+                first_sent = desc.split(". ")[0].rstrip(".")
+                desc = f": {first_sent[:90]}"
             sigs.append(f"  - mcp.{_clean(s.name)}.{_clean(tool)}({args_str}){desc}")
 
         tools_list_text = "\n".join(sigs) if sigs else "  (no MCP tools currently registered)"
         desc = (
-            "Execute Python code to interact with MCP tools and process data locally.\n"
-            "Tools are called via `mcp.<server>.<tool>(...)` or `mcp.call('<server>__<tool>', ...)`. "
-            "Positional and keyword arguments are supported.\n"
-            "Intermediate outputs stay in memory; only stdout (`print()`) or the `result` variable enters context.\n"
-            "Helpers: `mcp.search(query)` searches tools, `mcp.list_tools()` lists all tools.\n\n"
-            f"Available tools:\n{tools_list_text}"
+            "Execute Python code to interact with MCP tools and process data locally.\n\n"
+            "CRITICAL INSTRUCTIONS:\n"
+            "1. `run_python` is the ONLY valid function name for tool calls. You MUST call `run_python`.\n"
+            "2. NEVER emit `<function=mcp...>` or invoke MCP functions directly as tool names.\n"
+            "3. All tool calls must be written as Python code inside `run_python(code=...)` using `mcp.<server>.<tool>(...)`.\n"
+            "4. Only printed output (`print(...)`) or the `result` variable is returned to context.\n\n"
+            "EXAMPLES:\n"
+            "# Clock / time:\n"
+            "run_python(code='print(mcp.clock.get_current_time(timezone=\"UTC\"))')\n\n"
+            "# Math calculation:\n"
+            "run_python(code='import math\\nprint(mcp.math.calculate(expression=\"sqrt(10230) + pow(32, 32) + exp(2)\"))')\n\n"
+            f"Python functions callable inside your script (via the `mcp` module):\n{tools_list_text}"
         )
         return [{
             "name": "run_python",
@@ -664,7 +702,7 @@ class McpHub:
         if name == "run_python":
             return self.call_codemode(arguments, cancel)
         t0 = time.monotonic()
-        server, tool = self._routes.get(name) or self.routes().get(name, (None, name))
+        server, tool = self.resolve_route(name)
         out = {"server": server.name if server else None, "tool": tool}
         if server is None:
             text, ok = f"error: there is no tool named {name!r}", False
@@ -754,7 +792,11 @@ def servers_from(block, where: str) -> dict[str, dict]:
 def settings_from(cfg: dict) -> dict:
     """The run config's optional `"mcp"` block: timeout_s, max_result_chars, max_rounds, start_timeout_s, image_results."""
     out = {}
-    for key, value in (cfg.get("mcp") or {}).items():
+    block = dict(cfg.get("mcp") or {})
+    for k in ("codemode", "code_mode"):
+        if k in cfg and "codemode" not in block and "code_mode" not in block:
+            block["codemode"] = cfg[k]
+    for key, value in block.items():
         number = isinstance(value, (int, float)) and not isinstance(value, bool)
         if key == "image_results":
             if not isinstance(value, bool):
@@ -794,8 +836,11 @@ def hub_from_config(cfg: dict, mcp_config_path: str | None = None) -> McpHub | N
         if block is None:
             raise SystemExit(f"[strata] --mcp-config {mcp_config_path}: expected {{\"mcpServers\": {{...}}}}")
         servers.update(servers_from(block, f"--mcp-config {mcp_config_path}"))
-        if isinstance(data, dict) and isinstance(data.get("mcp"), dict):
-            file_settings = settings_from({"mcp": data["mcp"]})
+        if isinstance(data, dict):
+            if isinstance(data.get("mcp"), dict):
+                file_settings = settings_from({"mcp": data["mcp"]})
+            elif "codemode" in data or "code_mode" in data:
+                file_settings = settings_from(data)
     if not servers:
         return None
     merged = {**file_settings, **settings_from(cfg)}
