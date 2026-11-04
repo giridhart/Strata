@@ -37,6 +37,11 @@ COMMON_PACKAGE_MAP = {
     "serial": "pyserial",
     "usb": "pyusb",
     "dateutil": "python-dateutil",
+    "px": "plotly",
+    "go": "plotly",
+    "sp": "sympy",
+    "np": "numpy",
+    "pd": "pandas",
 }
 
 
@@ -75,7 +80,10 @@ def extract_dependencies(code: str) -> list[str]:
     try:
         tree = ast.parse(clean)
         stdlib = getattr(sys, "stdlib_module_names", set())
-        local_builtins = {"mcp", "serve", "strata", "__main__", "builtins", "json", "math", "os", "sys"}
+        local_builtins = {
+            "mcp", "serve", "strata", "__main__", "builtins", "json", "math", "cmath", "os", "sys",
+            "px", "go", "sp", "np", "pd", "numpy", "pandas", "sympy", "plotly", "pint", "z3", "ruff"
+        }
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
                 for alias in node.names:

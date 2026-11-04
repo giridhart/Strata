@@ -661,7 +661,7 @@ class McpHub:
             "   - solve_constraints(variables, constraints, types=None, maximize=None, minimize=None) -> dict\n"
             "   - lint_python_code(code) -> dict\n"
             "   - calculate_time_delta(start, end, timezone1, timezone2, business_days_only) -> dict\n"
-            "6. To generate charts, use the pre-imported `px` (Plotly Express) or `go` (Plotly Graph Objects) libraries. Pass your final figure to the `render_interactive_plot(fig)` function.\n"
+            "6. To generate charts, use pre-imported `px` (Plotly Express) or `go` (Plotly Graph Objects) directly (or `import plotly.express as px`). Pass your final figure to `render_interactive_plot(fig)`.\n"
             "7. You may also import any PyPI package (resolved dynamically via uv in milliseconds).\n\n"
             "EXAMPLES:\n"
             "# Interactive Plotting:\n"

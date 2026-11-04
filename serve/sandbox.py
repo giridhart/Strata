@@ -118,6 +118,46 @@ def render_interactive_plot(fig: Any) -> dict[str, Any]:
     }
 
 
+class ImportAliasTransformer(ast.NodeTransformer):
+    """Rewrites convenience aliases (e.g. `import px` -> `import plotly.express as px`).
+
+    LLMs frequently write pseudo-imports like `import px`, `import pd`, `import np`, `import sp`,
+    or `from px import ...` based on prompt descriptions. This transformer normalizes them
+    to standard, valid Python imports before AST execution.
+    """
+    REWRITES = {
+        "px": ("plotly.express", "px"),
+        "go": ("plotly.graph_objects", "go"),
+        "sp": ("sympy", "sp"),
+        "np": ("numpy", "np"),
+        "pd": ("pandas", "pd"),
+    }
+    MODULE_REWRITES = {
+        "px": "plotly.express",
+        "go": "plotly.graph_objects",
+        "sp": "sympy",
+        "np": "numpy",
+        "pd": "pandas",
+    }
+
+    def visit_Import(self, node: ast.Import) -> ast.Import:
+        new_names = []
+        for alias in node.names:
+            if alias.name in self.REWRITES:
+                mod, default_as = self.REWRITES[alias.name]
+                asname = alias.asname or default_as
+                new_names.append(ast.alias(name=mod, asname=asname))
+            else:
+                new_names.append(alias)
+        node.names = new_names
+        return node
+
+    def visit_ImportFrom(self, node: ast.ImportFrom) -> ast.ImportFrom:
+        if node.module and node.module in self.MODULE_REWRITES:
+            node.module = self.MODULE_REWRITES[node.module]
+        return node
+
+
 def create_base_globals(custom_tools: dict[str, Any] | None = None) -> dict[str, Any]:
     """Builds a rich, pre-populated execution namespace so models never waste tokens on imports."""
     env: dict[str, Any] = {
@@ -132,6 +172,7 @@ def create_base_globals(custom_tools: dict[str, Any] | None = None) -> dict[str,
         import numpy as np
         env["np"] = np
         env["numpy"] = np
+        sys.modules.setdefault("np", np)
     except ImportError:
         pass
 
@@ -140,6 +181,7 @@ def create_base_globals(custom_tools: dict[str, Any] | None = None) -> dict[str,
         import sympy as sp
         env["sp"] = sp
         env["sympy"] = sp
+        sys.modules.setdefault("sp", sp)
     except ImportError:
         pass
 
@@ -162,6 +204,7 @@ def create_base_globals(custom_tools: dict[str, Any] | None = None) -> dict[str,
         import pandas as pd
         env["pd"] = pd
         env["pandas"] = pd
+        sys.modules.setdefault("pd", pd)
     except ImportError:
         pass
 
@@ -171,6 +214,8 @@ def create_base_globals(custom_tools: dict[str, Any] | None = None) -> dict[str,
         import plotly.graph_objects as go
         env["px"] = px
         env["go"] = go
+        sys.modules.setdefault("px", px)
+        sys.modules.setdefault("go", go)
     except ImportError:
         pass
 
@@ -278,6 +323,8 @@ class LLMSandbox:
 
         try:
             tree = ast.parse(clean_code, "<codemode>")
+            ImportAliasTransformer().visit(tree)
+            ast.fix_missing_locations(tree)
             last_expr = None
             if tree.body and isinstance(tree.body[-1], ast.Expr):
                 last_expr = tree.body.pop()

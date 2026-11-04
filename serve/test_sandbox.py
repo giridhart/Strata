@@ -106,6 +106,24 @@ class TestLLMSandbox(unittest.TestCase):
         self.assertTrue(res["ok"], res.get("error"))
         self.assertEqual(res["result"]["type"], "application/vnd.plotly.v1+json")
 
+    def test_pseudo_imports_px_pd_np_sp_go(self):
+        # LLMs often write `import px`, `import pd`, etc. due to fine-tuned import reflexes
+        code = (
+            "import px\n"
+            "import pd\n"
+            "import np\n"
+            "import sp\n"
+            "import go\n"
+            "from px import bar\n"
+            "df = pd.DataFrame({'x': np.array([1, 2]), 'y': [10, 20]})\n"
+            "sym = sp.Symbol('val')\n"
+            "fig = bar(df, x='x', y='y')\n"
+            "render_interactive_plot(fig)"
+        )
+        res = self.sandbox.execute(code)
+        self.assertTrue(res["ok"], res.get("error"))
+        self.assertEqual(res["result"]["type"], "application/vnd.plotly.v1+json")
+
     def test_render_interactive_plot_error_handling(self):
         from serve.sandbox import render_interactive_plot
         import pandas as pd
