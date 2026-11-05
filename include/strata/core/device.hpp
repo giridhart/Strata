@@ -66,6 +66,9 @@ DeviceInfo device_info(int ordinal = 0);
 /// otherwise fail at its first kernel launch, with nothing that names the cause.
 std::string device_code_error();
 
+// Active IGC compiler workaround version (e.g. "2.28.4") if active, or empty string.
+std::string compiler_workaround();
+
 class CudaError : public std::runtime_error {
 public:
     CudaError(const std::string& what, int code) : std::runtime_error(what), code_(code) {}
@@ -162,6 +165,9 @@ DeviceInfo device_info(int ordinal = 0);
 /// "" when this build has device code for the current device, else CUDA's error: a build for other GPUs would
 /// otherwise fail at its first kernel launch, with nothing that names the cause.
 std::string device_code_error();
+
+// Active IGC compiler workaround version (e.g. "2.28.4") if active, or empty string.
+std::string compiler_workaround();
 
 class CudaError : public std::runtime_error {
 public:

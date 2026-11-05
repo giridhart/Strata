@@ -303,16 +303,16 @@ elseif(STRATA_ENABLE_HIP)
   set(_strata_gpu_include_directories ${STRATA_HIP_COMPAT_INCLUDE_DIR})
 elseif(STRATA_ENABLE_SYCL)
   add_compile_definitions(STRATA_ENABLE_SYCL)
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsycl")
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsycl -foffload-fp32-prec-div -foffload-fp32-prec-sqrt")
   if(CMAKE_CXX_COMPILER_ID MATCHES "IntelLLVM")
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fp-model=precise")
   endif()
   find_library(ZE_LOADER ze_loader)
   if(ZE_LOADER)
-    set(_strata_gpu_runtime_target ${ZE_LOADER})
+    set(_strata_ze_loader ${ZE_LOADER})
     add_compile_definitions(STRATA_HAVE_ZE=1)
   else()
-    set(_strata_gpu_runtime_target "")
+    set(_strata_ze_loader "")
   endif()
   if(STRATA_TARGET_XE2)
     add_compile_definitions(STRATA_TARGET_XE2)
@@ -325,6 +325,29 @@ elseif(STRATA_ENABLE_SYCL)
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsycl-targets=spir64_gen -Xs \"-device bmg\" -Qunused-arguments")
     message(STATUS "Strata: Intel Battlemage (bmg) Ahead-of-Time compilation ENABLED")
   endif()
+
+  add_library(strata_sycl INTERFACE)
+  # CUDA divides and takes square roots with IEEE rounding by default; SYCL device code does not unless asked, and
+  # quantize_act_parity sees the one-ulp difference in Q8_K's 1/iscale.
+  target_compile_options(strata_sycl INTERFACE -fsycl -foffload-fp32-prec-div -foffload-fp32-prec-sqrt)
+  # SPV_KHR_integer_dot_product carries CUDA's __dp4a (src/kernels/xe/cuda_intrinsics.hpp); device code becomes
+  # SPIR-V when the executable links.
+  set(_strata_spirv_translator -Xspirv-translator)
+  cmake_host_system_information(RESULT _strata_link_jobs QUERY NUMBER_OF_LOGICAL_CORES)
+  target_link_options(strata_sycl INTERFACE -fsycl -foffload-fp32-prec-div -foffload-fp32-prec-sqrt
+                      -fsycl-max-parallel-link-jobs=${_strata_link_jobs}
+                      "SHELL:${_strata_spirv_translator} --spirv-ext=+SPV_KHR_integer_dot_product")
+  if(NOT WIN32)
+    get_filename_component(_strata_sycl_lib "${CMAKE_CXX_COMPILER}" DIRECTORY)
+    get_filename_component(_strata_sycl_lib "${_strata_sycl_lib}/../lib" ABSOLUTE)
+    target_link_options(strata_sycl INTERFACE "LINKER:-rpath-link,${_strata_sycl_lib}" "LINKER:-rpath,${_strata_sycl_lib}")
+    target_link_libraries(strata_sycl INTERFACE ${CMAKE_DL_LIBS})
+  endif()
+  if(_strata_ze_loader)
+    target_link_libraries(strata_sycl INTERFACE ${_strata_ze_loader})
+  endif()
+  set(_strata_gpu_runtime_target strata_sycl)
+
   if(DEFINED ENV{MKLROOT})
     set(_mkl_root "$ENV{MKLROOT}")
   elseif(EXISTS "/opt/intel/oneapi/mkl/2025.3")
@@ -471,6 +494,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP OR STRATA_ENABLE_SYCL)
   if(STRATA_ENABLE_SYCL)
     add_library(strata_core STATIC src/core/sycl/device.cpp src/core/sycl/pinned.cpp src/core/sycl/graph.cpp src/core/sycl/weights.cpp
                                  src/platform/memory.cpp src/platform/io_priority.cpp src/core/layout.cpp)
+    target_link_libraries(strata_core PUBLIC strata_sycl)
   else()
     add_library(strata_core STATIC src/core/device.cu src/core/pinned.cu src/platform/memory.cpp src/platform/io_priority.cpp src/core/graph.cpp src/core/weights.cpp
                                  src/core/layout.cpp)
@@ -2136,6 +2160,13 @@ endif()
     set_tests_properties(sycl_doorbell_handshake PROPERTIES RESOURCE_LOCK gpu TIMEOUT 60)
   endif()
 
+  if(STRATA_ENABLE_SYCL AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/sycl/igc_workaround_test.cpp")
+    add_executable(sycl_igc_workaround_test tests/sycl/igc_workaround_test.cpp)
+    target_include_directories(sycl_igc_workaround_test PRIVATE ${_strata_gpu_include_directories})
+    target_link_libraries(sycl_igc_workaround_test PRIVATE strata_core strata_kernels ${_strata_gpu_runtime_target})
+    add_test(NAME sycl_igc_workaround_test COMMAND sycl_igc_workaround_test)
+  endif()
+
   if(STRATA_ENABLE_SYCL AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/sycl/native_gr_norm_test.cpp")
     add_executable(sycl_native_gr_norm tests/sycl/native_gr_norm_test.cpp)
     target_include_directories(sycl_native_gr_norm PRIVATE ${_strata_gpu_include_directories})
@@ -3734,7 +3765,7 @@ if(STRATA_ENABLE_SYCL)
             s_gemv_pair_parity quantize_act_images_parity bf16_gemv_pair_parity
             kv_gather_wide_parity qsa_scores_rows_parity prefill_mmq_tab_parity
             gdn_chunk_parity trellis_parity finish_test gemv_rows_test numerics_test
-            hc_mix_split_test q8_quant_multi_test
+            hc_mix_split_test q8_quant_multi_test sycl_igc_workaround_test
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
     COMMENT "Running Intel SYCL tests via ctest"
     USES_TERMINAL
