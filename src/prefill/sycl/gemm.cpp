@@ -6,6 +6,7 @@
 #include "strata/kernels/bf16_gemv.hpp"
 #include "strata/prefill/gemm.hpp"
 #include "strata/kernels/dequant_bf16.hpp"
+#include "strata/kernels/xmx_gemm.hpp"
 
 #if defined(__HIPCC__) && defined(STRATA_HIPBLASLT_AVAILABLE)
 // The HIP compatibility shim maps CUDA shuffle spellings to Strata helpers.
@@ -514,6 +515,13 @@ void Gemm::bf16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64
         return;
     }
 
+    if ((beta == 0.0f || beta == 1.0f) &&
+        strata::kernels::xmx_available(stream_, strata::kernels::XmxType::bf16) &&
+        strata::kernels::xmx_gemm_ok(X, W, Y, N, K, ldy)) {
+        strata::kernels::xmx_gemm(strata::kernels::XmxType::bf16, X, W, Y, T, N, K, ldy, stream_, beta != 0.0f);
+        return;
+    }
+
     static const bool xmx_enabled = [] {
         const char* v = std::getenv("STRATA_PREFILL_XMX_GEMM");
         if (v) return std::atoi(v) != 0;
@@ -576,6 +584,13 @@ void Gemm::f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_
     if (ldy <= 0) ldy = N;
     auto* q = static_cast<sycl::queue*>(stream_);
     if (!q) return;
+
+    if ((beta == 0.0f || beta == 1.0f) &&
+        strata::kernels::xmx_available(stream_, strata::kernels::XmxType::f16) &&
+        strata::kernels::xmx_gemm_ok(X, W, Y, N, K, ldy)) {
+        strata::kernels::xmx_gemm(strata::kernels::XmxType::f16, X, W, Y, T, N, K, ldy, stream_, beta != 0.0f);
+        return;
+    }
 
     static const bool xmx_enabled = [] {
         const char* v = std::getenv("STRATA_PREFILL_XMX_GEMM");

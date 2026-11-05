@@ -588,6 +588,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP OR STRATA_ENABLE_SYCL)
                           src/kernels/sycl/verify_kernels.cpp
                           src/kernels/sycl/iq_kernels.cpp
                           src/kernels/sycl/tq_gemv.cpp
+                          src/kernels/sycl/xmx_gemm.cpp
                           src/kernels/ngram.cpp
                           src/ngram/ple_reader.cpp
                           src/platform/direct_file.cpp)
@@ -2269,6 +2270,7 @@ endif()
     target_include_directories(prefill_gemm_parity PRIVATE ${_strata_gpu_include_directories})
     target_link_libraries(prefill_gemm_parity PRIVATE strata_prefill strata_kernels ${_strata_gpu_runtime_target})
     add_test(NAME prefill_gemm_parity COMMAND prefill_gemm_parity)
+    add_test(NAME sycl_prefill_gemm_parity COMMAND prefill_gemm_parity)
   endif()
 
   if(STRATA_ENABLE_SYCL AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/sycl/xmx_group_parity.cpp")
@@ -3774,7 +3776,7 @@ if(STRATA_ENABLE_SYCL)
             kv_gather_wide_parity qsa_scores_rows_parity prefill_mmq_tab_parity
             gdn_chunk_parity trellis_parity finish_test gemv_rows_test numerics_test
             hc_mix_split_test q8_quant_multi_test sycl_igc_workaround_test
-            sycl_level_zero_memory_test
+            sycl_level_zero_memory_test prefill_gemm_parity
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
     COMMENT "Running Intel SYCL tests via ctest"
     USES_TERMINAL
