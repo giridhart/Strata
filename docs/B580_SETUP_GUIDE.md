@@ -88,20 +88,39 @@ mkdir -p "${MODELS_DIR}"
 # 1. Source Intel oneAPI environment
 source /opt/intel/oneapi/setvars.sh --force 2>/dev/null
 
-# 2. Prevent Xe2 Level Zero JIT persistent cache crash (CRITICAL)
-export SYCL_CACHE_PERSISTENT=0
+# 2. IGC Compiler Workaround (CRITICAL for Ubuntu 24.04 / libigc2 2.27–2.30 on Xe2/Xe3)
+# Fixes GEP pointer offset simplification bug (e.g. x[2N] miscompiled as x[8N]) causing memory faults and non-finite logits
+export IGC_EnableGEPSimplification=0
 
-# 3. Explicitly select the discrete Intel Arc B580 (avoid CPU iGPU)
+# 3. Persistent JIT kernel caching across runs
+export SYCL_CACHE_PERSISTENT=1
+
+# 4. Explicitly select the discrete Intel Arc B580 (avoid CPU iGPU)
 export ONEAPI_DEVICE_SELECTOR=level_zero:0
 
-# 4. Enable Level Zero Sysman metrics (allows querying free VRAM for --expert-cache auto)
+# 5. Enable Level Zero Sysman metrics (allows querying free VRAM for --expert-cache auto)
 export ZES_ENABLE_SYSMAN=1
 
-# 5. Handle Linux memory locking limit (prevents "mlock failed (raise ulimit -l)"):
+# 6. Low-overhead Level Zero barrier synchronization (replaces profiling tag polling; up to +38% prompt throughput)
+export STRATA_EVENT_MARK=barrier
+
+# 7. Dedicated Level Zero copy-engine queue for asynchronous host-to-device USM DMA transfers
+export STRATA_COPY_ENGINE=1
+
+# 8. Handle Linux memory locking limit (prevents "mlock failed (raise ulimit -l)"):
 # Either raise memlock limit if permitted:
 ulimit -l unlimited 2>/dev/null || true
 # Or tell Strata to use pageable memory (bypasses mlock entirely, no root required):
 export STRATA_RESIDENT_PIN=0
+
+# 9. Multi-part USM arena and THP settle time (for massive system RAM expert pinning)
+export STRATA_PIN_PARTS=1
+export STRATA_SETTLE_S=10
+
+# 10. Speculative decoding MTP 2-bit coarse candidate filter & resident graph bypass
+export STRATA_DRAFT_INT2=1
+export STRATA_DRAFT_INT2_K=16
+export STRATA_VERIFY_RESIDENT_GRAPH=1
 ```
 
 ### Step 3.2: Build Using the Quiet Wrapper (Recommended)
@@ -218,6 +237,12 @@ Empirical results from the `perf/` benchmarks directly map to zero-recompile run
 | **`perf_residual_pipeline`** (Cache hints) | 1.5%–3.3% latency reduction using non-temporal loads | `STRATA_XE2_CACHE_HINT=1` | Streams bulk model weights without evicting active KV cache from L2/L3 |
 | **`perf_moe_accumulate`** (Dual-Column MoE) | Up to 2.94x speedup on grouped gate+up SwiGLU | `STRATA_XE2_DUAL_COLUMN=1` *(opt-in)* | In-register SwiGLU fusion (fast decode path) |
 | **Workload Profile Tracing** | Identifies top 2,500–3,800 active experts | `--expert-profile data/expert-profile.bin` | Directs `--expert-cache auto` to pre-stage the hottest experts in VRAM |
+| **IGC Compiler GEP Bug** | Workaround for Ubuntu 24.04 `libigc2 2.27–2.30` | `IGC_EnableGEPSimplification=0` | Eliminates GEP multiplication corruption and non-finite logits |
+| **Driver Queue Barrier** | 22–115 µs submission latency $\rightarrow$ sub-µs | `STRATA_EVENT_MARK=barrier` | +38% prompt throughput by bypassing profiling tag driver stalls |
+| **Level Zero Copy Queue** | Concurrent PCIe DMA + XMX compute | `STRATA_COPY_ENGINE=1` | Directs USM streaming through dedicated DMA copy engine |
+| **USM Memory Pinning** | Avoids host kernel failure on >64 GB RAM | `STRATA_PIN_PARTS=1`, `STRATA_SETTLE_S=10` | Registers host memory in 1 GiB slabs with THP compaction settle wait |
+| **MTP Draft Candidate Filter** | Fast top-16 vocabulary screening | `STRATA_DRAFT_INT2=1`, `STRATA_DRAFT_INT2_K=16` | Accelerates speculative drafting with exact precision verification |
+| **Resident Speculative Graph** | Host CPU doorbell polling elimination | `STRATA_VERIFY_RESIDENT_GRAPH=1` | GPU-resident graph bypass when verify layers are 100% in VRAM |
 
 ---
 

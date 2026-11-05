@@ -149,3 +149,11 @@ strata: SYCL tuning table loaded for [Intel(R) Graphics [0x64a0]] (26 entries fr
 | `STRATA_SYCL_TRACE` | `1`, `0` | `0` | Verbose shape logging to `stderr` and workload file on every kernel dispatch. |
 | `STRATA_SYCL_TUNING_TABLE` | File path | auto | Explicit path to a calibration table file, overriding auto-discovery. |
 | `STRATA_SYCL_NO_TUNING` | `1`, `0` | `0` | Disables the tuning registry and forces safe untuned 1-subgroup fallback. |
+| `IGC_EnableGEPSimplification` | `0`, `1` | `0` (recommended on Xe2/Xe3) | Workaround for Ubuntu 24.04 `libigc2 2.27–2.30` GEP pointer scaling miscompilation. |
+| `STRATA_EVENT_MARK` | `barrier`, `event` | `barrier` on Level Zero | Uses low-overhead Level Zero barrier instead of profiling tag polling (saves 22–115 µs/submission). |
+| `STRATA_COPY_ENGINE` | `1`, `0` | `1` on Level Zero | Routes asynchronous USM transfers to dedicated Level Zero copy queue (`EXPLICIT_ONLY`). |
+| `STRATA_DRAFT_INT2` | `1`, `0` | `1` | Enables 2-bit coarse MTP vocabulary candidate pre-filtering during speculative drafting. |
+| `STRATA_DRAFT_INT2_K` | `1`..`64` | `16` | Top-$K$ candidate tokens selected by the 2-bit coarse filter before high-precision scoring. |
+| `STRATA_VERIFY_RESIDENT_GRAPH` | `1`, `0` | `1` | Bypasses host doorbell polling with resident GPU graph when all active experts fit in VRAM. |
+| `STRATA_PIN_PARTS` | `1`, `0` | `1` | Slices large host memory allocations into 1 GiB slabs for robust USM registration. |
+| `STRATA_SETTLE_S` | Seconds | `10` | THP compaction settle delay after large pinned allocations. |
