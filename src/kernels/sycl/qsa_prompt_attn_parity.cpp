@@ -14,6 +14,7 @@
 #include "strata/kernels/qsa.hpp"
 #include "strata/kernels/qsa_decode_attn.hpp"
 #include "strata/kernels/qsa_prompt_attn.hpp"
+#include "strata/kernels/kv_q4.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -61,7 +62,21 @@ int run(int fmt, int64_t ctx, int64_t nq, int reps) {
     // pools; page table a shuffled permutation (the readers must follow it)
     std::vector<int8_t> kq, vq;
     std::vector<uint16_t> ks, vs, kh, vh;
-    if (fmt == 1) {
+    std::vector<uint8_t> k4, v4;
+    constexpr int64_t B4 = 18, ROW4 = 8 * B4;
+    if (fmt == 2) {
+        std::uniform_int_distribution<int> byte(0, 255);
+        std::uniform_real_distribution<float> lg(std::log(0.01f), std::log(1.0f));
+        auto sc4 = [&](std::mt19937& r) { return std::exp(lg(r)) * (byte(r) & 1 ? -1.0f : 1.0f); };
+        k4.resize(rows * ROW4);
+        v4.resize(rows * ROW4);
+        for (auto* pool : {&k4, &v4})
+            for (int64_t b = 0; b < rows * 8; ++b) {
+                const uint16_t d = f2h(sc4(rng));
+                std::memcpy(pool->data() + b * B4, &d, 2);
+                for (int j = 0; j < 16; ++j) (*pool)[b * B4 + 2 + j] = (uint8_t)byte(rng);
+            }
+    } else if (fmt == 1) {
         kq.resize(rows * HD);
         vq.resize(rows * HD);
         ks.resize(rows * 4);
@@ -124,7 +139,10 @@ int run(int fmt, int64_t ctx, int64_t nq, int reps) {
         std::copy(v.begin(), v.end(), sel);
     }
     k::QsaAttnPools pl;
-    if (fmt == 1) {
+    if (fmt == 2) {
+        pl.k_q4 = up(k4);
+        pl.v_q4 = up(v4);
+    } else if (fmt == 1) {
         pl.k_q = up(kq);
         pl.v_q = up(vq);
         pl.k_scale = up(ks);
@@ -133,6 +151,14 @@ int run(int fmt, int64_t ctx, int64_t nq, int reps) {
         pl.k_pool = up(kh);
         pl.v_pool = up(vh);
     }
+    auto q4v = [&](const std::vector<uint8_t>& pool, int64_t row, int64_t d) {
+        const uint8_t* blk = pool.data() + row * ROW4 + (d / 32) * B4;
+        uint16_t sc;
+        std::memcpy(&sc, blk, 2);
+        const int j = (int)(d % 32);
+        const int c = j < 16 ? (blk[2 + j] & 0x0F) : (blk[2 + j - 16] >> 4);
+        return (double)(c - 8) * (double)h2f(sc);
+    };
     pl.page_table = up(table);
     const int32_t* d_ids = up(ids);
     const int32_t* d_steps = up(steps);
@@ -172,8 +198,9 @@ int run(int fmt, int64_t ctx, int64_t nq, int reps) {
                 const int64_t cell = sel[c], row = ((int64_t)table[cell / PS] * NKV + kvh) * PS + cell % PS;
                 double a = 0;
                 for (int64_t d = 0; d < HD; ++d) {
-                    const double kv =
-                        fmt == 1 ? (double)kq[row * HD + d] * h2f(ks[row * 4 + d / 64]) : h2f(kh[row * HD + d]);
+                    const double kv = fmt == 2 ? q4v(k4, row, d)
+                                      : fmt == 1 ? (double)kq[row * HD + d] * h2f(ks[row * 4 + d / 64])
+                                                 : h2f(kh[row * HD + d]);
                     a += (double)q[(i * NH + h) * HD + d] * kv;
                 }
                 sco[c] = a / 16.0;
@@ -188,8 +215,9 @@ int run(int fmt, int64_t ctx, int64_t nq, int reps) {
                 double a = 0;
                 for (int64_t c = 0; c < w; ++c) {
                     const int64_t cell = sel[c], row = ((int64_t)table[cell / PS] * NKV + kvh) * PS + cell % PS;
-                    const double vv =
-                        fmt == 1 ? (double)vq[row * HD + d] * h2f(vs[row * 4 + d / 64]) : h2f(vh[row * HD + d]);
+                    const double vv = fmt == 2 ? q4v(v4, row, d)
+                                      : fmt == 1 ? (double)vq[row * HD + d] * h2f(vs[row * 4 + d / 64])
+                                                 : h2f(vh[row * HD + d]);
                     a += sco[c] * vv;
                 }
                 const double r = a / l;
@@ -234,8 +262,8 @@ int run(int fmt, int64_t ctx, int64_t nq, int reps) {
     std::printf(
         "%s %s ctx %lld, %lld queries: vs FP64 old %.3g new %.3g (output scale %.3g); new vs old %.3g (%.2g of "
         "scale); %.3f -> %.3f ms per chunk (%.2fx)%s\n",
-        ok1 && ok2 ? "PASS" : "FAIL", fmt == 1 ? "int8" : "fp16", (long long)ctx, (long long)nq, err_old, err_new,
-        ref_scale, diff, diff / scale, ms_old / reps, ms_new / reps, ms_old / ms_new,
+        ok1 && ok2 ? "PASS" : "FAIL", fmt == 2 ? "q4_0" : fmt == 1 ? "int8" : "fp16", (long long)ctx, (long long)nq,
+        err_old, err_new, ref_scale, diff, diff / scale, ms_old / reps, ms_new / reps, ms_old / ms_new,
         has_nan ? " [CONTAINS NAN/INF]" : "");
     sycl::free((void*)d_ids, q_ct1);
     sycl::free((void*)d_steps, q_ct1);
@@ -243,14 +271,15 @@ int run(int fmt, int64_t ctx, int64_t nq, int reps) {
     sycl::free((void*)d_old, q_ct1);
     sycl::free((void*)d_new, q_ct1);
     sycl::free((void*)scratch, q_ct1);
-    sycl::free((void*)pl.k_q, q_ct1);
-    sycl::free((void*)pl.v_q, q_ct1);
-    sycl::free((void*)pl.k_scale, q_ct1);
-    sycl::free((void*)pl.v_scale, q_ct1);
-    (void)pl.k_pool;
-    sycl::free((void*)(void*)pl.k_pool, q_ct1);
-    sycl::free((void*)(void*)pl.v_pool, q_ct1);
-    sycl::free((void*)(void*)pl.page_table, q_ct1);
+    if (pl.k_q4) sycl::free((void*)pl.k_q4, q_ct1);
+    if (pl.v_q4) sycl::free((void*)pl.v_q4, q_ct1);
+    if (pl.k_q) sycl::free((void*)pl.k_q, q_ct1);
+    if (pl.v_q) sycl::free((void*)pl.v_q, q_ct1);
+    if (pl.k_scale) sycl::free((void*)pl.k_scale, q_ct1);
+    if (pl.v_scale) sycl::free((void*)pl.v_scale, q_ct1);
+    if (pl.k_pool) sycl::free((void*)pl.k_pool, q_ct1);
+    if (pl.v_pool) sycl::free((void*)pl.v_pool, q_ct1);
+    sycl::free((void*)pl.page_table, q_ct1);
     return ok1 && ok2 ? 0 : 1;
 }
 }  // namespace
@@ -280,6 +309,8 @@ int main(int argc, char** argv) {
     fails += run(1, ctx, nq, reps);
 #if !defined(__HIP_PLATFORM_AMD__)
     fails += run(0, ctx, nq, reps);  // FP16 KV: the RDNA4 kernel takes int8 KV only
+    fails += run(2, ctx, nq, reps);  // Q4_0 KV
+    fails += run(2, 1500, std::min<int64_t>(nq, 1500), reps);
 #endif
     fails += run(1, 1500, std::min<int64_t>(nq, 1500), reps);  // short context: the selection is every cell
     fails += run(1, 2100, std::min<int64_t>(nq, 256), reps);   // the identity-to-sparse edge

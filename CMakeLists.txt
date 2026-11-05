@@ -677,6 +677,8 @@ endif()
   else()
     target_link_libraries(qsa_prompt_attn_parity PRIVATE strata_kernels CUDA::cudart)
   endif()
+    add_test(NAME qsa_prompt_attn_parity COMMAND qsa_prompt_attn_parity)
+    set_tests_properties(qsa_prompt_attn_parity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 180)
   # PR #3943: STRATA_PATTN_SM60's score and value kernels against the decode kernels' output (the Daily's chunk kernel and
   # the merge), bitwise, on random int8 K/V (GPU, synthetic, no model).  Only in the experimental sm_60 build; it skips
   # (77) on a build without the kernels.
