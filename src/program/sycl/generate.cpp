@@ -5197,6 +5197,7 @@ int main(int argc, char** argv) try {
         strata::core::Verifier ver;
         strata::core::VerifyHits vh;
         vh.d_res = thits.d_res;
+        vh.h_res = host_res.empty() ? nullptr : host_res.data();
         vh.cache_base = thits.cache_base;
         vh.blob = thits.blob;
         vh.slot_off = xcache.slot_offsets();  // E-6: the device plan's pointers
@@ -5254,6 +5255,7 @@ int main(int argc, char** argv) try {
                     const strata::core::OnDevice on(gs.dev);
                     strata::core::VerifyHits vs;
                     vs.d_res = gs.d_res;
+                    vs.h_res = host_res.empty() ? nullptr : host_res.data();
                     vs.cache_base = gs.cache.device_slot(0);
                     vs.blob = thits.blob;
                     vs.slot_off = gs.cache.slot_offsets();
@@ -7561,6 +7563,7 @@ int main(int argc, char** argv) try {
         strata::core::Verifier ver;
         strata::core::VerifyHits vh;
         vh.d_res = thits.d_res;
+        vh.h_res = host_res.empty() ? nullptr : host_res.data();
         vh.cache_base = thits.cache_base;
         vh.blob = thits.blob;
         vh.slot_off = xcache.slot_offsets();  // E-6: the device plan's pointers

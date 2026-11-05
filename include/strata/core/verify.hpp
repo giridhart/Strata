@@ -45,6 +45,7 @@ using PoolMultiFn = void (*)(void* user, const float* x_f, const int32_t* ids, i
 
 struct VerifyHits {
     const int32_t* d_res = nullptr;      ///< device [n_layers * n_expert] slot or -1
+    const int32_t* h_res = nullptr;      ///< host [n_layers * n_expert] slot or -1
     const uint8_t* cache_base = nullptr; ///< slot 0 of the VRAM expert arena
     const uint64_t* slot_off = nullptr;   ///< E-6: host per-slot offsets when slots differ in size (null: slot * blob)
     int64_t n_slots = 0;                  ///< E-6: how many (for the device copy)
@@ -192,6 +193,8 @@ private:
     Verifier* next_ = nullptr;
     void* next_user_ = nullptr;
     bool ple_stage() const { return lb_ <= 1 && 1 < le_; }   ///< holds layer 1, where the PLE block runs
+    bool all_resident() const;
+    bool capture_res(int T, std::string& err);
     bool capture_commit(std::string& err);
     bool record_commit(sycl::queue* cs, std::string& err);
     bool record_window(int T, sycl::queue* cs, std::string &err, void* chunk_rec = nullptr);
@@ -223,6 +226,9 @@ private:
     int64_t n_vocab_ = 0;
     sycl::queue* cs_ = nullptr;
     void* exec_[9] = {};
+    void* exec_res_[9] = {};
+    bool res_graph_ = false;
+    bool recording_res_ = false;
     std::vector<void*> exec_chunks_[9] = {};
     void* commit_exec_ = nullptr;
 

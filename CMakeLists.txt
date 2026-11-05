@@ -590,6 +590,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP OR STRATA_ENABLE_SYCL)
                           src/kernels/sycl/tq_gemv.cpp
                           src/kernels/sycl/xmx_gemm.cpp
                           src/kernels/sycl/iq_mmq.cpp
+                          src/kernels/sycl/draft_head.cpp
                           src/kernels/ngram.cpp
                           src/ngram/ple_reader.cpp
                           src/platform/direct_file.cpp)
@@ -856,7 +857,7 @@ endif()
   # library is the honest shape of the dependency graph: core knows about devices and weights, kernels know
   # about arithmetic, and this one knows the ORDER the arithmetic happens in.
   if(STRATA_ENABLE_SYCL)
-    add_library(strata_engine STATIC src/core/sycl/layer.cpp src/core/sycl/session.cpp src/core/sycl/expert_source.cpp src/core/sycl/remote_experts.cpp src/core/sycl/expert_cache.cpp src/core/sycl/native_head.cpp src/core/sycl/native_dense.cpp src/core/sycl/verify.cpp src/core/sycl/mtp.cpp src/core/sycl/conversation_snapshot.cpp src/core/sycl/conversation_state.cpp src/core/sycl/conversation_memory.cpp src/core/arch_defaults.cpp src/core/nv_defaults.cpp src/core/vmm.cpp src/core/conversation_file.cpp)
+    add_library(strata_engine STATIC src/core/sycl/layer.cpp src/core/sycl/session.cpp src/core/sycl/expert_source.cpp src/core/sycl/remote_experts.cpp src/core/sycl/expert_cache.cpp src/core/sycl/native_head.cpp src/core/sycl/native_dense.cpp src/core/sycl/verify.cpp src/core/sycl/mtp.cpp src/core/sycl/draft_head.cpp src/core/sycl/conversation_snapshot.cpp src/core/sycl/conversation_state.cpp src/core/sycl/conversation_memory.cpp src/core/arch_defaults.cpp src/core/nv_defaults.cpp src/core/vmm.cpp src/core/conversation_file.cpp)
   else()
     add_library(strata_engine STATIC src/core/layer.cpp src/core/session.cpp src/core/expert_source.cpp src/core/remote_experts.cpp
       src/core/remote_expert_opt.cu
@@ -2131,6 +2132,13 @@ endif()
     target_include_directories(sycl_verify_kernels PRIVATE ${_strata_gpu_include_directories})
     target_link_libraries(sycl_verify_kernels PRIVATE strata_kernels ${_strata_gpu_runtime_target})
     add_test(NAME sycl_verify_kernels COMMAND sycl_verify_kernels)
+  endif()
+
+  if(STRATA_ENABLE_SYCL AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/sycl/draft_head_test.cpp")
+    add_executable(sycl_draft_head tests/sycl/draft_head_test.cpp)
+    target_include_directories(sycl_draft_head PRIVATE ${_strata_gpu_include_directories})
+    target_link_libraries(sycl_draft_head PRIVATE strata_core strata_engine strata_kernels strata_kernels_cpu ggml-cpu ggml-base ${_strata_gpu_runtime_target})
+    add_test(NAME sycl_draft_head COMMAND sycl_draft_head)
   endif()
 
   if(STRATA_ENABLE_SYCL AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/sycl/graph_test.cpp")
@@ -3782,7 +3790,7 @@ if(STRATA_ENABLE_SYCL)
     DEPENDS sycl_native_qsa_score sycl_native_router sycl_native_ple_postops
             sycl_native_bf16 sycl_native_gdn sycl_native_gdn_preprocess
             sycl_native_flash_attn sycl_native_mmvq sycl_model_shapes sycl_fused_gdn
-            sycl_dequant_bf16 sycl_verify_kernels sycl_graph strata-device
+            sycl_dequant_bf16 sycl_verify_kernels sycl_draft_head sycl_graph strata-device
             sycl_native_gr_norm sycl_xe2_subgroup_gemv sycl_xmx_joint_matrix
             sycl_qsa_negative_cell_guard sycl_queue_sync_test sycl_subgroup_divergence_test
             s_gemv_pair_parity quantize_act_images_parity bf16_gemv_pair_parity

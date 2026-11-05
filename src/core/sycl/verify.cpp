@@ -264,6 +264,8 @@ Verifier::~Verifier() {
     }
     for (auto& e : exec_)
         if (e) cudaGraphExecDestroy_mock(e);
+    for (auto& e : exec_res_)
+        if (e) cudaGraphExecDestroy_mock(e);
     for (auto& chunks : exec_chunks_) {
         for (void* e : chunks)
             if (e) cudaGraphExecDestroy_mock(e);
@@ -544,7 +546,12 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         const char* nh = std::getenv("STRATA_VERIFY_NO_HOST");
         device_plan_ = (v != nullptr && std::atoi(v) != 0) || (nh != nullptr && *nh && std::strcmp(nh, "0") != 0);
     }
-    if (device_plan_) {
+    {
+        const char* v = std::getenv("STRATA_VERIFY_RESIDENT_GRAPH");
+        res_graph_ = hits.h_res != nullptr && hits.d_res != nullptr &&
+                     (v == nullptr || std::strtol(v, nullptr, 10) != 0);
+    }
+    if (device_plan_ || res_graph_) {
         bool ok2 = true;
         try {
             skip_ = (uint32_t*)sycl::malloc_device(64, get_default_queue());
@@ -570,6 +577,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         }
         if (!ok2) {
             device_plan_ = false;
+            res_graph_ = false;
         }
     }
     std::fprintf(stderr, "strata verify: window up to %d tokens, %.1f MiB of device buffers\n", max_t,
@@ -590,6 +598,17 @@ float* Verifier::Rt(int t) const { return R_ + (size_t)t * (size_t)(g_->hc * g_-
 
 void Verifier::stamp(int64_t l, int i, int grp, sycl::queue* cs) {
     if (prof_on_ && grp == 0) strata::kernels::gpu_stamp(prof_, (int)(l * kProfPer + i), cs);
+}
+
+bool Verifier::all_resident() const {
+    if (!hits_.h_res || !g_) return false;
+    const int64_t ne = g_->n_expert;
+    const int64_t start = lb_ * ne;
+    const int64_t end = (le_ < 0 ? g_->n_layers : le_) * ne;
+    for (int64_t i = start; i < end; ++i) {
+        if (hits_.h_res[i] < 0) return false;
+    }
+    return true;
 }
 
 // ================================ THE WINDOW, AS CAPTURED ================================
@@ -1089,14 +1108,14 @@ bool Verifier::record_layer_pre(int T, int64_t l, int grp, sycl::queue* cs, std:
                 return false;
             }
         }
-        if (device_plan_ && hits_.d_res != nullptr) {
+        if ((device_plan_ || recording_res_) && hits_.d_res != nullptr) {
             VDBG("layer_pre (l=%lld, grp=%d): resident_plan\n", (long long)l, grp);
             resident_plan(ids_ + tb * K, n * (int)K, (int)K, hits_.d_res + l * g.n_expert, (int)g.n_expert,
                           hits_.cache_base, slot_off_d_, (long long)hits_.blob,
                           plan_ + (size_t)grp * (size_t)(plan_i32_ + 16), (long long)max_t_ * K, skip_ + grp,
                           (uint32_t)((l - lb_) * G + grp + 1), cs);
         }
-        if (!lean) {
+        if (!lean && !recording_res_) {
             const uint32_t want = (uint32_t)((l - lb_) * G + grp + 1);
             VDBG("layer_pre (l=%lld, grp=%d): doorbell_publish_value (m_seq_=%p, want=%u, n=%d, k=%ld)\n",
                  (long long)l, grp, m_seq_, want, n, (long)K);
@@ -1185,7 +1204,9 @@ bool Verifier::record_layer_post(int T, int64_t l, int grp, sycl::queue* cs, std
         const uint32_t ring = (uint32_t)((l - lb_) * G + grp + 1);
         const int64_t cap = (int64_t)n * K, capx = (int64_t)max_t_ * K;
         int32_t* pl = plan_ + (size_t)grp * (size_t)(plan_i32_ + 16);
-        if (device_plan_) {  // E-6: skipped when the device planned this group (all its experts resident)
+        if (recording_res_) {
+            // the plan resident_plan built in pre(l)
+        } else if (device_plan_) {  // E-6: skipped when the device planned this group (all its experts resident)
             if (!lean) {
                 VDBG("layer_post (l=%lld, grp=%d): wait_flag_ge_or flagA ring=%u\n", (long long)l, grp, ring);
                 wait_flag_ge_or(m_flagA_, ring, skip_ + grp, cs);
@@ -1228,30 +1249,35 @@ bool Verifier::record_layer_post(int T, int64_t l, int grp, sycl::queue* cs, std
         grouped(p_ptr, p_start, p_counts);
         VDBG("layer_post (l=%lld, grp=%d): grouped 0 (VRAM) done\n", (long long)l, grp);
         stamp(l, 20, grp, cs);
-        if (device_plan_) {
-            if (!lean) {
-                VDBG("layer_post (l=%lld, grp=%d): wait_flag_ge_or flagB ring=%u\n", (long long)l, grp, ring);
-                wait_flag_ge_or(m_flagB_, ring, skip_ + grp, cs);
+        if (!recording_res_) {
+            if (device_plan_) {
+                if (!lean) {
+                    VDBG("layer_post (l=%lld, grp=%d): wait_flag_ge_or flagB ring=%u\n", (long long)l, grp, ring);
+                    wait_flag_ge_or(m_flagB_, ring, skip_ + grp, cs);
+                }
+            } else {
+                VDBG("layer_post (l=%lld, grp=%d): wait_flag_ge flagB ring=%u\n", (long long)l, grp, ring);
+                wait_flag_ge(m_flagB_, ring, cs);  // the PCIe share is in staging (DMA) or mapped
             }
-        } else {
-            VDBG("layer_post (l=%lld, grp=%d): wait_flag_ge flagB ring=%u\n", (long long)l, grp, ring);
-            wait_flag_ge(m_flagB_, ring, cs);  // the PCIe share is in staging (DMA) or mapped
-        }
-        if (!lean && sink_.pcie_mode == 2) {   // stage it with a copy kernel, then point at staging
-            VDBG("layer_post (l=%lld, grp=%d): pcie staging copy\n", (long long)l, grp);
-            const int64_t per = G == 2 ? kStagingBlobs / 2 : kStagingBlobs;
-            uint8_t* stage = staging_ + (size_t)(grp * per) * lay.max_blob;
-            fetch_blobs(p_ptr2, p_counts + 2, stage, (int64_t)lay.blob_bytes(l), (int)per, cs);
-            rebase_ptrs((unsigned long long*)p_ptr2, p_counts + 2, stage, (int64_t)lay.blob_bytes(l), cs);
+            if (!lean && sink_.pcie_mode == 2) {   // stage it with a copy kernel, then point at staging
+                VDBG("layer_post (l=%lld, grp=%d): pcie staging copy\n", (long long)l, grp);
+                const int64_t per = G == 2 ? kStagingBlobs / 2 : kStagingBlobs;
+                uint8_t* stage = staging_ + (size_t)(grp * per) * lay.max_blob;
+                fetch_blobs(p_ptr2, p_counts + 2, stage, (int64_t)lay.blob_bytes(l), (int)per, cs);
+                rebase_ptrs((unsigned long long*)p_ptr2, p_counts + 2, stage, (int64_t)lay.blob_bytes(l), cs);
+            }
         }
         stamp(l, 21, grp, cs);
-        if (!lean) {
+        if (!lean && !recording_res_) {
             VDBG("layer_post (l=%lld, grp=%d): grouped 1 (PCIe) start\n", (long long)l, grp);
             grouped(p_ptr2, p_start2, p_counts + 2);
             VDBG("layer_post (l=%lld, grp=%d): grouped 1 (PCIe) done\n", (long long)l, grp);
         }
         stamp(l, 22, grp, cs);
-        if (device_plan_) {  // no CPU share when the device planned the group: its rows are zeros
+        if (recording_res_) {
+            copy_or_zero_from_mapped(parts_ + (size_t)tb * K * N, m_ymiss_ + (size_t)tb * K * N, (long long)n * K * N,
+                                     skip_ + grp, ring, cs);
+        } else if (device_plan_) {  // no CPU share when the device planned the group: its rows are zeros
             if (!lean) {
                 VDBG("layer_post (l=%lld, grp=%d): wait_flag_ge_or flag ring=%u\n", (long long)l, grp, ring);
                 wait_flag_ge_or(m_flag_, ring, skip_ + grp, cs);
@@ -1664,6 +1690,57 @@ bool Verifier::capture(int T, std::string& err) try {
     return false;
 }
 
+bool Verifier::capture_res(int T, std::string& err) try {
+    if (exec_res_[T] != nullptr) return true;
+    const Clock::time_point t_start = Clock::now();
+    strata::core::progress_at("verify window: capturing resident graph", (int64_t)T);
+    strata::core::progress_beat();
+    VDBG("capture_res start: T=%d\n", T);
+    if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != 0) {
+        err = "verify: begin capture failed";
+        return false;
+    }
+    std::string rerr;
+    bool ok = false;
+    recording_res_ = true;
+    try {
+        ok = record_window(T, cs_, rerr, nullptr);
+    } catch (const std::exception& e) {
+        rerr = std::string("verify: window capture: ") + e.what();
+    }
+    recording_res_ = false;
+    cudaGraph_t graph = nullptr;
+    const int ce = cudaStreamEndCapture(cs_, &graph);
+    if (!ok) {
+        if (graph) cudaGraphDestroy(graph);
+        err = rerr;
+        return false;
+    }
+    if (ce != 0) {
+        err = "verify: end capture error: " + std::to_string(ce);
+        return false;
+    }
+    VDBG("capture_res recorded: T=%d in %.2f ms, instantiating graph\n", T, ms_since(t_start));
+    strata::core::progress_at("verify window: instantiating resident graph", (int64_t)T);
+    const int ie = cudaGraphInstantiate(&exec_res_[T], graph, 0);
+    cudaGraphDestroy(graph);
+    if (ie != 0) {
+        std::fprintf(stderr, "strata verify: resident graph instantiation failed (code %d)\n", ie);
+        exec_res_[T] = nullptr;
+        err = "verify: resident graph instantiation failed: " + std::to_string(ie);
+        return false;
+    }
+    cs_->wait();
+    VDBG("capture_res complete: T=%d in %.2f ms total\n", T, ms_since(t_start));
+    strata::core::progress_beat();
+    std::fprintf(stderr, "strata verify: captured the %d-token window with every expert resident\n", T);
+    return true;
+} catch (const std::exception& exc) {
+    recording_res_ = false;
+    err = std::string("verify capture_res exception: ") + exc.what();
+    return false;
+}
+
 bool Verifier::record_commit(sycl::queue* cs, std::string& err) {
     VDBG("record_commit: begin\n");
     using namespace strata::kernels;
@@ -1750,8 +1827,9 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     }
     VDBG("run start: T=%d, pos0=%lld, tokens=[%d%s], exec=%p\n",
          T, (long long)pos0, tokens ? tokens[0] : -1, T > 1 ? ", ..." : "", (void*)exec_[T]);
-    if (!capture(T, err) || !capture_commit(err)) return false;
-    VDBG("captured; staging\n");
+    const bool res = res_graph_ && all_resident();
+    if (!(res ? capture_res(T, err) : capture(T, err)) || !capture_commit(err)) return false;
+    VDBG("captured; staging (res=%d)\n", (int)res);
     const Clock::time_point t0 = Clock::now();
     const QsaShapes s = shapes_of(g);
     for (int t = 0; t < T; ++t) {
@@ -1789,23 +1867,24 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     ms_host += ms_since(t0);
     const int G = (split_ && T >= 2) ? 2 : 1;
     groups_[T] = G;
-    const bool progressive = (exec_[T] == nullptr && exec_chunks_[T].empty());
-    VDBG("staged in %.2f ms; launching (exec=%p, chunks=%zu, progressive=%d, G=%d)\n",
-         ms_since(t0), exec_[T], exec_chunks_[T].size(), (int)progressive, G);
+    const bool progressive = !res && (exec_[T] == nullptr && exec_chunks_[T].empty());
+    VDBG("staged in %.2f ms; launching (exec=%p, chunks=%zu, progressive=%d, G=%d, res=%d)\n",
+         ms_since(t0), res ? exec_res_[T] : exec_[T], exec_chunks_[T].size(), (int)progressive, G, (int)res);
     progress_at("verify window: launching", (int64_t)T);
     struct AllowScope {
         explicit AllowScope(int64_t seconds) { progress_allow(seconds); }
         ~AllowScope() { progress_allow(0); }
     } allow_scope(300);  // Allow up to 300 s for cold JIT compilation of SPIR-V modules on Intel Arc
     progress_beat();
-    if (exec_[T] != nullptr) {
-        VDBG("launching whole graph exec=%p\n", exec_[T]);
-        const int le = cudaGraphLaunch_mock(exec_[T], cs_);
+    void* to_launch = res ? exec_res_[T] : exec_[T];
+    if (to_launch != nullptr) {
+        VDBG("launching %s graph exec=%p\n", res ? "resident" : "whole", to_launch);
+        const int le = cudaGraphLaunch_mock(to_launch, cs_);
         if (le != 0) {
             err = std::string("verify: launch: error ") + std::to_string(le);
             return false;
         }
-    } else if (!exec_chunks_[T].empty()) {
+    } else if (!exec_chunks_[T].empty() && !res) {
         VDBG("launching %zu graph chunks for T=%d\n", exec_chunks_[T].size(), T);
         for (void* ch : exec_chunks_[T]) {
             const int le = cudaGraphLaunch_mock(ch, cs_);
@@ -1845,7 +1924,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     const bool test_stall = g_test_stall > 0 && windows + 1 == g_test_stall;  // #267 test hook (off: false)
     const bool lean = is_lean();
     VDBG("waiting loop starting: lean=%d, test_stall=%d, steps=%lld, G=%d\n", (int)lean, (int)test_stall, (long long)steps, G);
-    for (int64_t k = 0; (!lean || test_stall) && k < steps; ++k) {
+    for (int64_t k = 0; (!res && (!lean || test_stall)) && k < steps; ++k) {
         const int64_t l = lb_ + k / G;
         const int grp = (int)(k % G);
         const uint32_t want = (uint32_t)(k + 1);
@@ -1968,7 +2047,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         }
         VDBG("direct epilogue done\n");
     }
-    if (lean && !test_stall) {
+    if ((res || lean) && !test_stall) {
         cur_layer_ = (uint32_t)(steps > 0 ? steps - 1 : 0);
     }
     progress_at("verify window: waiting for the GPU to finish the window (flags A/B/M raised)", (int64_t)T);
@@ -2005,7 +2084,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         return false;
     }
     VDBG("cs_->wait() finished\n");
-    if (lean && !test_stall) {
+    if ((res || lean) && !test_stall) {
         ms_wait += std::chrono::duration<double, std::milli>(Clock::now() - t_wait_start).count();
     }
     progress_at("verify window: waiting for the expert copies", (int64_t)T);

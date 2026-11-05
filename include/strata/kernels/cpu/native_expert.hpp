@@ -51,6 +51,12 @@ bool native_experts_available() noexcept;
 /// Fills `f` for a layer; false (with a reason) when ggml-cpu has no dot product for a type.
 bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt& f, std::string& err);
 
+/// One row of `n` values of a GGUF tensor of ggml type `type` to floats, by ggml's own dequantizer (a model's
+/// embedding row read on the host).  False when ggml has none for the type or `n` is not whole blocks.
+bool native_row_to_float(int type, const void* src, float* dst, int64_t n);
+/// Bytes of one row of `n` values of ggml type `type` (0 when `n` is not whole blocks).
+size_t native_row_bytes(int type, int64_t n);
+
 /// x (n_embd floats) -> the gate/up activation (act_bytes), rotated first when the layer is Hadamard-folded.
 void native_quant_act(const NativeFmt& f, const float* x, void* dst);
 /// h (n_ff floats) -> the down activation (h_bytes), rotated first when the layer is Hadamard-folded.

@@ -33,6 +33,7 @@
 namespace strata::core {
 
 class NativeHead;
+class DraftHeadInt2;
 
 class MtpDrafter {
 public:
@@ -189,6 +190,8 @@ private:
     float *h_prob_ = nullptr, *m_prob_ = nullptr;   // each draft's probability under the draft layer
     // the draft head: the main head's rows for a token subset (rt/draft_vocab.bin), or the whole head
     uint8_t* dhead_ = nullptr;
+    std::shared_ptr<DraftHeadInt2> int2_;
+    void setup_int2();
     int32_t* dvocab_ = nullptr;
     int64_t n_dvocab_ = 0;
     std::string rt_dir_;
@@ -257,6 +260,7 @@ private:
 namespace strata::core {
 
 class NativeHead;
+class DraftHeadInt2;
 
 class MtpDrafter {
 public:
@@ -557,6 +561,8 @@ private:
     float *h_prob_ = nullptr, *m_prob_ = nullptr;   // each draft's probability under the draft layer
     // the draft head: the main head's rows for a token subset (rt/draft_vocab.bin), or the whole head
     uint8_t* dhead_ = nullptr;
+    std::shared_ptr<DraftHeadInt2> int2_;
+    void setup_int2();
     int32_t* dvocab_ = nullptr;
     int64_t n_dvocab_ = 0;
     std::string rt_dir_;
