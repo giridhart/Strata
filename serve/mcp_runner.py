@@ -300,7 +300,18 @@ def execute_in_runner(code: str, hub: McpHub, timeout_s: float, cancel: threadin
     for d in extract_dependencies(clean_code):
         if d not in all_deps:
             all_deps.append(d)
-    clean_deps = [str(d).strip() for d in all_deps if str(d).strip()]
+    BASE_PACKAGES = {
+        "px", "go", "sp", "np", "pd", "plotly", "pandas", "numpy", "sympy",
+        "astropy", "math", "cmath", "json", "os", "sys", "pint", "z3", "ruff"
+    }
+    clean_deps = []
+    for d in all_deps:
+        d_str = str(d).strip()
+        if not d_str or d_str in BASE_PACKAGES:
+            continue
+        mapped = COMMON_PACKAGE_MAP.get(d_str, d_str)
+        if mapped not in BASE_PACKAGES and mapped not in clean_deps:
+            clean_deps.append(mapped)
 
     cleanup_idle_runners()
 
@@ -321,7 +332,7 @@ def execute_in_runner(code: str, hub: McpHub, timeout_s: float, cancel: threadin
 
             uv_bin = shutil.which("uv")
             if uv_bin:
-                cmd = [uv_bin, "run", "-q"]
+                cmd = [uv_bin, "run", "--python", sys.executable, "-q"]
                 if clean_deps:
                     cmd += ["--with", ",".join(clean_deps)]
                 cmd += ["python", "-m", "serve.mcp_runner"]

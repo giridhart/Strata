@@ -55,7 +55,7 @@ class MockPlotTest(unittest.TestCase):
             self.assertGreater(len(data), 0)
 
     def test_app_js_includes_tool_plots(self):
-        """Web app script must include toolPlots and hydrateToolPlots hooks."""
+        """Web app script must include toolPlots, hydrateToolPlots, and DOM preservation hooks."""
         req = urllib.request.Request(f"{self.base}/web/app.js")
         with urllib.request.urlopen(req, timeout=10) as resp:
             self.assertEqual(resp.status, 200)
@@ -63,6 +63,8 @@ class MockPlotTest(unittest.TestCase):
             self.assertIn("toolPlots", content)
             self.assertIn("hydrateToolPlots", content)
             self.assertIn("plotCache", content)
+            self.assertIn("savedPlots", content)
+            self.assertIn("replaceWith", content)
 
     def test_mock_chat_completion_streams_plotly_result(self):
         """Simulated model tool call generates Plotly JSON and streams SSE result with plot object."""
@@ -105,6 +107,102 @@ class MockPlotTest(unittest.TestCase):
         self.assertGreaterEqual(len(content["data"]), 1)
         self.assertEqual(content["data"][0].get("type"), "bar")
 
+    def test_codemode_import_px_and_trailing_print_preserves_plot(self):
+        """Calling run_python with import px, dependencies=['px'], and trailing print retains the plot."""
+        code = (
+            "import px\n"
+            "df = pd.DataFrame({'x': [1, 2], 'y': [10, 20]})\n"
+            "fig = px.scatter(df, x='x', y='y', title='Scatter Test')\n"
+            "render_interactive_plot(fig)\n"
+            "print('Plot created successfully')\n"
+        )
+        tok = ByteTokenizer()
+        first_turn = call_script("run_python", code=code, dependencies=["px"])
+        second_turn = "</think>\n\nHere is your scatter plot."
+        engine = ScriptedEngine(tok, [first_turn, second_turn])
+        svc = Service(engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        svc.mcp = McpHub({})
+        httpd = serve(svc, port=0)
+        port = httpd.server_address[1]
+        try:
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{port}/v1/chat/completions",
+                data=json.dumps({
+                    "model": "qwen",
+                    "messages": [{"role": "user", "content": "draw a scatter plot"}],
+                    "stream": True,
+                    "strata_mcp": True,
+                    "codemode": True
+                }).encode("utf-8"),
+                headers={"Content-Type": "application/json"}
+            )
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                self.assertEqual(resp.status, 200)
+                events = []
+                for line in resp:
+                    line_str = line.decode("utf-8").strip()
+                    if line_str.startswith("data: ") and not line_str.endswith("[DONE]"):
+                        chunk = json.loads(line_str[6:])
+                        if "strata_mcp" in chunk:
+                            events.append(chunk["strata_mcp"])
+
+            results = [e for e in events if e.get("event") == "result"]
+            self.assertGreaterEqual(len(results), 1)
+            res = results[0]
+            self.assertTrue(res.get("ok"), f"Tool call failed: {res.get('text')}")
+            self.assertIn("plot", res)
+            self.assertEqual(res["plot"]["content"]["layout"]["title"]["text"], "Scatter Test")
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+
+    def test_codemode_fig_show_preserves_plot(self):
+        """Calling run_python with standard fig.show() routes to plot capture."""
+        code = (
+            "df = pd.DataFrame({'x': ['A', 'B'], 'y': [5, 15]})\n"
+            "fig = px.bar(df, x='x', y='y', title='Bar Test')\n"
+            "fig.show()\n"
+        )
+        tok = ByteTokenizer()
+        first_turn = call_script("run_python", code=code)
+        second_turn = "</think>\n\nHere is your chart."
+        engine = ScriptedEngine(tok, [first_turn, second_turn])
+        svc = Service(engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        svc.mcp = McpHub({})
+        httpd = serve(svc, port=0)
+        port = httpd.server_address[1]
+        try:
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{port}/v1/chat/completions",
+                data=json.dumps({
+                    "model": "qwen",
+                    "messages": [{"role": "user", "content": "draw a bar chart"}],
+                    "stream": True,
+                    "strata_mcp": True,
+                    "codemode": True
+                }).encode("utf-8"),
+                headers={"Content-Type": "application/json"}
+            )
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                self.assertEqual(resp.status, 200)
+                events = []
+                for line in resp:
+                    line_str = line.decode("utf-8").strip()
+                    if line_str.startswith("data: ") and not line_str.endswith("[DONE]"):
+                        chunk = json.loads(line_str[6:])
+                        if "strata_mcp" in chunk:
+                            events.append(chunk["strata_mcp"])
+
+            results = [e for e in events if e.get("event") == "result"]
+            self.assertGreaterEqual(len(results), 1)
+            res = results[0]
+            self.assertTrue(res.get("ok"), f"Tool call failed: {res.get('text')}")
+            self.assertIn("plot", res)
+            self.assertEqual(res["plot"]["content"]["layout"]["title"]["text"], "Bar Test")
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+
 
 def run_interactive_server(port: int = 8080):
     """Launches a standalone mock server for instant browser previewing."""
@@ -119,13 +217,13 @@ def run_interactive_server(port: int = 8080):
     actual_port = httpd.server_address[1]
 
     url = f"http://127.0.0.1:{actual_port}"
-    print(f"\n=======================================================")
+    print("\n=======================================================")
     print(f"  Strata Mock Plotting Server running at: {url}")
-    print(f"  - No GPU or model weights needed (< 0.1s startup)")
+    print("  - No GPU or model weights needed (< 0.1s startup)")
     print(f"  - Open {url} in your browser")
-    print(f"  - Send any message to trigger the interactive Plotly chart")
-    print(f"  - Press Ctrl+C to stop")
-    print(f"=======================================================\n")
+    print("  - Send any message to trigger the interactive Plotly chart")
+    print("  - Press Ctrl+C to stop")
+    print("=======================================================\n")
     try:
         while True:
             time.sleep(1)

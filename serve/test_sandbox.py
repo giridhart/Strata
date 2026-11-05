@@ -146,6 +146,55 @@ class TestLLMSandbox(unittest.TestCase):
         with self.assertRaises(TypeError):
             render_interactive_plot(123)
 
+    def test_plot_capture_followed_by_stdout(self):
+        # When render_interactive_plot is followed by print(), the plot must not be lost
+        code = (
+            "df = pd.DataFrame({'x': [1, 2], 'y': [3, 4]})\n"
+            "fig = px.bar(df, x='x', y='y')\n"
+            "render_interactive_plot(fig)\n"
+            "print('Plot created successfully')\n"
+        )
+        res = self.sandbox.execute(code)
+        self.assertTrue(res["ok"], res.get("error"))
+        self.assertIsNotNone(res["result"])
+        self.assertEqual(res["result"].get("type"), "application/vnd.plotly.v1+json")
+        self.assertIn("Plot created successfully", res["output"])
+
+    def test_fig_show_captures_plot(self):
+        # fig.show() should route to plot capture
+        code = (
+            "df = pd.DataFrame({'x': [1, 2], 'y': [3, 4]})\n"
+            "fig = px.bar(df, x='x', y='y')\n"
+            "fig.show()\n"
+        )
+        res = self.sandbox.execute(code)
+        self.assertTrue(res["ok"], res.get("error"))
+        self.assertIsNotNone(res["result"])
+        self.assertEqual(res["result"].get("type"), "application/vnd.plotly.v1+json")
+
+    def test_variable_fig_auto_capture(self):
+        # If model assigns fig without calling render_interactive_plot or leaving it as last expr
+        code = (
+            "df = pd.DataFrame({'x': [1, 2], 'y': [3, 4]})\n"
+            "fig = px.bar(df, x='x', y='y')\n"
+        )
+        res = self.sandbox.execute(code)
+        self.assertTrue(res["ok"], res.get("error"))
+        self.assertIsNotNone(res["result"])
+        self.assertEqual(res["result"].get("type"), "application/vnd.plotly.v1+json")
+
+    def test_pseudo_imports_with_submodules(self):
+        code = (
+            "import px.colors\n"
+            "from px.colors import sequential\n"
+            "df = pd.DataFrame({'x': [1, 2], 'y': [3, 4]})\n"
+            "fig = px.bar(df, x='x', y='y', color_continuous_scale=sequential.Viridis)\n"
+            "render_interactive_plot(fig)\n"
+        )
+        res = self.sandbox.execute(code)
+        self.assertTrue(res["ok"], res.get("error"))
+        self.assertEqual(res["result"]["type"], "application/vnd.plotly.v1+json")
+
 
 if __name__ == "__main__":
     unittest.main()
