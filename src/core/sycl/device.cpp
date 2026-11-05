@@ -117,7 +117,7 @@ CompilerWorkaround intel_compiler_workaround() {
     static const CompilerWorkaround done = [] {
         CompilerWorkaround w;
 #if !defined(_WIN32)
-        if (std::getenv("IGC_EnableGEPSimplification") != nullptr || !xe_gpu_from_xe2()) return w;
+        if (!xe_gpu_from_xe2()) return w;
         void* lib = dlopen("libigc.so.2", RTLD_LAZY | RTLD_LOCAL);   // the driver loads the same one later
         if (lib == nullptr) return w;                                 // no Intel compiler: nothing to set
         bool affected = true;                                         // (a file name with no version: as affected)
@@ -139,8 +139,12 @@ CompilerWorkaround intel_compiler_workaround() {
                 if (minor >= 0) affected = major == 2 && minor >= 25 && minor < 32;
             }
         }
-        if (affected) setenv("IGC_EnableGEPSimplification", "0", 0);
-        w.set = affected;
+        if (std::getenv("IGC_EnableGEPSimplification") == nullptr) {
+            if (affected) setenv("IGC_EnableGEPSimplification", "0", 0);
+            w.set = affected;
+        } else {
+            w.set = (std::strcmp(std::getenv("IGC_EnableGEPSimplification"), "0") == 0);
+        }
 #endif
         return w;
     }();

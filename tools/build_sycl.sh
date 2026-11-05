@@ -12,6 +12,11 @@ if [[ -f /opt/intel/oneapi/setvars.sh ]]; then
     source /opt/intel/oneapi/setvars.sh --force >/dev/null 2>&1
 fi
 
+# Set default runtime environment for Intel Xe2/B580 if not already configured
+export IGC_EnableGEPSimplification="${IGC_EnableGEPSimplification:-0}"
+export SYCL_CACHE_PERSISTENT="${SYCL_CACHE_PERSISTENT:-1}"
+export ONEAPI_DEVICE_SELECTOR="${ONEAPI_DEVICE_SELECTOR:-level_zero:0}"
+
 RECONFIGURE=false
 BUILD_TYPE="${BUILD_TYPE:-Release}"
 EXTRA_CXX_FLAGS=""
