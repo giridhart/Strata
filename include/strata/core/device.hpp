@@ -12,6 +12,12 @@
 // startup so the discrepancy is visible immediately.
 #pragma once
 
+#if defined(__has_include)
+#if __has_include(<sycl/sycl.hpp>)
+#include <sycl/sycl.hpp>
+#endif
+#endif
+
 #include <cstdint>
 #include <stdexcept>
 #include <string>
@@ -68,6 +74,30 @@ std::string device_code_error();
 
 // Active IGC compiler workaround version (e.g. "2.28.4") if active, or empty string.
 std::string compiler_workaround();
+
+// Dedicated copy engine queue: returns a queue on a copy-only queue group (Level Zero)
+// or an ordinary stream. STRATA_COPY_ENGINE=0 turns it off.
+sycl::queue* create_copy_stream(int ordinal = 0);
+
+// Creates an in-order SYCL stream (queue) for the given device.
+sycl::queue* create_stream(int ordinal = 0, bool high_priority = false);
+
+// Event profiling vs barrier auto-calibration: benchmarks 64 profiling tags vs 64 barriers.
+// Returns true if profiling tags overhead exceeds 6 us per tag.
+// STRATA_EVENT_MARK=barrier or tag can override.
+bool measure_marks(int ordinal = 0);
+bool marks_by_barrier(int ordinal = 0);
+
+// Device status query: "answers", "lost", or "unknown"
+std::string device_status(int ordinal = 0);
+
+// Device context and queue access
+const std::vector<sycl::device>& get_devices_list();
+sycl::context get_device_context(int ordinal = 0);
+sycl::queue& get_queue(int ordinal = 0);
+
+// Chunked device memset (<= 1 GiB blocks) to prevent driver hangs on large buffers
+sycl::event device_memset(void* dst, int value, size_t bytes, sycl::queue& q);
 
 class CudaError : public std::runtime_error {
 public:

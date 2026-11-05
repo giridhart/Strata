@@ -16,6 +16,7 @@
 
 #include <sycl/sycl.hpp>
 #include "strata/core/device.hpp"
+#include "strata/platform/memory.hpp"
 #include "strata/core/emulate.hpp"
 #include "strata/core/sycl_doorbell.hpp"
 #include "strata/pipeline_auto.hpp"
@@ -61,6 +62,7 @@
 #include "strata/kernels/cvec.hpp"
 #include "strata/core/progress.hpp"
 #include "strata/core/device.hpp"
+#include "strata/platform/memory.hpp"
 #include "strata/core/emulate.hpp"
 #ifndef NOMINMAX
 #define NOMINMAX  // gguf_reader.hpp includes windows.h
@@ -5874,6 +5876,7 @@ int main(int argc, char** argv) try {
                     }
                 }).detach();
         }
+        strata::platform::settle_before_ready();
         std::printf("READY %lld stop\n", (long long)o.max_context);  // "stop": this engine honours STOP
         std::fflush(stdout);
         std::string line;

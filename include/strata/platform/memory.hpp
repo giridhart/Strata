@@ -94,4 +94,12 @@ struct ProcIo {
 };
 ProcIo proc_io_sample();
 
+/// Waits until the kernel has stopped migrating host pages (Linux's /proc/vmstat pgmigrate_success: below `quiet_rate`
+/// pages a second for `quiet_s` seconds), at most `cap_s` seconds; the seconds waited, and the highest rate seen in
+/// `peak`. 0 at once where the counter cannot be read (Windows, a kernel without it).
+double settle_page_migration(double cap_s, double quiet_s, double quiet_rate, double& peak);
+
+/// The engine's wait for that before it says READY (STRATA_SETTLE_S, memory.cpp), with a line on stderr.
+void settle_before_ready();
+
 }  // namespace strata::platform

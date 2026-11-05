@@ -1,5 +1,7 @@
 // src/core/pinned.cu - P2.S1: the pinned host arena and the parallel expert load.
 #include <sycl/sycl.hpp>
+#include <sycl/usm.hpp>
+#include "strata/core/device.hpp"
 #include "strata/core/pinned.hpp"
 #include "strata/platform/memory.hpp"
 
@@ -58,6 +60,62 @@ struct SharedArenaHeader {
     uint64_t reserved[4];
 };
 static_assert(sizeof(SharedArenaHeader) <= kSharedArenaHeaderBytes);
+
+#if !defined(_WIN32)
+// bytes in free blocks of 2 MiB or more (/proc/buddyinfo, order >= 9): what MADV_HUGEPAGE can get without compaction
+uint64_t free_huge_bytes() {
+    uint64_t total = 0;
+    if (std::FILE* f = std::fopen("/proc/buddyinfo", "r")) {
+        char line[512];
+        while (std::fgets(line, sizeof line, f) != nullptr) {
+            const char* z = std::strstr(line, "zone");
+            if (z == nullptr) continue;
+            const char* q = z + 4;
+            while (*q == ' ') ++q;
+            while (*q != '\0' && *q != ' ') ++q;   // the zone's name
+            unsigned long long c[11] = {0};
+            int n = 0;
+            for (; n < 11; ++n) {
+                char* e = nullptr;
+                const unsigned long long v = std::strtoull(q, &e, 10);
+                if (e == q) break;
+                c[n] = v;
+                q = e;
+            }
+            for (int o = 9; o < n; ++o) total += c[o] * (4096ull << o);
+        }
+        std::fclose(f);
+    }
+    return total;
+}
+
+std::string thp_request_skipped(uint64_t bytes) {
+    if (std::getenv("STRATA_NO_ARENA_THP") != nullptr) return "transparent huge pages skipped (STRATA_NO_ARENA_THP)";
+    std::string mode;
+    if (std::FILE* f = std::fopen("/sys/kernel/mm/transparent_hugepage/enabled", "r")) {
+        char line[128] = {0};
+        if (std::fgets(line, sizeof line, f) != nullptr) {
+            const char* open = std::strchr(line, '[');
+            const char* close = open ? std::strchr(open, ']') : nullptr;
+            if (open && close) mode.assign(open + 1, close);
+        }
+        std::fclose(f);
+    }
+    if (mode == "always")
+        return "transparent huge pages are on for every mapping (THP always): MADV_HUGEPAGE not requested";
+    if (std::getenv("STRATA_ARENA_THP") == nullptr) {
+        const uint64_t free_huge = free_huge_bytes();
+        if (free_huge < bytes / 2) {
+            std::string why = "transparent huge pages NOT requested: only " + std::to_string(free_huge >> 30) +
+                              " GiB of free 2 MiB blocks for a " + std::to_string(bytes >> 30) +
+                              " GiB arena, compaction would stall the load (STRATA_ARENA_THP=1 requests them anyway)";
+            std::fprintf(stderr, "strata: expert arena: %s\n", why.c_str());
+            return why;
+        }
+    }
+    return std::string();
+}
+#endif
 
 // A 2 MB-aligned reservation.  Large pages first, then the largest alignment the OS will give us for free.
 // A non-empty shared_file instead maps one file whose first 4 KiB identify the pack and whose remaining bytes
@@ -204,17 +262,25 @@ void* reserve(uint64_t bytes, PageBacking& got, std::string& note, const std::st
         return (uint8_t*)map + kSharedArenaHeaderBytes;
     }
 
-    void* p =
-        mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB | MAP_HUGE_2MB, -1, 0);
-    if (p != MAP_FAILED) {
-        got = PageBacking::LargePages;
-        note = "hugetlb 2 MB pages";
-        return p;
+    constexpr uint64_t kHugePage = 2ull << 20;
+    // Over-map by one huge page so the arena starts on a 2 MB boundary and THP can back it from the first byte.
+    mapping_bytes = (size_t) bytes + kHugePage;
+    mapping_base = mmap(nullptr, (size_t) mapping_bytes, PROT_READ | PROT_WRITE,
+                        MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    if (mapping_base == MAP_FAILED) {
+        mapping_base = nullptr;
+        mapping_bytes = 0;
+        note = "mmap failed for " + std::to_string(bytes) + " bytes: " + std::string(std::strerror(errno));
+        return nullptr;
     }
-    note = "MAP_HUGETLB unavailable (no hugetlb pool configured?); using 4 KB pages";
-    p = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    got = PageBacking::NormalPages;
-    return p == MAP_FAILED ? nullptr : p;
+    void* base = (void*) (((uintptr_t) mapping_base + kHugePage - 1) & ~(uintptr_t) (kHugePage - 1));
+    const std::string thp_skip = thp_request_skipped(bytes);
+    const bool huge = thp_skip.empty() && madvise(base, (size_t) bytes, MADV_HUGEPAGE) == 0;
+    got = huge ? PageBacking::LargePages : PageBacking::NormalPages;
+    note = !thp_skip.empty() ? thp_skip
+                             : (huge ? "transparent huge pages requested (madvise)"
+                                     : "madvise(MADV_HUGEPAGE) refused: 4 KB pages");
+    return base;
 #endif
 }
 
@@ -281,6 +347,79 @@ bool sliced_pin_limit(uint64_t& limit, std::string& why) {
 }  // namespace
 
 namespace {
+std::vector<int> g_copy_devices;
+}
+
+void arena_copy_devices(const std::vector<int>& devices) { g_copy_devices = devices; }
+
+uint64_t max_alloc_bytes(int ordinal) {
+    if (const char* v = std::getenv("STRATA_MAX_ALLOC_MIB")) {
+        uint64_t mib = std::strtoull(v, nullptr, 10);
+        if (mib > 0) return mib << 20;
+    }
+    try {
+        auto devs = get_devices_list();
+        if (ordinal >= 0 && ordinal < static_cast<int>(devs.size())) {
+            return devs[ordinal].get_info<sycl::info::device::max_mem_alloc_size>();
+        }
+        sycl::device d{sycl::default_selector_v};
+        return d.get_info<sycl::info::device::max_mem_alloc_size>();
+    } catch (...) {
+        return 1ull << 30; // 1 GiB fallback
+    }
+}
+
+namespace {
+bool pin_parts_enabled() {
+    const char* v = std::getenv("STRATA_PIN_PARTS");
+    if (v != nullptr && std::strcmp(v, "0") == 0) return false;
+    return true; // enabled by default (STRATA_PIN_PARTS=1)
+}
+
+uint64_t register_pieces(uint8_t* base, uint64_t bytes, const std::vector<uint64_t>& cuts,
+                         std::vector<void*>& reg, std::vector<std::pair<void*, size_t>>& pieces, uint64_t cap) {
+    uint64_t limit = bytes;
+    if (pin_parts_enabled()) {
+        limit = max_alloc_bytes();
+        for (int d : g_copy_devices) {
+            limit = std::min(limit, max_alloc_bytes(d));
+        }
+    }
+    std::vector<uint64_t> ends, c;
+    for (uint64_t x : cuts)
+        if (x > 0 && x < bytes) c.push_back(x);
+    std::sort(c.begin(), c.end());
+    c.erase(std::unique(c.begin(), c.end()), c.end());
+    c.push_back(bytes);
+
+    for (uint64_t start = 0; start < bytes;) {
+        size_t i = 0;
+        while (i < c.size() && c[i] <= start) ++i;
+        uint64_t prev = start;
+        while (i < c.size() && c[i] - start <= limit) prev = c[i++];
+        const uint64_t end = prev > start ? prev : std::min(bytes, start + limit);
+        ends.push_back(end);
+        start = end;
+    }
+
+    uint64_t start = 0;
+    sycl::context ctx = get_device_context(0);
+    for (uint64_t end : ends) {
+        if (cap > 0 && end > cap) break;
+        try {
+            sycl::ext::oneapi::experimental::prepare_for_device_copy(base + start, (size_t) (end - start), ctx);
+            reg.push_back(base + start);
+            pieces.emplace_back(base + start, (size_t) (end - start));
+            start = end;
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "strata: prepare_for_device_copy failed for piece [%llu, %llu): %s\n",
+                         (unsigned long long)start, (unsigned long long)end, e.what());
+            break;
+        }
+    }
+    return start;
+}
+
 std::vector<uint64_t> uniform_bounds(uint64_t bytes, uint64_t slice) {
     std::vector<uint64_t> b;
     if (slice == 0) return b;
@@ -291,14 +430,61 @@ std::vector<uint64_t> uniform_bounds(uint64_t bytes, uint64_t slice) {
 }
 }  // namespace
 
-PinnedArena::PinnedArena(uint64_t bytes, uint64_t slice) : PinnedArena(bytes, uniform_bounds(bytes, slice)) {
-    if (slice_bytes) slice_bytes = slice;  // sliced registration: record the uniform size
+PinnedArena::PinnedArena(uint64_t bytes, uint64_t slice)
+    : PinnedArena(bytes, uniform_bounds(bytes, slice)) {
+    if (slice_bytes) slice_bytes = slice;
+}
+
+PinnedArena::PinnedArena(uint64_t bytes, uint64_t slice, const std::vector<uint64_t>& cuts)
+    : PinnedArena(bytes, cuts.empty() ? uniform_bounds(bytes, slice) : cuts) {
+    if (slice_bytes) slice_bytes = slice;
+}
+
+PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds, uint64_t pad, bool host_usm,
+                         const std::vector<uint64_t>& cuts)
+    : capacity(bytes), bounds_(bounds) {
+    if (!host_usm) {
+        std::vector<uint64_t> cuts_to_use = cuts;
+        if (cuts_to_use.empty() && bounds.size() > 1) {
+            cuts_to_use.assign(bounds.begin() + 1, bounds.end());
+        }
+        base = reserve(bytes, backing, note, {}, 0, mapping_base, mapping_bytes);
+        if (base) {
+            registered_bytes = register_pieces((uint8_t*) base, bytes, cuts_to_use, reg_, pieces_, 0);
+            registered_slices = static_cast<int>(pieces_.size());
+            slice_starts.clear();
+            for (const auto& p : pieces_)
+                slice_starts.push_back(static_cast<uint8_t*>(p.first) - static_cast<uint8_t*>(base));
+            note = std::string("mapping registered for device copies") +
+                   (reg_.size() > 1 ? " in " + std::to_string(reg_.size()) + " pieces (max_mem_alloc_size)" : "") +
+                   "; " + note;
+        }
+        return;
+    }
+    if (bounds.size() < 2 || bounds.back() > bytes) throw std::runtime_error("expert arena bounds invalid");
+    auto ctx = get_device_context(0);
+    for (size_t l = 0; l + 1 < bounds.size(); ++l) {
+        const uint64_t n = bounds[l + 1] - bounds[l] + pad;
+        void* p = sycl::malloc_host((size_t) n, ctx);
+        if (!p) {
+            for (uint8_t* q : layer_base) sycl::free(q, ctx);
+            layer_base.clear();
+            throw std::runtime_error("host USM allocation failed");
+        }
+        layer_base.push_back((uint8_t*) p);
+        pieces_.emplace_back(p, (size_t) n);
+        slice_starts.push_back(bounds[l]);
+    }
+    base = layer_base[0];
+    backing = PageBacking::NormalPages;
+    registered_bytes = bytes;
+    registered_slices = static_cast<int>(layer_base.size());
+    note = "host USM, one block per layer (" + std::to_string(layer_base.size()) + ")";
 }
 
 PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds, uint64_t max_pinned_bytes,
                          const std::string& shared_file, uint64_t shared_pack_hash) try
-    : capacity(bytes) {
-    (void)bounds;
+    : capacity(bytes), bounds_(bounds) {
     if (bytes == 0) return;
     base = reserve(bytes, backing, note, shared_file, shared_pack_hash, mapping_base, mapping_bytes);
     if (base != nullptr && mapping_base == nullptr) {
@@ -306,21 +492,23 @@ PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds, ui
         mapping_bytes = bytes;
     }
 
-    // Register with CUDA BEFORE any page is touched: cudaHostRegister pins what is resident now, and a region
-    // that has already been faulted in page by page is far more expensive to register and may fail outright.
     if (base) {
-        // #243: STRATA_ARENA_PIN_GIB=N caps the registration from the start where the caller set no cap
         const int env_gib = arena_pin_cap_gib();
         uint64_t cap = max_pinned_bytes;
-        std::string cap_why = "by the engine (multi-GPU under WDDM, or remote experts)";
         if (cap == 0 && env_gib > 0) {
             cap = (uint64_t)env_gib << 30;
-            cap_why = "by STRATA_ARENA_PIN_GIB";
         }
-        (void)cap;
-        (void)cap_why;
-        registered_bytes = bytes;
-        note = "SYCL host memory accessible; " + note;
+        std::vector<uint64_t> cuts_to_use;
+        if (bounds.size() > 1) cuts_to_use.assign(bounds.begin() + 1, bounds.end());
+        registered_bytes = register_pieces((uint8_t*) base, bytes, cuts_to_use, reg_, pieces_, cap);
+        registered_slices = static_cast<int>(pieces_.size());
+        slice_starts.clear();
+        for (const auto& p : pieces_)
+            slice_starts.push_back(static_cast<uint8_t*>(p.first) - static_cast<uint8_t*>(base));
+
+        note = std::string("mapping registered for device copies") +
+               (reg_.size() > 1 ? " in " + std::to_string(reg_.size()) + " pieces (max_mem_alloc_size)" : "") +
+               "; " + note;
         const char* env = std::getenv("STRATA_ARENA_LOCK");
         if (env == nullptr || std::string(env) != "0") {
             const strata::platform::LockResult lr = strata::platform::lock_resident(base, bytes);
@@ -334,8 +522,43 @@ PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds, ui
     std::cerr << exc.what() << " Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
 }
 
+PinnedArena::PinnedArena(uint64_t bytes, ByNeed, const std::vector<std::pair<uint64_t, uint64_t>>& ranges,
+                         uint64_t max_pinned_bytes, const std::string& shared_file, uint64_t shared_pack_hash)
+    : PinnedArena(bytes, {}, max_pinned_bytes, shared_file, shared_pack_hash) {
+    by_need = true;
+    pin_ranges = ranges;
+}
+
+PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds, Deferred)
+    : PinnedArena(bytes, bounds) {}
+
+void PinnedArena::register_slices(std::atomic<int>& ready) {
+    ready.store(INT_MAX);
+}
+
+uint8_t* PinnedArena::at(uint64_t off) const {
+    if (layer_base.empty()) return (uint8_t*) base + off;
+    size_t l = (size_t) (std::upper_bound(bounds_.begin(), bounds_.end() - 1, off) - bounds_.begin());
+    l = l == 0 ? 0 : l - 1;
+    return layer_base[l] + (off - bounds_[l]);
+}
+
 PinnedArena::~PinnedArena() {
-    if (base) {
+    if (base || mapping_base) {
+        for (void* r : reg_) {
+            try {
+                sycl::ext::oneapi::experimental::release_from_device_copy(r, get_device_context(0));
+            } catch (...) {}
+        }
+        reg_.clear();
+        pieces_.clear();
+        for (uint8_t* q : layer_base) {
+            try {
+                sycl::free(q, get_device_context(0));
+            } catch (...) {}
+        }
+        layer_base.clear();
+
         if (locked_bytes)
             strata::platform::unlock_resident((uint8_t*)base + (slice_bytes ? registered_bytes : 0), locked_bytes);
         release(mapping_base ? mapping_base : base, mapping_bytes ? mapping_bytes : capacity);

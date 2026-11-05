@@ -2397,6 +2397,14 @@ endif()
     set_tests_properties(mock_graph_test PROPERTIES RESOURCE_LOCK gpu TIMEOUT 180)
   endif()
 
+  if(STRATA_ENABLE_SYCL AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/sycl/level_zero_memory_test.cpp")
+    add_executable(sycl_level_zero_memory_test tests/sycl/level_zero_memory_test.cpp)
+    target_include_directories(sycl_level_zero_memory_test PRIVATE ${_strata_gpu_include_directories})
+    target_link_libraries(sycl_level_zero_memory_test PRIVATE strata_core strata_kernels ${_strata_gpu_runtime_target})
+    add_test(NAME sycl_level_zero_memory_test COMMAND sycl_level_zero_memory_test)
+    set_tests_properties(sycl_level_zero_memory_test PROPERTIES RESOURCE_LOCK gpu TIMEOUT 60)
+  endif()
+
 
 
 
@@ -3766,6 +3774,7 @@ if(STRATA_ENABLE_SYCL)
             kv_gather_wide_parity qsa_scores_rows_parity prefill_mmq_tab_parity
             gdn_chunk_parity trellis_parity finish_test gemv_rows_test numerics_test
             hc_mix_split_test q8_quant_multi_test sycl_igc_workaround_test
+            sycl_level_zero_memory_test
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
     COMMENT "Running Intel SYCL tests via ctest"
     USES_TERMINAL

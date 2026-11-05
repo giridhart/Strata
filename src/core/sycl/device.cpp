@@ -3,14 +3,29 @@
 #include "strata/core/device.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
+#include <chrono>
 #include <climits>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <list>
 #include <map>
 #include <mutex>
 #include <vector>
+
+#if defined(__has_include)
+#if __has_include(<level_zero/ze_api.h>) && __has_include(<sycl/ext/oneapi/backend/level_zero.hpp>)
+#include <level_zero/ze_api.h>
+#include <sycl/ext/oneapi/backend/level_zero.hpp>
+#define STRATA_HAVE_ZE_API 1
+#endif
+#if __has_include(<sycl/ext/oneapi/experimental/profiling_tag.hpp>)
+#include <sycl/ext/oneapi/experimental/profiling_tag.hpp>
+#define STRATA_HAVE_PROFILING_TAG 1
+#endif
+#endif
 
 #if !defined(_WIN32)
 #include <dlfcn.h>
@@ -144,7 +159,9 @@ static void sycl_code_cache() {
 #endif
 }
 
-inline const std::vector<sycl::device>& get_devices_list() {
+}  // namespace
+
+const std::vector<sycl::device>& get_devices_list() {
     static const std::vector<sycl::device> devices = [] {
         sycl_code_cache();
         const CompilerWorkaround w = intel_compiler_workaround();
@@ -174,7 +191,31 @@ inline const std::vector<sycl::device>& get_devices_list() {
     return devices;
 }
 
-inline sycl::queue& get_queue(int ordinal = 0) {
+namespace {
+static std::recursive_mutex g_streams_mutex;
+static std::map<int, sycl::context> g_contexts;
+static std::list<sycl::queue> g_streams;
+static std::map<int, bool> g_marks_barrier_result;
+static std::map<int, bool> g_marks_calibrated;
+}  // namespace
+
+sycl::context get_device_context(int ordinal) {
+    std::lock_guard<std::recursive_mutex> lock(g_streams_mutex);
+    auto it = g_contexts.find(ordinal);
+    if (it != g_contexts.end()) return it->second;
+    auto devs = get_devices_list();
+    if (ordinal >= 0 && ordinal < static_cast<int>(devs.size())) {
+        sycl::context ctx(devs[ordinal]);
+        g_contexts.emplace(ordinal, ctx);
+        return ctx;
+    }
+    sycl::device def_dev{sycl::default_selector_v};
+    sycl::context ctx(def_dev);
+    g_contexts.emplace(ordinal, ctx);
+    return ctx;
+}
+
+sycl::queue& get_queue(int ordinal) {
     static std::mutex mtx;
     std::lock_guard<std::mutex> lock(mtx);
     static std::map<int, std::unique_ptr<sycl::queue>> queues;
@@ -184,7 +225,8 @@ inline sycl::queue& get_queue(int ordinal = 0) {
     }
     auto devs = get_devices_list();
     if (ordinal >= 0 && ordinal < static_cast<int>(devs.size())) {
-        auto q = std::make_unique<sycl::queue>(devs[ordinal], sycl::property::queue::in_order());
+        auto ctx = get_device_context(ordinal);
+        auto q = std::make_unique<sycl::queue>(ctx, devs[ordinal], sycl::property::queue::in_order());
         auto& ref = *q;
         queues[ordinal] = std::move(q);
         return ref;
@@ -192,6 +234,188 @@ inline sycl::queue& get_queue(int ordinal = 0) {
     static sycl::queue fallback{sycl::default_selector_v, sycl::property::queue::in_order()};
     return fallback;
 }
+
+sycl::queue* create_stream(int ordinal, bool high_priority) {
+    std::lock_guard<std::recursive_mutex> lock(g_streams_mutex);
+    auto devs = get_devices_list();
+    if (ordinal < 0 || ordinal >= static_cast<int>(devs.size())) {
+        return &g_streams.emplace_back(sycl::default_selector_v, sycl::property::queue::in_order{});
+    }
+    const auto& dev = devs[ordinal];
+    sycl::context ctx = get_device_context(ordinal);
+#if defined(SYCL_EXT_ONEAPI_QUEUE_PRIORITY)
+    if (high_priority) {
+        return &g_streams.emplace_back(ctx, dev,
+                                      sycl::property_list{sycl::property::queue::in_order{},
+                                                          sycl::ext::oneapi::property::queue::priority_high{}});
+    }
+#else
+    (void) high_priority;
+#endif
+    return &g_streams.emplace_back(ctx, dev, sycl::property::queue::in_order{});
+}
+
+sycl::queue* create_copy_stream(int ordinal) {
+#ifdef STRATA_HAVE_ZE_API
+    static const bool off = [] {
+        const char* v = std::getenv("STRATA_COPY_ENGINE");
+        return v != nullptr && std::strtol(v, nullptr, 10) == 0;
+    }();
+    auto devs = get_devices_list();
+    if (!off && ordinal >= 0 && ordinal < static_cast<int>(devs.size()) &&
+        devs[ordinal].get_backend() == sycl::backend::ext_oneapi_level_zero) {
+        try {
+            const auto& dev = devs[ordinal];
+            sycl::context ctx = get_device_context(ordinal);
+            void* lib = dlopen("libze_loader.so.1", RTLD_NOW | RTLD_NOLOAD);
+            if (lib == nullptr) lib = dlopen("libze_loader.so.1", RTLD_NOW);
+            using GroupsFn = decltype(&zeDeviceGetCommandQueueGroupProperties);
+            using ImmFn = decltype(&zeCommandListCreateImmediate);
+            auto groups = lib ? reinterpret_cast<GroupsFn>(dlsym(lib, "zeDeviceGetCommandQueueGroupProperties")) : nullptr;
+            auto imm = lib ? reinterpret_cast<ImmFn>(dlsym(lib, "zeCommandListCreateImmediate")) : nullptr;
+            const auto zdev = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(dev);
+            const auto zctx = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(ctx);
+            uint32_t n = 0;
+            std::vector<ze_command_queue_group_properties_t> g;
+            if (groups != nullptr && imm != nullptr && groups(zdev, &n, nullptr) == ZE_RESULT_SUCCESS && n > 0) {
+                ze_command_queue_group_properties_t blank;
+                std::memset(&blank, 0, sizeof blank);
+                blank.stype = ZE_STRUCTURE_TYPE_COMMAND_QUEUE_GROUP_PROPERTIES;
+                g.assign(n, blank);
+                if (groups(zdev, &n, g.data()) != ZE_RESULT_SUCCESS) g.clear();
+            }
+            for (uint32_t i = 0; i < static_cast<uint32_t>(g.size()); ++i) {
+                if (!(g[i].flags & ZE_COMMAND_QUEUE_GROUP_PROPERTY_FLAG_COPY) ||
+                    (g[i].flags & ZE_COMMAND_QUEUE_GROUP_PROPERTY_FLAG_COMPUTE) || g[i].numQueues == 0)
+                    continue;
+                ze_command_queue_desc_t d;
+                std::memset(&d, 0, sizeof d);
+                d.stype = ZE_STRUCTURE_TYPE_COMMAND_QUEUE_DESC;
+                d.ordinal = i;
+                d.flags = ZE_COMMAND_QUEUE_FLAG_IN_ORDER;
+                d.mode = ZE_COMMAND_QUEUE_MODE_ASYNCHRONOUS;
+                d.priority = ZE_COMMAND_QUEUE_PRIORITY_NORMAL;
+                ze_command_list_handle_t cl = nullptr;
+                if (imm(zctx, zdev, &d, &cl) != ZE_RESULT_SUCCESS || cl == nullptr) break;
+                sycl::backend_input_t<sycl::backend::ext_oneapi_level_zero, sycl::queue> in(
+                    cl, dev, sycl::ext::oneapi::level_zero::ownership::transfer,
+                    sycl::property_list{sycl::property::queue::in_order{}});
+                std::lock_guard<std::recursive_mutex> lock(g_streams_mutex);
+                sycl::queue* q = &g_streams.emplace_back(
+                    sycl::make_queue<sycl::backend::ext_oneapi_level_zero>(in, ctx));
+                static std::atomic<bool> said{false};
+                if (!said.exchange(true))
+                    std::fprintf(stderr, "strata: the prompt's expert copies on the GPU's copy engine (queue group %u; "
+                                         "STRATA_COPY_ENGINE=0 turns it off)\n", i);
+                return q;
+            }
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "strata: no copy-engine queue (%s): an ordinary stream\n", e.what());
+        }
+    }
+#endif
+    return create_stream(ordinal);
+}
+
+bool measure_marks(int ordinal) {
+    if (const char* v = std::getenv("STRATA_EVENT_MARK")) {
+        if (std::strcmp(v, "barrier") == 0) return true;
+        if (std::strcmp(v, "tag") == 0) return false;
+    }
+    constexpr int kMarks = 64;
+    constexpr double kCostUs = 6.0;
+    try {
+        auto devs = get_devices_list();
+        if (ordinal < 0 || ordinal >= static_cast<int>(devs.size())) return false;
+        const auto& dev = devs[ordinal];
+        auto ctx = get_device_context(ordinal);
+        sycl::queue q(ctx, dev, sycl::property::queue::in_order{});
+        std::vector<sycl::event> held(kMarks);
+        auto cost_us = [&q, &held](bool tag) {
+            q.wait();
+            const auto t0 = std::chrono::steady_clock::now();
+            for (auto& e : held) {
+#if defined(STRATA_HAVE_PROFILING_TAG)
+                e = tag ? sycl::ext::oneapi::experimental::submit_profiling_tag(q) : q.ext_oneapi_submit_barrier();
+#else
+                e = q.ext_oneapi_submit_barrier();
+#endif
+            }
+            q.ext_oneapi_submit_barrier().wait();
+            return std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
+        };
+        double tag = 1e30, barrier = 1e30;
+        for (int round = 0; round < 3; ++round) {
+            tag = std::min(tag, cost_us(true));
+            barrier = std::min(barrier, cost_us(false));
+        }
+        return tag - barrier > kMarks * kCostUs;
+    } catch (const std::exception&) {
+        return false;
+    }
+}
+
+bool marks_by_barrier(int ordinal) {
+    if (const char* v = std::getenv("STRATA_EVENT_MARK")) {
+        if (std::strcmp(v, "barrier") == 0) return true;
+        if (std::strcmp(v, "tag") == 0) return false;
+    }
+    std::lock_guard<std::recursive_mutex> lock(g_streams_mutex);
+    auto it = g_marks_calibrated.find(ordinal);
+    if (it != g_marks_calibrated.end()) return g_marks_barrier_result[ordinal];
+    bool res = measure_marks(ordinal);
+    g_marks_barrier_result[ordinal] = res;
+    g_marks_calibrated[ordinal] = true;
+    return res;
+}
+
+std::string device_status(int ordinal) {
+#ifdef STRATA_HAVE_ZE_API
+    auto devs = get_devices_list();
+    if (ordinal >= 0 && ordinal < static_cast<int>(devs.size()) &&
+        devs[ordinal].get_backend() == sycl::backend::ext_oneapi_level_zero) {
+        try {
+            void* lib = dlopen("libze_loader.so.1", RTLD_NOW | RTLD_NOLOAD);
+            if (lib == nullptr) lib = dlopen("libze_loader.so.1", RTLD_NOW);
+            using StatusFn = decltype(&zeDeviceGetStatus);
+            auto status = lib ? reinterpret_cast<StatusFn>(dlsym(lib, "zeDeviceGetStatus")) : nullptr;
+            if (status != nullptr) {
+                const ze_result_t r = status(sycl::get_native<sycl::backend::ext_oneapi_level_zero>(devs[ordinal]));
+                if (r == ZE_RESULT_SUCCESS) return "answers";
+                if (r == ZE_RESULT_ERROR_DEVICE_LOST) return "lost";
+                char buf[48];
+                std::snprintf(buf, sizeof buf, "Level Zero result 0x%x", (unsigned) r);
+                return buf;
+            }
+        } catch (...) {}
+    }
+#endif
+    try {
+        auto devs = get_devices_list();
+        if (ordinal >= 0 && ordinal < static_cast<int>(devs.size())) {
+            const auto& dev = devs[ordinal];
+            if (dev.has(sycl::aspect::ext_intel_free_memory)) {
+                (void) dev.get_info<sycl::ext::intel::info::device::free_memory>();
+                return "answers a memory query";
+            }
+        }
+    } catch (const std::exception& e) {
+        return std::string("does not answer a memory query (") + e.what() + ")";
+    }
+    return "unknown";
+}
+
+sycl::event device_memset(void* dst, int value, size_t bytes, sycl::queue& q) {
+    constexpr size_t kChunk = 1ull << 30; // <= 1 GiB blocks
+    sycl::event e;
+    for (size_t o = 0; o < bytes; o += kChunk) {
+        size_t cur = std::min(kChunk, bytes - o);
+        e = q.memset(static_cast<uint8_t*>(dst) + o, value, cur);
+    }
+    return e;
+}
+
+namespace {
 
 #if defined(STRATA_USE_HIP)
 #if !defined(STRATA_HIP_ARCHS)

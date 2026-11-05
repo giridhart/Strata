@@ -43,6 +43,10 @@ inline std::atomic<bool>& arena_uma_no_register_flag() {
 /// STRATA_ARENA_PIN_GIB to a number (STRATA_ARENA_PIN_GIB=0 registers the whole arena as before).
 bool arena_no_register();
 
+/// Later GPUs that register the arena for copies too
+void arena_copy_devices(const std::vector<int>& devices);
+uint64_t max_alloc_bytes(int ordinal = 0);
+
 /// #3431 (Windows, HIP): the stack [lo, hi) of a thread that only waits while the arena is registered (the process's first thread
 /// when the engine runs on its own one); a GPU alias may cover it.  0, 0: none.
 void set_idle_thread_stack(uint64_t lo, uint64_t hi);
@@ -65,6 +69,10 @@ struct PinnedArena {
     PinnedArena() = default;
     /// `slice`: the piece size for the per-slice registration fallback (0 = none).
     explicit PinnedArena(uint64_t bytes, uint64_t slice = 0);
+    /// Sliced registration with explicit cut points (layer starts)
+    PinnedArena(uint64_t bytes, uint64_t slice, const std::vector<uint64_t>& cuts);
+    PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds, uint64_t pad, bool host_usm,
+                const std::vector<uint64_t>& cuts = {});
     /// Plan v0.3 P6: slices of different sizes (one per layer of a native pack), given as their start offsets
     /// followed by the end of the last one.  `slice_starts` holds the registered ones.
     /// `max_pinned_bytes`: optional cap on CUDA registration. 0 preserves the normal unrestricted path.
@@ -109,6 +117,12 @@ struct PinnedArena {
 
     bool valid() const { return base != nullptr; }
     uint8_t* data() const { return (uint8_t*) base; }
+    uint8_t* at(uint64_t off) const;
+
+    std::vector<void*> reg_;
+    std::vector<std::pair<void*, size_t>> pieces_;
+    const std::vector<std::pair<void*, size_t>>& pieces() const { return pieces_; }
+    std::vector<uint8_t*> layer_base;
 };
 
 struct LoadStats {
@@ -265,6 +279,10 @@ struct PinnedArena {
     PinnedArena() = default;
     /// `slice`: the piece size for the per-slice registration fallback (0 = none).
     explicit PinnedArena(uint64_t bytes, uint64_t slice = 0);
+    /// Sliced registration with explicit cut points (layer starts)
+    PinnedArena(uint64_t bytes, uint64_t slice, const std::vector<uint64_t>& cuts);
+    PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds, uint64_t pad, bool host_usm,
+                const std::vector<uint64_t>& cuts = {});
     /// Plan v0.3 P6: slices of different sizes (one per layer of a native pack), given as their start offsets
     /// followed by the end of the last one.  `slice_starts` holds the registered ones.
     /// `max_pinned_bytes`: optional cap on CUDA registration. 0 preserves the normal unrestricted path.
@@ -283,6 +301,12 @@ struct PinnedArena {
 
     bool valid() const { return base != nullptr; }
     uint8_t* data() const { return (uint8_t*) base; }
+    uint8_t* at(uint64_t off) const;
+
+    std::vector<void*> reg_;
+    std::vector<std::pair<void*, size_t>> pieces_;
+    const std::vector<std::pair<void*, size_t>>& pieces() const { return pieces_; }
+    std::vector<uint8_t*> layer_base;
 };
 
 struct LoadStats {

@@ -34,6 +34,7 @@
 #include "ds4_experts_rule.hpp"
 #include "ds4_os.hpp"
 #include "strata/platform/io_priority.hpp"
+#include "strata/platform/memory.hpp"
 #include "ds4_packinfo.hpp"
 #include "ds4_slotmeta.hpp"
 
@@ -513,6 +514,7 @@ bool parse_gen(const std::string& line, Req& r, bool geni) {
 int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float conf_min, const std::string& pack) {
     std::vector<int> eos = parse_ids(eos_list);
     for (const std::string& l : m.info_lines()) std::printf("%s\n", l.c_str());
+    strata::platform::settle_before_ready();
     if (m.seq_count() > 1)   // (--parallel: n conversations at once, GEN rid=<id>)
         std::printf("READY %lld stop multi=%d\n", (long long) m.max_context(), m.seq_count());
     else

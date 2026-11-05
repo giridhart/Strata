@@ -231,6 +231,17 @@ static inline sycl::event dpct_memset(sycl::queue &q, void *dev_ptr,
     cgh.fill(acc, value);
   });
 #else
+  constexpr size_t kChunk = 1024 * 1024 * 1024; // 1 GiB block limit to avoid driver hang
+  size_t bytes = size * sizeof(valueT);
+  if (bytes > kChunk) {
+    sycl::event e;
+    for (size_t o = 0; o < size;) {
+      size_t chunk_elements = std::min(size - o, kChunk / sizeof(valueT));
+      e = q.fill(static_cast<valueT*>(dev_ptr) + o, value, chunk_elements);
+      o += chunk_elements;
+    }
+    return e;
+  }
   return q.fill(dev_ptr, value, size);
 #endif // DPCT_USM_LEVEL_NONE
 }

@@ -13382,6 +13382,7 @@ int main(int argc, char** argv) {
         }
         strata::core::pin_sim_report("at READY");
         strata::core::pin_reserve_release_hard();   // the load is over: nothing else needs the headroom
+        strata::platform::settle_before_ready();
         std::printf("READY %lld stop\n", (long long) o.max_context);   // "stop": this engine honours STOP
         std::fflush(stdout);
         std::string line;
