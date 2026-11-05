@@ -444,6 +444,7 @@ void group_case(mmq::Context& ctx, const Pair& pr, const std::vector<int>& cnt, 
 }  // namespace
 
 int main() {
+    setenv("STRATA_MMQ_TAB_TEST", "1", 1);
     try {
         sycl::queue q{sycl::default_selector_v, sycl::property::queue::in_order()};
         auto dev = q.get_device();

@@ -4,6 +4,7 @@
 #include "strata/prefill/moe_mmq.hpp"
 #include "strata/core/sycl_arch.hpp"
 #include "strata/kernels/q8_1_finite.hpp"
+#include "strata/kernels/iq_mmq.hpp"
 
 #include "ggml.h"
 #define GGML_COMMON_DECL_SYCL
@@ -392,10 +393,17 @@ Nvfp4Mode nvfp4_mode() { return Nvfp4Mode::FP16; }
 bool supported(int t) {
     switch ((ggml_type)t) {
         case GGML_TYPE_Q2_0:
-        case GGML_TYPE_IQ3_S:
+        case GGML_TYPE_Q8_0:
         case GGML_TYPE_IQ4_NL:
         case GGML_TYPE_IQ4_XS:
-        case GGML_TYPE_Q8_0:
+        case GGML_TYPE_IQ3_S:
+        case GGML_TYPE_IQ3_XXS:
+        case GGML_TYPE_IQ2_XXS:
+        case GGML_TYPE_IQ2_XS:
+        case GGML_TYPE_IQ2_S:
+        case GGML_TYPE_Q4_K:
+        case GGML_TYPE_Q5_K:
+        case GGML_TYPE_Q6_K:
             return true;
         default:
             return false;
@@ -417,6 +425,9 @@ inline int64_t type_blck_size(int t) {
         case GGML_TYPE_IQ2_S: return 256;
         case GGML_TYPE_IQ3_XXS: return 256;
         case GGML_TYPE_IQ4_XS: return 256;
+        case GGML_TYPE_Q4_K: return 256;
+        case GGML_TYPE_Q5_K: return 256;
+        case GGML_TYPE_Q6_K: return 256;
         default: return 32;
     }
 }
@@ -432,6 +443,9 @@ inline size_t type_size(int t) {
         case GGML_TYPE_IQ2_S: return sizeof(block_iq2_s);
         case GGML_TYPE_IQ3_XXS: return sizeof(block_iq3_xxs);
         case GGML_TYPE_IQ4_XS: return sizeof(block_iq4_xs);
+        case GGML_TYPE_Q4_K: return sizeof(block_q4_K);
+        case GGML_TYPE_Q5_K: return sizeof(block_q5_K);
+        case GGML_TYPE_Q6_K: return sizeof(block_q6_K);
         default: return 0;
     }
 }
@@ -443,7 +457,9 @@ size_t matrix_bytes(int t, int64_t rows, int64_t cols) {
 }
 
 size_t q8_bytes(int64_t rows, int64_t cols) {
-    return (size_t)rows * (size_t)pad512(cols) * sizeof(block_q8_1) / 32 + 128 * sizeof(block_q8_1);
+    const size_t iq_bytes = (size_t)(rows + 16) * (size_t)(2 * cols + 2 * (cols / 32) * (int64_t)sizeof(float));
+    const size_t q8_1_bytes = (size_t)rows * (size_t)pad512(cols) * sizeof(block_q8_1) / 32 + 128 * sizeof(block_q8_1);
+    return std::max(q8_1_bytes, iq_bytes);
 }
 
 bool fp4_activations(int) { return false; }
@@ -454,15 +470,38 @@ void scale_down_rows(float*, int64_t, const int32_t*, int, const float*, int64_t
 
 void quantize_scatter(const float* x, const int32_t* slot, const int32_t* src, void* xq, int ggml_type, int64_t cols,
                       int64_t ld, int64_t tokens, int k_used, void* stream) {
+    sycl::queue* q = stream ? static_cast<sycl::queue*>(stream) : &default_queue();
+    static const bool tab_test = (std::getenv("STRATA_MMQ_TAB_TEST") != nullptr);
+    if (!tab_test && kernels::iq_mmq_usable(*q) && kernels::iq_mmq_type_ok(ggml_type)) {
+        static const bool gather = [] {
+            const char* e = std::getenv("STRATA_QUANT_GATHER");
+            return e != nullptr && e[0] == '1';
+        }();
+        if (gather) {
+            quantize(x, src, xq, ggml_type, cols, ld, tokens * k_used, stream, nullptr);
+            return;
+        }
+        if (tokens > 0)
+            kernels::iq_mmq_quantize_scatter(*q, x, slot, xq, cols, ld, tokens, k_used,
+                                             kernels::iq_mmq_type_sums(ggml_type),
+                                             kernels::iq_mmq_type_dup(ggml_type));
+        return;
+    }
     (void)slot;
     quantize(x, src, xq, ggml_type, cols, ld, tokens * k_used, stream, nullptr);
 }
 
 void quantize(const float* x, const int32_t* ids, void* xq, int t, int64_t cols, int64_t ld, int64_t rows,
               void* stream, float* yscale) {
-    (void)t; (void)yscale;
+    (void)yscale;
     if (rows <= 0) return;
     sycl::queue* q = stream ? static_cast<sycl::queue*>(stream) : &default_queue();
+    static const bool tab_test = (std::getenv("STRATA_MMQ_TAB_TEST") != nullptr);
+    if (!tab_test && kernels::iq_mmq_usable(*q) && kernels::iq_mmq_type_ok(t)) {
+        kernels::iq_mmq_quantize(*q, x, ids, xq, cols, ld, rows, kernels::iq_mmq_type_sums(t),
+                                 kernels::iq_mmq_type_dup(t));
+        return;
+    }
     const size_t act_row_stride = pad512(cols) * sizeof(block_q8_1) / 32;
     const int64_t blocks_per_row = pad512(cols) / 32;
 
@@ -519,6 +558,16 @@ Context::~Context() {}
 void Context::run(const Product& p, void* stream) {
     if (p.n <= 0 || p.max_rows <= 0 || p.total_rows <= 0 || p.w_rows <= 0) return;
     sycl::queue* q = stream ? static_cast<sycl::queue*>(stream) : &default_queue();
+
+    static const bool tab_test = (std::getenv("STRATA_MMQ_TAB_TEST") != nullptr);
+
+    if (!tab_test && p.tab == nullptr && kernels::iq_mmq_usable(*q) && kernels::iq_mmq_type_ok(p.type)) {
+        const int64_t cols = kernels::iq_mmq_type_dup(p.type) ? 2 * p.w_cols : p.w_cols;
+        kernels::iq_mmq_grouped(*q, p.type, p.w, p.expert_bytes, p.w_rows, cols, p.n, p.xq,
+                                p.total_rows, p.bounds, p.max_rows, p.ids, p.dst, p.ld_dst,
+                                nullptr, 0, p.total_rows);
+        return;
+    }
 
     const WeightTab tab = p.tab ? *p.tab : WeightTab{};
     const bool has_tab = (p.tab != nullptr);

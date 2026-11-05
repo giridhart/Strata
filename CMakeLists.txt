@@ -589,6 +589,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP OR STRATA_ENABLE_SYCL)
                           src/kernels/sycl/iq_kernels.cpp
                           src/kernels/sycl/tq_gemv.cpp
                           src/kernels/sycl/xmx_gemm.cpp
+                          src/kernels/sycl/iq_mmq.cpp
                           src/kernels/ngram.cpp
                           src/ngram/ple_reader.cpp
                           src/platform/direct_file.cpp)
@@ -2297,6 +2298,16 @@ endif()
     add_test(NAME prefill_mmq_tab_parity COMMAND prefill_mmq_tab_parity)
   endif()
 
+  if(STRATA_ENABLE_SYCL AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/sycl/iq_mmq_parity.cpp")
+    add_executable(sycl_iq_mmq_parity tests/sycl/iq_mmq_parity.cpp)
+    target_include_directories(sycl_iq_mmq_parity PRIVATE
+      ${_strata_gpu_include_directories}
+      "${CMAKE_CURRENT_SOURCE_DIR}/third_party/llama.cpp/ggml/include"
+      "${CMAKE_CURRENT_SOURCE_DIR}/third_party/llama.cpp/ggml/src")
+    target_link_libraries(sycl_iq_mmq_parity PRIVATE strata_kernels ggml-base ${_strata_gpu_runtime_target})
+    add_test(NAME sycl_iq_mmq_parity COMMAND sycl_iq_mmq_parity)
+  endif()
+
   if(STRATA_ENABLE_SYCL AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/sycl/gdn_chunk_parity.cpp")
     add_executable(gdn_chunk_parity tests/sycl/gdn_chunk_parity.cpp)
     target_include_directories(gdn_chunk_parity PRIVATE ${_strata_gpu_include_directories})
@@ -3776,7 +3787,7 @@ if(STRATA_ENABLE_SYCL)
             kv_gather_wide_parity qsa_scores_rows_parity prefill_mmq_tab_parity
             gdn_chunk_parity trellis_parity finish_test gemv_rows_test numerics_test
             hc_mix_split_test q8_quant_multi_test sycl_igc_workaround_test
-            sycl_level_zero_memory_test prefill_gemm_parity
+            sycl_level_zero_memory_test prefill_gemm_parity sycl_iq_mmq_parity
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
     COMMENT "Running Intel SYCL tests via ctest"
     USES_TERMINAL
