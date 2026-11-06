@@ -115,8 +115,28 @@ class TestCodeModeSandboxing(unittest.TestCase):
         scratch = "/tmp/strata_test_scratch"
         cmd = ["python", "-m", "serve.mcp_runner"]
         wrapped = _wrap_with_bwrap_if_available(cmd, scratch)
-        # On systems without bwrap binary, wrapped is returned as-is
+        # On systems without bwrap binary or where AppArmor restricts userns, wrapped is returned as-is
         self.assertTrue(len(wrapped) >= len(cmd))
+
+    def test_layer3_bwrap_probe_apparmor_denial_fallback(self):
+        """When AppArmor denies unprivileged userns to bwrap, probe returns False and bypasses wrapping."""
+        from unittest.mock import patch
+        import serve.mcp_runner as runner_mod
+
+        old_cached = runner_mod._BWRAP_SUPPORTED
+        try:
+            with patch("shutil.which", return_value="/usr/bin/bwrap"):
+                with patch("subprocess.run") as mock_run:
+                    # Simulate AppArmor AUDIT denial: bwrap fails with exit code 1
+                    mock_run.return_value.returncode = 1
+                    runner_mod._BWRAP_SUPPORTED = None
+                    self.assertFalse(runner_mod._is_bwrap_supported())
+
+                    cmd = ["python", "-m", "serve.mcp_runner"]
+                    wrapped = runner_mod._wrap_with_bwrap_if_available(cmd, "/tmp/scratch")
+                    self.assertEqual(wrapped, cmd)
+        finally:
+            runner_mod._BWRAP_SUPPORTED = old_cached
 
 
 if __name__ == "__main__":

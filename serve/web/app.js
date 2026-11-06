@@ -646,6 +646,7 @@ function renderMcp() {
   $("mcp-card").hidden = !servers.length;
   $("mcp-row").hidden = !servers.length;
   if ($("mcp-rounds-row")) $("mcp-rounds-row").hidden = !servers.length;
+  if ($("mcp-lang-row")) $("mcp-lang-row").hidden = !servers.length || !(mcpInfo.settings && mcpInfo.settings.codemode);
   const ready = servers.filter((s) => s.status === "ready" || s.status === "stopped");
   $("mcp-sum").textContent = servers.length ? `${fmt(mcpInfo.tools)} tools · ${ready.length} of ${servers.length} servers connected` : "";
   $("mcp-row-sub").textContent = mcpInfo.tools ? `${fmt(mcpInfo.tools)} tools from ${ready.map((s) => s.name).join(", ")}; the model calls them when it decides to`
@@ -1398,6 +1399,7 @@ async function generateReply() {
   if (settings.mcp !== false && mcpInfo.tools > 0) {
     body.strata_mcp = true;   // this server may run MCP tools for it
     if (settings.max_rounds) body.max_rounds = Number(settings.max_rounds);
+    if (settings.codemode_lang) body.strata_codemode_lang = settings.codemode_lang;
   }
 
   let firstAt = null, thinkStart = null, usage = null, frame = 0;
@@ -1621,6 +1623,10 @@ function loadDrawer(s = settings) {
   $("esp-row").hidden = !projectionLoaded();
   $("s-mcp").setAttribute("aria-checked", String(s.mcp !== false));
   if ($("s-rounds")) $("s-rounds").value = s.max_rounds || (mcpInfo.settings && mcpInfo.settings.max_rounds) || 8;
+  const lang = s.codemode_lang || (mcpInfo.settings && mcpInfo.settings.codemode_lang) || "python";
+  if ($("s-codemode-lang")) {
+    for (const b of $("s-codemode-lang").children) b.setAttribute("aria-checked", String(b.dataset.v === lang));
+  }
   $("s-share").setAttribute("aria-checked", String(sharedOn));
   $("s-list").setAttribute("aria-checked", String(!!s.chatList));
   $("s-edit").setAttribute("aria-checked", String(!!s.chatEdit));
@@ -1677,6 +1683,11 @@ function outputs() {
 }
 for (const b of $("s-thinking").children) b.onclick = () => { for (const x of $("s-thinking").children) x.setAttribute("aria-checked", String(x === b)); outputs(); };
 for (const b of $("s-busy").children) b.onclick = () => { for (const x of $("s-busy").children) x.setAttribute("aria-checked", String(x === b)); outputs(); };
+if ($("s-codemode-lang")) {
+  for (const b of $("s-codemode-lang").children) {
+    b.onclick = () => { for (const x of $("s-codemode-lang").children) x.setAttribute("aria-checked", String(x === b)); };
+  }
+}
 for (const id of ["s-temp", "s-topp", "s-topk", "s-rounds"]) if ($(id)) $(id).oninput = outputs;
 for (const id of ["s-math", "s-show", "s-esp", "s-mcp", "s-share", "s-list", "s-edit"]) {
   $(id).onclick = () => $(id).setAttribute("aria-checked", String($(id).getAttribute("aria-checked") !== "true"));
@@ -1690,6 +1701,7 @@ $("s-apply").onclick = async () => {
               top_k: +$("s-topk").value, max: $("s-max").value.trim(), seed: $("s-seed").value.trim(),
               math: checked("s-math"), show: checked("s-show"), esp: checked("s-esp"), mcp: checked("s-mcp"),
               max_rounds: ($("s-rounds") ? +$("s-rounds").value : 8) || 8,
+              codemode_lang: segValue("s-codemode-lang") || "python",
               chatList: locked ? !!prev.chatList : checked("s-list"), chatEdit: locked ? !!prev.chatEdit : checked("s-edit"),
               whileBusy: segValue("s-busy") || "wait"};
   store.set("sampling", settings);

@@ -4,10 +4,6 @@
       "command": "python3",
       "args": ["tools/mcp_math.py"]
     },
-    "clock": {
-      "command": "python3",
-      "args": ["tools/mcp_datetime.py"]
-    },
     "linter": {
       "command": "python3",
       "args": ["tools/mcp_linter.py"]
@@ -17,10 +13,6 @@
     "math": {
       "command": "python3",
       "args": ["tools/mcp_math.py"]
-    },
-    "clock": {
-      "command": "python3",
-      "args": ["tools/mcp_datetime.py"]
     },
     "linter": {
       "command": "python3",

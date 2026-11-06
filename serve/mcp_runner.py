@@ -6,6 +6,7 @@ over stdin/stdout JSON-RPC pipes. Captures user prints and return values; interm
 from __future__ import annotations
 
 import ast
+import collections
 import io
 import json
 import os
@@ -95,11 +96,48 @@ def _apply_rlimits():
         pass
 
 
+_BWRAP_SUPPORTED: bool | None = None
+
+
+def _is_bwrap_supported() -> bool:
+    """Checks whether Bubblewrap is installed and permitted to unshare user namespaces.
+
+    On modern Linux distributions (e.g. Ubuntu 24.04+ with kernel.apparmor_restrict_unprivileged_userns=1),
+    unprivileged user namespaces are restricted by default by AppArmor. Attempting to run bwrap triggers
+    an AppArmor AUDIT denial and immediately terminates the runner with exit code 1.
+    This probe verifies whether bwrap is actually functional before wrapping commands.
+    """
+    global _BWRAP_SUPPORTED
+    if _BWRAP_SUPPORTED is not None:
+        return _BWRAP_SUPPORTED
+    if os.name != "posix" or sys.platform == "darwin" or os.environ.get("STRATA_NO_BWRAP") == "1":
+        _BWRAP_SUPPORTED = False
+        return False
+    bwrap_bin = shutil.which("bwrap")
+    if not bwrap_bin:
+        _BWRAP_SUPPORTED = False
+        return False
+    try:
+        probe_cmd = [bwrap_bin, "--ro-bind", "/usr", "/usr", "--proc", "/proc", "--dev", "/dev",
+                     "--unshare-user", "--", "true"]
+        if os.path.exists("/lib"):
+            probe_cmd = [bwrap_bin, "--ro-bind", "/usr", "/usr", "--ro-bind", "/lib", "/lib",
+                         "--proc", "/proc", "--dev", "/dev", "--unshare-user", "--", "true"]
+        res = subprocess.run(
+            probe_cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=1.5,
+        )
+        _BWRAP_SUPPORTED = (res.returncode == 0)
+    except Exception:
+        _BWRAP_SUPPORTED = False
+    return _BWRAP_SUPPORTED
+
+
 def _wrap_with_bwrap_if_available(cmd: list[str], scratch_dir: str) -> list[str]:
-    """Wraps runner execution with Bubblewrap container isolation if available on Linux."""
-    if os.name != "posix" or sys.platform == "darwin":
-        return cmd
-    if os.environ.get("STRATA_NO_BWRAP") == "1":
+    """Wraps runner execution with Bubblewrap container isolation if available and permitted on Linux."""
+    if not _is_bwrap_supported():
         return cmd
     bwrap_bin = shutil.which("bwrap")
     if not bwrap_bin:
@@ -302,7 +340,8 @@ def _run_child():
 
 # ------------------------------------------------------------------------------------------------ the host caller (parent)
 class RunnerHandle:
-    def __init__(self, proc, q, reader_thread, stop_reader, clean_deps, scratch_dir: str | None = None):
+    def __init__(self, proc, q, reader_thread, stop_reader, clean_deps, scratch_dir: str | None = None,
+                 stderr_lines: collections.deque | None = None):
         self.proc = proc
         self.q = q
         self.reader_thread = reader_thread
@@ -311,6 +350,7 @@ class RunnerHandle:
         self.last_used = time.monotonic()
         self.lock = threading.Lock()
         self.scratch_dir = scratch_dir
+        self.stderr_lines = stderr_lines if stderr_lines is not None else collections.deque(maxlen=50)
 
     def alive(self) -> bool:
         return self.proc.poll() is None
@@ -454,7 +494,20 @@ def execute_in_runner(code: str, hub: McpHub, timeout_s: float, cancel: threadin
             reader_thread = threading.Thread(target=reader, daemon=True)
             reader_thread.start()
 
-            runner = RunnerHandle(proc, q, reader_thread, stop_reader, clean_deps, scratch_dir=scratch_dir)
+            stderr_lines = collections.deque(maxlen=50)
+
+            def err_reader():
+                try:
+                    for line in proc.stderr:
+                        stderr_lines.append(line.decode("utf-8", "replace").rstrip())
+                except (OSError, ValueError):
+                    pass
+
+            err_thread = threading.Thread(target=err_reader, daemon=True)
+            err_thread.start()
+
+            runner = RunnerHandle(proc, q, reader_thread, stop_reader, clean_deps, scratch_dir=scratch_dir,
+                                  stderr_lines=stderr_lines)
             _RUNNER_POOL[session_id] = runner
 
     with runner.lock:
@@ -539,7 +592,13 @@ def execute_in_runner(code: str, hub: McpHub, timeout_s: float, cancel: threadin
         runner.close()
         if cancel is not None and cancel.is_set():
             raise McpCancelled("stopped")
-        return {"ok": False, "text": f"error: Code Mode Python execution timed out after {timeout_s:g} s", "ms": ms}
+        if time.monotonic() >= deadline:
+            return {"ok": False, "text": f"error: Code Mode Python execution timed out after {timeout_s:g} s", "ms": ms}
+        err_detail = "\n".join(runner.stderr_lines).strip()
+        code = runner.proc.poll()
+        if err_detail:
+            return {"ok": False, "text": f"error: Code Mode Python runner exited (code {code}): {err_detail}", "ms": ms}
+        return {"ok": False, "text": f"error: Code Mode Python runner exited unexpectedly (code {code})", "ms": ms}
 
     if output.get("ok"):
         return {"ok": True, "text": output.get("output", ""), "ms": ms, "result": output.get("result")}
