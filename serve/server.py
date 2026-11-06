@@ -6879,8 +6879,8 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
     messages = list(messages)
     run_tools = parser_tools if parser_tools is not None else tools
     req_lang = (sampling.get("codemode_lang") or sampling.get("codemode_language") or
-                sampling.get("strata_codemode_lang") or hub.settings.get("codemode_lang", "python")
-                if isinstance(sampling, dict) else "python")
+                sampling.get("strata_codemode_lang") or hub.settings.get("codemode_lang", "javascript")
+                if isinstance(sampling, dict) else "javascript")
     req_lang = "javascript" if str(req_lang).lower() in ("javascript", "js") else "python"
     while True:
         text, reasoning, calls, own_calls = [], [], [], 0
@@ -8679,7 +8679,7 @@ def make_handler(svc: Service):
                                     svc.mcp.settings.get("codemode"))
                 if use_codemode:
                     req_lang = (req.get("codemode_lang") or req.get("codemode_language") or
-                                req.get("strata_codemode_lang") or svc.mcp.settings.get("codemode_lang", "python"))
+                                req.get("strata_codemode_lang") or svc.mcp.settings.get("codemode_lang", "javascript"))
                     extra = svc.mcp.codemode_tools(exclude=own, lang=req_lang)
                 else:
                     extra = svc.mcp.template_tools(exclude=own)       # the request's own tools win a name clash
@@ -10058,7 +10058,7 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
     ap.add_argument("--codemode", action="store_true",
                     help="enable Code Mode for MCP tools (synthesizes a single execution tool to reduce tokens)")
     ap.add_argument("--codemode-lang", "--codemode-language", choices=["python", "javascript", "js"], default=None,
-                    help="execution language for Code Mode ('python' or 'javascript'; default: python)")
+                    help="execution language for Code Mode ('python' or 'javascript'; default: javascript)")
     ap.add_argument("--lazy", action="store_true", help="start the API unloaded (the engine and the vision encoder start with the first request)")
     ap.add_argument("--api-monitor", action="store_true",
                     help="the API request monitor at /api-monitor: keeps the last 100 requests' prompts and answers in "

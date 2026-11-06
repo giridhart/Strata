@@ -18,7 +18,7 @@ from serve.mcp import McpHub
 class MockMcpHub:
     """Mock McpHub providing a simple test tool."""
     def __init__(self):
-        self.settings = {"codemode": True, "codemode_lang": "python", "timeout_s": 5.0, "max_result_chars": 20000}
+        self.settings = {"codemode": True, "codemode_lang": "javascript", "timeout_s": 5.0, "max_result_chars": 20000}
         self.call_log = []
 
     def call(self, name: str, arguments: dict, cancel=None) -> dict:
@@ -124,26 +124,27 @@ class TestQuickJSCodeMode(unittest.TestCase):
 
 class TestLanguageSelection(unittest.TestCase):
     def setUp(self):
-        self.hub = McpHub({}, settings={"codemode": True, "codemode_lang": "python"})
+        self.hub = McpHub({}, settings={"codemode": True, "codemode_lang": "javascript"})
 
-    def test_default_tool_is_run_python(self):
-        """Default codemode tools should offer run_python."""
+    def test_default_tool_is_run_javascript(self):
+        """Default codemode tools should offer run_javascript."""
         tools = self.hub.codemode_tools()
-        self.assertEqual(len(tools), 1)
-        self.assertEqual(tools[0]["name"], "run_python")
-
-    def test_language_selection_javascript_offers_run_javascript(self):
-        """When lang='javascript', codemode_tools should offer run_javascript."""
-        tools = self.hub.codemode_tools(lang="javascript")
         self.assertEqual(len(tools), 1)
         self.assertEqual(tools[0]["name"], "run_javascript")
         self.assertIn("JavaScript (ES6)", tools[0]["description"])
 
+    def test_language_selection_python_offers_run_python(self):
+        """When lang='python', codemode_tools should offer run_python."""
+        tools = self.hub.codemode_tools(lang="python")
+        self.assertEqual(len(tools), 1)
+        self.assertEqual(tools[0]["name"], "run_python")
+        self.assertIn("Python", tools[0]["description"])
+
     def test_hub_settings_language_switch(self):
         """Switching hub.settings['codemode_lang'] switches the default codemode tool."""
-        self.hub.settings["codemode_lang"] = "javascript"
+        self.hub.settings["codemode_lang"] = "python"
         tools = self.hub.codemode_tools()
-        self.assertEqual(tools[0]["name"], "run_javascript")
+        self.assertEqual(tools[0]["name"], "run_python")
 
     def test_direct_call_run_javascript(self):
         """Calling run_javascript directly executes via QuickJS sandbox."""

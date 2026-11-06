@@ -38,7 +38,7 @@ from serve import lifeline
 
 PROTOCOL = "2025-06-18"               # the MCP revision Strata asks for; the server's answer is used as given
 DEFAULTS = {"timeout_s": 60.0, "max_result_chars": 20000, "max_rounds": 8, "start_timeout_s": 120.0, "image_results": False,
-            "codemode": False, "codemode_lang": "python"}
+            "codemode": False, "codemode_lang": "javascript"}
 
 CODEMODE_PYTHON_NAMES = ("run_python", "python", "py")
 CODEMODE_JS_NAMES = ("run_javascript", "javascript", "js", "run_js")
@@ -630,7 +630,7 @@ class McpHub:
 
     def codemode_tools(self, exclude=(), lang: str | None = None) -> list[dict]:
         """A single execution tool for Code Mode with compact signatures of all MCP tools."""
-        effective_lang = (lang or self.settings.get("codemode_lang") or "python").lower()
+        effective_lang = (lang or self.settings.get("codemode_lang") or "javascript").lower()
         if effective_lang in ("javascript", "js"):
             tool_name = "run_javascript"
             if tool_name in exclude:
@@ -775,7 +775,7 @@ class McpHub:
                 deps = [str(d) for d in arguments["dependencies"]]
             arg_lang = arguments.get("language") or arguments.get("lang")
 
-        effective_lang = (lang or arg_lang or self.settings.get("codemode_lang") or "python").lower()
+        effective_lang = (lang or arg_lang or self.settings.get("codemode_lang") or "javascript").lower()
         tool_name = "run_javascript" if effective_lang in ("javascript", "js") else "run_python"
 
         timeout = float(timeout_s if timeout_s is not None else self.settings.get("timeout_s", 60.0))
@@ -824,7 +824,7 @@ class McpHub:
             return self.call_codemode(arguments, cancel, timeout_s=timeout_s, lang="javascript")
         if name in CODEMODE_GENERIC_NAMES:
             arg_lang = arguments.get("language") if isinstance(arguments, dict) else None
-            effective = (arg_lang or default_lang or self.settings.get("codemode_lang") or "python").lower()
+            effective = (arg_lang or default_lang or self.settings.get("codemode_lang") or "javascript").lower()
             return self.call_codemode(arguments, cancel, timeout_s=timeout_s,
                                       lang="javascript" if effective in ("javascript", "js") else "python")
         t0 = time.monotonic()

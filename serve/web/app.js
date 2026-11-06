@@ -824,7 +824,7 @@ function markdown(text) {
 // 0.7 / 0.8 / 20 with a presence penalty). Before 0.1.45 the page sent 0.6 itself; a stored 0.6 with the other two
 // values untouched counts as "not set" too.
 const DEFAULTS = {thinking: "high", temperature: 1.0, top_p: 0.95, top_k: 20, max: "", seed: "", show: true, esp: true, mcp: true, max_rounds: 8, math: false,
-                  codemode_lang: "python", chatList: false, chatEdit: false, whileBusy: "wait"};
+                  codemode_lang: "javascript", chatList: false, chatEdit: false, whileBusy: "wait"};
 const OLD_DEFAULT_TEMPERATURE = 0.6;
 function samplingUntouched(s) {
   const t = +s.temperature;
@@ -1623,7 +1623,7 @@ function loadDrawer(s = settings) {
   $("esp-row").hidden = !projectionLoaded();
   $("s-mcp").setAttribute("aria-checked", String(s.mcp !== false));
   if ($("s-rounds")) $("s-rounds").value = s.max_rounds || (mcpInfo.settings && mcpInfo.settings.max_rounds) || 8;
-  const lang = s.codemode_lang || (mcpInfo.settings && mcpInfo.settings.codemode_lang) || "python";
+  const lang = s.codemode_lang || (mcpInfo.settings && mcpInfo.settings.codemode_lang) || "javascript";
   if ($("s-codemode-lang")) {
     for (const b of $("s-codemode-lang").children) b.setAttribute("aria-checked", String(b.dataset.v === lang));
   }
@@ -1701,7 +1701,7 @@ $("s-apply").onclick = async () => {
               top_k: +$("s-topk").value, max: $("s-max").value.trim(), seed: $("s-seed").value.trim(),
               math: checked("s-math"), show: checked("s-show"), esp: checked("s-esp"), mcp: checked("s-mcp"),
               max_rounds: ($("s-rounds") ? +$("s-rounds").value : 8) || 8,
-              codemode_lang: segValue("s-codemode-lang") || "python",
+              codemode_lang: segValue("s-codemode-lang") || "javascript",
               chatList: locked ? !!prev.chatList : checked("s-list"), chatEdit: locked ? !!prev.chatEdit : checked("s-edit"),
               whileBusy: segValue("s-busy") || "wait"};
   store.set("sampling", settings);

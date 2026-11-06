@@ -170,10 +170,14 @@ class Client(unittest.TestCase):
     def test_codemode_tool_definition(self):
         tools = self.hub.codemode_tools()
         self.assertEqual(len(tools), 1)
-        self.assertEqual(tools[0]["name"], "run_python")
+        self.assertEqual(tools[0]["name"], "run_javascript")
         self.assertIn("mcp.fake.echo", tools[0]["description"])
         self.assertIn("mcp.fake.add", tools[0]["description"])
-        self.assertEqual(self.hub.codemode_tools(exclude={"run_python"}), [])
+        self.assertEqual(self.hub.codemode_tools(exclude={"run_javascript"}), [])
+        py_tools = self.hub.codemode_tools(lang="python")
+        self.assertEqual(len(py_tools), 1)
+        self.assertEqual(py_tools[0]["name"], "run_python")
+        self.assertEqual(self.hub.codemode_tools(exclude={"run_python"}, lang="python"), [])
 
     def test_call_codemode_execution(self):
         r = self.hub.call("run_python", {"code": "s = mcp.fake.add(a=20, b=30)\nprint(f'sum={s}')"})
@@ -480,9 +484,26 @@ class ToolLoop(unittest.TestCase):
         self.assertEqual(msg["strata_mcp"][-1]["text"], "5")
 
     def test_codemode_e2e_request(self):
-        script = call_script("run_python", code="s = mcp.fake.add(a=15, b=25)\nprint(f'sum={s}')")
+        script = call_script("run_javascript", code="const s = mcp.fake.add({a: 15, b: 25}); `sum=${s.text}`")
         self.start(script, "</think>\n\nThe sum is 40.")
         code, text = self.post({"strata_mcp": True, "codemode": True})
+        self.assertEqual(code, 200, text)
+        cs = self.chunks(text)
+        mcp = [c["strata_mcp"] for c in cs if "strata_mcp" in c]
+        self.assertEqual([m["event"] for m in mcp], ["start", "call", "result"])
+        self.assertEqual(mcp[1]["name"], "run_javascript")
+        self.assertTrue(mcp[2]["ok"])
+        self.assertIn("sum=40", mcp[2]["text"])
+        self.assertEqual(len(self.engine.prompts), 2)
+        first, second = self.engine.prompt_text(0), self.engine.prompt_text(1)
+        self.assertIn('"name": "run_javascript"', first)
+        self.assertNotIn('"name": "fake__echo"', first)
+        self.assertIn("<tool_response>\nsum=40\n</tool_response>", second)
+
+    def test_codemode_python_explicit_opt_in(self):
+        script = call_script("run_python", code="s = mcp.fake.add(a=15, b=25)\nprint(f'sum={s}')")
+        self.start(script, "</think>\n\nThe sum is 40.")
+        code, text = self.post({"strata_mcp": True, "codemode": True, "codemode_lang": "python"})
         self.assertEqual(code, 200, text)
         cs = self.chunks(text)
         mcp = [c["strata_mcp"] for c in cs if "strata_mcp" in c]
@@ -490,15 +511,12 @@ class ToolLoop(unittest.TestCase):
         self.assertEqual(mcp[1]["name"], "run_python")
         self.assertTrue(mcp[2]["ok"])
         self.assertIn("sum=40", mcp[2]["text"])
-        self.assertEqual(len(self.engine.prompts), 2)
-        first, second = self.engine.prompt_text(0), self.engine.prompt_text(1)
+        first = self.engine.prompt_text(0)
         self.assertIn('"name": "run_python"', first)
-        self.assertNotIn('"name": "fake__echo"', first)
-        self.assertIn("<tool_response>\nsum=40\n</tool_response>", second)
 
     def test_codemode_config_opt_in(self):
         self.hub.settings["codemode"] = True
-        script = call_script("run_python", code="print(mcp.fake.echo(text='codemode from config'))")
+        script = call_script("run_javascript", code="mcp.fake.echo({text: 'codemode from config'}).text")
         self.start(script, "</think>\n\nDone.")
         code, text = self.post({"strata_mcp": True})
         self.assertEqual(code, 200, text)
@@ -507,7 +525,7 @@ class ToolLoop(unittest.TestCase):
         self.assertEqual([m["event"] for m in mcp], ["start", "call", "result"])
         self.assertIn("codemode from config", mcp[2]["text"])
         first = self.engine.prompt_text(0)
-        self.assertIn('"name": "run_python"', first)
+        self.assertIn('"name": "run_javascript"', first)
         self.assertNotIn('"name": "fake__echo"', first)
 
     def test_codemode_direct_tool_fallback_execution(self):
@@ -523,7 +541,7 @@ class ToolLoop(unittest.TestCase):
         self.assertEqual(mcp[1]["tool"], "add")
         self.assertEqual(mcp[2]["text"], "40")
         first, second = self.engine.prompt_text(0), self.engine.prompt_text(1)
-        self.assertIn('"name": "run_python"', first)
+        self.assertIn('"name": "run_javascript"', first)
         self.assertNotIn('"name": "fake__add"', first)
         self.assertIn("<tool_response>\n40\n</tool_response>", second)
 

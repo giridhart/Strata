@@ -959,7 +959,7 @@ after a change.
 - **Code Mode** (`"codemode": true` in the `"mcp"` config block, or per request `"codemode": true`): instead of injecting
   every tool's JSON schema into the prompt, Strata offers a single execution tool (`run_python` or `run_javascript`) with compact signatures. The
   model writes code to chain tools (e.g. `mcp.files.read(...)`), filters large intermediate data in memory, and returns only
-  the final output into the context. The language can be chosen at launch (`--codemode-lang python|javascript`) or per chat/request (`"codemode_lang": "javascript"`).
+  the final output into the context. The language can be chosen at launch (`--codemode-lang javascript|python`, default: `javascript`) or per chat/request (`"codemode_lang": "javascript"`).
   JavaScript runs in an embedded, memory-safe QuickJS sandbox with sub-millisecond execution. Python runs in an isolated runner with 3-layer sandboxing:
   sanitized environment and ephemeral scratch directory (Layer 1), AST security visitor blocking host inspection/subprocesses alongside syntax auto-repair and loop bounding (Layer 2),
   and optional Bubblewrap container isolation with unshared networking (Layer 3). If `uv` is installed, dynamic PyPI packages (via `"dependencies": ["pandas"]`) are
