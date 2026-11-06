@@ -77,6 +77,11 @@ def get_sandboxed_env() -> dict[str, str]:
     clean["PYTHONDONTWRITEBYTECODE"] = "1"
     clean["PYTHONUNBUFFERED"] = "1"
     clean["STRATA_SANDBOX"] = "1"
+    clean["OPENBLAS_NUM_THREADS"] = "1"
+    clean["OMP_NUM_THREADS"] = "1"
+    clean["MKL_NUM_THREADS"] = "1"
+    clean["NUMEXPR_NUM_THREADS"] = "1"
+    clean["VECLIB_MAXIMUM_THREADS"] = "1"
     current_pp = clean.get("PYTHONPATH", "")
     root_str = str(ROOT)
     clean["PYTHONPATH"] = f"{root_str}{os.pathsep}{current_pp}" if current_pp else root_str
@@ -233,6 +238,13 @@ def _kill_tree(p):
 # ------------------------------------------------------------------------------------------------ the runner process (child)
 def _run_child():
     """Child process entry point (`python -m serve.mcp_runner`)."""
+    # Enforce single-threaded BLAS/OMP to prevent OpenBLAS RLIMIT_NPROC exhaustion crashes
+    os.environ["OPENBLAS_NUM_THREADS"] = "1"
+    os.environ["OMP_NUM_THREADS"] = "1"
+    os.environ["MKL_NUM_THREADS"] = "1"
+    os.environ["NUMEXPR_NUM_THREADS"] = "1"
+    os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
+
     from serve.sandbox import LLMSandbox
 
     ipc_in = sys.stdin.buffer

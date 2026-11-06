@@ -109,6 +109,8 @@ class TestCodeModeSandboxing(unittest.TestCase):
         self.assertIn("PATH", clean_env)
         self.assertIn("PYTHONPATH", clean_env)
         self.assertEqual(clean_env.get("STRATA_SANDBOX"), "1")
+        self.assertEqual(clean_env.get("OPENBLAS_NUM_THREADS"), "1")
+        self.assertEqual(clean_env.get("OMP_NUM_THREADS"), "1")
 
     def test_layer3_bwrap_wrapper_logic(self):
         """Layer 3 bwrap logic wraps commands with unshare-net and read-only bindings when available."""
