@@ -2943,10 +2943,13 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             const size_t kend = seq_start[(size_t)l + 1];
                             auto release_to = [&](int32_t e_stop) {
                                 while (k < kend && seq[k].e < e_stop) {
-                                    if (use_xmx && xg_n > 0) xflush();
+                                    if (use_xmx && xg_ns > 0 &&
+                                        (size_t)(k - a_consumed.load(std::memory_order_relaxed)) + 16 >= (size_t)m.ring) {
+                                        xflush();
+                                    }
                                     *m.used[k % (size_t)m.ring] = m.cs->ext_oneapi_submit_barrier();
                                     consumed = ++k;
-                                    give_back(consumed);
+                                    if (xg_ns == 0) give_back(consumed);
                                 }
                             };
                             for (size_t j = 0; j < order.size(); ++j) {
