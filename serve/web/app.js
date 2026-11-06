@@ -1396,7 +1396,7 @@ async function generateReply() {
   if (settings.seed) body.seed = +settings.seed;
   if (settings.max) body.max_tokens = +settings.max;
   if (projectionLoaded()) body.experimental_speed_projection = !!settings.esp;
-  if (settings.mcp !== false && mcpInfo.tools > 0) {
+  if (settings.mcp !== false && (mcpInfo.tools > 0 || (mcpInfo.settings && mcpInfo.settings.codemode))) {
     body.strata_mcp = true;   // this server may run MCP tools for it
     if (settings.max_rounds) body.max_rounds = Number(settings.max_rounds);
     if (settings.codemode_lang) body.strata_codemode_lang = settings.codemode_lang;

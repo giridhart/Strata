@@ -157,6 +157,77 @@ class TestLanguageSelection(unittest.TestCase):
         self.assertTrue(res["ok"])
         self.assertIn("hello world", res["text"])
 
+    def test_run_code_with_default_lang(self):
+        """Calling run_code without language parameter respects default_lang."""
+        res = self.hub.call("run_code", {"code": "'default ' + 'lang'"}, default_lang="javascript")
+        self.assertTrue(res["ok"])
+        self.assertIn("default lang", res["text"])
+
+    def test_native_datetime_in_javascript(self):
+        """Standard Date() in JavaScript should evaluate cleanly without needing Python datetime."""
+        res = self.hub.call("run_javascript", {"code": "new Date().toISOString()"})
+        self.assertTrue(res["ok"])
+        self.assertIn("T", res["text"])
+        self.assertIn("Z", res["text"])
+
+
+class TestCodeModeFallbackIsolation(unittest.TestCase):
+    """Verifies that an ad-hoc fallback execution does not globally alter session language."""
+
+    def test_with_history_tools_blocks_fallback_runner_leakage(self):
+        from serve.server import with_history_tools
+        # Request declares run_javascript as the active codemode tool
+        tools = [{"name": "run_javascript", "parameters": {}}]
+        # Conversation history has a previous turn that fell back to run_python
+        req = {
+            "messages": [
+                {"role": "user", "content": "what time is it?"},
+                {"role": "assistant", "content": "", "tool_calls": [
+                    {"id": "call_1", "type": "function", "function": {"name": "run_python", "arguments": "{}"}}
+                ]},
+                {"role": "tool", "tool_call_id": "call_1", "content": "2026-11-06T23:00:00Z"},
+                {"role": "user", "content": "now plot a chart"}
+            ]
+        }
+        res_tools = with_history_tools(tools, req)
+        # run_python must NOT be added to tools; only run_javascript should be present
+        names = [t["name"] for t in res_tools]
+        self.assertEqual(names, ["run_javascript"])
+
+    def test_steer_codemode_history_injects_steering_note(self):
+        from serve.server import steer_codemode_history
+        messages = [
+            {"role": "user", "content": "what time is it?"},
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "call_1", "type": "function", "function": {"name": "run_python", "arguments": "{}"}}
+            ]},
+            {"role": "tool", "tool_call_id": "call_1", "content": "2026-11-06T23:00:00Z"},
+            {"role": "user", "content": "now plot a chart"}
+        ]
+        steered = steer_codemode_history(messages, req_lang="javascript")
+        tool_msg = next(m for m in steered if m.get("role") == "tool")
+        self.assertIn("2026-11-06T23:00:00Z", tool_msg["content"])
+        self.assertIn("[Note: This tool call executed Python as an ad-hoc fallback", tool_msg["content"])
+        self.assertIn("The active Code Mode environment for this conversation remains javascript (run_javascript)", tool_msg["content"])
+
+        # Idempotence: running it again does not duplicate the note
+        steered_again = steer_codemode_history(steered, req_lang="javascript")
+        tool_msg_again = next(m for m in steered_again if m.get("role") == "tool")
+        self.assertEqual(tool_msg["content"], tool_msg_again["content"])
+
+    def test_steer_codemode_history_clean_when_no_fallback(self):
+        from serve.server import steer_codemode_history
+        messages = [
+            {"role": "user", "content": "calculate 2 + 2"},
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "call_1", "type": "function", "function": {"name": "run_javascript", "arguments": "{}"}}
+            ]},
+            {"role": "tool", "tool_call_id": "call_1", "content": "4"}
+        ]
+        steered = steer_codemode_history(messages, req_lang="javascript")
+        tool_msg = next(m for m in steered if m.get("role") == "tool")
+        self.assertEqual(tool_msg["content"], "4")
+
 
 if __name__ == "__main__":
     unittest.main()

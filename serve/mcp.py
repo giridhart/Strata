@@ -40,6 +40,11 @@ PROTOCOL = "2025-06-18"               # the MCP revision Strata asks for; the se
 DEFAULTS = {"timeout_s": 60.0, "max_result_chars": 20000, "max_rounds": 8, "start_timeout_s": 120.0, "image_results": False,
             "codemode": False, "codemode_lang": "python"}
 
+CODEMODE_PYTHON_NAMES = ("run_python", "python", "py")
+CODEMODE_JS_NAMES = ("run_javascript", "javascript", "js", "run_js")
+CODEMODE_GENERIC_NAMES = ("run_code", "execute_code")
+CODEMODE_CALL_NAMES = frozenset(CODEMODE_PYTHON_NAMES + CODEMODE_JS_NAMES + CODEMODE_GENERIC_NAMES)
+
 
 class McpError(RuntimeError):
     """A server answered with an error, stopped, or could not be reached."""
@@ -648,15 +653,23 @@ class McpHub:
 
             tools_list_text = "\n".join(sigs) if sigs else "  (no MCP tools currently registered)"
             desc = (
-                "Execute JavaScript (ES6) code in an isolated QuickJS sandbox to interact with MCP tools or process data.\n\n"
+                "Execute JavaScript (ES6) code in an isolated QuickJS sandbox to interact with MCP tools, perform calculations, or process data.\n\n"
                 "CRITICAL INSTRUCTIONS:\n"
                 "1. `run_javascript` is the ONLY valid function name for tool calls. You MUST call `run_javascript`.\n"
                 "2. NEVER emit `<function=mcp...>` or invoke MCP functions directly as tool names.\n"
                 "3. Variables defined in global scope persist across turns within the same conversation session.\n"
                 "4. Expressions at the end of the script auto-return their value. `console.log(...)` is also captured.\n"
                 "5. MCP tools are callable via `mcp.<server>.<tool>({ arg1: value, ... })`.\n"
-                "6. To render interactive plots, pass a Plotly figure object to `render_interactive_plot(fig)`.\n\n"
+                "6. Native JavaScript builtins available:\n"
+                "   - Date and time: `new Date().toISOString()`, `new Date().toLocaleString()`, etc.\n"
+                "   - Math: `Math.sqrt()`, `Math.sin()`, `Math.PI`, `Math.round()`, etc.\n"
+                "   - Standard ES6: Object, Array, String, Number, JSON, RegExp, Map, Set.\n"
+                "7. To render interactive plots, pass a Plotly figure object to `render_interactive_plot(fig)`.\n\n"
                 "EXAMPLES:\n"
+                "# Date and time:\n"
+                "run_javascript(code='new Date().toLocaleString()')\n\n"
+                "# Interactive Plotting:\n"
+                "run_javascript(code='render_interactive_plot({ data: [{ x: [\"A\", \"B\", \"C\"], y: [10, 25, 15], type: \"bar\" }], layout: { title: \"Sample Bar Chart\" } })')\n\n"
                 "# Chaining MCP tools and calculating in JS:\n"
                 "run_javascript(code='const data = mcp.filesystem.read_file({ path: \"data.json\" });\\nconst parsed = JSON.parse(data.text);\\nparsed.filter(x => x.active).length;')\n\n"
                 f"MCP server tools callable via `mcp.<server>.<tool>({{...}})`:\n{tools_list_text}"
@@ -801,15 +814,19 @@ class McpHub:
             out["plot"] = r["plot"]
         return out
 
-    def call(self, name: str, arguments: dict, cancel: threading.Event | None = None, timeout_s: float | None = None) -> dict:
+    def call(self, name: str, arguments: dict, cancel: threading.Event | None = None,
+             timeout_s: float | None = None, default_lang: str | None = None) -> dict:
         """Run one tool -> {"ok", "text" (what the model reads, capped), "chars" (its full length), "truncated",
         "ms", "server", "tool"}.  Errors become text starting with "error:"; only McpCancelled is raised."""
-        if name in ("run_python", "python", "py", "run_code", "execute_code"):
-            if name == "run_code" and isinstance(arguments, dict) and arguments.get("language") in ("javascript", "js"):
-                return self.call_codemode(arguments, cancel, timeout_s=timeout_s, lang="javascript")
+        if name in CODEMODE_PYTHON_NAMES:
             return self.call_codemode(arguments, cancel, timeout_s=timeout_s, lang="python")
-        if name in ("run_javascript", "javascript", "js", "run_js"):
+        if name in CODEMODE_JS_NAMES:
             return self.call_codemode(arguments, cancel, timeout_s=timeout_s, lang="javascript")
+        if name in CODEMODE_GENERIC_NAMES:
+            arg_lang = arguments.get("language") if isinstance(arguments, dict) else None
+            effective = (arg_lang or default_lang or self.settings.get("codemode_lang") or "python").lower()
+            return self.call_codemode(arguments, cancel, timeout_s=timeout_s,
+                                      lang="javascript" if effective in ("javascript", "js") else "python")
         t0 = time.monotonic()
         server, tool = self.resolve_route(name)
         out = {"server": server.name if server else None, "tool": tool}

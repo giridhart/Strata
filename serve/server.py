@@ -63,7 +63,8 @@ sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a
 from serve.frontend import (THINK_END, ChatTemplate, Event, OutputParser, anthropic_to_messages, anthropic_tools,  # noqa: E402
                             forced_call, images_of, literal_tags, mark_think_literals, openai_to_messages, require_messages,
                             tool_choice_of, unmark_think_literals)
-from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
+from serve.mcp import (McpCancelled, hub_from_config, CODEMODE_PYTHON_NAMES,  # noqa: E402
+                       CODEMODE_JS_NAMES, CODEMODE_CALL_NAMES)
 from serve import runconfig  # noqa: E402
 from serve.webfiles import subtree_file as web_subtree_file  # noqa: E402
 from strata_control import engine_component  # noqa: E402
@@ -6877,6 +6878,10 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
     finalizing = False
     messages = list(messages)
     run_tools = parser_tools if parser_tools is not None else tools
+    req_lang = (sampling.get("codemode_lang") or sampling.get("codemode_language") or
+                sampling.get("strata_codemode_lang") or hub.settings.get("codemode_lang", "python")
+                if isinstance(sampling, dict) else "python")
+    req_lang = "javascript" if str(req_lang).lower() in ("javascript", "js") else "python"
     while True:
         text, reasoning, calls, own_calls = [], [], [], 0
         started_mcp_ids = set()
@@ -6889,9 +6894,9 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
                 ev: Event = x
                 is_mcp = (ev.call is not None and
                           (ev.call.name in mcp_names or
+                           ev.call.name in CODEMODE_CALL_NAMES or
                            (hub and hasattr(hub, "resolve_route") and
-                            (hub.resolve_route(ev.call.name)[0] is not None or
-                             hub.resolve_route(ev.call.name)[1] == "run_python"))))
+                            hub.resolve_route(ev.call.name)[0] is not None)))
                 if is_mcp:
                     if ev.kind == "tool_start":          # the model has started writing a call: say so at once
                         started_mcp_ids.add(ev.call.id)
@@ -6939,7 +6944,7 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
                         s_id = sampling.get("chat_id") or sampling.get("session_id") if isinstance(sampling, dict) else None
                         if s_id:
                             args["session_id"] = str(s_id)
-                    box["r"] = hub.call(c.name, args, cancel, timeout_s=req_timeout)
+                    box["r"] = hub.call(c.name, args, cancel, timeout_s=req_timeout, default_lang=req_lang)
                 except McpCancelled:
                     box["cancelled"] = True
             worker = threading.Thread(target=work, daemon=True)
@@ -6957,7 +6962,27 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
             r = box["r"]
             print(f"[strata] tool {c.name}: {'ok' if r['ok'] else 'error'}, {r['chars']:,} characters in "
                   f"{r['ms'] / 1000:.1f} s{' (truncated for the model)' if r['truncated'] else ''}", flush=True)
-            results.append(r.get("model_content", r["text"]) if svc.vision is not None else r["text"])
+            res_content = r.get("model_content", r["text"]) if svc.vision is not None else r["text"]
+            is_fallback = False
+            if req_lang == "javascript" and c.name in CODEMODE_PYTHON_NAMES:
+                is_fallback = True
+                expected_fn = "run_javascript"
+                fallback_lang = "Python"
+            elif req_lang == "python" and c.name in CODEMODE_JS_NAMES:
+                is_fallback = True
+                expected_fn = "run_python"
+                fallback_lang = "JavaScript"
+            if is_fallback:
+                fallback_note = (
+                    f"\n\n[Note: This tool call executed {fallback_lang} as an ad-hoc fallback. "
+                    f"The active Code Mode environment for this conversation remains {req_lang} ({expected_fn}). "
+                    f"All subsequent tool calls must use {expected_fn}.]"
+                )
+                if isinstance(res_content, list):
+                    res_content = [*res_content, {"type": "text", "text": fallback_note}]
+                else:
+                    res_content = str(res_content) + fallback_note
+            results.append(res_content)
             finished_mcp_ids.add(c.id)
             yield "mcp", {"event": "result", "id": c.id,
                           **({"plot": r["plot"]} if r.get("plot") else {}),
@@ -8667,6 +8692,8 @@ def make_handler(svc: Service):
             check_request_sampling(req)                       # ... and a sampling field of the wrong type
             cancel = threading.Event()
             self._watch_client(cancel)                       # #430 #431 (#1999: before prepare, which can take long)
+            if use_mcp and use_codemode:
+                messages = steer_codemode_history(messages, req_lang)
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, force=force, req=req, cancel=cancel)
             _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
             if use_mcp:
@@ -9838,14 +9865,75 @@ def with_history_tools(tools, req) -> list:
         return tools
     try:
         have = {t.get("name") for t in tools if isinstance(t, dict)}
+        has_codemode = bool(have & CODEMODE_CALL_NAMES)
         extra = []
         for name in _history_call_names(req):
             if isinstance(name, str) and name and name not in have:
+                if has_codemode and name in CODEMODE_CALL_NAMES:
+                    continue
                 have.add(name)
                 extra.append({"name": name, "parameters": {"type": "object", "properties": {}}})
         return [*tools, *extra] if extra else tools
     except Exception:
         return tools
+
+
+def steer_codemode_history(messages: list[dict], req_lang: str) -> list[dict]:
+    """Ensures that any ad-hoc fallback tool call in conversation history (e.g. run_python when
+    the active session language is JavaScript) does not poison the model into switching languages
+    globally. Injects a steering note into the tool response if one is not already present."""
+    if not messages or not isinstance(messages, list):
+        return messages
+    req_lang_norm = "javascript" if str(req_lang).lower() in ("javascript", "js") else "python"
+    target_fn = "run_javascript" if req_lang_norm == "javascript" else "run_python"
+    fallback_names = CODEMODE_PYTHON_NAMES if req_lang_norm == "javascript" else CODEMODE_JS_NAMES
+    fallback_lang = "Python" if req_lang_norm == "javascript" else "JavaScript"
+    fallback_note = (
+        f"[Note: This tool call executed {fallback_lang} as an ad-hoc fallback. "
+        f"The active Code Mode environment for this conversation remains {req_lang_norm} ({target_fn}). "
+        f"All subsequent tool calls must use {target_fn}.]"
+    )
+
+    fallback_call_ids = set()
+    needs_steering = False
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        role = msg.get("role")
+        if role == "assistant":
+            for call in msg.get("tool_calls") or []:
+                if isinstance(call, dict):
+                    fn_name = (call.get("function") or {}).get("name")
+                    if fn_name in fallback_names:
+                        cid = call.get("id")
+                        if cid:
+                            fallback_call_ids.add(cid)
+                        needs_steering = True
+
+    if not needs_steering:
+        return messages
+
+    out = []
+    for msg in messages:
+        if not isinstance(msg, dict):
+            out.append(msg)
+            continue
+        role = msg.get("role")
+        if role == "tool":
+            cid = msg.get("tool_call_id")
+            content = msg.get("content")
+            if (cid and cid in fallback_call_ids) or (not cid and fallback_call_ids):
+                note_present = isinstance(content, str) and "[Note: This tool call executed" in content
+                if not note_present:
+                    new_msg = dict(msg)
+                    if isinstance(content, str):
+                        new_msg["content"] = f"{content}\n\n{fallback_note}"
+                    elif isinstance(content, list):
+                        new_msg["content"] = [*content, {"type": "text", "text": f"\n\n{fallback_note}"}]
+                    out.append(new_msg)
+                    continue
+        out.append(msg)
+    return out
 
 
 def _component_exe(reference: str, cfg: dict) -> str:
