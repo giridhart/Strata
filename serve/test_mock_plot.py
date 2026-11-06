@@ -203,6 +203,140 @@ class MockPlotTest(unittest.TestCase):
             httpd.shutdown()
             httpd.server_close()
 
+    def test_codemode_subsequent_non_plot_turn_has_no_plot_field(self):
+        """A subsequent tool call that does not generate a plot must not leak the previous turn's plot."""
+        tok = ByteTokenizer()
+        plot_turn = call_script("run_python", code="fig = px.bar(x=[1, 2], y=[3, 4])\nrender_interactive_plot(fig)")
+        answer1 = "</think>\n\nHere is your chart."
+        non_plot_turn = call_script("run_python", code="print('Non-plot computation: 42')")
+        answer2 = "</think>\n\nHere is the calculation result."
+
+        engine = ScriptedEngine(tok, [plot_turn, answer1, non_plot_turn, answer2], max_context=32768)
+        svc = Service(engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        svc.mcp = McpHub({})
+        httpd = serve(svc, port=0)
+        port = httpd.server_address[1]
+        try:
+            # 1. First request generates plot
+            req1 = urllib.request.Request(
+                f"http://127.0.0.1:{port}/v1/chat/completions",
+                data=json.dumps({
+                    "model": "qwen",
+                    "messages": [{"role": "user", "content": "draw plot"}],
+                    "stream": True,
+                    "strata_mcp": True,
+                    "codemode": True
+                }).encode("utf-8"),
+                headers={"Content-Type": "application/json"}
+            )
+            with urllib.request.urlopen(req1, timeout=15) as resp:
+                self.assertEqual(resp.status, 200)
+                events1 = []
+                for line in resp:
+                    line_str = line.decode("utf-8").strip()
+                    if line_str.startswith("data: ") and not line_str.endswith("[DONE]"):
+                        chunk = json.loads(line_str[6:])
+                        if "strata_mcp" in chunk:
+                            events1.append(chunk["strata_mcp"])
+
+            results1 = [e for e in events1 if e.get("event") == "result"]
+            self.assertEqual(len(results1), 1)
+            self.assertIn("plot", results1[0], "First turn must have plot")
+
+            # 2. Second request in new conversation does not ask for plot
+            req2 = urllib.request.Request(
+                f"http://127.0.0.1:{port}/v1/chat/completions",
+                data=json.dumps({
+                    "model": "qwen",
+                    "messages": [{"role": "user", "content": "compute numbers"}],
+                    "stream": True,
+                    "strata_mcp": True,
+                    "codemode": True
+                }).encode("utf-8"),
+                headers={"Content-Type": "application/json"}
+            )
+            with urllib.request.urlopen(req2, timeout=15) as resp:
+                self.assertEqual(resp.status, 200)
+                events2 = []
+                for line in resp:
+                    line_str = line.decode("utf-8").strip()
+                    if line_str.startswith("data: ") and not line_str.endswith("[DONE]"):
+                        chunk = json.loads(line_str[6:])
+                        if "strata_mcp" in chunk:
+                            events2.append(chunk["strata_mcp"])
+
+            results2 = [e for e in events2 if e.get("event") == "result"]
+            self.assertEqual(len(results2), 1)
+            self.assertTrue(results2[0].get("ok"))
+            self.assertNotIn("plot", results2[0], "Second turn must NOT contain plot from previous conversation")
+            self.assertIn("Non-plot computation: 42", results2[0].get("text", ""))
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+
+    def test_chat_id_isolates_session_state(self):
+        """Requests with different chat_id parameters operate in isolated Python runner sessions."""
+        tok = ByteTokenizer()
+        t1 = call_script("run_python", code="my_secret_var = 'isolated_secret'")
+        ans1 = "</think>\n\nStored."
+        t2 = call_script("run_python", code="print('found:', 'my_secret_var' in locals() or 'my_secret_var' in globals())")
+        ans2 = "</think>\n\nChecked."
+
+        engine = ScriptedEngine(tok, [t1, ans1, t2, ans2], max_context=32768)
+        svc = Service(engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        svc.mcp = McpHub({})
+        httpd = serve(svc, port=0)
+        port = httpd.server_address[1]
+        try:
+            # 1. Chat 1 defines my_secret_var
+            req1 = urllib.request.Request(
+                f"http://127.0.0.1:{port}/v1/chat/completions",
+                data=json.dumps({
+                    "model": "qwen",
+                    "messages": [{"role": "user", "content": "store secret"}],
+                    "stream": True,
+                    "strata_mcp": True,
+                    "codemode": True,
+                    "chat_id": "chat_session_alpha"
+                }).encode("utf-8"),
+                headers={"Content-Type": "application/json"}
+            )
+            with urllib.request.urlopen(req1, timeout=15) as resp:
+                self.assertEqual(resp.status, 200)
+                for _ in resp:
+                    pass
+
+            # 2. Chat 2 in a different chat_id should NOT see my_secret_var
+            req2 = urllib.request.Request(
+                f"http://127.0.0.1:{port}/v1/chat/completions",
+                data=json.dumps({
+                    "model": "qwen",
+                    "messages": [{"role": "user", "content": "check secret"}],
+                    "stream": True,
+                    "strata_mcp": True,
+                    "codemode": True,
+                    "chat_id": "chat_session_beta"
+                }).encode("utf-8"),
+                headers={"Content-Type": "application/json"}
+            )
+            with urllib.request.urlopen(req2, timeout=15) as resp:
+                self.assertEqual(resp.status, 200)
+                events2 = []
+                for line in resp:
+                    line_str = line.decode("utf-8").strip()
+                    if line_str.startswith("data: ") and not line_str.endswith("[DONE]"):
+                        chunk = json.loads(line_str[6:])
+                        if "strata_mcp" in chunk:
+                            events2.append(chunk["strata_mcp"])
+
+            results2 = [e for e in events2 if e.get("event") == "result"]
+            self.assertEqual(len(results2), 1)
+            self.assertTrue(results2[0].get("ok"))
+            self.assertIn("found: False", results2[0].get("text", ""))
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+
 
 def run_interactive_server(port: int = 8080):
     """Launches a standalone mock server for instant browser previewing."""

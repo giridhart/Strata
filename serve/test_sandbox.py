@@ -195,6 +195,43 @@ class TestLLMSandbox(unittest.TestCase):
         self.assertTrue(res["ok"], res.get("error"))
         self.assertEqual(res["result"]["type"], "application/vnd.plotly.v1+json")
 
+    def test_subsequent_turns_do_not_leak_previous_plot(self):
+        # Turn 1: create a plot via auto-capture
+        code1 = (
+            "df = pd.DataFrame({'x': [1, 2], 'y': [3, 4]})\n"
+            "fig = px.bar(df, x='x', y='y')\n"
+        )
+        res1 = self.sandbox.execute(code1, session_id="leak_test")
+        self.assertTrue(res1["ok"])
+        self.assertIsNotNone(res1["result"])
+        self.assertEqual(res1["result"].get("type"), "application/vnd.plotly.v1+json")
+
+        # Turn 2: regular print - must not return plot
+        res2 = self.sandbox.execute("print('Turn 2 output')", session_id="leak_test")
+        self.assertTrue(res2["ok"])
+        self.assertIsNone(res2["result"])
+        self.assertEqual(res2["output"], "Turn 2 output")
+        self.assertNotIn("application/vnd.plotly.v1+json", res2["output"])
+
+        # Turn 3: assignment of unrelated variable - must not return plot
+        res3 = self.sandbox.execute("x = 42", session_id="leak_test")
+        self.assertTrue(res3["ok"])
+        self.assertIsNone(res3["result"])
+        self.assertNotIn("application/vnd.plotly.v1+json", res3["output"])
+
+        # Turn 4: explicit call to render_interactive_plot(fig) still works
+        res4 = self.sandbox.execute("render_interactive_plot(fig)", session_id="leak_test")
+        self.assertTrue(res4["ok"])
+        self.assertIsNotNone(res4["result"])
+        self.assertEqual(res4["result"].get("type"), "application/vnd.plotly.v1+json")
+
+        # Turn 5: subsequent computation turn - must not leak plot again
+        res5 = self.sandbox.execute("print(x * 2)", session_id="leak_test")
+        self.assertTrue(res5["ok"])
+        self.assertIsNone(res5["result"])
+        self.assertEqual(res5["output"], "84")
+        self.assertNotIn("application/vnd.plotly.v1+json", res5["output"])
+
 
 if __name__ == "__main__":
     unittest.main()

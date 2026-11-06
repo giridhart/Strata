@@ -832,6 +832,14 @@ function samplingUntouched(s) {
 let settings = {...DEFAULTS, ...store.get("sampling", {})};
 if (samplingUntouched(settings)) settings.temperature = DEFAULTS.temperature;
 let messages = store.get("chat", []);   // the open chat's messages (chats-ui.js: with the saved-chats list on, also that chat's own)
+let currentChatSessionId = "c_" + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+function activeChatId() {
+  if (typeof window.getChatId === "function") {
+    const id = window.getChatId();
+    if (id) return id;
+  }
+  return currentChatSessionId;
+}
 let attachments = [];                 // {name, url}
 let busy = null;                      // {controller, msg, cut, cutAfterTool}
 let pending = null;                   // a message parked while an answer is written: {text, images, files, mode}
@@ -914,6 +922,7 @@ function clearToolMedia() {
   mediaEpoch++;
   for (const pending of mediaBlobs.values()) pending.then((url) => URL.revokeObjectURL(url), () => {});
   mediaBlobs.clear();
+  plotCache.clear();
 }
 window.addEventListener("pagehide", clearToolMedia);
 window.addEventListener("pageshow", (event) => { if (event.persisted) hydrateToolImages(document); });
@@ -1376,7 +1385,8 @@ async function generateReply() {
   paintLive();
 
   const body = {model: health.model, messages: apiMessages(), stream: true,
-                reasoning_effort: settings.thinking};
+                reasoning_effort: settings.thinking,
+                chat_id: activeChatId()};
   if (!(settings.temperature > 0)) {
     body.temperature = 0;
   } else if (!samplingUntouched(settings)) {
@@ -1487,6 +1497,7 @@ $("new-btn").onclick = () => {
   if (!messages.length) return;
   const backup = messages;
   clearToolMedia();
+  currentChatSessionId = "c_" + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
   messages = [];
   saveChat();
   renderChat();

@@ -448,3 +448,4 @@ function initChats() {
   // a narrow screen starts with the list closed so the chat has room
   setSidebar(store.get("sidebar", true) && !matchMedia("(max-width: 760px)").matches, false);
 }
+window.getChatId = () => (listOn && chatId ? chatId : null);

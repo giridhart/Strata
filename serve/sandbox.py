@@ -167,6 +167,30 @@ class ImportAliasTransformer(ast.NodeTransformer):
         return node
 
 
+def extract_assigned_names(tree: ast.AST) -> set[str]:
+    """Collects variable names assigned or bound in an AST."""
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            for t in node.targets:
+                for sub in ast.walk(t):
+                    if isinstance(sub, ast.Name):
+                        names.add(sub.id)
+        elif isinstance(node, (ast.AnnAssign, ast.AugAssign)):
+            for sub in ast.walk(node.target):
+                if isinstance(sub, ast.Name):
+                    names.add(sub.id)
+        elif isinstance(node, ast.NamedExpr):
+            for sub in ast.walk(node.target):
+                if isinstance(sub, ast.Name):
+                    names.add(sub.id)
+        elif isinstance(node, (ast.For, ast.AsyncFor)):
+            for sub in ast.walk(node.target):
+                if isinstance(sub, ast.Name):
+                    names.add(sub.id)
+    return names
+
+
 def create_base_globals(custom_tools: dict[str, Any] | None = None) -> dict[str, Any]:
     """Builds a rich, pre-populated execution namespace so models never waste tokens on imports."""
     env: dict[str, Any] = {
@@ -358,6 +382,7 @@ class LLMSandbox:
             tree = ast.parse(clean_code, "<codemode>")
             ImportAliasTransformer().visit(tree)
             ast.fix_missing_locations(tree)
+            assigned_names = extract_assigned_names(tree)
             last_expr = None
             if tree.body and isinstance(tree.body[-1], ast.Expr):
                 last_expr = tree.body.pop()
@@ -403,10 +428,11 @@ class LLMSandbox:
             if ret is None and callable(state.get("main")):
                 ret = state["main"]()
 
-            # If still None, check if any variable in state holds an unrendered Plotly figure
-            if ret is None:
-                candidates = ["fig", "figure", "plot", "chart"] + [k for k in state.keys() if not k.startswith("_")]
-                for k in candidates:
+            # If still None, check if any variable assigned during THIS execution holds an unrendered Plotly figure
+            if ret is None and assigned_names:
+                preferred = [k for k in ("fig", "figure", "plot", "chart") if k in assigned_names]
+                other = [k for k in assigned_names if k not in preferred and not k.startswith("_")]
+                for k in preferred + other:
                     val = state.get(k)
                     if val is None:
                         continue

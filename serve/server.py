@@ -6611,7 +6611,12 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
 
             def work(c=c, box=box):
                 try:
-                    box["r"] = hub.call(c.name, c.arguments, cancel, timeout_s=req_timeout)
+                    args = dict(c.arguments) if isinstance(c.arguments, dict) else c.arguments
+                    if isinstance(args, dict) and "session_id" not in args:
+                        s_id = sampling.get("chat_id") or sampling.get("session_id") if isinstance(sampling, dict) else None
+                        if s_id:
+                            args["session_id"] = str(s_id)
+                    box["r"] = hub.call(c.name, args, cancel, timeout_s=req_timeout)
                 except McpCancelled:
                     box["cancelled"] = True
             worker = threading.Thread(target=work, daemon=True)
