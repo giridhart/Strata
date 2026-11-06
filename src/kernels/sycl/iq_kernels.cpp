@@ -151,7 +151,7 @@ inline int iq3s_apply_sign(unsigned grid, unsigned sign) {
 #ifndef STRATA_IQ4NL_LUT_SWAR
 #define STRATA_IQ4NL_LUT_SWAR 1
 #endif
-inline uint32_t iq4nl_lut4(uint32_t q4) {
+[[maybe_unused]] inline uint32_t iq4nl_lut4(uint32_t q4) {
 #if STRATA_IQ4NL_LUT_SWAR
     return iq4_lut4_swar(q4);
 #else
@@ -3920,6 +3920,9 @@ void launch(sycl::queue& q, int ty, bool gu, const sycl::half* X, float* Y, cons
     const int nb = N / BN;
     constexpr int TN = kSgW;
 
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+#pragma clang diagnostic ignored "-Wignored-attributes"
     q.submit([&](sycl::handler& h) {
         sycl::local_accessor<sycl::half, 1> sa(BM * LDA, h), sb(BN * LDB, h);
         auto props = sycl::ext::oneapi::experimental::properties{sycl::ext::intel::experimental::grf_size<256>};
@@ -4010,6 +4013,7 @@ void launch(sycl::queue& q, int ty, bool gu, const sycl::half* X, float* Y, cons
             }
         });
     });
+#pragma clang diagnostic pop
 }
 
 class k_xg_micro;

@@ -93,7 +93,7 @@ public:
     void run(const Product& p, void* stream);
 
 private:
-    void* ctx_ = nullptr;
+    [[maybe_unused]] void* ctx_ = nullptr;
 };
 
 /// A GGUF-native expert (gate at `gate`, up at `up`, down at `down`, each its GGUF rows) into a group buffer's

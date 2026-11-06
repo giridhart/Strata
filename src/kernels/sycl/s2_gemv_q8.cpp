@@ -66,7 +66,7 @@ void s2_gemv_q8_kernel(sycl::nd_item<1> item, const uint8_t* __restrict__ act, c
             partial[tid / SG_SIZE] = acc_sum;
         }
         item.barrier(sycl::access::fence_space::local_space);
-        const int num_sgs = threads_per_row / SG_SIZE;
+        const size_t num_sgs = static_cast<size_t>(threads_per_row / SG_SIZE);
         if (item.get_sub_group().get_group_id()[0] == 0) {
             float p_val = (item.get_local_id(0) < num_sgs) ? partial[item.get_local_id(0)] : 0.0f;
             p_val = sycl::reduce_over_group(sg, p_val, sycl::plus<float>());

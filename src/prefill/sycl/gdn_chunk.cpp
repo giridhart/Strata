@@ -263,6 +263,8 @@ public:
     sycl::local_accessor<float, 1> beta_tile;        // [16]
     sycl::local_accessor<float, 2> sn;               // [16][8]
 
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wpass-failed"
     void operator()(sycl::nd_item<1> item) const {
         auto sg = item.get_sub_group();
         const int vh = item.get_group(0);               // 0..47 (value head)
@@ -274,7 +276,7 @@ public:
 
         // Persistent 128 rows of state for column `col` held strictly in registers
         float W[GDN_S];
-#pragma unroll
+#pragma unroll 8
         for (int r = 0; r < GDN_S; ++r) {
             W[r] = state[(size_t)r * rs + (size_t)vh * GDN_S + col];
         }
@@ -322,7 +324,7 @@ public:
             for (int tok = 0; tok < GDN_CK; ++tok) {
                 float u_val = 0.0f;
                 float qw_val = 0.0f;
-#pragma unroll
+#pragma unroll 8
                 for (int r = 0; r < GDN_S; ++r) {
                     u_val += K_tile[tok][r] * W[r];
                     qw_val += Q_tile[tok][r] * W[r];
@@ -417,11 +419,12 @@ public:
         }
 
         // Write final resident state back to global memory
-#pragma unroll
+#pragma unroll 8
         for (int r = 0; r < GDN_S; ++r) {
             state[(size_t)r * rs + (size_t)vh * GDN_S + col] = W[r];
         }
     }
+#pragma clang diagnostic pop
 };
 
 }  // namespace

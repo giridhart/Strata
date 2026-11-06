@@ -201,9 +201,13 @@ inline void row_dot_iq2xs(const uint8_t* row, int nblocks, const block_q8_K* con
         for (int t = 0; t < NT; ++t) {
             const float d = h2f(u16(blk)) * (GGML ? y[t][i].d : 0.125f);
             const float scale = GGML ? d : d * y[t][i].d;
-            accf[t] = _mm256_fmadd_ps(_mm256_set1_ps(scale),
-                _mm256_cvtepi32_ps(CH == 4 ? _mm256_add_epi32(_mm256_add_epi32(acc[t][0], acc[t][1]), _mm256_add_epi32(acc[t][2], acc[t][3]))
-                                                       : _mm256_add_epi32(acc[t][0], acc[t][1])), accf[t]);
+            __m256i sum_acc;
+            if constexpr (CH == 4) {
+                sum_acc = _mm256_add_epi32(_mm256_add_epi32(acc[t][0], acc[t][1]), _mm256_add_epi32(acc[t][2], acc[t][3]));
+            } else {
+                sum_acc = _mm256_add_epi32(acc[t][0], acc[t][1]);
+            }
+            accf[t] = _mm256_fmadd_ps(_mm256_set1_ps(scale), _mm256_cvtepi32_ps(sum_acc), accf[t]);
         }
     }
     for (int t = 0; t < NT; ++t) res[t] = GGML ? 0.125f * ggml_hsum8(accf[t]) : hsum8(accf[t]);

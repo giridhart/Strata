@@ -605,7 +605,7 @@ void gather_native(const void* gate, const void* up, size_t gu_half_bytes, const
         const int64_t na = (int64_t)gu_half_bytes / 16, nc = (int64_t)d_bytes / 16, nz = (int64_t)zero_bytes / 16;
         const int64_t total = 2 * na + nc + 2 * nz + (tail_dst ? 1 : 0);
         s->parallel_for(sycl::nd_range<1>(sycl::range<1>(blocks(total) * 256), sycl::range<1>(256)),
-                        [=](sycl::nd_item<1> it) {
+                        [=](sycl::nd_item<1>) {
                             copy16_kernel((const sycl::uint4*)gate, na, (const sycl::uint4*)up, na,
                                           (sycl::uint4*)gu_dst, (const sycl::uint4*)down, nc, (sycl::uint4*)d_dst,
                                           (const sycl::uint4*)tail, (sycl::uint4*)tail_dst, nz);
@@ -618,7 +618,7 @@ void gather_native(const void* gate, const void* up, size_t gu_half_bytes, const
         }
         const int64_t na = (int64_t)gu_half_bytes, nc = (int64_t)d_bytes;
         s->parallel_for(sycl::nd_range<1>(sycl::range<1>(blocks(2 * na + nc) * 256), sycl::range<1>(256)),
-                        [=](sycl::nd_item<1> it) {
+                        [=](sycl::nd_item<1>) {
                             copy1_kernel((const uint8_t*)gate, na, (const uint8_t*)up, na, (uint8_t*)gu_dst,
                                          (const uint8_t*)down, nc, (uint8_t*)d_dst);
                         });
@@ -650,7 +650,7 @@ bool gather_native_group(const GatherGroup& g, size_t up_off, size_t gu_half_byt
     const size_t ny = (size_t)(g.n - g.first);
     s->parallel_for(
         sycl::nd_range<2>(sycl::range<2>(ny, blocks(work) * 256), sycl::range<2>(1, 256)),
-        [=](sycl::nd_item<2> it) {
+        [=](sycl::nd_item<2>) {
             copy16_group_kernel(ga, g.first, g.n, na, nc, nz, (sycl::uint4*)gu_dst, (sycl::uint4*)d_dst,
                                 (sycl::uint4*)tail_dst);
         });
@@ -660,14 +660,14 @@ bool gather_native_group(const GatherGroup& g, size_t up_off, size_t gu_half_byt
 void gather_strata_q2(const uint8_t* blob, void* gu_dst, void* d_dst, void* stream) {
     sycl::queue* s = stream ? static_cast<sycl::queue*>(stream) : &default_queue();
     s->parallel_for(sycl::nd_range<1>(sycl::range<1>(blocks(1280LL * 40 + 2560LL * 10) * 256), sycl::range<1>(256)),
-                    [=](sycl::nd_item<1> it) { strata_q2_kernel(blob, (uint16_t*)gu_dst, (uint16_t*)d_dst); });
+                    [=](sycl::nd_item<1>) { strata_q2_kernel(blob, (uint16_t*)gu_dst, (uint16_t*)d_dst); });
 }
 
 void swiglu(const float* gu, float* h, int64_t rows, int64_t n_ff, bool interleaved, void* stream) {
     if (rows <= 0) return;
     sycl::queue* s = stream ? static_cast<sycl::queue*>(stream) : &default_queue();
     s->parallel_for(sycl::nd_range<1>(sycl::range<1>(blocks(rows * n_ff) * 256), sycl::range<1>(256)),
-                    [=](sycl::nd_item<1> it) { swiglu_kernel(gu, h, rows, n_ff, interleaved); });
+                    [=](sycl::nd_item<1>) { swiglu_kernel(gu, h, rows, n_ff, interleaved); });
 }
 
 void swiglu_scaled(const float* gu, float* h, int64_t rows, int64_t n_ff, const int32_t* bounds, int n,
@@ -675,28 +675,28 @@ void swiglu_scaled(const float* gu, float* h, int64_t rows, int64_t n_ff, const 
     if (rows <= 0) return;
     sycl::queue* s = stream ? static_cast<sycl::queue*>(stream) : &default_queue();
     s->parallel_for(sycl::nd_range<1>(sycl::range<1>(blocks(rows * n_ff) * 256), sycl::range<1>(256)),
-                    [=](sycl::nd_item<1> it) { swiglu_scaled_kernel(gu, h, rows, n_ff, bounds, n, tails, row0); });
+                    [=](sycl::nd_item<1>) { swiglu_scaled_kernel(gu, h, rows, n_ff, bounds, n, tails, row0); });
 }
 
 void down_row_scales(float* sd, const int32_t* bounds, int n, const float* tails, int64_t nrows, void* stream) {
     if (nrows <= 0 || n <= 0) return;
     sycl::queue* s = stream ? static_cast<sycl::queue*>(stream) : &default_queue();
     s->parallel_for(sycl::nd_range<1>(sycl::range<1>(blocks(nrows) * 256), sycl::range<1>(256)),
-                    [=](sycl::nd_item<1> it) { down_row_scales_kernel(sd, bounds, n, tails, nrows); });
+                    [=](sycl::nd_item<1>) { down_row_scales_kernel(sd, bounds, n, tails, nrows); });
 }
 
 void iota(int32_t* dst, int64_t n, void* stream) {
     if (n <= 0) return;
     sycl::queue* s = stream ? static_cast<sycl::queue*>(stream) : &default_queue();
     s->parallel_for(sycl::nd_range<1>(sycl::range<1>(blocks(n) * 256), sycl::range<1>(256)),
-                    [=](sycl::nd_item<1> it) { iota_kernel(dst, n); });
+                    [=](sycl::nd_item<1>) { iota_kernel(dst, n); });
 }
 
 void f16_to_f32(const uint16_t* x, float* y, int64_t n, void* stream) {
     if (n <= 0) return;
     sycl::queue* s = stream ? static_cast<sycl::queue*>(stream) : &default_queue();
     s->parallel_for(sycl::nd_range<1>(sycl::range<1>(blocks(n) * 256), sycl::range<1>(256)),
-                    [=](sycl::nd_item<1> it) { f16_to_f32_kernel(x, y, n); });
+                    [=](sycl::nd_item<1>) { f16_to_f32_kernel(x, y, n); });
 }
 
 void set_bounds(int32_t* dst, int32_t rows, void* stream) {

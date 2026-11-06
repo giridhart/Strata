@@ -387,7 +387,7 @@ bool bf16_gemv_fp32_mmvf_multi_aux(const float* x, int64_t ldx, const uint16_t* 
         (reinterpret_cast<uintptr_t>(x) & 7u) != 0)
         return false;
     sycl::queue* q = stream ? static_cast<sycl::queue*>(stream) : &default_queue();
-    const bool large_grf = [q] {
+    [[maybe_unused]] const bool large_grf = [q] {
         const auto gen = strata::intel_gpu_gen(q->get_device());
         return gen == strata::IntelGpuGen::Alchemist || gen == strata::IntelGpuGen::Battlemage;
     }();
@@ -422,7 +422,7 @@ void bf16_gemv_fp32_mmvf_multi(const float* x, int64_t ldx, const uint16_t* w, f
         return;
     }
     sycl::queue* q = stream ? static_cast<sycl::queue*>(stream) : &default_queue();
-    const bool large_grf = [q] {
+    [[maybe_unused]] const bool large_grf = [q] {
         const auto gen = strata::intel_gpu_gen(q->get_device());
         return gen == strata::IntelGpuGen::Alchemist || gen == strata::IntelGpuGen::Battlemage;
     }();
@@ -493,7 +493,7 @@ void bf16_gemv_fp32_mmvf(const float* x, const uint16_t* w, float* y, int64_t n_
         (reinterpret_cast<uintptr_t>(w) & 3u) != 0 || (reinterpret_cast<uintptr_t>(y) & 3u) != 0)
         throw std::invalid_argument("bf16_gemv_fp32_mmvf: null or misaligned pointer");
     sycl::queue* q = stream ? static_cast<sycl::queue*>(stream) : &default_queue();
-    const bool large_grf = [q] {
+    [[maybe_unused]] const bool large_grf = [q] {
         const auto gen = strata::intel_gpu_gen(q->get_device());
         return gen == strata::IntelGpuGen::Alchemist || gen == strata::IntelGpuGen::Battlemage;
     }();

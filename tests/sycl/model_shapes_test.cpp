@@ -334,6 +334,8 @@ static int test_iq3s_moe_grouped(sycl::queue& q, std::mt19937& rng) {
 }
 
 int main(int argc, char** argv) {
+    (void)argc;
+    (void)argv;
     setvbuf(stdout, nullptr, _IONBF, 0);
     sycl::queue q{sycl::default_selector_v, sycl::property::queue::in_order()};
     const auto dev_name = q.get_device().get_info<sycl::info::device::name>();

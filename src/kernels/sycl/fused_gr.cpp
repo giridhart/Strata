@@ -773,8 +773,8 @@ void gr_up_v3_kernel(GrMulti m, const float* __restrict__ part, const float* __r
 //    (and on HIP) the staging is a plain copy: the same bits, only not asynchronous.
 constexpr int kHcPlain = 1, kHcSplit = 2, kHcStaged = 3;
 constexpr int H_TILE = 1280;  // staged tile: half a stream = 160 chunks of 8, 5 per lane
-constexpr int HQ = H_TILE / 8 / 32;
-constexpr int N_HTILES = D / H_TILE;  // 8
+[[maybe_unused]] constexpr int HQ = H_TILE / 8 / 32;
+[[maybe_unused]] constexpr int N_HTILES = D / H_TILE;  // 8
 static_assert(N % H_TILE == 0, "a staged tile never straddles two streams");
 static_assert(H_TILE % 256 == 0, "a staged tile holds whole rounds of 32 chunks: the plain read's lane order");
 
@@ -909,14 +909,14 @@ void gr_norm_split_fast_kernel(GrMulti m, float* part, float& s_rs) {
     }
 }
 
-inline void cp_async16(void* smem, const void* gmem) {
+[[maybe_unused]] inline void cp_async16(void* smem, const void* gmem) {
     *reinterpret_cast<sycl::float4*>(smem) = *reinterpret_cast<const sycl::float4*>(gmem);
 }
-inline void cp_async_commit() {}
-inline void cp_async_wait1() {}
-inline void cp_async_wait0() {}
+[[maybe_unused]] inline void cp_async_commit() {}
+[[maybe_unused]] inline void cp_async_wait1() {}
+[[maybe_unused]] inline void cp_async_wait0() {}
 
-void gr_down_staged_kernel(GrMulti m, uint8_t* smem_raw) {
+[[maybe_unused]] void gr_down_staged_kernel(GrMulti m, uint8_t* smem_raw) {
     GrDownArgs da{};
     da.w_down = m.a[0].w_down;
     da.w_inject = m.a[0].w_inject;

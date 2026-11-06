@@ -78,7 +78,7 @@ void native_swiglu_kernel(const float* gate, const float* up, float* out, int n,
     if (i < n) out[i] = f16_from_f32(in[i]);
 }
 
-inline double warp_sum_d(sycl::sub_group sg, double v) {
+[[maybe_unused]] inline double warp_sum_d(sycl::sub_group sg, double v) {
     return sycl::reduce_over_group(sg, v, sycl::plus<double>());
 }
 
@@ -89,8 +89,8 @@ void scalar_gate_kernel(const uint16_t* __restrict__ x_bf16, const uint16_t* __r
     for (int i = item.get_local_id(0); i < n_embd; i += item.get_local_range(0))
         acc += (double)f32_from_bf16(x_bf16[i]) * (double)f32_from_bf16(w_bf16[i]);
     acc = sycl::reduce_over_group(sg, acc, sycl::plus<double>());
-    const int sg_id = sg.get_group_id()[0];
-    const int sg_num = sg.get_group_range()[0];
+    const size_t sg_id = sg.get_group_id()[0];
+    const size_t sg_num = sg.get_group_range()[0];
     if (sg.get_local_id()[0] == 0) scratch[sg_id] = acc;
     item.barrier(sycl::access::fence_space::local_space);
     if (sg_id == 0) {

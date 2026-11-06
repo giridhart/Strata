@@ -211,7 +211,7 @@ void project_bf16_pair(const float* x, const uint16_t* x_bf16, const uint16_t* w
     }
 }
 
-void project_bf16_multi(const float* x, size_t ldx, const uint16_t* weights, float* out, size_t ldy,
+[[maybe_unused]] void project_bf16_multi(const float* x, size_t ldx, const uint16_t* weights, float* out, size_t ldy,
                         int64_t n_in, int64_t n_out, int T, void* stream) {
     using namespace strata::kernels;
     if (T > 1 && multi_row_gemv_enabled()) {
