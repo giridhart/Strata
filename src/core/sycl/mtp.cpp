@@ -53,10 +53,10 @@ inline sycl::queue& default_queue() {
     return q;
 }
 
-// STRATA_DRAFT_INT2=0: never the draft head at 2 bits (1: always, 0 or 1 skips the measurement)
+// STRATA_DRAFT_INT2=1: draft head at 2 bits (opt-in; default: off to preserve draft token acceptance rate)
 bool int2_allowed(int64_t n_embd) {
     const char* v = std::getenv("STRATA_DRAFT_INT2");
-    return n_embd % strata::kernels::kInt2Group == 0 && (v == nullptr || v[0] == 0 || std::strtol(v, nullptr, 10) != 0);
+    return n_embd % strata::kernels::kInt2Group == 0 && (v != nullptr && std::strtol(v, nullptr, 10) > 0);
 }
 
 constexpr float EPS = 1e-6f;

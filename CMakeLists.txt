@@ -303,7 +303,7 @@ elseif(STRATA_ENABLE_HIP)
   set(_strata_gpu_include_directories ${STRATA_HIP_COMPAT_INCLUDE_DIR})
 elseif(STRATA_ENABLE_SYCL)
   add_compile_definitions(STRATA_ENABLE_SYCL)
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsycl -foffload-fp32-prec-div -foffload-fp32-prec-sqrt")
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsycl")
   if(CMAKE_CXX_COMPILER_ID MATCHES "IntelLLVM")
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fp-model=precise")
   endif()
@@ -327,14 +327,12 @@ elseif(STRATA_ENABLE_SYCL)
   endif()
 
   add_library(strata_sycl INTERFACE)
-  # CUDA divides and takes square roots with IEEE rounding by default; SYCL device code does not unless asked, and
-  # quantize_act_parity sees the one-ulp difference in Q8_K's 1/iscale.
-  target_compile_options(strata_sycl INTERFACE -fsycl -foffload-fp32-prec-div -foffload-fp32-prec-sqrt)
+  target_compile_options(strata_sycl INTERFACE -fsycl)
   # SPV_KHR_integer_dot_product carries CUDA's __dp4a (src/kernels/xe/cuda_intrinsics.hpp); device code becomes
   # SPIR-V when the executable links.
   set(_strata_spirv_translator -Xspirv-translator)
   cmake_host_system_information(RESULT _strata_link_jobs QUERY NUMBER_OF_LOGICAL_CORES)
-  target_link_options(strata_sycl INTERFACE -fsycl -foffload-fp32-prec-div -foffload-fp32-prec-sqrt
+  target_link_options(strata_sycl INTERFACE -fsycl
                       -fsycl-max-parallel-link-jobs=${_strata_link_jobs}
                       "SHELL:${_strata_spirv_translator} --spirv-ext=+SPV_KHR_integer_dot_product")
   if(NOT WIN32)

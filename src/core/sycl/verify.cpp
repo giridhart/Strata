@@ -110,6 +110,39 @@ inline int64_t select_long_at() {
     return at;
 }
 
+enum class VerifyGraphMode {
+    Direct = 0,
+    Split = 1,
+    Whole = 2
+};
+
+inline VerifyGraphMode verify_graph_mode() {
+    static const VerifyGraphMode mode = [] {
+        const char* v = std::getenv("STRATA_VERIFY_GRAPH");
+        if (!v || v[0] == '\0' || std::strcmp(v, "0") == 0 || std::strcmp(v, "direct") == 0 || std::strcmp(v, "off") == 0) {
+            return VerifyGraphMode::Direct;
+        }
+        if (std::strcmp(v, "whole") == 0 || std::strcmp(v, "monolithic") == 0 || std::strcmp(v, "2") == 0) {
+            return VerifyGraphMode::Whole;
+        }
+        return VerifyGraphMode::Split;
+    }();
+    return mode;
+}
+
+inline int verify_graph_chunk_layers() {
+    static const int n = [] {
+        const char* v = std::getenv("STRATA_VERIFY_GRAPH_CHUNK");
+        if (!v || v[0] == '\0') {
+            const char* v2 = std::getenv("STRATA_GRAPH_CHUNK_LAYERS");
+            if (v2 && v2[0] != '\0') return std::max(1, std::atoi(v2));
+            return 1;
+        }
+        return std::max(1, std::atoi(v));
+    }();
+    return n;
+}
+
 struct Bump {
     uint8_t* base = nullptr;
     uint64_t used = 0;
@@ -548,8 +581,10 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     }
     {
         const char* v = std::getenv("STRATA_VERIFY_RESIDENT_GRAPH");
+        const bool user_res = (v != nullptr && std::strtol(v, nullptr, 10) != 0);
+        const bool graph_enabled = verify_graph_mode() != VerifyGraphMode::Direct;
         res_graph_ = hits.h_res != nullptr && hits.d_res != nullptr &&
-                     (v == nullptr || std::strtol(v, nullptr, 10) != 0);
+                     ((v == nullptr && graph_enabled) || user_res);
     }
     if (device_plan_ || res_graph_) {
         bool ok2 = true;
@@ -1477,39 +1512,6 @@ struct ChunkRecorder {
         return true;
     }
 };
-
-enum class VerifyGraphMode {
-    Direct = 0,
-    Split = 1,
-    Whole = 2
-};
-
-inline VerifyGraphMode verify_graph_mode() {
-    static const VerifyGraphMode mode = [] {
-        const char* v = std::getenv("STRATA_VERIFY_GRAPH");
-        if (!v || v[0] == '\0' || std::strcmp(v, "0") == 0 || std::strcmp(v, "direct") == 0 || std::strcmp(v, "off") == 0) {
-            return VerifyGraphMode::Direct;
-        }
-        if (std::strcmp(v, "whole") == 0 || std::strcmp(v, "monolithic") == 0 || std::strcmp(v, "2") == 0) {
-            return VerifyGraphMode::Whole;
-        }
-        return VerifyGraphMode::Split;
-    }();
-    return mode;
-}
-
-inline int verify_graph_chunk_layers() {
-    static const int n = [] {
-        const char* v = std::getenv("STRATA_VERIFY_GRAPH_CHUNK");
-        if (!v || v[0] == '\0') {
-            const char* v2 = std::getenv("STRATA_GRAPH_CHUNK_LAYERS");
-            if (v2 && v2[0] != '\0') return std::max(1, std::atoi(v2));
-            return 1;
-        }
-        return std::max(1, std::atoi(v));
-    }();
-    return n;
-}
 }  // namespace
 
 bool Verifier::record_window(int T, sycl::queue* cs, std::string& err, void* chunk_rec) try {
