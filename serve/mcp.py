@@ -38,7 +38,7 @@ from serve import lifeline
 
 PROTOCOL = "2025-06-18"               # the MCP revision Strata asks for; the server's answer is used as given
 DEFAULTS = {"timeout_s": 60.0, "max_result_chars": 20000, "max_rounds": 8, "start_timeout_s": 120.0, "image_results": False,
-            "codemode": False}
+            "codemode": False, "codemode_lang": "python"}
 
 
 class McpError(RuntimeError):
@@ -582,6 +582,8 @@ class McpHub:
         """
         if name in ("run_python", "python", "py", "run_code", "execute_code") and self.settings.get("codemode"):
             return None, "run_python"
+        if name in ("run_javascript", "javascript", "js", "run_js") and self.settings.get("codemode"):
+            return None, "run_javascript"
         routes = self._routes or self.routes()
         if name in routes:
             return routes[name]
@@ -621,8 +623,59 @@ class McpHub:
     def openai_tools(self) -> list[dict]:
         return [{"type": "function", "function": t} for t in self.template_tools()]
 
-    def codemode_tools(self, exclude=()) -> list[dict]:
-        """A single execution tool for Code Mode with compact Python signatures of all MCP tools."""
+    def codemode_tools(self, exclude=(), lang: str | None = None) -> list[dict]:
+        """A single execution tool for Code Mode with compact signatures of all MCP tools."""
+        effective_lang = (lang or self.settings.get("codemode_lang") or "python").lower()
+        if effective_lang in ("javascript", "js"):
+            tool_name = "run_javascript"
+            if tool_name in exclude:
+                return []
+            sigs = []
+            for name, (s, tool) in self.routes().items():
+                if tool == "generate_plot" or name == "generate_plot" or name.endswith("__generate_plot"):
+                    continue
+                t = next((x for x in s.tools if x["name"] == tool), None)
+                if not t:
+                    continue
+                schema = t.get("inputSchema") if isinstance(t.get("inputSchema"), dict) else {}
+                props = schema.get("properties") or {}
+                args_str = ", ".join(f"{k}: {v.get('type', 'any')}" for k, v in props.items())
+                desc = str(t.get("description") or t.get("title") or "").strip().replace("\n", " ")
+                if desc:
+                    first_sent = desc.split(". ")[0].rstrip(".")
+                    desc = f": {first_sent[:90]}"
+                sigs.append(f"  - mcp.{_clean(s.name)}.{_clean(tool)}({{{args_str}}}){desc}")
+
+            tools_list_text = "\n".join(sigs) if sigs else "  (no MCP tools currently registered)"
+            desc = (
+                "Execute JavaScript (ES6) code in an isolated QuickJS sandbox to interact with MCP tools or process data.\n\n"
+                "CRITICAL INSTRUCTIONS:\n"
+                "1. `run_javascript` is the ONLY valid function name for tool calls. You MUST call `run_javascript`.\n"
+                "2. NEVER emit `<function=mcp...>` or invoke MCP functions directly as tool names.\n"
+                "3. Variables defined in global scope persist across turns within the same conversation session.\n"
+                "4. Expressions at the end of the script auto-return their value. `console.log(...)` is also captured.\n"
+                "5. MCP tools are callable via `mcp.<server>.<tool>({ arg1: value, ... })`.\n"
+                "6. To render interactive plots, pass a Plotly figure object to `render_interactive_plot(fig)`.\n\n"
+                "EXAMPLES:\n"
+                "# Chaining MCP tools and calculating in JS:\n"
+                "run_javascript(code='const data = mcp.filesystem.read_file({ path: \"data.json\" });\\nconst parsed = JSON.parse(data.text);\\nparsed.filter(x => x.active).length;')\n\n"
+                f"MCP server tools callable via `mcp.<server>.<tool>({{...}})`:\n{tools_list_text}"
+            )
+            return [{
+                "name": "run_javascript",
+                "description": desc,
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "code": {
+                            "type": "string",
+                            "description": "Self-contained JavaScript (ES6) code to execute."
+                        }
+                    },
+                    "required": ["code"]
+                }
+            }]
+
         if "run_python" in exclude:
             return []
         sigs = []
@@ -694,25 +747,44 @@ class McpHub:
             }
         }]
 
-    def call_codemode(self, arguments: dict | str, cancel: threading.Event | None = None, timeout_s: float | None = None) -> dict:
-        from serve import mcp_runner
+    def call_codemode(self, arguments: dict | str, cancel: threading.Event | None = None,
+                      timeout_s: float | None = None, lang: str | None = None) -> dict:
         code = ""
         deps = None
+        arg_lang = None
         if isinstance(arguments, str):
             code = arguments
         elif isinstance(arguments, dict):
             code = (arguments.get("code") or arguments.get("script") or arguments.get("python") or
+                    arguments.get("javascript") or arguments.get("js") or
                     arguments.get("command") or arguments.get("input") or arguments.get("source") or "")
             if isinstance(arguments.get("dependencies"), list):
                 deps = [str(d) for d in arguments["dependencies"]]
-        code = mcp_runner.strip_markdown_fences(code)
-        if not isinstance(code, str) or not code.strip():
-            return {"server": "codemode", "tool": "run_python", "ok": False,
-                    "text": "error: run_python requires a 'code' string argument", "chars": 52,
-                    "truncated": False, "ms": 0}
+            arg_lang = arguments.get("language") or arguments.get("lang")
+
+        effective_lang = (lang or arg_lang or self.settings.get("codemode_lang") or "python").lower()
+        tool_name = "run_javascript" if effective_lang in ("javascript", "js") else "run_python"
+
         timeout = float(timeout_s if timeout_s is not None else self.settings.get("timeout_s", 60.0))
         session_id = str(arguments.get("session_id") or "default") if isinstance(arguments, dict) else "default"
-        r = mcp_runner.execute_in_runner(code, self, timeout_s=timeout, cancel=cancel, dependencies=deps, session_id=session_id)
+
+        if effective_lang in ("javascript", "js"):
+            from serve import js_sandbox
+            code = js_sandbox.strip_markdown_fences(code)
+            if not isinstance(code, str) or not code.strip():
+                return {"server": "codemode", "tool": tool_name, "ok": False,
+                        "text": f"error: {tool_name} requires a 'code' string argument", "chars": 50,
+                        "truncated": False, "ms": 0}
+            r = js_sandbox.execute_js_in_sandbox(code, self, timeout_s=timeout, cancel=cancel, session_id=session_id)
+        else:
+            from serve import mcp_runner
+            code = mcp_runner.strip_markdown_fences(code)
+            if not isinstance(code, str) or not code.strip():
+                return {"server": "codemode", "tool": tool_name, "ok": False,
+                        "text": f"error: {tool_name} requires a 'code' string argument", "chars": 52,
+                        "truncated": False, "ms": 0}
+            r = mcp_runner.execute_in_runner(code, self, timeout_s=timeout, cancel=cancel, dependencies=deps, session_id=session_id)
+
         text, ok = r["text"], r["ok"]
         cap = int(self.settings["max_result_chars"])
         full = len(text)
@@ -720,18 +792,24 @@ class McpHub:
         if truncated:
             text = text[:cap] + (f"\n\n[... truncated: the tool returned {full:,} characters; only the first "
                                  f"{cap:,} are shown]")
-        out = {"server": "codemode", "tool": "run_python", "ok": ok, "text": text, "chars": full,
-                "truncated": truncated, "ms": r["ms"]}
+        out = {"server": "codemode", "tool": tool_name, "ok": ok, "text": text, "chars": full,
+               "truncated": truncated, "ms": r["ms"]}
         res = r.get("result")
         if isinstance(res, dict) and res.get("type") == "application/vnd.plotly.v1+json":
             out["plot"] = res
+        elif isinstance(r.get("plot"), dict):
+            out["plot"] = r["plot"]
         return out
 
     def call(self, name: str, arguments: dict, cancel: threading.Event | None = None, timeout_s: float | None = None) -> dict:
         """Run one tool -> {"ok", "text" (what the model reads, capped), "chars" (its full length), "truncated",
         "ms", "server", "tool"}.  Errors become text starting with "error:"; only McpCancelled is raised."""
         if name in ("run_python", "python", "py", "run_code", "execute_code"):
-            return self.call_codemode(arguments, cancel, timeout_s=timeout_s)
+            if name == "run_code" and isinstance(arguments, dict) and arguments.get("language") in ("javascript", "js"):
+                return self.call_codemode(arguments, cancel, timeout_s=timeout_s, lang="javascript")
+            return self.call_codemode(arguments, cancel, timeout_s=timeout_s, lang="python")
+        if name in ("run_javascript", "javascript", "js", "run_js"):
+            return self.call_codemode(arguments, cancel, timeout_s=timeout_s, lang="javascript")
         t0 = time.monotonic()
         server, tool = self.resolve_route(name)
         out = {"server": server.name if server else None, "tool": tool}
@@ -781,7 +859,7 @@ class McpHub:
                             "tools": [{"name": names.get(t["name"], t["name"]), "tool": t["name"],
                                        "description": str(t.get("description") or "")[:300]} for t in s.tools]})
         return {"servers": servers, "tools": len(routes),
-                "settings": {k: self.settings[k] for k in ("timeout_s", "max_result_chars", "max_rounds", "codemode")}}
+                "settings": {k: self.settings[k] for k in ("timeout_s", "max_result_chars", "max_rounds", "codemode", "codemode_lang")}}
 
     def close(self):
         for s in self.servers.values():
@@ -833,6 +911,9 @@ def settings_from(cfg: dict) -> dict:
     for k in ("codemode", "code_mode"):
         if k in cfg and "codemode" not in block and "code_mode" not in block:
             block["codemode"] = cfg[k]
+    for k in ("codemode_lang", "codemode_language"):
+        if k in cfg and "codemode_lang" not in block and "codemode_language" not in block:
+            block["codemode_lang"] = cfg[k]
     for key, value in block.items():
         number = isinstance(value, (int, float)) and not isinstance(value, bool)
         if key == "image_results":
@@ -843,6 +924,11 @@ def settings_from(cfg: dict) -> dict:
             if not isinstance(value, bool):
                 raise SystemExit(f"[strata] config mcp.{key}={value!r}: expected a boolean")
             out["codemode"] = value
+        elif key in ("codemode_lang", "codemode_language"):
+            lang_val = str(value).lower()
+            if lang_val not in ("python", "javascript", "js"):
+                raise SystemExit(f"[strata] config mcp.{key}={value!r}: expected 'python' or 'javascript'")
+            out["codemode_lang"] = "javascript" if lang_val in ("javascript", "js") else "python"
         elif key in ("timeout_s", "start_timeout_s"):
             if not number or value <= 0:
                 raise SystemExit(f"[strata] config mcp.{key}={value!r}: expected a number of seconds > 0")

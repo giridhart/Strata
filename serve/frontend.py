@@ -1208,6 +1208,9 @@ class OutputParser:
         if "run_python" in self.schemas:
             for alias in ("python", "py", "run_code", "execute_code"):
                 aliases.setdefault(alias, set()).add("run_python")
+        if "run_javascript" in self.schemas:
+            for alias in ("javascript", "js", "run_js", "run_code", "execute_code"):
+                aliases.setdefault(alias, set()).add("run_javascript")
         self.aliases = {alias: next(iter(names)) for alias, names in aliases.items()
                         if len(names) == 1 and alias not in self.schemas}
         self.unread = 0              # #3441: `<tool_call>` blocks that opened like a call and were returned as text

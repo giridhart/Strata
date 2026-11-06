@@ -957,14 +957,17 @@ after a change.
 - Only the chat page uses them. API clients see the API exactly as before and keep their own tools. A request to
   `/v1/chat/completions` opts in with `"strata_mcp": true`.
 - **Code Mode** (`"codemode": true` in the `"mcp"` config block, or per request `"codemode": true`): instead of injecting
-  every tool's JSON schema into the prompt, Strata offers a single `run_python` tool with compact Python signatures. The
-  model writes Python to chain tools (e.g. `mcp.files.read(...)`), filters large intermediate data in memory, and returns only
-  the final output into the context. If `uv` is installed, dynamic PyPI packages (via `"dependencies": ["pandas"]`) are
-  resolved on the fly in milliseconds in an isolated environment.
+  every tool's JSON schema into the prompt, Strata offers a single execution tool (`run_python` or `run_javascript`) with compact signatures. The
+  model writes code to chain tools (e.g. `mcp.files.read(...)`), filters large intermediate data in memory, and returns only
+  the final output into the context. The language can be chosen at launch (`--codemode-lang python|javascript`) or per chat/request (`"codemode_lang": "javascript"`).
+  JavaScript runs in an embedded, memory-safe QuickJS sandbox with sub-millisecond execution. Python runs in an isolated runner with 3-layer sandboxing:
+  sanitized environment and ephemeral scratch directory (Layer 1), AST security visitor blocking host inspection/subprocesses alongside syntax auto-repair and loop bounding (Layer 2),
+  and optional Bubblewrap container isolation with unshared networking (Layer 3). If `uv` is installed, dynamic PyPI packages (via `"dependencies": ["pandas"]`) are
+  resolved on the fly in milliseconds.
 
 **Security.** MCP tools run on your PC with your user's rights, and the model decides when to call them, also because of what
-it reads (a web page or file can contain instructions). Give a filesystem server only the folders it needs, prefer read-only
-tools and add only servers you trust. If Strata is reachable from other devices, set an API key.
+it reads (a web page or file can contain instructions). Code Mode sandboxes Python and JavaScript execution to prevent host inspection.
+Give a filesystem server only the folders it needs, prefer read-only tools and add only servers you trust. If Strata is reachable from other devices, set an API key.
 
 ## Manage Strata from your AI assistant (MCP server)
 

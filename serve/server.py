@@ -8310,7 +8310,9 @@ def make_handler(svc: Service):
                 use_codemode = bool(req.get("codemode") or req.get("code_mode") or req.get("strata_codemode") or
                                     svc.mcp.settings.get("codemode"))
                 if use_codemode:
-                    extra = svc.mcp.codemode_tools(exclude=own)
+                    req_lang = (req.get("codemode_lang") or req.get("codemode_language") or
+                                req.get("strata_codemode_lang") or svc.mcp.settings.get("codemode_lang", "python"))
+                    extra = svc.mcp.codemode_tools(exclude=own, lang=req_lang)
                 else:
                     extra = svc.mcp.template_tools(exclude=own)       # the request's own tools win a name clash
                 use_mcp = bool(extra)
@@ -9595,7 +9597,9 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
                                          "{...}}); the web app's chat can use their tools (also \"mcp_servers\" in "
                                          "the config)")
     ap.add_argument("--codemode", action="store_true",
-                    help="enable Code Mode for MCP tools (synthesizes a single run_python tool to reduce tokens)")
+                    help="enable Code Mode for MCP tools (synthesizes a single execution tool to reduce tokens)")
+    ap.add_argument("--codemode-lang", "--codemode-language", choices=["python", "javascript", "js"], default=None,
+                    help="execution language for Code Mode ('python' or 'javascript'; default: python)")
     ap.add_argument("--lazy", action="store_true", help="start the API unloaded (the engine and the vision encoder start with the first request)")
     ap.add_argument("--api-monitor", action="store_true",
                     help="the API request monitor at /api-monitor: keeps the last 100 requests' prompts and answers in "
@@ -9749,6 +9753,8 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
     hub = hub_from_config(cfg, a.mcp_config)            # before the minutes of loading: a bad entry stops here
     if a.codemode and hub is not None:
         hub.settings["codemode"] = True
+    if getattr(a, "codemode_lang", None) and hub is not None:
+        hub.settings["codemode_lang"] = "javascript" if a.codemode_lang in ("javascript", "js") else "python"
     if a.offline and (hub is not None or cfg.get("before_load") or a.before_load):
         ap.error("--offline requires MCP servers and before_load commands to be disabled in this profile")
     if a.offline:
