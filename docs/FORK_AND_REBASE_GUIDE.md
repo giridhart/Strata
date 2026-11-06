@@ -155,10 +155,11 @@ git apply strata-sycl-b580.patch
 ## 5. Status & Next Session Work Plan
 
 ### Current Status (Completed & Tested)
+- **Commit `9ed9888b`**: Upstream Merge v0.2.11 (`9f7d977d`), bringing 208 upstream commits, Unsloth v3.1 Qwen3.8-Flash-Next quant definitions, Q5_0 quantization activation sum fix (-16 offset with quantized sum) ported to SYCL kernels, and full conflict resolution in `CMakeLists.txt` and `server_intel.py`.
 - **Commit `0962e1bc`**: MoE 16-Lane Subgroup GEMV (`s2_expert_grouped.cpp`, Xe2 SIMD16 subgroup matrix multiplication).
 - **Commit `03aaa697`**: Fused Per-Head RMSNorm + RoPE (`src/kernels/sycl/native_rope.cpp`, `rope_parity.cpp`, benchmarks).
 - **Commit `a576809e`**: Multi-Token Router (`native_router_top10_multi`, 256 threads / 8 subgroups) and Residency-Biased Routing (`native_route_resident`, `route_resident_k`).
-- **All 43 Host/Emulation Tests Pass**: Verified 100% pass rate via `./tools/test_sycl.sh`.
+- **All Host/Emulation Tests Pass**: Verified 100% pass rate via `./tools/test_sycl.sh cpu`.
 
 ### Next Session Kernel Porting Tasks
 
