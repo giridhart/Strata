@@ -155,11 +155,21 @@ CompilerWorkaround intel_compiler_workaround() {
 // without it every start builds each kernel module it uses from the SPIR-V again, linking the device libraries in, and
 // the GPU driver's own cache does not spare that.
 static void sycl_code_cache() {
-    if (std::getenv("SYCL_CACHE_PERSISTENT") != nullptr) return;
+    if (std::getenv("SYCL_CACHE_PERSISTENT") == nullptr) {
 #if defined(_WIN32)
-    _putenv_s("SYCL_CACHE_PERSISTENT", "1");
+        _putenv_s("SYCL_CACHE_PERSISTENT", "1");
 #else
-    setenv("SYCL_CACHE_PERSISTENT", "1", 0);
+        setenv("SYCL_CACHE_PERSISTENT", "1", 0);
+#endif
+    }
+#if !defined(_WIN32)
+    // Reduce Level Zero driver event tracking overhead on Intel Xe2/Linux
+    if (std::getenv("UR_L0_DEVICE_SCOPE_EVENTS") == nullptr) {
+        setenv("UR_L0_DEVICE_SCOPE_EVENTS", "2", 0);
+    }
+    if (std::getenv("SYCL_PI_LEVEL_ZERO_DEVICE_SCOPE_EVENTS") == nullptr) {
+        setenv("SYCL_PI_LEVEL_ZERO_DEVICE_SCOPE_EVENTS", "2", 0);
+    }
 #endif
 }
 

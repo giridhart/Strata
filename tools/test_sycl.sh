@@ -18,8 +18,10 @@ fi
 export IGC_EnableGEPSimplification="${IGC_EnableGEPSimplification:-0}"
 export SYCL_CACHE_PERSISTENT="${SYCL_CACHE_PERSISTENT:-1}"
 export ONEAPI_DEVICE_SELECTOR="${ONEAPI_DEVICE_SELECTOR:-level_zero:0}"
+export UR_L0_DEVICE_SCOPE_EVENTS="${UR_L0_DEVICE_SCOPE_EVENTS:-2}"
+export SYCL_PI_LEVEL_ZERO_DEVICE_SCOPE_EVENTS="${SYCL_PI_LEVEL_ZERO_DEVICE_SCOPE_EVENTS:-2}"
 export STRATA_EVENT_MARK="${STRATA_EVENT_MARK:-barrier}"
-export STRATA_COPY_ENGINE="${STRATA_COPY_ENGINE:-1}"
+export STRATA_COPY_ENGINE="${STRATA_COPY_ENGINE:-0}"
 
 # Argument handling: 'all' or empty runs all tests by default
 CTEST_BIN="$(command -v /usr/bin/ctest || command -v ctest)"
