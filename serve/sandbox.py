@@ -143,18 +143,27 @@ class ImportAliasTransformer(ast.NodeTransformer):
     def visit_Import(self, node: ast.Import) -> ast.Import:
         new_names = []
         for alias in node.names:
-            if alias.name in self.REWRITES:
-                mod, default_as = self.REWRITES[alias.name]
-                asname = alias.asname or default_as
-                new_names.append(ast.alias(name=mod, asname=asname))
+            parts = alias.name.split(".", 1)
+            root = parts[0]
+            if root in self.REWRITES:
+                mod, default_as = self.REWRITES[root]
+                rest = f".{parts[1]}" if len(parts) > 1 else ""
+                full_mod = mod + rest
+                asname = alias.asname or (default_as if not rest else None)
+                new_names.append(ast.alias(name=full_mod, asname=asname))
             else:
                 new_names.append(alias)
         node.names = new_names
         return node
 
     def visit_ImportFrom(self, node: ast.ImportFrom) -> ast.ImportFrom:
-        if node.module and node.module in self.MODULE_REWRITES:
-            node.module = self.MODULE_REWRITES[node.module]
+        if node.module:
+            parts = node.module.split(".", 1)
+            root = parts[0]
+            if root in self.MODULE_REWRITES:
+                mod = self.MODULE_REWRITES[root]
+                rest = f".{parts[1]}" if len(parts) > 1 else ""
+                node.module = mod + rest
         return node
 
 
@@ -209,6 +218,7 @@ def create_base_globals(custom_tools: dict[str, Any] | None = None) -> dict[str,
         pass
 
     # Pre-import plotly.express as px and plotly.graph_objects as go if present
+    _plot_wrapper = None
     try:
         import plotly.express as px
         import plotly.graph_objects as go
@@ -216,6 +226,8 @@ def create_base_globals(custom_tools: dict[str, Any] | None = None) -> dict[str,
         env["go"] = go
         sys.modules.setdefault("px", px)
         sys.modules.setdefault("go", go)
+        if hasattr(px, "colors"):
+            sys.modules.setdefault("px.colors", px.colors)
     except ImportError:
         pass
 
@@ -226,8 +238,21 @@ def create_base_globals(custom_tools: dict[str, Any] | None = None) -> dict[str,
     except ImportError:
         pass
 
-    # Injected interactive plotting helper
-    env["render_interactive_plot"] = render_interactive_plot
+    # Injected interactive plotting helper that captures plot in state so it is never lost
+    def _plot_wrapper(fig: Any) -> dict[str, Any]:
+        plot_dict = render_interactive_plot(fig)
+        env["_last_plot"] = plot_dict
+        env["result"] = plot_dict
+        return plot_dict
+
+    env["render_interactive_plot"] = _plot_wrapper
+
+    # Monkey patch Plotly Figure.show so standard Plotly fig.show() routes to render_interactive_plot
+    try:
+        import plotly.graph_objects as go
+        go.Figure.show = lambda self, *a, **kw: _plot_wrapper(self)
+    except ImportError:
+        pass
 
     # Injected symbolic & logic tools
     if verify_equivalence is not None:
@@ -321,8 +346,9 @@ class LLMSandbox:
             }
 
         state = self.get_session_state(session_id, custom_tools)
-        # Clear previous run's result variable so each turn evaluates fresh
+        # Clear previous run's result and plot variables so each turn evaluates fresh
         state["result"] = None
+        state["_last_plot"] = None
 
         user_stdout = io.StringIO()
         user_stderr = io.StringIO()
@@ -370,8 +396,36 @@ class LLMSandbox:
                     state["result"] = evaluated_val
 
             ret = state.get("result")
+            # If result is not set, fallback to the last captured plot
+            if ret is None and state.get("_last_plot") is not None:
+                ret = state["_last_plot"]
+
             if ret is None and callable(state.get("main")):
                 ret = state["main"]()
+
+            # If still None, check if any variable in state holds an unrendered Plotly figure
+            if ret is None:
+                candidates = ["fig", "figure", "plot", "chart"] + [k for k in state.keys() if not k.startswith("_")]
+                for k in candidates:
+                    val = state.get(k)
+                    if val is None:
+                        continue
+                    is_candidate_fig = False
+                    try:
+                        import plotly.graph_objects as go
+                        if isinstance(val, go.Figure):
+                            is_candidate_fig = True
+                    except ImportError:
+                        pass
+                    if not is_candidate_fig and hasattr(val, "data") and hasattr(val, "layout") and callable(getattr(val, "to_json", None)):
+                        is_candidate_fig = True
+                    if is_candidate_fig:
+                        try:
+                            ret = render_interactive_plot(val)
+                            state["_last_plot"] = ret
+                            break
+                        except Exception:
+                            pass
 
             stdout_val = user_stdout.getvalue().strip()
             stderr_val = user_stderr.getvalue().strip()
@@ -387,7 +441,14 @@ class LLMSandbox:
                 return str(v)
 
             if stdout_val and ret is not None:
-                output_text = f"{stdout_val}\n\nResult: {_format_val(ret)}"
+                formatted_ret = _format_val(ret)
+                # Avoid duplicating output if stdout already contains the JSON plot payload
+                if isinstance(ret, dict) and ret.get("type") == "application/vnd.plotly.v1+json" and (
+                    formatted_ret in stdout_val or stdout_val.startswith('{"type": "application/vnd.plotly.v1+json"')
+                ):
+                    output_text = stdout_val
+                else:
+                    output_text = f"{stdout_val}\n\nResult: {formatted_ret}"
             elif stdout_val:
                 output_text = stdout_val
             elif ret is not None:

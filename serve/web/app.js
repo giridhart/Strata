@@ -950,14 +950,38 @@ function toolPlots(t) {
 }
 let plotlyLoadingPromise = null;
 function loadPlotly() {
-  if (window.Plotly) return Promise.resolve(window.Plotly);
+  const existing = window.Plotly || window.moduleName;
+  if (existing && typeof existing.newPlot === "function") {
+    window.Plotly = existing;
+    return Promise.resolve(existing);
+  }
   if (!plotlyLoadingPromise) {
     plotlyLoadingPromise = new Promise((resolve, reject) => {
       const script = document.createElement("script");
       script.src = "web/vendor/plotly/plotly.min.js";
       script.async = true;
-      script.onload = () => resolve(window.Plotly);
-      script.onerror = () => reject(new Error("Plotly library failed to load"));
+      const timer = setTimeout(() => {
+        plotlyLoadingPromise = null;
+        script.remove();
+        reject(new Error("Plotly library load timed out"));
+      }, 15000);
+      script.onload = () => {
+        clearTimeout(timer);
+        const p = window.Plotly || window.moduleName;
+        if (p && typeof p.newPlot === "function") {
+          window.Plotly = p;
+          resolve(p);
+        } else {
+          plotlyLoadingPromise = null;
+          reject(new Error("Plotly object not found on window"));
+        }
+      };
+      script.onerror = () => {
+        clearTimeout(timer);
+        plotlyLoadingPromise = null;
+        script.remove();
+        reject(new Error("Plotly library failed to load"));
+      };
       document.head.appendChild(script);
     });
   }
@@ -987,7 +1011,10 @@ function hydrateToolPlots(root) {
   if (!plots.length) return;
 
   loadPlotly().then((Plotly) => {
-    plots.forEach((fig) => {
+    if (!Plotly) return;
+    const currentPlots = root.querySelectorAll("[data-plot-tool-id]:not([data-rendered])");
+    currentPlots.forEach((fig) => {
+      if (!fig.isConnected) return;
       fig.dataset.rendered = "1";
       const id = fig.dataset.plotToolId;
       const chartEl = fig.querySelector(".tool-plot__chart");
@@ -1007,7 +1034,9 @@ function hydrateToolPlots(root) {
       }
     });
   }).catch((err) => {
-    plots.forEach((fig) => {
+    const currentPlots = root.querySelectorAll("[data-plot-tool-id]:not([data-rendered])");
+    currentPlots.forEach((fig) => {
+      if (!fig.isConnected) return;
       fig.dataset.rendered = "1";
       const chartEl = fig.querySelector(".tool-plot__chart");
       if (chartEl) {
@@ -1067,7 +1096,25 @@ function updateAssistant(el, m, streaming) {
   } else if (!m.text && streaming && !(m.tools && m.tools.length)) {
     bubble.innerHTML = m.reasoning ? `<span class="muted cursor">Writing</span>` : `<span class="cursor"></span>`;
   } else {
+    // Preserve existing rendered interactive plots across streaming frames / re-renders
+    const savedPlots = new Map();
+    bubble.querySelectorAll(".tool-plot[data-rendered]").forEach((p) => {
+      const id = p.dataset.plotToolId;
+      if (id) savedPlots.set(id, p);
+    });
+
     bubble.innerHTML = answerHtml(m);
+
+    // Reattach preserved rendered plots so DOM and WebGL contexts are kept intact
+    if (savedPlots.size > 0) {
+      bubble.querySelectorAll(".tool-plot").forEach((newP) => {
+        const id = newP.dataset.plotToolId;
+        if (id && savedPlots.has(id)) {
+          newP.replaceWith(savedPlots.get(id));
+        }
+      });
+    }
+
     hydrateToolImages(bubble);
     hydrateToolPlots(bubble);
     if (settings.math) StrataMath.hydrate(bubble);
