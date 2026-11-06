@@ -342,7 +342,8 @@ def install_two_card_spec():
                 cards = [sysfs[i] for i in S.gpu_list(cfg) if isinstance(i, int) and 0 <= i < len(sysfs)]
                 new, note = intel_spec.plan(arg_list, cfg.get("user_args"), cards, mtp_off=cfg.get("mtp") is False)
                 if note:
-                    print("[strata] " + note, flush=True)
+                    if announce:                                   # (announce=False builds the arguments without any line)
+                        print("[strata] " + note, flush=True)
                     return new
         except Exception as exc:  # noqa: BLE001 - a rule that cannot be read leaves the config's own args
             print(f"[strata] two-card --spec rule skipped: {exc}", flush=True)
