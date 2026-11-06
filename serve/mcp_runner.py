@@ -16,6 +16,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -46,8 +47,15 @@ COMMON_PACKAGE_MAP = {
 
 
 def strip_markdown_fences(code: str) -> str:
-    """Strips markdown code block wrappers (e.g. ```python ... ```) if present."""
+    """Strips markdown code block wrappers (e.g. ```python ... ```) or XML prompt tags if present."""
     s = code.strip()
+    s = re.sub(r"^\s*<tool_call>\s*", "", s, flags=re.IGNORECASE)
+    s = re.sub(r"\s*</tool_call>\s*$", "", s, flags=re.IGNORECASE)
+    s = re.sub(r"^\s*<function=[^>]+>\s*", "", s, flags=re.IGNORECASE)
+    s = re.sub(r"\s*</function>\s*$", "", s, flags=re.IGNORECASE)
+    s = re.sub(r"^\s*<parameter=[^>]+>\s*", "", s, flags=re.IGNORECASE)
+    s = re.sub(r"\s*</parameter>\s*$", "", s, flags=re.IGNORECASE)
+    s = s.strip()
     if s.startswith("```"):
         lines = s.splitlines()
         if lines and lines[0].startswith("```"):
@@ -56,6 +64,69 @@ def strip_markdown_fences(code: str) -> str:
             lines = lines[:-1]
         return "\n".join(lines).strip()
     return s
+
+
+def get_sandboxed_env() -> dict[str, str]:
+    """Builds a minimal, secure environment for the runner with zero host secrets or credentials."""
+    allowed_keys = {
+        "PATH", "PYTHONPATH", "PYTHONHOME", "LANG", "LC_ALL", "LC_CTYPE",
+        "SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT", "TEMP", "TMP"
+    }
+    clean = {k: v for k, v in os.environ.items() if k in allowed_keys}
+    clean["PYTHONDONTWRITEBYTECODE"] = "1"
+    clean["PYTHONUNBUFFERED"] = "1"
+    clean["STRATA_SANDBOX"] = "1"
+    current_pp = clean.get("PYTHONPATH", "")
+    root_str = str(ROOT)
+    clean["PYTHONPATH"] = f"{root_str}{os.pathsep}{current_pp}" if current_pp else root_str
+    return clean
+
+
+def _apply_rlimits():
+    """Applies POSIX resource limits (CPU time, memory) to prevent runaway execution and memory bombs."""
+    try:
+        import resource
+        resource.setrlimit(resource.RLIMIT_CPU, (35, 40))
+        mem_limit = 2 * 1024 * 1024 * 1024  # 2 GiB virtual address space
+        resource.setrlimit(resource.RLIMIT_AS, (mem_limit, mem_limit))
+        max_fsize = 50 * 1024 * 1024  # 50 MiB max file write
+        resource.setrlimit(resource.RLIMIT_FSIZE, (max_fsize, max_fsize))
+    except Exception:
+        pass
+
+
+def _wrap_with_bwrap_if_available(cmd: list[str], scratch_dir: str) -> list[str]:
+    """Wraps runner execution with Bubblewrap container isolation if available on Linux."""
+    if os.name != "posix" or sys.platform == "darwin":
+        return cmd
+    if os.environ.get("STRATA_NO_BWRAP") == "1":
+        return cmd
+    bwrap_bin = shutil.which("bwrap")
+    if not bwrap_bin:
+        return cmd
+
+    bwrap_cmd = [
+        bwrap_bin,
+        "--ro-bind", "/usr", "/usr",
+        "--ro-bind", "/lib", "/lib",
+        "--tmpfs", "/tmp",
+        "--bind", scratch_dir, scratch_dir,
+        "--chdir", scratch_dir,
+        "--unshare-all",
+        "--unshare-net",
+        "--proc", "/proc",
+        "--dev", "/dev",
+    ]
+    if os.path.exists("/lib64"):
+        bwrap_cmd += ["--ro-bind", "/lib64", "/lib64"]
+    if os.path.exists("/bin"):
+        bwrap_cmd += ["--ro-bind", "/bin", "/bin"]
+    if os.path.exists("/etc/alternatives"):
+        bwrap_cmd += ["--ro-bind-try", "/etc/alternatives", "/etc/alternatives"]
+    if sys.prefix:
+        bwrap_cmd += ["--ro-bind-try", sys.prefix, sys.prefix]
+    bwrap_cmd += ["--ro-bind", str(ROOT), str(ROOT)]
+    return bwrap_cmd + cmd
 
 
 def extract_dependencies(code: str) -> list[str]:
@@ -231,7 +302,7 @@ def _run_child():
 
 # ------------------------------------------------------------------------------------------------ the host caller (parent)
 class RunnerHandle:
-    def __init__(self, proc, q, reader_thread, stop_reader, clean_deps):
+    def __init__(self, proc, q, reader_thread, stop_reader, clean_deps, scratch_dir: str | None = None):
         self.proc = proc
         self.q = q
         self.reader_thread = reader_thread
@@ -239,6 +310,7 @@ class RunnerHandle:
         self.deps = set(clean_deps)
         self.last_used = time.monotonic()
         self.lock = threading.Lock()
+        self.scratch_dir = scratch_dir
 
     def alive(self) -> bool:
         return self.proc.poll() is None
@@ -257,6 +329,11 @@ class RunnerHandle:
             except Exception:
                 pass
         _kill_tree(self.proc)
+        if self.scratch_dir and os.path.isdir(self.scratch_dir):
+            try:
+                shutil.rmtree(self.scratch_dir, ignore_errors=True)
+            except Exception:
+                pass
 
 
 _RUNNER_POOL: dict[str, RunnerHandle] = {}
@@ -324,11 +401,16 @@ def execute_in_runner(code: str, hub: McpHub, timeout_s: float, cancel: threadin
                 existing.close()
                 _RUNNER_POOL.pop(session_id, None)
 
+            clean_session = re.sub(r"[^A-Za-z0-9_-]", "_", str(session_id)) or "default"
+            scratch_dir = tempfile.mkdtemp(prefix=f"strata_codemode_{clean_session}_")
+            sandboxed_env = get_sandboxed_env()
+
             extra = {}
             if os.name == "nt":
                 extra["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
             else:
                 extra["start_new_session"] = True
+                extra["preexec_fn"] = _apply_rlimits
 
             uv_bin = shutil.which("uv")
             if uv_bin:
@@ -339,6 +421,8 @@ def execute_in_runner(code: str, hub: McpHub, timeout_s: float, cancel: threadin
             else:
                 cmd = [sys.executable, "-m", "serve.mcp_runner"]
 
+            cmd = _wrap_with_bwrap_if_available(cmd, scratch_dir)
+
             try:
                 proc = lifeline.popen(
                     cmd,
@@ -346,11 +430,15 @@ def execute_in_runner(code: str, hub: McpHub, timeout_s: float, cancel: threadin
                     stdin=subprocess.PIPE,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
-                    cwd=str(ROOT),
-                    env=dict(os.environ),
+                    cwd=scratch_dir,
+                    env=sandboxed_env,
                     **extra
                 )
             except OSError as e:
+                try:
+                    shutil.rmtree(scratch_dir, ignore_errors=True)
+                except Exception:
+                    pass
                 return {"ok": False, "text": f"error: could not start Python runner: {e}", "ms": int((time.monotonic() - t0) * 1000)}
 
             q = queue.Queue()
@@ -366,7 +454,7 @@ def execute_in_runner(code: str, hub: McpHub, timeout_s: float, cancel: threadin
             reader_thread = threading.Thread(target=reader, daemon=True)
             reader_thread.start()
 
-            runner = RunnerHandle(proc, q, reader_thread, stop_reader, clean_deps)
+            runner = RunnerHandle(proc, q, reader_thread, stop_reader, clean_deps, scratch_dir=scratch_dir)
             _RUNNER_POOL[session_id] = runner
 
     with runner.lock:

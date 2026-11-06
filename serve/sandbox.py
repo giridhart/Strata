@@ -14,6 +14,7 @@ import cmath
 import io
 import json
 import math
+import re
 import sys
 import time
 import traceback
@@ -50,8 +51,15 @@ MAX_SESSIONS = 100
 
 
 def strip_markdown_fences(code: str) -> str:
-    """Strips markdown code block wrappers (e.g. ```python ... ```) if present."""
+    """Strips markdown code block wrappers (e.g. ```python ... ```) or stray XML tags if present."""
     s = code.strip()
+    s = re.sub(r"^\s*<tool_call>\s*", "", s, flags=re.IGNORECASE)
+    s = re.sub(r"\s*</tool_call>\s*$", "", s, flags=re.IGNORECASE)
+    s = re.sub(r"^\s*<function=[^>]+>\s*", "", s, flags=re.IGNORECASE)
+    s = re.sub(r"\s*</function>\s*$", "", s, flags=re.IGNORECASE)
+    s = re.sub(r"^\s*<parameter=[^>]+>\s*", "", s, flags=re.IGNORECASE)
+    s = re.sub(r"\s*</parameter>\s*$", "", s, flags=re.IGNORECASE)
+    s = s.strip()
     if s.startswith("```"):
         lines = s.splitlines()
         if lines and lines[0].startswith("```"):
@@ -60,6 +68,160 @@ def strip_markdown_fences(code: str) -> str:
             lines = lines[:-1]
         return "\n".join(lines).strip()
     return s
+
+
+def attempt_syntax_repair(code: str) -> str:
+    """Attempts lightweight auto-repair for common LLM syntax slips like unclosed brackets/parens."""
+    pairs = {"(": ")", "[": "]", "{": "}"}
+    inv = {v: k for k, v in pairs.items()}
+
+    repaired = code
+    for _ in range(5):
+        try:
+            ast.parse(repaired)
+            return repaired
+        except SyntaxError as e:
+            lines = repaired.splitlines()
+            if not lines:
+                return code
+
+            target_idx = (e.lineno - 1) if (e.lineno and 1 <= e.lineno <= len(lines)) else (len(lines) - 1)
+            target_line = lines[target_idx]
+
+            stack = []
+            in_q = None
+            esc = False
+            for ch in target_line:
+                if in_q:
+                    if esc:
+                        esc = False
+                    elif ch == "\\":
+                        esc = True
+                    elif ch == in_q:
+                        in_q = None
+                else:
+                    if ch in ('"', "'"):
+                        in_q = ch
+                    elif ch in pairs:
+                        stack.append(pairs[ch])
+                    elif ch in inv:
+                        if stack and stack[-1] == ch:
+                            stack.pop()
+
+            patch = (in_q or "") + "".join(reversed(stack))
+            if patch:
+                lines[target_idx] = target_line + patch
+                repaired = "\n".join(lines)
+                continue
+
+            # Fallback: check unclosed delimiters across the entire code buffer
+            all_stack = []
+            in_q_all = None
+            esc_all = False
+            for ch in repaired:
+                if in_q_all:
+                    if esc_all:
+                        esc_all = False
+                    elif ch == "\\":
+                        esc_all = True
+                    elif ch == in_q_all:
+                        in_q_all = None
+                else:
+                    if ch in ('"', "'"):
+                        in_q_all = ch
+                    elif ch in pairs:
+                        all_stack.append(pairs[ch])
+                    elif ch in inv:
+                        if all_stack and all_stack[-1] == ch:
+                            all_stack.pop()
+
+            patch_all = (in_q_all or "") + "".join(reversed(all_stack))
+            if patch_all:
+                lines[-1] = lines[-1] + patch_all
+                repaired = "\n".join(lines)
+                continue
+            break
+
+    try:
+        ast.parse(repaired)
+        return repaired
+    except Exception:
+        return code
+
+
+BANNED_MODULES = {
+    "os", "sys", "subprocess", "socket", "urllib", "requests", "http",
+    "shutil", "ctypes", "pathlib", "pty", "platform", "psutil", "winreg",
+    "posix", "importlib", "builtins", "__builtin__"
+}
+BANNED_ATTRIBUTES = {
+    "__subclasses__", "__globals__", "__code__", "__bases__", "__builtins__",
+    "__import__", "__loader__", "__spec__"
+}
+
+
+class SecurityVisitor(ast.NodeVisitor):
+    """Enforces AST-level sandboxing (Layer 2): blocks host inspection, subprocesses, and sandbox escapes."""
+
+    def visit_Import(self, node: ast.Import):
+        for alias in node.names:
+            root = alias.name.split(".")[0]
+            if root in BANNED_MODULES:
+                raise PermissionError(
+                    f"Direct access to module '{root}' is restricted in Code Mode sandbox for host protection. "
+                    f"Use mcp tools for host or external operations."
+                )
+        self.generic_visit(node)
+
+    def visit_ImportFrom(self, node: ast.ImportFrom):
+        if node.module:
+            root = node.module.split(".")[0]
+            if root in BANNED_MODULES:
+                raise PermissionError(
+                    f"Direct import from module '{root}' is restricted in Code Mode sandbox for host protection."
+                )
+        self.generic_visit(node)
+
+    def visit_Attribute(self, node: ast.Attribute):
+        if node.attr in BANNED_ATTRIBUTES:
+            raise PermissionError(
+                f"Access to attribute '{node.attr}' is restricted in Code Mode sandbox."
+            )
+        self.generic_visit(node)
+
+    def visit_Call(self, node: ast.Call):
+        if isinstance(node.func, ast.Name):
+            if node.func.id in ("__import__", "exec", "eval", "compile"):
+                raise PermissionError(
+                    f"Direct invocation of '{node.func.id}()' is restricted in Code Mode sandbox."
+                )
+        self.generic_visit(node)
+
+
+class LoopBoundingTransformer(ast.NodeTransformer):
+    """Injects iteration counters into while and for loops to prevent runaway execution / 30s timeouts."""
+
+    def __init__(self, max_iters: int = 500_000):
+        self.max_iters = max_iters
+
+    def _guard_stmts(self) -> list[ast.stmt]:
+        guard_code = (
+            f"global _st_loop_count\n"
+            f"_st_loop_count += 1\n"
+            f"if _st_loop_count > {self.max_iters}:\n"
+            f"    raise TimeoutError('Loop iteration limit exceeded in Code Mode ({self.max_iters:,} iterations)')"
+        )
+        return ast.parse(guard_code).body
+
+    def visit_While(self, node: ast.While) -> ast.While:
+        self.generic_visit(node)
+        node.body = self._guard_stmts() + node.body
+        return node
+
+    def visit_For(self, node: ast.For) -> ast.For:
+        self.generic_visit(node)
+        node.body = self._guard_stmts() + node.body
+        return node
 
 
 def render_interactive_plot(fig: Any) -> dict[str, Any]:
@@ -278,6 +440,19 @@ def create_base_globals(custom_tools: dict[str, Any] | None = None) -> dict[str,
     except ImportError:
         pass
 
+    def _blocked_input(*a, **kw):
+        raise RuntimeError("Interactive input() is not permitted in Code Mode.")
+
+    def _blocked_open(*a, **kw):
+        raise PermissionError(
+            "Direct filesystem open() is restricted in Code Mode sandbox for host protection. "
+            "Use mcp tools for file operations."
+        )
+
+    env["input"] = _blocked_input
+    env["getpass"] = _blocked_input
+    env["open"] = _blocked_open
+
     # Injected symbolic & logic tools
     if verify_equivalence is not None:
         env["verify_equivalence"] = verify_equivalence
@@ -369,10 +544,13 @@ class LLMSandbox:
                 "error": None,
             }
 
+        clean_code = attempt_syntax_repair(clean_code)
+
         state = self.get_session_state(session_id, custom_tools)
         # Clear previous run's result and plot variables so each turn evaluates fresh
         state["result"] = None
         state["_last_plot"] = None
+        state["_st_loop_count"] = 0
 
         user_stdout = io.StringIO()
         user_stderr = io.StringIO()
@@ -380,7 +558,11 @@ class LLMSandbox:
 
         try:
             tree = ast.parse(clean_code, "<codemode>")
+            # Layer 2 Security sandbox static checks
+            SecurityVisitor().visit(tree)
             ImportAliasTransformer().visit(tree)
+            # Layer 2 Loop bounding / timeout guard injection
+            LoopBoundingTransformer().visit(tree)
             ast.fix_missing_locations(tree)
             assigned_names = extract_assigned_names(tree)
             last_expr = None
