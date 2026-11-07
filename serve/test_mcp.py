@@ -780,6 +780,36 @@ class ToolLoop(unittest.TestCase):
         self.assertIn("const b = 2;", compacted[3]["tool_calls"][0]["function"]["arguments"]["code"])
         self.assertNotIn("omitted for superseded round", compacted[4]["content"])
 
+    def test_compact_superseded_tool_rounds_python(self):
+        from serve.server import compact_superseded_tool_rounds
+        msgs = [
+            {"role": "user", "content": "solve task"},
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"function": {"name": "run_python", "arguments": {"code": "a = 1\n" * 30}}}
+            ]},
+            {"role": "tool", "content": "error: SyntaxError\n" + ("line\n" * 30)},
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"function": {"name": "run_python", "arguments": {"code": "b = 2\n" * 30}}}
+            ]},
+            {"role": "tool", "content": "error: ValueError\n" + ("line\n" * 30)}
+        ]
+        compacted = compact_superseded_tool_rounds(msgs, default_lang="python")
+        # Python Code Mode must use '#' comment prefix, NEVER '//'
+        self.assertEqual(compacted[1]["tool_calls"][0]["function"]["arguments"]["code"],
+                         "# [Superseded failed attempt omitted to conserve context]")
+        self.assertIn("omitted for superseded round", compacted[2]["content"])
+        self.assertIn("b = 2", compacted[3]["tool_calls"][0]["function"]["arguments"]["code"])
+
+    def test_call_codemode_blocks_superseded_placeholder(self):
+        hub = McpHub({}, settings={"codemode": True})
+        res_py = hub.call_codemode({"code": "// [Superseded failed attempt omitted to conserve context]"}, lang="python")
+        self.assertFalse(res_py["ok"])
+        self.assertIn("placeholder stub", res_py["text"])
+
+        res_js = hub.call_codemode({"code": "// [Superseded failed attempt omitted to conserve context]"}, lang="javascript")
+        self.assertFalse(res_js["ok"])
+        self.assertIn("placeholder stub", res_js["text"])
+
 
 class NoServers(unittest.TestCase):
     def test_opt_in_without_servers_is_a_plain_chat(self):

@@ -795,6 +795,11 @@ class McpHub:
         timeout = float(timeout_s if timeout_s is not None else self.settings.get("timeout_s", 60.0))
         session_id = str(arguments.get("session_id") or "default") if isinstance(arguments, dict) else "default"
 
+        if "[Superseded failed attempt" in code:
+            return {"server": "codemode", "tool": tool_name, "ok": False,
+                    "text": "error: Cannot execute placeholder stub. Please provide your actual code solution.",
+                    "chars": 80, "truncated": False, "ms": 0}
+
         if effective_lang in ("javascript", "js"):
             from serve import js_sandbox
             code = js_sandbox.strip_markdown_fences(code)

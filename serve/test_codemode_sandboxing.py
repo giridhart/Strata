@@ -133,6 +133,12 @@ class TestCodeModeSandboxing(unittest.TestCase):
         self.assertTrue(res2["ok"])
         self.assertEqual(res2["result"], [10, 20])
 
+        # Auto-repair C/JS style line comments (//) to Python (#)
+        code3 = "// initialize variable\na = 10\n// compute result\na * 5"
+        res3 = self.sandbox.execute(code3)
+        self.assertTrue(res3["ok"], f"Expected // comment auto-repair to succeed: {res3.get('error')}")
+        self.assertEqual(res3["result"], 50)
+
     def test_layer2_strips_xml_prompt_artifacts(self):
         """Stray <tool_call> or <parameter=code> tags emitted by LLM must be stripped."""
         raw = "<tool_call>\n<function=run_python>\n<parameter=code>\nx = 42\nx * 2\n</parameter>\n</tool_call>"

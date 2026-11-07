@@ -77,11 +77,23 @@ def strip_markdown_fences(code: str) -> str:
 
 
 def attempt_syntax_repair(code: str) -> str:
-    """Attempts lightweight auto-repair for common LLM syntax slips like unclosed brackets/parens."""
+    """Attempts lightweight auto-repair for common LLM syntax slips like unclosed brackets/parens
+    and C/JS-style line comments (//) in Python Code Mode."""
     pairs = {"(": ")", "[": "]", "{": "}"}
     inv = {v: k for k, v in pairs.items()}
 
     repaired = code
+    if "//" in repaired:
+        lines = []
+        for line in repaired.splitlines():
+            stripped = line.lstrip()
+            if stripped.startswith("//"):
+                indent = line[:len(line) - len(stripped)]
+                lines.append(indent + "#" + stripped[2:])
+            else:
+                lines.append(line)
+        repaired = "\n".join(lines)
+
     for _ in range(5):
         try:
             ast.parse(repaired)

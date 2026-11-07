@@ -6891,7 +6891,7 @@ def _debug_req(api, req, messages, tools, max_new, thinking, prompt_tokens):
           f"prompt_tokens={prompt_tokens} last={last.get('role')!r}:{preview!r}", flush=True)
 
 
-def compact_superseded_tool_rounds(messages: list[dict]) -> list[dict]:
+def compact_superseded_tool_rounds(messages: list[dict], default_lang: str = "javascript") -> list[dict]:
     """Compacts older failed tool attempts in the live multi-round loop so failed scripts
     and stack traces don't accumulate in context. Only the most recent round is kept in full."""
     asst_indices = [i for i, m in enumerate(messages) if m.get("role") == "assistant" and m.get("tool_calls")]
@@ -6918,15 +6918,23 @@ def compact_superseded_tool_rounds(messages: list[dict]) -> list[dict]:
         if all_failed:
             for c in calls:
                 fn = c.get("function") or {}
+                fn_name = fn.get("name") or c.get("name") or ""
                 args = fn.get("arguments")
+                is_python = (fn_name in CODEMODE_PYTHON_NAMES or
+                             (not fn_name and str(default_lang).lower() in ("python", "py")) or
+                             (isinstance(args, dict) and str(args.get("language", "")).lower() in ("python", "py")))
+                stub = ("# [Superseded failed attempt omitted to conserve context]" if is_python else
+                        "// [Superseded failed attempt omitted to conserve context]")
                 if isinstance(args, dict) and "code" in args:
                     if len(str(args.get("code", ""))) > 100:
-                        args["code"] = "// [Superseded failed attempt omitted to conserve context]"
+                        args["code"] = stub
                 elif isinstance(args, str) and '"code"' in args:
                     try:
                         parsed = json.loads(args)
                         if "code" in parsed and len(str(parsed.get("code", ""))) > 100:
-                            parsed["code"] = "// [Superseded failed attempt omitted to conserve context]"
+                            if parsed.get("language") and str(parsed.get("language")).lower() in ("python", "py"):
+                                stub = "# [Superseded failed attempt omitted to conserve context]"
+                            parsed["code"] = stub
                             fn["arguments"] = json.dumps(parsed)
                     except Exception:
                         pass
@@ -7085,7 +7093,7 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
                          "tool_calls": [{"function": {"name": c.name, "arguments": c.arguments}} for c in calls]})
         messages += [{"role": "tool", "content": r} for r in results]
         if rounds >= 2:
-            messages = compact_superseded_tool_rounds(messages)
+            messages = compact_superseded_tool_rounds(messages, default_lang=req_lang)
         if rounds >= max_rounds:
             finalizing = True
             tools = None
