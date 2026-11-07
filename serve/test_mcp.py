@@ -757,6 +757,29 @@ class ToolLoop(unittest.TestCase):
         settings = settings_from(cfg)
         self.assertEqual(settings["max_error_chars"], 800)
 
+    def test_compact_superseded_tool_rounds(self):
+        from serve.server import compact_superseded_tool_rounds
+        msgs = [
+            {"role": "user", "content": "solve task"},
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"function": {"name": "run_javascript", "arguments": {"code": "const a = 1;\n" * 20}}}
+            ]},
+            {"role": "tool", "content": "error: SyntaxError\n" + ("line\n" * 30)},
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"function": {"name": "run_javascript", "arguments": {"code": "const b = 2;\n" * 20}}}
+            ]},
+            {"role": "tool", "content": "error: TypeError\n" + ("line\n" * 30)}
+        ]
+        compacted = compact_superseded_tool_rounds(msgs)
+        # Round 1 code should be replaced by stub
+        self.assertEqual(compacted[1]["tool_calls"][0]["function"]["arguments"]["code"],
+                         "// [Superseded failed attempt omitted to conserve context]")
+        # Round 1 tool error should be truncated
+        self.assertIn("omitted for superseded round", compacted[2]["content"])
+        # Round 2 code should stay intact for the model to fix
+        self.assertIn("const b = 2;", compacted[3]["tool_calls"][0]["function"]["arguments"]["code"])
+        self.assertNotIn("omitted for superseded round", compacted[4]["content"])
+
 
 class NoServers(unittest.TestCase):
     def test_opt_in_without_servers_is_a_plain_chat(self):

@@ -265,7 +265,13 @@ function msgActions(m, i) {
     row.appendChild(b);
   };
   const last = i === messages.length - 1;
+  const hasToolError = !!m.error || (m.tools || []).some((t) => !t.ok || t.state === "error");
   if (m.role === "assistant" || last) {
+    if (hasToolError) {
+      add(tr("hist.retryWithFeedback", "Retry with feedback"),
+          tr("hist.retryWithFeedbackTitle", "Retry this question with failure feedback in a clean chat, avoiding context bloat from failed attempts"),
+          () => retryWithFeedbackAt(i));
+    }
     add(tr("hist.regenerate", "Regenerate"), tr("hist.regenerateTitle", "Ask for a new answer to this question. Tools may run again."), () => regenerateAt(i));
   }
   if (m.role === "assistant") add(tr("hist.editAnswer", "Edit answer"), tr("hist.editAnswerTitle", "Correct the answer's text. No request is sent."), () => editAnswerAt(i));
@@ -309,6 +315,55 @@ function regenerateAt(i) {
   }
   commit(plan.keep, tr("hist.replaced", "The answer was replaced"));
   return generateReply();
+}
+
+function retryWithFeedbackAt(i) {
+  if (!historyReady()) return false;
+  const m = messages[i];
+  if (!m) return false;
+  let u = i;
+  while (u >= 0 && messages[u] && messages[u].role !== "user") u--;
+  if (u < 0 || !messages[u]) return false;
+
+  let errSummary = "";
+  if (m.error) {
+    errSummary = m.error;
+  } else if (m.tools && m.tools.length) {
+    const failed = m.tools.filter((t) => !t.ok || t.state === "error");
+    if (failed.length) {
+      errSummary = failed.map((t) => {
+        const first = (t.result || "").split("\n")[0].trim();
+        return (t.tool || t.name) + ": " + (first || "error");
+      }).join("; ");
+    }
+  }
+  if (!errSummary) errSummary = "tool execution error";
+  if (errSummary.length > 200) errSummary = errSummary.slice(0, 195) + "...";
+
+  const feedbackNote = `\n\n[Feedback: Previous attempt encountered: "${errSummary}". Please provide a clean, working solution avoiding this error.]`;
+  const prevUser = messages[u];
+  const newUser = {...prevUser, text: (prevUser.text || "") + feedbackNote};
+
+  if (H.lostAttachments(newUser)) {
+    toast("warn", tr("hist.lostTitle", "Attachments need to be added again"), tr("hist.lostText", "This browser kept their names, not their contents. Start a new chat and attach them again."), 7000);
+    return false;
+  }
+
+  const listOn = settings.chatList && typeof chat !== "undefined" && chat;
+  if (listOn) {
+    const prev = chatId;
+    const base = [...messages.slice(0, u), newUser];
+    const c = H.branch(chat, base, base.length, tr("branch.feedbackTitle", "Retry of {title}", {title: H.chatTitle(chat, untitled())}));
+    chats.push(c);
+    showChat(c);
+    toast("info", tr("branch.retryStarted", "Retry started in new chat"), tr("branch.retryStartedText", "The original chat is preserved in your saved chats."), 6000,
+          {label: tr("branch.back", "Back to it"), run: () => openChat(prev)});
+    return generateReply();
+  } else {
+    const planKeep = [...messages.slice(0, u), newUser];
+    commit(planKeep, tr("hist.feedbackRetry", "Retrying with error feedback"));
+    return generateReply();
+  }
 }
 
 // edit an answer: its text, in place. The old thinking and tool calls go, and so do the messages after it.

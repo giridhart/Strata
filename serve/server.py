@@ -6857,6 +6857,54 @@ def _debug_req(api, req, messages, tools, max_new, thinking, prompt_tokens):
           f"prompt_tokens={prompt_tokens} last={last.get('role')!r}:{preview!r}", flush=True)
 
 
+def compact_superseded_tool_rounds(messages: list[dict]) -> list[dict]:
+    """Compacts older failed tool attempts in the live multi-round loop so failed scripts
+    and stack traces don't accumulate in context. Only the most recent round is kept in full."""
+    asst_indices = [i for i, m in enumerate(messages) if m.get("role") == "assistant" and m.get("tool_calls")]
+    if len(asst_indices) <= 1:
+        return messages
+
+    for idx in asst_indices[:-1]:
+        asst = messages[idx]
+        calls = asst.get("tool_calls") or []
+        j = idx + 1
+        tool_results = []
+        while j < len(messages) and messages[j].get("role") == "tool":
+            tool_results.append(messages[j])
+            j += 1
+
+        all_failed = all(
+            (isinstance(tr.get("content"), str) and tr.get("content", "").startswith("error:")) or
+            (isinstance(tr.get("content"), list) and any(
+                isinstance(p, dict) and str(p.get("text", "")).startswith("error:") for p in tr["content"]
+            ))
+            for tr in tool_results
+        ) if tool_results else False
+
+        if all_failed:
+            for c in calls:
+                fn = c.get("function") or {}
+                args = fn.get("arguments")
+                if isinstance(args, dict) and "code" in args:
+                    if len(str(args.get("code", ""))) > 100:
+                        args["code"] = "// [Superseded failed attempt omitted to conserve context]"
+                elif isinstance(args, str) and '"code"' in args:
+                    try:
+                        parsed = json.loads(args)
+                        if "code" in parsed and len(str(parsed.get("code", ""))) > 100:
+                            parsed["code"] = "// [Superseded failed attempt omitted to conserve context]"
+                            fn["arguments"] = json.dumps(parsed)
+                    except Exception:
+                        pass
+            for tr in tool_results:
+                txt = tr.get("content", "")
+                if isinstance(txt, str) and len(txt) > 160:
+                    first_line = txt.splitlines()[0]
+                    tr["content"] = f"{first_line} [... full traceback omitted for superseded round]"
+
+    return messages
+
+
 # ------------------------------------------------------------------------------------------------ MCP tool loop
 def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new, max_req, sampling, cancel,
                  mcp_names, parser_tools=None):
@@ -6991,10 +7039,19 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
         if cancel.is_set() or len(results) < len(calls):
             done = {**done, "finish": "cancel"}
             break
+        any_failed = any(
+            (isinstance(r, str) and r.startswith("error:")) or
+            (isinstance(r, list) and any(isinstance(p, dict) and str(p.get("text", "")).startswith("error:") for p in r))
+            for r in results
+        )
+        # Drop reasoning_content from intermediate tool rounds when a failure occurred to avoid accumulating thousands
+        # of dead thinking tokens in the retry prompt.
         messages.append({"role": "assistant", "content": "".join(text).strip(),
-                         **({"reasoning_content": "".join(reasoning).strip()} if reasoning else {}),
+                         **({"reasoning_content": "".join(reasoning).strip()} if (reasoning and not any_failed) else {}),
                          "tool_calls": [{"function": {"name": c.name, "arguments": c.arguments}} for c in calls]})
         messages += [{"role": "tool", "content": r} for r in results]
+        if rounds >= 2:
+            messages = compact_superseded_tool_rounds(messages)
         if rounds >= max_rounds:
             finalizing = True
             tools = None
