@@ -51,14 +51,43 @@ class TestCodeModeSandboxing(unittest.TestCase):
             self.assertIn("PermissionError", res["output"])
 
     def test_layer2_blocked_open_and_input(self):
-        """Direct file open() and interactive input() must be blocked in the execution namespace."""
+        """Direct file open() outside workspace and interactive input() must be blocked."""
         res_open = self.sandbox.execute("open('/etc/passwd')")
         self.assertFalse(res_open["ok"])
         self.assertIn("PermissionError", res_open["output"])
 
+        res_traversal = self.sandbox.execute("open('../../outside_secret.txt')")
+        self.assertFalse(res_traversal["ok"])
+        self.assertIn("PermissionError", res_traversal["output"])
+
         res_input = self.sandbox.execute("val = input('enter: ')")
         self.assertFalse(res_input["ok"])
         self.assertIn("RuntimeError", res_input["output"])
+
+    def test_layer2_jailed_workspace_read_write(self):
+        """File I/O inside the designated workspace directory must succeed."""
+        write_code = (
+            "with open('sandbox_test_note.txt', 'w') as f:\n"
+            "    f.write('hello jailed workspace')\n"
+            "with open('sandbox_test_note.txt', 'r') as f:\n"
+            "    content = f.read()\n"
+            "content"
+        )
+        res = self.sandbox.execute(write_code)
+        self.assertTrue(res["ok"], f"Expected workspace write/read to succeed, got: {res.get('error')}")
+        self.assertEqual(res["result"], "hello jailed workspace")
+
+        # Subdirectory auto-creation in workspace
+        subdir_code = (
+            "with open('sub_folder/nested.txt', 'w') as f:\n"
+            "    f.write('nested data')\n"
+            "with open('sub_folder/nested.txt', 'r') as f:\n"
+            "    nested_content = f.read()\n"
+            "nested_content"
+        )
+        res_sub = self.sandbox.execute(subdir_code)
+        self.assertTrue(res_sub["ok"], f"Expected nested workspace write to succeed: {res_sub.get('error')}")
+        self.assertEqual(res_sub["result"], "nested data")
 
     def test_layer2_loop_bounding_prevents_30s_timeout(self):
         """While and for loops must be bounded so infinite loops raise TimeoutError in ms."""
@@ -74,6 +103,21 @@ class TestCodeModeSandboxing(unittest.TestCase):
         res_legit = self.sandbox.execute("total = 0\nfor i in range(100): total += i\ntotal")
         self.assertTrue(res_legit["ok"])
         self.assertEqual(res_legit["result"], 4950)
+
+        # Sequential loops must not raise SyntaxError (used prior to global declaration)
+        res_seq = self.sandbox.execute("tot = 0\nfor i in range(10): tot += i\nfor j in range(10): tot += j\ntot")
+        self.assertTrue(res_seq["ok"], f"Sequential loops failed: {res_seq.get('error')}")
+        self.assertEqual(res_seq["result"], 90)
+
+        # Nested loops must not raise SyntaxError
+        res_nested = self.sandbox.execute("m = 0\nfor i in range(4):\n    for j in range(5):\n        m += 1\nm")
+        self.assertTrue(res_nested["ok"], f"Nested loops failed: {res_nested.get('error')}")
+        self.assertEqual(res_nested["result"], 20)
+
+        # Loops inside functions must not raise SyntaxError
+        res_fn = self.sandbox.execute("def calc():\n    s = 0\n    for x in range(5):\n        s += x\n    return s\ncalc()")
+        self.assertTrue(res_fn["ok"], f"Loop inside function failed: {res_fn.get('error')}")
+        self.assertEqual(res_fn["result"], 10)
 
     def test_layer2_syntax_auto_repair(self):
         """Syntax auto-repair must close unclosed brackets, parens, and quotes without error."""

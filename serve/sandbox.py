@@ -10,15 +10,21 @@ Provides a stateful Python execution environment with:
 from __future__ import annotations
 
 import ast
+import builtins
 import cmath
 import io
 import json
 import math
+import os
+from pathlib import Path
 import re
 import sys
 import time
 import traceback
 from typing import Any
+
+ROOT = Path(__file__).resolve().parent.parent
+WORKSPACE_DIR = Path(os.environ.get("STRATA_WORKSPACE") or (ROOT / "workspace")).resolve()
 
 # Import domain tools for pre-injection into the sandbox namespace
 try:
@@ -205,13 +211,11 @@ class LoopBoundingTransformer(ast.NodeTransformer):
         self.max_iters = max_iters
 
     def _guard_stmts(self) -> list[ast.stmt]:
-        guard_code = (
-            f"global _st_loop_count\n"
-            f"_st_loop_count += 1\n"
-            f"if _st_loop_count > {self.max_iters}:\n"
-            f"    raise TimeoutError('Loop iteration limit exceeded in Code Mode ({self.max_iters:,} iterations)')"
-        )
-        return ast.parse(guard_code).body
+        return [ast.Expr(value=ast.Call(
+            func=ast.Name(id="_st_loop_tick", ctx=ast.Load()),
+            args=[],
+            keywords=[]
+        ))]
 
     def visit_While(self, node: ast.While) -> ast.While:
         self.generic_visit(node)
@@ -353,6 +357,41 @@ def extract_assigned_names(tree: ast.AST) -> set[str]:
     return names
 
 
+def create_jailed_open(workspace_dir: Path | str):
+    """Creates a jailed open() function that restricts file I/O to the workspace directory."""
+    real_ws = os.path.realpath(str(workspace_dir))
+    os.makedirs(real_ws, exist_ok=True)
+
+    def _jailed_open(file, mode="r", *args, **kwargs):
+        if isinstance(file, int):
+            raise PermissionError("Access to raw file descriptors is restricted in Code Mode sandbox.")
+        raw_path = str(file)
+        if not os.path.isabs(raw_path):
+            target = os.path.realpath(os.path.join(real_ws, raw_path))
+        else:
+            target = os.path.realpath(raw_path)
+
+        try:
+            common = os.path.commonpath([real_ws, target])
+        except ValueError:
+            raise PermissionError(
+                f"Access denied: '{file}' is outside the allowed workspace directory ({real_ws})."
+            )
+
+        if common != real_ws:
+            raise PermissionError(
+                f"Access denied: '{file}' is outside the allowed workspace directory ({real_ws})."
+            )
+
+        # Automatically create parent directories on write / append
+        if any(m in mode for m in ("w", "a", "x", "+")):
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+
+        return builtins.open(target, mode, *args, **kwargs)
+
+    return _jailed_open
+
+
 def create_base_globals(custom_tools: dict[str, Any] | None = None) -> dict[str, Any]:
     """Builds a rich, pre-populated execution namespace so models never waste tokens on imports."""
     env: dict[str, Any] = {
@@ -440,18 +479,33 @@ def create_base_globals(custom_tools: dict[str, Any] | None = None) -> dict[str,
     except ImportError:
         pass
 
+    def _st_loop_tick():
+        env["_st_loop_count"] = env.get("_st_loop_count", 0) + 1
+        if env["_st_loop_count"] > 500_000:
+            raise TimeoutError("Loop iteration limit exceeded in Code Mode (500,000 iterations)")
+
+    env["_st_loop_tick"] = _st_loop_tick
+    env["_st_loop_count"] = 0
+
     def _blocked_input(*a, **kw):
         raise RuntimeError("Interactive input() is not permitted in Code Mode.")
 
-    def _blocked_open(*a, **kw):
-        raise PermissionError(
-            "Direct filesystem open() is restricted in Code Mode sandbox for host protection. "
-            "Use mcp tools for file operations."
-        )
-
     env["input"] = _blocked_input
     env["getpass"] = _blocked_input
-    env["open"] = _blocked_open
+    env["open"] = create_jailed_open(WORKSPACE_DIR)
+    env["WORKSPACE_DIR"] = str(WORKSPACE_DIR)
+
+    def _list_workspace_files() -> list[str]:
+        real_ws = os.path.realpath(str(WORKSPACE_DIR))
+        files = []
+        for root, _, filenames in os.walk(real_ws):
+            for fn in filenames:
+                full = os.path.join(root, fn)
+                rel = os.path.relpath(full, real_ws)
+                files.append(rel)
+        return sorted(files)
+
+    env["list_workspace_files"] = _list_workspace_files
 
     # Injected symbolic & logic tools
     if verify_equivalence is not None:
@@ -551,6 +605,13 @@ class LLMSandbox:
         state["result"] = None
         state["_last_plot"] = None
         state["_st_loop_count"] = 0
+
+        def _st_loop_tick():
+            state["_st_loop_count"] += 1
+            if state["_st_loop_count"] > 500_000:
+                raise TimeoutError("Loop iteration limit exceeded in Code Mode (500,000 iterations)")
+
+        state["_st_loop_tick"] = _st_loop_tick
 
         user_stdout = io.StringIO()
         user_stderr = io.StringIO()

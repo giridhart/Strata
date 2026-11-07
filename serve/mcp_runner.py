@@ -71,7 +71,7 @@ def get_sandboxed_env() -> dict[str, str]:
     """Builds a minimal, secure environment for the runner with zero host secrets or credentials."""
     allowed_keys = {
         "PATH", "PYTHONPATH", "PYTHONHOME", "LANG", "LC_ALL", "LC_CTYPE",
-        "SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT", "TEMP", "TMP"
+        "SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT", "TEMP", "TMP", "STRATA_WORKSPACE"
     }
     clean = {k: v for k, v in os.environ.items() if k in allowed_keys}
     clean["PYTHONDONTWRITEBYTECODE"] = "1"
@@ -82,6 +82,8 @@ def get_sandboxed_env() -> dict[str, str]:
     clean["MKL_NUM_THREADS"] = "1"
     clean["NUMEXPR_NUM_THREADS"] = "1"
     clean["VECLIB_MAXIMUM_THREADS"] = "1"
+    workspace_dir = Path(os.environ.get("STRATA_WORKSPACE") or (ROOT / "workspace")).resolve()
+    clean["STRATA_WORKSPACE"] = str(workspace_dir)
     current_pp = clean.get("PYTHONPATH", "")
     root_str = str(ROOT)
     clean["PYTHONPATH"] = f"{root_str}{os.pathsep}{current_pp}" if current_pp else root_str
@@ -196,7 +198,7 @@ def extract_dependencies(code: str) -> list[str]:
         stdlib = getattr(sys, "stdlib_module_names", set())
         local_builtins = {
             "mcp", "serve", "strata", "__main__", "builtins", "json", "math", "cmath", "os", "sys",
-            "px", "go", "sp", "np", "pd", "numpy", "pandas", "sympy", "plotly", "pint", "z3", "ruff", "astropy"
+            "px", "go", "sp", "np", "pd"
         }
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
@@ -353,7 +355,7 @@ def _run_child():
 # ------------------------------------------------------------------------------------------------ the host caller (parent)
 class RunnerHandle:
     def __init__(self, proc, q, reader_thread, stop_reader, clean_deps, scratch_dir: str | None = None,
-                 stderr_lines: collections.deque | None = None):
+                 stderr_lines: collections.deque | None = None, is_ephemeral: bool = False):
         self.proc = proc
         self.q = q
         self.reader_thread = reader_thread
@@ -363,6 +365,7 @@ class RunnerHandle:
         self.lock = threading.Lock()
         self.scratch_dir = scratch_dir
         self.stderr_lines = stderr_lines if stderr_lines is not None else collections.deque(maxlen=50)
+        self.is_ephemeral = is_ephemeral
 
     def alive(self) -> bool:
         return self.proc.poll() is None
@@ -381,7 +384,7 @@ class RunnerHandle:
             except Exception:
                 pass
         _kill_tree(self.proc)
-        if self.scratch_dir and os.path.isdir(self.scratch_dir):
+        if self.scratch_dir and self.is_ephemeral and os.path.isdir(self.scratch_dir):
             try:
                 shutil.rmtree(self.scratch_dir, ignore_errors=True)
             except Exception:
@@ -429,17 +432,17 @@ def execute_in_runner(code: str, hub: McpHub, timeout_s: float, cancel: threadin
     for d in extract_dependencies(clean_code):
         if d not in all_deps:
             all_deps.append(d)
-    BASE_PACKAGES = {
-        "px", "go", "sp", "np", "pd", "plotly", "pandas", "numpy", "sympy",
-        "astropy", "math", "cmath", "json", "os", "sys", "pint", "z3", "ruff"
-    }
+    import importlib.util
     clean_deps = []
     for d in all_deps:
         d_str = str(d).strip()
-        if not d_str or d_str in BASE_PACKAGES:
+        if not d_str:
             continue
         mapped = COMMON_PACKAGE_MAP.get(d_str, d_str)
-        if mapped not in BASE_PACKAGES and mapped not in clean_deps:
+        # Skip if already installed in the base python environment
+        if importlib.util.find_spec(mapped) is not None:
+            continue
+        if mapped not in clean_deps:
             clean_deps.append(mapped)
 
     cleanup_idle_runners()
@@ -453,8 +456,9 @@ def execute_in_runner(code: str, hub: McpHub, timeout_s: float, cancel: threadin
                 existing.close()
                 _RUNNER_POOL.pop(session_id, None)
 
-            clean_session = re.sub(r"[^A-Za-z0-9_-]", "_", str(session_id)) or "default"
-            scratch_dir = tempfile.mkdtemp(prefix=f"strata_codemode_{clean_session}_")
+            workspace_dir = Path(os.environ.get("STRATA_WORKSPACE") or (ROOT / "workspace")).resolve()
+            workspace_dir.mkdir(parents=True, exist_ok=True)
+            scratch_dir = str(workspace_dir)
             sandboxed_env = get_sandboxed_env()
 
             extra = {}
@@ -519,7 +523,7 @@ def execute_in_runner(code: str, hub: McpHub, timeout_s: float, cancel: threadin
             err_thread.start()
 
             runner = RunnerHandle(proc, q, reader_thread, stop_reader, clean_deps, scratch_dir=scratch_dir,
-                                  stderr_lines=stderr_lines)
+                                  stderr_lines=stderr_lines, is_ephemeral=False)
             _RUNNER_POOL[session_id] = runner
 
     with runner.lock:
