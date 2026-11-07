@@ -37,13 +37,25 @@ import urllib.request
 from serve import lifeline
 
 PROTOCOL = "2025-06-18"               # the MCP revision Strata asks for; the server's answer is used as given
-DEFAULTS = {"timeout_s": 60.0, "max_result_chars": 20000, "max_rounds": 8, "start_timeout_s": 120.0, "image_results": False,
+DEFAULTS = {"timeout_s": 60.0, "max_result_chars": 20000, "max_error_chars": 1200, "max_rounds": 8, "start_timeout_s": 120.0, "image_results": False,
             "codemode": False, "codemode_lang": "javascript"}
 
 CODEMODE_PYTHON_NAMES = ("run_python", "python", "py")
 CODEMODE_JS_NAMES = ("run_javascript", "javascript", "js", "run_js")
 CODEMODE_GENERIC_NAMES = ("run_code", "execute_code")
 CODEMODE_CALL_NAMES = frozenset(CODEMODE_PYTHON_NAMES + CODEMODE_JS_NAMES + CODEMODE_GENERIC_NAMES)
+
+
+def truncate_error(text: str, max_chars: int = 1200) -> tuple[str, bool]:
+    """Truncates an error or traceback while preserving the error header and root exception tail."""
+    if max_chars <= 0 or len(text) <= max_chars:
+        return text, False
+    head_len = min(250, max_chars // 4)
+    tail_len = max_chars - head_len - 80
+    head = text[:head_len].rstrip()
+    tail = text[-tail_len:].lstrip()
+    truncated_text = f"{head}\n\n[... truncated {len(text) - max_chars:,} error characters ...]\n\n{tail}"
+    return truncated_text, True
 
 
 class McpError(RuntimeError):
@@ -799,12 +811,16 @@ class McpHub:
             r = mcp_runner.execute_in_runner(code, self, timeout_s=timeout, cancel=cancel, dependencies=deps, session_id=session_id)
 
         text, ok = r["text"], r["ok"]
-        cap = int(self.settings["max_result_chars"])
         full = len(text)
-        truncated = cap > 0 and full > cap
-        if truncated:
-            text = text[:cap] + (f"\n\n[... truncated: the tool returned {full:,} characters; only the first "
-                                 f"{cap:,} are shown]")
+        if not ok:
+            err_cap = int(self.settings.get("max_error_chars", 1200))
+            text, truncated = truncate_error(text, err_cap)
+        else:
+            cap = int(self.settings["max_result_chars"])
+            truncated = cap > 0 and full > cap
+            if truncated:
+                text = text[:cap] + (f"\n\n[... truncated: the tool returned {full:,} characters; only the first "
+                                     f"{cap:,} are shown]")
         out = {"server": "codemode", "tool": tool_name, "ok": ok, "text": text, "chars": full,
                "truncated": truncated, "ms": r["ms"]}
         res = r.get("result")
@@ -852,16 +868,21 @@ class McpHub:
                 raise
             except McpError as e:
                 text, ok = f"error: {e}", False
-        cap = int(self.settings["max_result_chars"])
         full = len(text)
-        if cap > 0 and full > cap:
-            text = text[:cap] + (f"\n\n[... truncated: the tool returned {full:,} characters; only the first "
-                                 f"{cap:,} are shown]")
+        if not ok:
+            err_cap = int(self.settings.get("max_error_chars", 1200))
+            text, truncated = truncate_error(text, err_cap)
+        else:
+            cap = int(self.settings["max_result_chars"])
+            truncated = cap > 0 and full > cap
+            if truncated:
+                text = text[:cap] + (f"\n\n[... truncated: the tool returned {full:,} characters; only the first "
+                                     f"{cap:,} are shown]")
         if ok and out.get("images"):
             out["model_content"] = [{"type": "text", "text": text.replace(": not shown to the model]", ": image attached]")}] + [
                 {"type": "image", "source": str(Path(self.media_dir) / im["url"].split("/")[-1])}
                 for im in out["images"]]
-        out.update(ok=ok, text=text, chars=full, truncated=cap > 0 and full > cap,
+        out.update(ok=ok, text=text, chars=full, truncated=truncated,
                    ms=int((time.monotonic() - t0) * 1000))
         return out
 
@@ -876,7 +897,7 @@ class McpHub:
                             "tools": [{"name": names.get(t["name"], t["name"]), "tool": t["name"],
                                        "description": str(t.get("description") or "")[:300]} for t in s.tools]})
         return {"servers": servers, "tools": len(routes),
-                "settings": {k: self.settings[k] for k in ("timeout_s", "max_result_chars", "max_rounds", "codemode", "codemode_lang")}}
+                "settings": {k: self.settings[k] for k in ("timeout_s", "max_result_chars", "max_error_chars", "max_rounds", "codemode", "codemode_lang")}}
 
     def close(self):
         for s in self.servers.values():
@@ -950,7 +971,7 @@ def settings_from(cfg: dict) -> dict:
             if not number or value <= 0:
                 raise SystemExit(f"[strata] config mcp.{key}={value!r}: expected a number of seconds > 0")
             out[key] = float(value)
-        elif key in ("max_result_chars", "max_rounds"):
+        elif key in ("max_result_chars", "max_error_chars", "max_rounds"):
             if not number or value != int(value) or value < 1:
                 raise SystemExit(f"[strata] config mcp.{key}={value!r}: expected a positive integer")
             out[key] = int(value)

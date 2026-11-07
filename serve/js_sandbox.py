@@ -56,6 +56,90 @@ def inject_js_loop_guards(code: str, max_iters: int = 500_000) -> str:
     return "globalThis._st_loop = 0;\n" + guarded
 
 
+def attempt_js_syntax_repair(code: str, cx: Any = None) -> str:
+    """Attempts lightweight auto-repair for common LLM JavaScript syntax slips like unclosed quotes, brackets, or parens."""
+    pairs = {"(": ")", "[": "]", "{": "}"}
+    inv = {v: k for k, v in pairs.items()}
+    out = []
+    stack: list[str] = []
+    in_q = None
+    esc = False
+    in_line_comment = False
+    in_block_comment = False
+
+    i = 0
+    n = len(code)
+    while i < n:
+        ch = code[i]
+        nxt = code[i + 1] if i + 1 < n else ""
+
+        if in_line_comment:
+            if ch == "\n":
+                in_line_comment = False
+            out.append(ch)
+        elif in_block_comment:
+            if ch == "*" and nxt == "/":
+                in_block_comment = False
+                out.append(ch)
+                out.append(nxt)
+                i += 2
+                continue
+            out.append(ch)
+        elif in_q:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == in_q:
+                in_q = None
+            out.append(ch)
+        else:
+            if ch == "/" and nxt == "/":
+                in_line_comment = True
+                out.append(ch)
+                out.append(nxt)
+                i += 2
+                continue
+            elif ch == "/" and nxt == "*":
+                in_block_comment = True
+                out.append(ch)
+                out.append(nxt)
+                i += 2
+                continue
+            elif ch in ('"', "'", "`"):
+                in_q = ch
+                out.append(ch)
+            elif ch in pairs:
+                stack.append(pairs[ch])
+                out.append(ch)
+            elif ch in inv:
+                if stack and stack[-1] == ch:
+                    stack.pop()
+                out.append(ch)
+            elif ch == ";":
+                # Semicolons are illegal inside array literals: close the unclosed array bracket before ';'
+                patch = []
+                while stack and stack[-1] == "]":
+                    patch.append(stack.pop())
+                if patch:
+                    out.extend(patch)
+                out.append(ch)
+            else:
+                out.append(ch)
+        i += 1
+
+    patch_end = (in_q or "") + ("*/" if in_block_comment else "") + "".join(reversed(stack))
+    repaired = "".join(out) + patch_end
+
+    if cx is not None:
+        try:
+            cx.eval("new Function(" + json.dumps(repaired) + ")")
+            return repaired
+        except Exception:
+            pass
+    return repaired
+
+
 class QuickJSSandbox:
     """Stateful JavaScript sandbox managing isolated QuickJS contexts per session."""
 
@@ -135,6 +219,32 @@ class QuickJSSandbox:
             throw new TypeError("render_interactive_plot() requires a figure object (with data/layout)");
         }
 
+        // Pythonism compatibility aliases for LLMs writing Python idioms in JS
+        const True = true;
+        const False = false;
+        const None = null;
+        const print = (...args) => console.log(...args);
+
+        function len(x) {
+            if (x == null) return 0;
+            if (typeof x.length === 'number') return x.length;
+            if (typeof x.size === 'number') return x.size;
+            if (typeof x === 'object') return Object.keys(x).length;
+            return 0;
+        }
+
+        function range(start, stop, step) {
+            if (stop === undefined) { stop = start; start = 0; }
+            if (step === undefined) { step = 1; }
+            const arr = [];
+            if (step > 0) {
+                for (let i = start; i < stop; i += step) arr.push(i);
+            } else if (step < 0) {
+                for (let i = start; i > stop; i += step) arr.push(i);
+            }
+            return arr;
+        }
+
         const mcp = new Proxy({}, {
             get(target, server) {
                 if (server === 'call') {
@@ -178,8 +288,6 @@ class QuickJSSandbox:
                 "ms": 0,
             }
 
-        guarded_code = inject_js_loop_guards(clean_code)
-
         now = time.monotonic()
         with self.lock:
             self._cleanup_expired(now)
@@ -196,6 +304,9 @@ class QuickJSSandbox:
                         "ms": int((time.monotonic() - t0) * 1000),
                     }
                 self._sessions[session_id] = (now, cx)
+
+        repaired_code = attempt_js_syntax_repair(clean_code, cx)
+        guarded_code = inject_js_loop_guards(repaired_code)
 
         # Clear turn logs & previous plot
         try:

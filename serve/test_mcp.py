@@ -736,6 +736,27 @@ class ToolLoop(unittest.TestCase):
             urllib.request.urlopen(self.base + "/mcp", timeout=10)
         self.svc.api_key = ""
 
+    def test_truncate_error_preserves_head_and_tail(self):
+        from serve.mcp import truncate_error
+        long_err = "Traceback (most recent call last):\n" + ("  File 'lib.py', line 1\n" * 50) + "ZeroDivisionError: division by zero"
+        truncated, was_trunc = truncate_error(long_err, max_chars=400)
+        self.assertTrue(was_trunc)
+        self.assertLessEqual(len(truncated), 450)
+        self.assertTrue(truncated.startswith("Traceback (most recent call last):"))
+        self.assertTrue(truncated.endswith("ZeroDivisionError: division by zero"))
+        self.assertIn("truncated", truncated)
+
+        short_err = "error: small issue"
+        untouched, was_trunc = truncate_error(short_err, max_chars=400)
+        self.assertFalse(was_trunc)
+        self.assertEqual(untouched, short_err)
+
+    def test_settings_max_error_chars(self):
+        from serve.mcp import settings_from
+        cfg = {"mcp": {"max_error_chars": 800}}
+        settings = settings_from(cfg)
+        self.assertEqual(settings["max_error_chars"], 800)
+
 
 class NoServers(unittest.TestCase):
     def test_opt_in_without_servers_is_a_plain_chat(self):

@@ -1248,15 +1248,29 @@ function assistantMessages(m) {
   }
   const out = [];
   let pos = 0;
-  for (const r of [...new Set(ran.map((t) => t.round))]) {
+  const allRounds = [...new Set(ran.map((t) => t.round))].sort((a, b) => a - b);
+  // Superseded failed round pruning: if all tool calls in round R failed (state === 'error' or !t.ok)
+  // and there is a subsequent round in this turn, omit round R from past conversation history so dead
+  // trial-and-error attempts and error traces do not bloat context in subsequent turns.
+  const activeRounds = allRounds.filter((r, idx) => {
+    const calls = ran.filter((t) => t.round === r);
+    const allFailed = calls.every((t) => !t.ok || t.state === "error");
+    const hasLater = idx < allRounds.length - 1;
+    return !(allFailed && hasLater);
+  });
+  for (const r of activeRounds) {
     const calls = ran.filter((t) => t.round === r);
     const at = Math.min(Math.max(pos, calls[0].at || 0), m.text.length);
     out.push({role: "assistant", content: m.text.slice(pos, at).trim(),
               tool_calls: calls.map((t) => ({id: t.id, type: "function", function: {name: t.name, arguments: JSON.stringify(t.arguments || {})}}))});
     for (const t of calls) {
       const pictures = t.vision ? (t.images || []).filter((im) => safeToolMedia(im.url)) : [];
-      const content = pictures.length ? [{type: "text", text: t.result}, ...pictures.map((im) =>
-        ({type: "image_url", image_url: {url: "strata-tool-media:" + im.url.split("/").pop()}}))] : t.result;
+      let resText = t.result;
+      if ((!t.ok || t.state === "error") && typeof resText === "string" && resText.length > 1200) {
+        resText = resText.slice(0, 300) + "\n\n[... truncated historical error ...]\n\n" + resText.slice(-800);
+      }
+      const content = pictures.length ? [{type: "text", text: resText}, ...pictures.map((im) =>
+        ({type: "image_url", image_url: {url: "strata-tool-media:" + im.url.split("/").pop()}}))] : resText;
       out.push({role: "tool", tool_call_id: t.id, content});
     }
     pos = at;

@@ -229,6 +229,46 @@ class TestCodeModeFallbackIsolation(unittest.TestCase):
         tool_msg = next(m for m in steered if m.get("role") == "tool")
         self.assertEqual(tool_msg["content"], "4")
 
+    def test_pythonism_aliases(self):
+        from serve.js_sandbox import execute_js_in_sandbox
+        # Test True, False, None, print, len, range in JS Code Mode
+        code = """
+        print('val:', True, False, None);
+        const l1 = len([10, 20, 30]);
+        const l2 = len({a: 1, b: 2});
+        const r = range(1, 4);
+        ({l1, l2, r})
+        """
+        res = execute_js_in_sandbox(code, None, session_id="test_pythonisms")
+        self.assertTrue(res["ok"], res.get("text"))
+        self.assertIn("val: true false null", res["text"])
+        result = res.get("result")
+        self.assertIsInstance(result, dict)
+        self.assertEqual(result["l1"], 3)
+        self.assertEqual(result["l2"], 2)
+        self.assertEqual(result["r"], [1, 2, 3])
+
+    def test_js_syntax_auto_repair(self):
+        from serve.js_sandbox import execute_js_in_sandbox, attempt_js_syntax_repair
+        # Test unclosed brackets and quotes
+        broken_bracket = "const data = [1, 2, 3"
+        repaired = attempt_js_syntax_repair(broken_bracket)
+        self.assertEqual(repaired, "const data = [1, 2, 3]")
+
+        broken_object = "const obj = {x: 10, y: [1, 2"
+        repaired_obj = attempt_js_syntax_repair(broken_object)
+        self.assertEqual(repaired_obj, "const obj = {x: 10, y: [1, 2]}")
+
+        # Test execution of repaired code in sandbox
+        res = execute_js_in_sandbox("const nums = [1, 2, 3; nums.reduce((a, b) => a + b, 0", None, session_id="test_repair")
+        self.assertTrue(res["ok"], res.get("text"))
+        self.assertEqual(res.get("result"), 6)
+
+        # Test unclosed template literal and parens
+        res2 = execute_js_in_sandbox("console.log(`hello ${1 + 1}", None, session_id="test_repair_template")
+        self.assertTrue(res2["ok"], res2.get("text"))
+        self.assertIn("hello 2", res2["text"])
+
 
 if __name__ == "__main__":
     unittest.main()
