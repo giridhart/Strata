@@ -155,11 +155,18 @@ git apply strata-sycl-b580.patch
 ## 5. Status & Next Session Work Plan
 
 ### Current Status (Completed & Tested)
+- **Commit `3c964b13`**: Upstream Merge v0.2.12 (`146df3c4`), bringing 95 upstream commits (DeepSeek-V4.1-Flash presets, run manifest telemetry, MMQ margin over-read protection, QSA two-pass scorer bounds, prompt chunk split rules, and frontend tool alias extensions).
+- **Commit `3537f122`**: SYCL Port of v0.2.12 optimizations:
+  - Ordered DMA completion via `raise_flag_b_ordered` in `Verifier` (`verify.hpp`, `verify.cpp`) preventing Flag B from racing ahead of in-flight DMA on empty/lean steps.
+  - MMQ Stream-K over-read margin sizing (`mmq_ids_margin.hpp`) in `Prefill` (`prefill.cpp`), allocating sufficient rows to prevent Level Zero GPU page faults.
+  - Two-pass selection diagnostic hook (`tp_status.on("SYCL")`) and F16 MoE stubs (`want_dm_f16`, `dm_f16_used`).
+  - STRATA_MANIFEST telemetry hooks on ready and request loops in `src/program/sycl/generate.cpp`.
+  - STRATA_FORCE_FAULT token-forcing verification hook.
 - **Commit `9ed9888b`**: Upstream Merge v0.2.11 (`9f7d977d`), bringing 208 upstream commits, Unsloth v3.1 Qwen3.8-Flash-Next quant definitions, Q5_0 quantization activation sum fix (-16 offset with quantized sum) ported to SYCL kernels, and full conflict resolution in `CMakeLists.txt` and `server_intel.py`.
 - **Commit `0962e1bc`**: MoE 16-Lane Subgroup GEMV (`s2_expert_grouped.cpp`, Xe2 SIMD16 subgroup matrix multiplication).
 - **Commit `03aaa697`**: Fused Per-Head RMSNorm + RoPE (`src/kernels/sycl/native_rope.cpp`, `rope_parity.cpp`, benchmarks).
 - **Commit `a576809e`**: Multi-Token Router (`native_router_top10_multi`, 256 threads / 8 subgroups) and Residency-Biased Routing (`native_route_resident`, `route_resident_k`).
-- **All Host/Emulation Tests Pass**: Verified 100% pass rate via `./tools/test_sycl.sh cpu`.
+- **All Host/Emulation & SYCL Native Tests Pass**: Verified 100% pass rate via `./tools/test_sycl.sh cpu` (93/93 passed) and `./tools/build_sycl.sh sycl-test` (36/36 passed).
 
 ### Next Session Kernel Porting Tasks
 
