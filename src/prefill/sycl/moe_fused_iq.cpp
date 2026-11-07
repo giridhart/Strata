@@ -820,4 +820,7 @@ void experts_native(const Batch& b, const NativeGeom& g, int n_expert, int64_t n
     ck(0, "experts_native");
 }
 
+void want_dm_f16(bool) {}
+bool dm_f16_used() { return false; }
+
 }  // namespace strata::prefill::fused

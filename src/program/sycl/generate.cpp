@@ -31,6 +31,7 @@
 #include "strata/core/layer.hpp"
 #include "strata/core/layout.hpp"
 #include "strata/core/session.hpp"
+#include "strata/core/run_manifest.hpp"
 #include "strata/core/weights.hpp"
 #include "strata/kernels/cpu/expert.hpp"
 #include "strata/kernels/cpu/pool.hpp"
@@ -5879,6 +5880,7 @@ int main(int argc, char** argv) try {
                 }).detach();
         }
         strata::platform::settle_before_ready();
+        strata::core::manifest::instance().write("ready");   // STRATA_MANIFEST (a no-op unless it is set)
         std::printf("READY %lld stop\n", (long long)o.max_context);  // "stop": this engine honours STOP
         std::fflush(stdout);
         std::string line;
@@ -5897,6 +5899,7 @@ int main(int argc, char** argv) try {
         std::vector<float> img_rows;
         std::vector<const float*> row_ptr;
         while (next_line(line)) {
+            strata::core::manifest::instance().flush_if_dirty("request");   // STRATA_MANIFEST: what the last request added (a no-op when off)
             // #477: every --expert-profile-save-every minutes, before the next request (at QUIT: after the loop)
             if (!heat.empty() && line != "QUIT" && o.expert_profile_save_min > 0 &&
                 Clock::now() - profile_saved_at >= std::chrono::duration<double>(o.expert_profile_save_min * 60.0))

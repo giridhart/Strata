@@ -7,6 +7,8 @@ inline sycl::queue& default_queue() {
 }
 }  // namespace
 #include "strata/prefill/prefill.hpp"
+#include "strata/prefill/mmq_ids_margin.hpp"
+#include "strata/kernels/qsa_two_pass_status.hpp"
 #include "strata/prefill/kva.hpp"
 #include "strata/prefill/kva_floor.hpp"
 #include "strata/core/sm120_series.hpp"
@@ -746,6 +748,14 @@ constexpr int MMQ_GROUP = 16;  // experts per MMQ launch (the gather is per expe
 // product: 640 values).  Those bytes meet zero activations, which is harmless only if they decode to finite numbers -
 // llama.cpp zero-pads after every tensor, and so does a group buffer: this many zeroed bytes follow its last expert.
 constexpr size_t MMQ_TAIL = 4096;
+// J-column tile of ids before it compares the tile with the expert's rows (see mmq_ids_margin.hpp: the margin follows the
+// backend's tile bound).  An expert takes at most one row per token, so max_rows <= T.  Without the slack the table is an
+// exact-sized allocation that can end a 2 MiB page, and the over-read faults at the next one.
+size_t mmq_ids_rows(size_t T) {
+    if (T > (size_t) INT64_MAX / (size_t) K) return 0;
+    return (size_t) mmq::mmq_ids_table_rows((uint64_t) (T * (size_t) K), (uint64_t) T);
+}
+
 struct MmqPlan {
     bool any = false, fallback = true;
     std::vector<char> layer;  // per layer: MMQ
@@ -1147,7 +1157,9 @@ bool Prefill::carve(size_t T, void* alloc) {
     }
     if (mmq_plan().any) {
         const MmqPlan& mp = mmq_plan();
-        m.ids_identity = o.take<int32_t>(T * K, ok);
+        const size_t ids_rows = mmq_ids_rows(T);
+        if (ids_rows == 0) ok = false;
+        m.ids_identity = o.take<int32_t>(ids_rows, ok);
         m.bounds_dev = o.take<int32_t>((size_t)(2 * (m.g->n_expert + m.g->n_expert / MMQ_GROUP + 2)), ok);
         m.grp_gu = o.take<uint8_t>(MMQ_GROUP * mp.gu_max + MMQ_TAIL, ok);
         m.grp_d = o.take<uint8_t>(MMQ_GROUP * mp.d_max + MMQ_TAIL, ok);
@@ -1434,7 +1446,7 @@ uint64_t Prefill::bytes_needed(const core::ModelGeometry& g, const core::Session
     }
     if (mmq_plan().any) {
         const MmqPlan& mp = mmq_plan();
-        o.take<int32_t>(T * K, ok);
+        o.take<int32_t>(mmq_ids_rows(T), ok);
         o.take<int32_t>((size_t)(2 * (g.n_expert + g.n_expert / MMQ_GROUP + 2)), ok);
         o.take<uint8_t>(MMQ_GROUP * mp.gu_max + MMQ_TAIL, ok);
         o.take<uint8_t>(MMQ_GROUP * mp.d_max + MMQ_TAIL, ok);
@@ -1673,7 +1685,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     sycl::queue* cs = m.cs;
     // the MMQ row table lives in the borrowed cache slots, which the refill after a prompt overwrites with experts:
     // write it again for every prompt (a layout is reused as long as the chunk and the slots are the same)
-    if (m.ids_identity != nullptr) mmq::iota(m.ids_identity, m.T * K, m.cs);
+    if (m.ids_identity != nullptr) mmq::iota(m.ids_identity, (int64_t)mmq_ids_rows((size_t)m.T), m.cs);
     // The PLE rows of a chunk are read from the model file on the host (an SSD read per missed row): the chunk
     // after this one is read on a thread while the GPU runs this one, into the other of two buffers.  The rows
     // depend only on the tokens (the two before a position name its n-grams), so this is the same data.
@@ -3454,7 +3466,7 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
                                 (uint64_t)g.ssm_conv_channels * (g.ssm_d_conv - 1);
     int32_t prev[2] = {ss.ple_prev[0], ss.ple_prev[1]};
     PfTimer pt;
-    if (m.ids_identity) mmq::iota(m.ids_identity, m.T * K, m.cs);
+    if (m.ids_identity) mmq::iota(m.ids_identity, (int64_t)mmq_ids_rows((size_t)m.T), m.cs);
     const bool ple_on = ss.ple.ready();
     static const bool ple_batch_env = [] {
         const char* v = std::getenv("STRATA_PLE_BATCH");
@@ -4260,6 +4272,8 @@ int Prefill::stage_count() const {
 }
 
 bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err) {
+    static strata::kernels::two_pass::RequestStatus tp_status(std::getenv("STRATA_SELECT_TWO_PASS"));
+    (void)tp_status.on("SYCL");  // the two-pass scorer is CUDA-only: say once that a set switch is not used
     constexpr bool lm_hip = false;
     if (hand_in_ == nullptr && impl_ &&
         strata::prefill_layer_major_resolve(lm_env_text(), lm_hip, stage_count(), strata::qwen_defaults_026())) {

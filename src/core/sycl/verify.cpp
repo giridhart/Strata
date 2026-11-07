@@ -1860,6 +1860,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     *(volatile uint32_t*)h_flag_ = 0;
     *(volatile uint32_t*)h_flagA_ = 0;
     *(volatile uint32_t*)h_flagB_ = 0;
+    copy_used_ = false;
     std::atomic_thread_fence(std::memory_order_seq_cst);
     last_t_ = T;
     last_pos0_ = pos0;
@@ -2001,7 +2002,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
             sink_.start2[0] = 0;
             std::atomic_thread_fence(std::memory_order_seq_cst);
             *(volatile uint32_t*)h_flagA_ = want;
-            raise_flag(h_flagB_, want);
+            raise_flag_b_ordered(want);
         }
         if (!(test_stall && k + 1 == steps)) *flag = want;
         VDBG("layer %lld: flags updated (want=%u, flagA=%u, flagB=%u, flag=%u)\n",
@@ -2213,6 +2214,28 @@ void Verifier::raise_flag(uint32_t* flag, uint32_t value) {
 #endif
 }
 
+void Verifier::raise_flag_b_ordered(uint32_t want) {
+    if (!copy_used_ || copy_ == nullptr) {
+        raise_flag(h_flagB_, want);
+        return;
+    }
+    FlagSet& fs = flag_sets_[(want - 1) % (sizeof flag_sets_ / sizeof flag_sets_[0])];
+    fs.flag = h_flagB_;
+    fs.value = want;
+    try {
+        copy_->submit([&](sycl::handler& cgh) {
+            cgh.host_task([=]() {
+                raise_flag(fs.flag, fs.value);
+            });
+        });
+    } catch (const sycl::exception& e) {
+        std::fprintf(stderr, "strata DMA: ordered flag B completion failed: %s\n", e.what());
+        std::fflush(stderr);
+        release_gpu_waits(5000);
+        std::abort();
+    }
+}
+
 // Plan v0.3 P6: the PCIe share by DMA.  The copy engine moves the blobs while the CPU computes its own share and the
 // GPU its VRAM experts; a host function raises flag B when they have landed (the graph waits for it before the PCIe
 // groups).  Staging is split between the two token groups of a split window.
@@ -2221,9 +2244,10 @@ void Verifier::fetch_dma(void* ctx, const uint8_t* const* src, int n, size_t byt
     const uint32_t want = v->cur_layer_ + 1;
     VDBG("fetch_dma: layer=%u, want=%u, n=%d, bytes=%zu\n", v->cur_layer_, want, n, bytes);
     if (n <= 0) {
-        raise_flag(v->h_flagB_, want);
+        v->raise_flag_b_ordered(want);
         return;
     }
+    v->copy_used_ = true;
     uint8_t* stage = (uint8_t*)v->sink_.staging;  // this group's half in a split window
     /*
     DPCT1124:425: cudaMemcpyAsync is migrated to asynchronous memcpy API. While
@@ -2233,14 +2257,7 @@ void Verifier::fetch_dma(void* ctx, const uint8_t* const* src, int n, size_t byt
     */
     for (int i = 0; i < n; ++i)
         v->copy_->memcpy(stage + (size_t)i * bytes, src[i], bytes);
-    FlagSet& fs = v->flag_sets_[v->cur_layer_ % (sizeof v->flag_sets_ / sizeof v->flag_sets_[0])];
-    fs.flag = v->h_flagB_;
-    fs.value = want;
-    v->copy_->submit([&](sycl::handler& cgh) {
-        cgh.host_task([=]() {
-            raise_flag(fs.flag, fs.value);
-        });
-    });
+    v->raise_flag_b_ordered(want);
 }
 
 void Verifier::publish_plan(void* ctx) {
@@ -2262,6 +2279,20 @@ bool Verifier::window_logprobs(const int32_t* targets, int T, int64_t pos0, int3
     // run() synchronized cs_ before returning, so the head of this window is complete
     std::vector<float> h((size_t)T * (size_t)n_vocab_);
     get_default_queue().memcpy(h.data(), head_logits_, h.size() * sizeof(float)).wait();
+    // STRATA_FORCE_FAULT=<m>:<bias> (test only, off by default, no output): adds <bias> to the logit of every token id divisible by <m>
+    // before the rows are scored, so the token-forcing checker (tools/force_check.py) can be shown to reject a faulty build
+    {
+        static const std::pair<int64_t, float> fault = [] {
+            const char* v = std::getenv("STRATA_FORCE_FAULT");
+            long long m = 0;
+            float b = 0.0f;
+            if (v != nullptr && std::sscanf(v, "%lld:%f", &m, &b) == 2 && m > 0) return std::make_pair((int64_t)m, b);
+            return std::make_pair((int64_t)0, 0.0f);
+        }();
+        if (fault.first > 0)
+            for (int t = 0; t < T; ++t)
+                for (int64_t v = 0; v < n_vocab_; v += fault.first) h[(size_t)t * (size_t)n_vocab_ + (size_t)v] += fault.second;
+    }
     for (int t = 0; t < T; ++t) {
         const float* row = h.data() + (size_t)t * (size_t)n_vocab_;
         const int32_t tgt = targets[t];
