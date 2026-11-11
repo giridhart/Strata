@@ -540,6 +540,62 @@ static void BM_Xe2_Dense_B6_MMVQ_Rows(benchmark::State& state) {
     sycl::free(d_y, q);
 }
 
+/// Dense IQ4_XS MMVQ benchmark evaluating KREG vs KREG2 across 1-8 columns.
+static void BM_Xe2_Dense_IQ4_XS_MMVQ(benchmark::State& state) {
+    const int K = state.range(0);
+    const int N = state.range(1);
+    const int ncols = state.range(2);
+
+    sycl::queue q{sycl::default_selector_v, {sycl::property::queue::enable_profiling()}};
+
+    const size_t w_bytes = (size_t)N * (K / 256) * 136;
+    const size_t q8_1_bytes = strata::kernels::native_q8_1_bytes(K, ncols);
+    const size_t out_elements = (size_t)N * ncols;
+
+    auto* d_w = sycl::malloc_device<uint8_t>(w_bytes, q);
+    auto* d_x_q8_1 = sycl::malloc_device<uint8_t>(q8_1_bytes, q);
+    auto* d_y = sycl::malloc_device<float>(out_elements, q);
+
+    std::vector<uint8_t> hw(w_bytes, 0x55);
+    for (size_t b = 0; b < w_bytes / 136; ++b) {
+        uint16_t d = 0x2400; // sane fp16
+        std::memcpy(&hw[b * 136], &d, 2);
+    }
+    q.memcpy(d_w, hw.data(), w_bytes).wait();
+    q.memset(d_x_q8_1, 0xAA, q8_1_bytes).wait();
+    q.fill(d_y, 0.0f, out_elements).wait();
+
+    auto launch = [&]() {
+        strata::kernels::native_iq4_xs_mmvq(d_w, d_x_q8_1, d_y, K, N, ncols, &q);
+    };
+
+    for (int w = 0; w < 3; ++w) {
+        launch();
+    }
+    q.wait();
+
+    for (auto _ : state) {
+        auto t0 = std::chrono::steady_clock::now();
+        launch();
+        q.wait();
+        auto t1 = std::chrono::steady_clock::now();
+        state.SetIterationTime(std::chrono::duration<double>(t1 - t0).count());
+    }
+
+    const double bytes_read = (double)w_bytes + (double)q8_1_bytes;
+    const double bytes_written = (double)out_elements * sizeof(float);
+    state.counters["Bandwidth_GBps"] = benchmark::Counter(
+        bytes_read + bytes_written, benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
+    state.counters["TFLOPS"] = benchmark::Counter(
+        2.0 * (double)K * N * ncols, benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
+    state.counters["tokens_per_sec"] = benchmark::Counter(
+        (double)ncols, benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
+
+    sycl::free(d_w, q);
+    sycl::free(d_x_q8_1, q);
+    sycl::free(d_y, q);
+}
+
 // ============================================================================
 // Registration: Qwen3.8-Flash-Next Decode & Prefill Projections
 // ============================================================================
@@ -562,15 +618,32 @@ BENCHMARK(BM_Xe2_Dense_Q6_K_Planar_MMVQ)->UseManualTime()->Args({2560, 10240, 1,
 BENCHMARK(BM_Xe2_Dense_Q6_K_Planar_MMVQ)->UseManualTime()->Args({2560, 10240, 4, 0});
 BENCHMARK(BM_Xe2_Dense_Q6_K_Planar_MMVQ)->UseManualTime()->Args({2560, 10240, 4, 1});
 
+// Register Dense IQ4_XS MMVQ (evaluating KREG vs KREG2 at 5, 6, 8 columns)
+BENCHMARK(BM_Xe2_Dense_IQ4_XS_MMVQ)->UseManualTime()->Args({2560, 2560, 5});
+BENCHMARK(BM_Xe2_Dense_IQ4_XS_MMVQ)->UseManualTime()->Args({2560, 2560, 6});
+BENCHMARK(BM_Xe2_Dense_IQ4_XS_MMVQ)->UseManualTime()->Args({2560, 2560, 8});
+BENCHMARK(BM_Xe2_Dense_IQ4_XS_MMVQ)->UseManualTime()->Args({2560, 10240, 5});
+BENCHMARK(BM_Xe2_Dense_IQ4_XS_MMVQ)->UseManualTime()->Args({2560, 10240, 6});
+BENCHMARK(BM_Xe2_Dense_IQ4_XS_MMVQ)->UseManualTime()->Args({2560, 10240, 8});
+
 // Register B6 MMVQ rows: Q4_K and Q6_K rows 1 vs 2 vs 4
 BENCHMARK(BM_Xe2_Dense_B6_MMVQ_Rows<12>)->Name("BM_Xe2_Dense_B6_MMVQ_Q4_K")->UseManualTime()->Args({2560, 10240, 2, 0});
 BENCHMARK(BM_Xe2_Dense_B6_MMVQ_Rows<12>)->Name("BM_Xe2_Dense_B6_MMVQ_Q4_K")->UseManualTime()->Args({2560, 10240, 2, 1});
 BENCHMARK(BM_Xe2_Dense_B6_MMVQ_Rows<12>)->Name("BM_Xe2_Dense_B6_MMVQ_Q4_K")->UseManualTime()->Args({2560, 10240, 4, 0});
 BENCHMARK(BM_Xe2_Dense_B6_MMVQ_Rows<12>)->Name("BM_Xe2_Dense_B6_MMVQ_Q4_K")->UseManualTime()->Args({2560, 10240, 4, 1});
+BENCHMARK(BM_Xe2_Dense_B6_MMVQ_Rows<12>)->Name("BM_Xe2_Dense_B6_MMVQ_Q4_K")->UseManualTime()->Args({2560, 10240, 5, 0});
+BENCHMARK(BM_Xe2_Dense_B6_MMVQ_Rows<12>)->Name("BM_Xe2_Dense_B6_MMVQ_Q4_K")->UseManualTime()->Args({2560, 10240, 6, 0});
+BENCHMARK(BM_Xe2_Dense_B6_MMVQ_Rows<12>)->Name("BM_Xe2_Dense_B6_MMVQ_Q4_K")->UseManualTime()->Args({2560, 10240, 8, 0});
+BENCHMARK(BM_Xe2_Dense_B6_MMVQ_Rows<13>)->Name("BM_Xe2_Dense_B6_MMVQ_Q5_K")->UseManualTime()->Args({2560, 10240, 5, 0});
+BENCHMARK(BM_Xe2_Dense_B6_MMVQ_Rows<13>)->Name("BM_Xe2_Dense_B6_MMVQ_Q5_K")->UseManualTime()->Args({2560, 10240, 6, 0});
+BENCHMARK(BM_Xe2_Dense_B6_MMVQ_Rows<13>)->Name("BM_Xe2_Dense_B6_MMVQ_Q5_K")->UseManualTime()->Args({2560, 10240, 8, 0});
 BENCHMARK(BM_Xe2_Dense_B6_MMVQ_Rows<14>)->Name("BM_Xe2_Dense_B6_MMVQ_Q6_K")->UseManualTime()->Args({2560, 10240, 2, 0});
 BENCHMARK(BM_Xe2_Dense_B6_MMVQ_Rows<14>)->Name("BM_Xe2_Dense_B6_MMVQ_Q6_K")->UseManualTime()->Args({2560, 10240, 2, 1});
 BENCHMARK(BM_Xe2_Dense_B6_MMVQ_Rows<14>)->Name("BM_Xe2_Dense_B6_MMVQ_Q6_K")->UseManualTime()->Args({2560, 10240, 4, 0});
 BENCHMARK(BM_Xe2_Dense_B6_MMVQ_Rows<14>)->Name("BM_Xe2_Dense_B6_MMVQ_Q6_K")->UseManualTime()->Args({2560, 10240, 4, 1});
+BENCHMARK(BM_Xe2_Dense_B6_MMVQ_Rows<14>)->Name("BM_Xe2_Dense_B6_MMVQ_Q6_K")->UseManualTime()->Args({2560, 10240, 5, 0});
+BENCHMARK(BM_Xe2_Dense_B6_MMVQ_Rows<14>)->Name("BM_Xe2_Dense_B6_MMVQ_Q6_K")->UseManualTime()->Args({2560, 10240, 6, 0});
+BENCHMARK(BM_Xe2_Dense_B6_MMVQ_Rows<14>)->Name("BM_Xe2_Dense_B6_MMVQ_Q6_K")->UseManualTime()->Args({2560, 10240, 8, 0});
 
 // Register all 8 Qwen3.8-Flash-Next decode projections (B=1)
 BENCHMARK(BM_Xe2_GEMV)->UseManualTime()->Args({2560, 48, 1});    // ssm_alpha / ssm_beta [2560, 48]

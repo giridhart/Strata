@@ -105,6 +105,9 @@ mkdir -p "${BUILD_DIR}"
 CMAKE_AOT_FLAG="-DSTRATA_AOT_BMG=OFF"
 if [[ "${AOT_BMG:-0}" == "1" ]]; then
     CMAKE_AOT_FLAG="-DSTRATA_AOT_BMG=ON"
+    if [[ -n "${AOT_DEVICE}" ]]; then
+        CMAKE_AOT_FLAG="${CMAKE_AOT_FLAG} -DSTRATA_AOT_DEVICE=${AOT_DEVICE}"
+    fi
 fi
 
 # Ensure CMake is configured (or reconfigured if requested)

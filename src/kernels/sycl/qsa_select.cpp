@@ -3,6 +3,7 @@
 #include "strata/core/emulate.hpp"
 #include "strata/core/sycl_tuning.hpp"
 #include "strata/kernels/qsa_select.hpp"
+#include "strata/kernels/qsa_select_xmx.hpp"
 
 #include <algorithm>
 #include <cfloat>
@@ -10,9 +11,16 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
+#include <unordered_map>
 
 namespace strata::kernels {
 namespace {
+
+inline sycl::queue& get_default_queue() {
+    static sycl::queue q{sycl::property::queue::in_order()};
+    return q;
+}
 
 constexpr int IDX_DIM = 128, IDX_HEADS = 4, R = 4;
 constexpr int SCORE_WARPS = 8;
@@ -607,7 +615,7 @@ bool qsa_block_scores_rows(const float* pooled, const float* dead, const float* 
     if (nq <= 0) return true;
     if (nq > 4 || s.idx_dim != IDX_DIM || s.idx_n_head != IDX_HEADS || s.idx_block != R) return false;
     static sycl::queue default_queue{sycl::property::queue::in_order()};
-    sycl::queue* q_ptr = stream ? static_cast<sycl::queue*>(stream) : &default_queue;
+    sycl::queue* q_ptr = stream ? static_cast<sycl::queue*>(stream) : &get_default_queue();
     const int n = (int)nq;
     if (n == 1) launch_scores_rows<1>(q_ptr, pooled, dead, q_idx, steps, n, max_blocks, scores);
     else if (n == 2) launch_scores_rows<2>(q_ptr, pooled, dead, q_idx, steps, n, max_blocks, scores);
@@ -629,7 +637,7 @@ void qsa_block_scores_rows(const QsaScoreRows& rows, const float* q_idx, const i
     }();
     const bool early_exit = early;
     static sycl::queue default_queue{sycl::property::queue::in_order()};
-    sycl::queue* q_ptr = stream ? static_cast<sycl::queue*>(stream) : &default_queue;
+    sycl::queue* q_ptr = stream ? static_cast<sycl::queue*>(stream) : &get_default_queue();
     q_ptr->submit([&](sycl::handler& cgh) {
         sycl::local_accessor<float, 1> qs_acc(sycl::range<1>(MQ * IDX_HEADS * IDX_DIM), cgh);
         sycl::local_accessor<int64_t, 1> s_nkv_acc(sycl::range<1>(MQ), cgh);
@@ -670,7 +678,7 @@ bool qsa_block_scores_slots(const float* const* pooled, const float* const* dead
     }();
     const bool early_exit = early;
     static sycl::queue default_queue{sycl::property::queue::in_order()};
-    sycl::queue* q_ptr = stream ? static_cast<sycl::queue*>(stream) : &default_queue;
+    sycl::queue* q_ptr = stream ? static_cast<sycl::queue*>(stream) : &get_default_queue();
     q_ptr->submit([&](sycl::handler& cgh) {
         sycl::local_accessor<float, 1> qs_acc(sycl::range<1>(MQ * IDX_HEADS * IDX_DIM), cgh);
         sycl::local_accessor<int64_t, 1> s_nkv_acc(sycl::range<1>(MQ), cgh);
@@ -697,7 +705,7 @@ void qsa_block_scores(const float* pooled, const float* dead, const float* q_idx
         std::exit(1);
     }
     static sycl::queue default_queue{sycl::property::queue::in_order()};
-    sycl::queue* q_ptr = stream ? static_cast<sycl::queue*>(stream) : &default_queue;
+    sycl::queue* q_ptr = stream ? static_cast<sycl::queue*>(stream) : &get_default_queue();
 
     const char* multi_v = std::getenv("STRATA_SCORES_MULTI");
     const bool multi = (multi_v == nullptr || std::atoi(multi_v) != 0);
@@ -733,19 +741,101 @@ void qsa_block_scores(const float* pooled, const float* dead, const float* q_idx
         });
 }
 
+struct PerDeviceScratch {
+    void* ptr = nullptr;
+    size_t bytes = 0;
+    int64_t cap_blocks = 0;
+    int64_t cap_q = 0;
+    const float* last_pooled = nullptr;
+    int64_t last_key_blocks = 0;
+    int64_t last_max_q = 0;
+};
+static std::mutex g_scratch_mu;
+static std::unordered_map<sycl::device, PerDeviceScratch> g_scratch_cache;
+
+void qsa_block_scores_reduce(const float* S, int64_t ld, int64_t b0, int64_t nb, const float* dead, const float* q_idx,
+                             const int32_t* steps, int64_t nq, int64_t max_blocks, float* scores, void* stream) {
+    if (nq <= 0 || nb <= 0) return;
+    sycl::queue* q_ptr = stream ? static_cast<sycl::queue*>(stream) : &get_default_queue();
+    q_ptr->parallel_for(sycl::range<2>((size_t) nq, (size_t) nb), [=](sycl::id<2> it) {
+        const int64_t qi = (int64_t) it[0], b = b0 + (int64_t) it[1];
+        const int64_t n_kv = steps[qi * kStepCount + kStepNKv], n_bid = steps[qi * kStepCount + kStepNBid];
+        if (b > n_bid || b >= max_blocks) return;
+        float score = 0.0f;
+        if (b == n_bid) {
+            for (int h = 0; h < IDX_HEADS; ++h) {
+                float d = 0.0f;
+                for (int i = 0; i < IDX_DIM; ++i) d += dead[i] * q_idx[(qi * IDX_HEADS + h) * IDX_DIM + i];
+                score += d > 0.0f ? d : 0.0f;
+            }
+            if (n_kv % R != 0) score += 1e9f;
+        } else {
+            for (int h = 0; h < IDX_HEADS; ++h) {
+                const float d = S[(size_t) (qi * IDX_HEADS + h) * (size_t) ld + (size_t) (b - b0)];
+                score += d > 0.0f ? d : 0.0f;
+            }
+        }
+        scores[(size_t) qi * (size_t) max_blocks + (size_t) b] = score;
+    });
+}
+
 bool qsa_block_scores_tc(const float* pooled, const float* dead, const float* q_idx, const int32_t* steps, int64_t nq,
                          int64_t max_blocks, const QsaShapes& s, float* scores, void* stream, int64_t active_blocks) {
-    (void)pooled;
-    (void)dead;
-    (void)q_idx;
-    (void)steps;
-    (void)nq;
-    (void)max_blocks;
-    (void)s;
-    (void)scores;
-    (void)stream;
-    (void)active_blocks;
-    return false;
+    if (nq <= 0) return true;
+    if (s.idx_dim != IDX_DIM || s.idx_n_head != IDX_HEADS || s.idx_block != R) return false;
+    if (!qsa_select_xmx_supported(stream)) return false;
+
+    const int64_t reach = (active_blocks > 0 && active_blocks < max_blocks) ? active_blocks : max_blocks;
+    if (reach <= 0) return false;
+
+    sycl::queue* q_ptr = stream ? static_cast<sycl::queue*>(stream) : &get_default_queue();
+    const sycl::device dev = q_ptr->get_device();
+
+    std::lock_guard<std::mutex> lock(g_scratch_mu);
+    PerDeviceScratch& entry = g_scratch_cache[dev];
+
+    int64_t alloc_blocks = reach;
+    if (max_blocks > 0 && max_blocks <= 131072) {
+        alloc_blocks = std::max(alloc_blocks, max_blocks);
+    } else {
+        alloc_blocks = (alloc_blocks + 4095) / 4096 * 4096;
+    }
+    int64_t alloc_q = std::max(nq, (int64_t) 256);
+
+    bool realloc = false;
+    const uint64_t needed_bytes = qsa_select_xmx_bytes(alloc_blocks, alloc_q);
+    if (!entry.ptr || entry.cap_blocks < reach || entry.cap_q < nq || entry.bytes < needed_bytes) {
+        if (entry.ptr) {
+            try { sycl::free(entry.ptr, *q_ptr); } catch (...) {}
+            entry.ptr = nullptr;
+            entry.bytes = 0;
+        }
+        try {
+            entry.ptr = sycl::malloc_device(needed_bytes, *q_ptr);
+        } catch (...) {
+            entry.ptr = nullptr;
+        }
+        if (!entry.ptr) return false;
+        entry.bytes = needed_bytes;
+        entry.cap_blocks = alloc_blocks;
+        entry.cap_q = alloc_q;
+        realloc = true;
+    }
+
+    QsaSelectXmx xs;
+    xs.scratch = entry.ptr;
+    xs.key_blocks = reach;
+    xs.max_q = entry.cap_q;
+
+    const bool need_split = realloc || (pooled != entry.last_pooled) || (reach != entry.last_key_blocks) || (entry.cap_q != entry.last_max_q);
+    if (need_split) {
+        if (!qsa_select_xmx_keys(xs, pooled, s, stream)) return false;
+        entry.last_pooled = pooled;
+        entry.last_key_blocks = reach;
+        entry.last_max_q = entry.cap_q;
+    }
+
+    return qsa_block_scores_xmx(xs, dead, q_idx, steps, nq, max_blocks, reach, scores, stream);
 }
 
 void qsa_block_topk_ref(const float* scores, const int32_t* steps, int64_t nq, int64_t max_blocks, int64_t cap,
@@ -756,7 +846,7 @@ void qsa_block_topk_ref(const float* scores, const int32_t* steps, int64_t nq, i
         std::exit(1);
     }
     static sycl::queue default_queue{sycl::property::queue::in_order()};
-    sycl::queue* q_ptr = stream ? static_cast<sycl::queue*>(stream) : &default_queue;
+    sycl::queue* q_ptr = stream ? static_cast<sycl::queue*>(stream) : &get_default_queue();
 
     q_ptr->submit([&](sycl::handler& cgh) {
         sycl::local_accessor<int, 1> hist_acc(sycl::range<1>(256), cgh);
@@ -810,7 +900,7 @@ void qsa_block_topk(const float* scores, const int32_t* steps, int64_t nq, int64
         std::exit(1);
     }
     static sycl::queue default_queue{sycl::property::queue::in_order()};
-    sycl::queue* q_ptr = stream ? static_cast<sycl::queue*>(stream) : &default_queue;
+    sycl::queue* q_ptr = stream ? static_cast<sycl::queue*>(stream) : &get_default_queue();
 
     if (reach > fit) {
         q_ptr->submit([&](sycl::handler& cgh) {

@@ -27,6 +27,7 @@
 #include "strata/kernels/s2_expert_grouped.hpp"
 #include "strata/kernels/sampler.hpp"
 #include "strata/kernels/verify_kernels.hpp"
+#include "strata/kernels/resident_plan_mirror.hpp"
 
 #include <chrono>
 #include <cmath>
@@ -982,6 +983,128 @@ static void BM_Xe2_Verify_Logits_Nonfinite(benchmark::State& state) {
     sycl::free(d_flags, q);
 }
 
+// ============================================================================
+// Benchmark: BM_Xe2_Mirror_Stage
+// ============================================================================
+
+static void BM_Xe2_Mirror_Stage(benchmark::State& state) {
+    const int n_staged = state.range(0);
+    constexpr size_t BLOB_BYTES = 1536 * 1024;  // 1.5 MiB expert blob
+    constexpr int K = 10;
+    const long long capx = (long long)strata::kernels::kVerifyMaxT * K;
+    const long long ptr_off = ((4 + (capx + 1) + 2 * capx) + 1) & ~1ll;
+    const size_t plan_words = (size_t)(ptr_off + 4 * capx + capx + 16);
+
+    sycl::queue q{sycl::default_selector_v, {sycl::property::queue::in_order(), sycl::property::queue::enable_profiling()}};
+
+    auto* d_mhost = sycl::malloc_host<uint8_t>(n_staged * BLOB_BYTES, q);
+    auto* d_mvram = sycl::malloc_device<uint8_t>(n_staged * BLOB_BYTES, q);
+    auto* d_plan  = sycl::malloc_device<int32_t>(plan_words, q);
+    auto* d_src   = sycl::malloc_device<unsigned long long>(n_staged, q);
+
+    std::vector<int32_t> plan(plan_words, 0);
+    plan[2] = n_staged;
+    std::vector<unsigned long long> src(n_staged);
+    unsigned long long* pptr = (unsigned long long*)(plan.data() + ptr_off);
+    for (int j = 0; j < n_staged; ++j) {
+        src[j] = (unsigned long long)(d_mhost + j * BLOB_BYTES);
+        pptr[capx + j] = (unsigned long long)(d_mvram + j * BLOB_BYTES);
+    }
+    q.memcpy(d_plan, plan.data(), plan_words * sizeof(int32_t)).wait();
+    q.memcpy(d_src, src.data(), n_staged * sizeof(unsigned long long)).wait();
+    q.memset(d_mhost, 0x42, n_staged * BLOB_BYTES).wait();
+
+    // Warmup
+    for (int w = 0; w < 5; ++w) {
+        strata::kernels::mirror_stage(d_plan, capx, BLOB_BYTES, d_src, &q);
+        q.wait();
+    }
+
+    for (auto _ : state) {
+        auto t0 = std::chrono::steady_clock::now();
+        strata::kernels::mirror_stage(d_plan, capx, BLOB_BYTES, d_src, &q);
+        q.wait();
+        auto t1 = std::chrono::steady_clock::now();
+        state.SetIterationTime(std::chrono::duration<double>(t1 - t0).count());
+    }
+
+    const double total_bytes = (double)n_staged * (double)BLOB_BYTES;
+    state.counters["Blobs_M"] = benchmark::Counter((double)n_staged);
+    state.counters["Bandwidth_GBps"] = benchmark::Counter(total_bytes, benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
+
+    sycl::free(d_mhost, q);
+    sycl::free(d_mvram, q);
+    sycl::free(d_plan, q);
+    sycl::free(d_src, q);
+}
+
+// ============================================================================
+// Benchmark: BM_Xe2_Mirror_Ring_Lookup
+// ============================================================================
+
+static void BM_Xe2_Mirror_Ring_Lookup(benchmark::State& state) {
+    const int B = state.range(0);
+    constexpr int K = 10;
+    const int n_entries = B * K;
+    constexpr int NE = 512;
+    const long long capx = (long long)strata::kernels::kVerifyMaxT * K;
+    const long long ptr_off = ((4 + (capx + 1) + 2 * capx) + 1) & ~1ll;
+    const size_t plan_words = (size_t)(ptr_off + 4 * capx + capx + 16);
+
+    sycl::queue q{sycl::default_selector_v, {sycl::property::queue::in_order(), sycl::property::queue::enable_profiling()}};
+
+    auto* d_ids   = sycl::malloc_device<int32_t>(128, q);
+    auto* d_res   = sycl::malloc_device<int32_t>(NE, q);
+    auto* d_plan  = sycl::malloc_device<int32_t>(plan_words, q);
+    auto* d_src   = sycl::malloc_device<unsigned long long>(capx, q);
+    auto* d_err   = sycl::malloc_device<uint32_t>(1, q);
+    auto* d_tab   = sycl::malloc_device<unsigned long long>(NE, q);
+
+    std::vector<int32_t> ids(n_entries);
+    for (int i = 0; i < n_entries; ++i) ids[i] = i % 16;
+    q.memcpy(d_ids, ids.data(), n_entries * sizeof(int32_t)).wait();
+
+    std::vector<int32_t> res(NE, -1);
+    std::vector<unsigned long long> mtab(NE);
+    for (int e = 0; e < NE; ++e) mtab[e] = 0x7f0000000000ull + e * 4096;
+    q.memcpy(d_res, res.data(), NE * sizeof(int32_t)).wait();
+    q.memcpy(d_tab, mtab.data(), NE * sizeof(unsigned long long)).wait();
+
+    strata::kernels::resident_plan_set_mirror(d_res, d_tab, nullptr, NE);
+    std::string rerr;
+    strata::kernels::mirror_ring_create(256, 4096, rerr);
+    uint8_t* const stage = reinterpret_cast<uint8_t*>(uintptr_t(0x50000000));
+    strata::kernels::resident_plan_set_stage(stage, 4096, d_src, true);
+
+    // Warmup (populates ring)
+    for (int w = 0; w < 5; ++w) {
+        strata::kernels::resident_plan(d_ids, n_entries, K, d_res, NE, nullptr, nullptr, 1337, d_plan, capx, nullptr, 0u, &q, d_err);
+        q.wait();
+    }
+
+    for (auto _ : state) {
+        auto t0 = std::chrono::steady_clock::now();
+        strata::kernels::resident_plan(d_ids, n_entries, K, d_res, NE, nullptr, nullptr, 1337, d_plan, capx, nullptr, 0u, &q, d_err);
+        q.wait();
+        auto t1 = std::chrono::steady_clock::now();
+        state.SetIterationTime(std::chrono::duration<double>(t1 - t0).count());
+    }
+
+    state.counters["Batch_B"] = benchmark::Counter((double)B);
+    state.counters["Entries_N"] = benchmark::Counter((double)n_entries);
+    state.counters["plans_per_sec"] = benchmark::Counter(1.0, benchmark::Counter::kIsIterationInvariantRate, benchmark::Counter::kIs1000);
+
+    strata::kernels::resident_plan_set_stage(nullptr, 0, nullptr);
+    strata::kernels::resident_plan_set_mirror(nullptr, nullptr, nullptr, 0);
+
+    sycl::free(d_ids, q);
+    sycl::free(d_res, q);
+    sycl::free(d_plan, q);
+    sycl::free(d_src, q);
+    sycl::free(d_err, q);
+    sycl::free(d_tab, q);
+}
+
 BENCHMARK(BM_Xe2_Router_Sequential)->Arg(1)->Arg(2)->Arg(4)->Arg(8)->UseManualTime();
 BENCHMARK(BM_Xe2_Router_MultiToken)->Arg(1)->Arg(2)->Arg(4)->Arg(8)->UseManualTime();
 BENCHMARK(BM_Xe2_Route_Resident)->Arg(1)->Arg(2)->Arg(4)->Arg(8)->UseManualTime();
@@ -997,6 +1120,8 @@ BENCHMARK(BM_Xe2_Verify_Argmax_MultiBlock)->Arg(1)->Arg(2)->Arg(4)->Arg(8)->UseM
 BENCHMARK(BM_Xe2_Verify_RowTopProb_SingleBlock)->Arg(1)->Arg(2)->Arg(4)->Arg(8)->UseManualTime();
 BENCHMARK(BM_Xe2_Verify_RowTopProb_MultiBlock)->Arg(1)->Arg(2)->Arg(4)->Arg(8)->UseManualTime();
 BENCHMARK(BM_Xe2_Verify_Logits_Nonfinite)->Arg(1)->Arg(2)->Arg(4)->Arg(8)->UseManualTime();
+BENCHMARK(BM_Xe2_Mirror_Stage)->Arg(1)->Arg(2)->Arg(4)->Arg(8)->UseManualTime();
+BENCHMARK(BM_Xe2_Mirror_Ring_Lookup)->Arg(1)->Arg(2)->Arg(4)->Arg(8)->UseManualTime();
 
 BENCHMARK_MAIN();
 

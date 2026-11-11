@@ -224,19 +224,9 @@ bool conversation_kv_validate(const ConversationKv& image, const QsaState& st, c
     return true;
 }
 
-bool conversation_kv_restore(const ConversationKv& image, const QsaState& st, const ModelGeometry& g, int64_t upto,
-                             bool index, std::string& error) {
-    if (!conversation_kv_validate(image, st, g, upto, index, error)) return false;
-    const std::array<const ConversationBuffer*, 5> src = {&image.k, &image.v, &image.k_scale, &image.v_scale,
-                                                          &image.pooled};
-    const auto dst = pools(st);
-    for (size_t i = 0; i < src.size(); ++i)
-        if (!src[i]->visit(0, src[i]->size(), [&](const uint8_t* p, size_t n, size_t at) {
-                return transfer(static_cast<uint8_t*>(dst[i]) + at, p, n, error);
-            }))
-            return false;
-    // VRAM slots still contain the outgoing conversation. Resolve must refill
-    // them from the restored authoritative pools before any attention reads.
+namespace {
+bool refresh_residency(const QsaState& st, const ModelGeometry& g, int64_t upto, std::string& error) {
+    (void) error;
     if (st.kv_mode == 1) strata::kernels::kv_stream_reset(st.map, nullptr);
     if (st.kv_mode == 2 && upto > 0) {
         auto shapes = strata::kernels::qsa_real_shapes();
@@ -248,6 +238,115 @@ bool conversation_kv_restore(const ConversationKv& image, const QsaState& st, co
     }
     return true;
 }
+} // namespace
+
+bool conversation_kv_restore(const ConversationKv& image, const QsaState& st, const ModelGeometry& g, int64_t upto,
+                             bool index, std::string& error) {
+    if (!conversation_kv_validate(image, st, g, upto, index, error)) return false;
+    const std::array<const ConversationBuffer*, 5> src = {&image.k, &image.v, &image.k_scale, &image.v_scale,
+                                                          &image.pooled};
+    const auto dst = pools(st);
+    for (size_t i = 0; i < src.size(); ++i)
+        if (!src[i]->visit(0, src[i]->size(), [&](const uint8_t* p, size_t n, size_t at) {
+                return transfer(static_cast<uint8_t*>(dst[i]) + at, p, n, error);
+            }))
+            return false;
+    return refresh_residency(st, g, upto, error);
+}
+
+bool conversation_kv_restore_prefix(const ConversationKv& image, const QsaState& st, const ModelGeometry& g,
+                                    int64_t captured, int64_t upto, bool index, std::string& error) {
+    if (upto < 0 || upto > captured) {
+        error = "conversation snapshot: prefix beyond the captured K/V";
+        return false;
+    }
+    if (!conversation_kv_validate(image, st, g, captured, index, error)) return false;
+    Layout l{};
+    if (!layout(st, g, upto, index, l, error) || !valid(st, l, upto, error)) return false;
+    const std::array<size_t, 5> sizes = {l.data, l.value_data, l.scales, l.value_scales, l.pooled};
+    const std::array<const ConversationBuffer*, 5> src = {&image.k, &image.v, &image.k_scale, &image.v_scale, &image.pooled};
+    for (size_t i = 0; i < src.size(); ++i)
+        if (sizes[i] > src[i]->size()) { error = "conversation snapshot: prefix beyond the K/V payload"; return false; }
+    const auto dst = pools(st);
+    for (size_t i = 0; i < src.size(); ++i)
+        if (!src[i]->visit(0, sizes[i], [&](const uint8_t* p, size_t n, size_t at) {
+                return transfer(static_cast<uint8_t*>(dst[i]) + at, p, n, error);
+            })) return false;
+    return refresh_residency(st, g, upto, error);
+}
+
+bool conversation_kv_head_validate(const KvStoreLayer& h, const QsaState& st, const ModelGeometry& g, int64_t upto, bool index,
+                                   std::string& error) {
+    Layout l{};
+    if (!layout(st, g, upto, index, l, error) || !valid(st, l, upto, error)) return false;
+    const std::array<size_t, 5> sizes = {l.data, l.value_data, l.scales, l.value_scales, l.pooled};
+    if (h.format != l.format || h.cells != l.cells || h.heads != g.n_head_kv || h.head_dim != g.head_dim ||
+        h.page_size != l.page_size || h.pooled_rows != l.pooled_rows || h.idx_dim != g.idx_key_dim) {
+        error = "conversation snapshot: incompatible K/V geometry";
+        return false;
+    }
+    const auto dst = pools(st);
+    for (size_t i = 0; i < sizes.size(); ++i) {
+        if (h.sizes[i] != sizes[i]) { error = "conversation snapshot: invalid K/V payload size"; return false; }
+        if (sizes[i] && !dst[i]) { error = "conversation snapshot: missing target state buffer"; return false; }
+    }
+    return true;
+}
+
+bool conversation_kv_put(const QsaState& st, size_t part, uint64_t offset, const uint8_t* data, size_t n, std::string& error) {
+    const auto dst = pools(st);
+    if (part >= dst.size() || !dst[part]) { error = "conversation snapshot: missing target state buffer"; return false; }
+    return transfer(static_cast<uint8_t*>(dst[part]) + offset, data, n, error);
+}
+
+bool conversation_kv_put_done(const QsaState& st, const ModelGeometry& g, int64_t upto, std::string& error) {
+    return refresh_residency(st, g, upto, error);
+}
+
+bool conversation_kv_part_sizes(const QsaState& st, const ModelGeometry& g, int64_t upto, bool index,
+                                std::array<uint64_t, 5>& sizes, std::string& error) {
+    Layout l{};
+    if (!layout(st, g, upto, index, l, error)) return false;
+    sizes = {l.data, l.value_data, l.scales, l.value_scales, l.pooled};
+    return true;
+}
+
+bool conversation_kv_keep_sizes(const QsaState& st, const ModelGeometry& g, int64_t upto, bool index, int64_t unchanged,
+                                std::array<uint64_t, 5>& keep, std::string& error) {
+    Layout l{};
+    if (!layout(st, g, upto, index, l, error)) return false;
+    if (unchanged < 0 || unchanged > upto) { error = "conversation snapshot: invalid unchanged prefix"; return false; }
+    const int64_t whole_cells = (unchanged / l.page_size) * l.page_size;
+    const std::array<size_t, 5> sizes = {l.data, l.value_data, l.scales, l.value_scales, l.pooled};
+    for (size_t i = 0; i < 4; ++i)
+        keep[i] = l.cells ? (uint64_t) (sizes[i] / size_t(l.cells)) * (uint64_t) whole_cells : 0;
+    keep[4] = index ? (uint64_t) (unchanged / strata::kernels::qsa_real_shapes().idx_block) * (uint64_t) g.idx_key_dim * 4 : 0;
+    for (size_t i = 0; i < 5; ++i) keep[i] = std::min<uint64_t>(keep[i], sizes[i]);
+    return true;
+}
+
+bool conversation_kv_source(SessionKvSource& out, const QsaState& st, const ModelGeometry& g,
+                            int64_t upto, bool index, std::string& error) {
+    Layout l{};
+    if (!layout(st, g, upto, index, l, error) || !valid(st, l, upto, error)) return false;
+    SessionKvSource s;
+    s.format = l.format; s.cells = l.cells; s.heads = g.n_head_kv; s.head_dim = g.head_dim;
+    s.page_size = l.page_size; s.pooled_rows = l.pooled_rows; s.idx_dim = g.idx_key_dim;
+    s.sizes = {l.data, l.value_data, l.scales, l.value_scales, l.pooled};
+    const auto src = pools(st);
+    const auto sizes = s.sizes;
+    auto why = std::make_shared<std::string>();
+    s.read = [src, sizes, why](size_t part, size_t offset, void* dst, size_t n) {
+        if (part >= 5 || offset > sizes[part] || n > sizes[part] - offset) { *why = "K/V read out of range"; return false; }
+        return transfer(dst, src[part] ? static_cast<const uint8_t*>(src[part]) + offset : nullptr, n, *why);
+    };
+    s.error = [why] { return *why; };
+    out = std::move(s);
+    return true;
+}
+
+void conversation_park_join() {}
+void conversation_park_join_for(const SavedConversation&) {}
 
 bool conversation_kv_verify(const ConversationKv& image, const QsaState& st, const ModelGeometry& g, int64_t upto,
                             bool index, uint64_t& fingerprint, std::string& error) {

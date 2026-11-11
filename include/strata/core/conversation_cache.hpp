@@ -1,4 +1,3 @@
-#ifdef SYCL_LANGUAGE_VERSION
 // CPU-only ownership and matching policy for --serve's parked conversations.
 // Token equality, image identity, and steering mode are all required for reuse.
 #pragma once
@@ -10,11 +9,29 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <memory>
 #include <utility>
 #include <vector>
 
+#if defined(__GLIBC__)
+#include <malloc.h>
+#endif
+
 namespace strata::core {
+
+/// #5697: hands the memory this process freed back to the system where the C library keeps it in its heap (glibc:
+/// malloc_trim, every arena; freed pages inside the heap are released, not only its top).  MemAvailable, which the
+/// RAM gates read, counts only what was handed back.  False where there is no such call (Windows, macOS, musl: their
+/// allocators return large blocks on free).  Costs a walk over the heap's free chunks: call it when RAM is short.
+inline bool release_free_heap() {
+#if defined(__GLIBC__)
+    ::malloc_trim(0);
+    return true;
+#else
+    return false;
+#endif
+}
 
 struct ConversationImageKey {
     int64_t start = 0;
@@ -34,6 +51,11 @@ struct ConversationCheckpoint {
     // from, so retention never evicts it (conv_cache.hpp) and a parked conversation holding it stays parked.  A run-time
     // mark only: it is not in the session file, a request that pins the same prefix again sets it.
     bool pinned = false;
+    // The end of the system prompt (the first turn boundary of a prompt read from token 0, --prompt-cache-root): the
+    // point every new conversation of the same client mounts through.  Retention never evicts it (conv_cache.hpp keeps
+    // the chain's shortest item too, which with --prompt-cache-every is a periodic checkpoint INSIDE a long system
+    // prompt, not its end).  Unlike `pinned` it does not keep a parked conversation parked.  Run-time only.
+    bool root = false;
     // --prefill-pipe on a layer split: the plan a prompt segment [from, to) is read in - its chunk (0: none), the loan
     // its buffers were laid out for (which experts the prompt reads in place and which it streams: that sets bits
     // too), the pipe value it was planned with, whether it is one chunk and whether the plan changed the buffers'
@@ -126,7 +148,7 @@ inline ConversationCheckpointSplit conversation_checkpoints_split(std::vector<Co
         if (c.stage_parts.size() != stages) continue;
         for (size_t k = 0; k < stages; ++k) {
             ConversationCheckpoint part;
-            part.ids = c.ids; part.imgs = c.imgs; part.used = c.used; part.pinned = c.pinned;
+            part.ids = c.ids; part.imgs = c.imgs; part.used = c.used; part.pinned = c.pinned; part.root = c.root;
             out.parts[k].push_back(std::move(part));
         }
     }
@@ -238,6 +260,19 @@ int64_t conversation_prefix(const ConversationCheckpoint& c, const std::vector<T
     return (int64_t) n;
 }
 
+/// Where `prompt` and `other` part ways when they are SIBLINGS: two conversations that share a start (a sibling agent: the
+/// same tools and system prompt up to its working-directory line) and then differ, so a checkpoint there serves the next
+/// sibling.  The shared start is less than half of both; a conversation that goes on past a client's rewrite of its own
+/// last turn diverges near its end (the turn checkpoints serve that), a conversation going on diverges nowhere (`other`
+/// is a prefix of the prompt).  0 when they are not siblings.
+template<class Token>
+int64_t conversation_divergence(const std::vector<Token>& prompt, const std::vector<int32_t>& other) {
+    const size_t m = std::min(prompt.size(), other.size());
+    size_t k = 0;
+    while (k < m && (int64_t) other[k] == (int64_t) prompt[k]) ++k;
+    return k < other.size() && k * 2 < other.size() && k * 2 < prompt.size() ? (int64_t) k : 0;
+}
+
 class ConversationCache {
 public:
     struct Match {
@@ -257,6 +292,18 @@ public:
     bool wants(int64_t tokens) const { return min_tokens_ <= 0 || tokens >= min_tokens_; }
     size_t bytes() const { return bytes_ + reuse_.bytes(); }
     size_t size() const { return entries_.size(); }
+    /// Gets every entry evict_oldest() removes (the SSD tier writes it to a file); the entry is moved out, so a sink that
+    /// does not keep it just drops it.  It returns true when it kept the entry: that is not an eviction (the "evictions="
+    /// counter the server reads stays as it was: a thread whose conversation went to disk still has its place).  Not called
+    /// for drop_superseded() or clear().
+    void set_victim_sink(std::function<bool(SavedConversation&&)> sink) { sink_ = std::move(sink); }
+    /// The longest divergence point (conversation_divergence) between the prompt and any parked conversation.
+    template<class Token>
+    int64_t divergence(const std::vector<Token>& prompt) const {
+        int64_t best = 0;
+        for (const auto& e : entries_) best = std::max(best, conversation_divergence(prompt, e.live.ids));
+        return best;
+    }
     size_t evictions() const { return evictions_; }
     // the longest parked conversation, in tokens (--kv-grow keeps the K/V that long while it could be restored)
     int64_t longest_tokens() const {
@@ -396,27 +443,23 @@ public:
         while (!entries_.empty() && (entries_.size() >= slots_ || bytes_ > budget_ - held - incoming)) {
             // the oldest entry that does not hold a pinned shared prefix leaves; with only pinned ones left the new
             // image does not fit (the caller skips parking it - the pinned prefix is what the queries come back to)
-            if (!evict_oldest()) return false;
+            if (!drop_oldest()) return false;
         }
         return true;
     }
 
-    // The parked conversation that has gone unused the longest.  This is make_room()'s loop body, so
-    // the parking path can also free RAM one entry at a time on demand (see the physical-RAM admission
-    // gate in generate.cpp).  A ConversationBuffer is a list of 16 MiB segments and each segment is its
-    // own allocation, far above glibc's mmap threshold, so dropping an entry returns the whole footprint
-    // to the kernel at once - the next admission check reads it back from /proc/meminfo.
+    // The parked conversation that has gone unused the longest, for the callers that free RAM one entry at a time
+    // and read MemAvailable after each (the physical-RAM admission gate in generate.cpp, session_save_reclaim).
+    // #5697: a ConversationBuffer's segments are plain allocations of up to 16 MiB; once glibc's dynamic mmap
+    // threshold has risen (the first freed segment raises it), they come from the heap, and free() hands back only
+    // the heap's top - an entry below a newer one stayed resident and the gate read no change.  So the freed memory
+    // is handed back here (release_free_heap).  make_room() drops entries without it: its room is for the image
+    // that is allocated right after, which reuses that memory.
     // False when none can go (empty, or only entries that hold a pinned shared prefix are left).
     bool evict_oldest() {
-        // the oldest entry that holds no pinned shared prefix and is not the guarded (borrowed) donor
-        for (size_t i = 0; i < entries_.size(); ++i) {
-            if (entries_[i].pinned() || (guarded_ != 0 && serials_[i] == guarded_)) continue;
-            bytes_ -= entries_[i].bytes();
-            erase(i);
-            ++evictions_;
-            return true;
-        }
-        return false;
+        if (!drop_oldest()) return false;
+        release_free_heap();
+        return true;
     }
 
     // #879: every parked conversation (pinned ones too) and the retained K/V go - after non-finite logits any of them
@@ -527,6 +570,19 @@ public:
     }
 
 private:
+    // evict_oldest() without handing the memory back (make_room's loop)
+    bool drop_oldest() {
+        // the oldest entry that holds no pinned shared prefix and is not the guarded (borrowed) donor
+        for (size_t i = 0; i < entries_.size(); ++i) {
+            if (entries_[i].pinned() || (guarded_ != 0 && serials_[i] == guarded_)) continue;
+            SavedConversation victim = std::move(entries_[i]);
+            bytes_ -= victim.bytes();
+            erase(i);
+            if (!(sink_ && sink_(std::move(victim)))) ++evictions_;
+            return true;
+        }
+        return false;
+    }
     void erase(size_t index) {
         entries_.erase(entries_.begin() + (std::ptrdiff_t) index);
         serials_.erase(serials_.begin() + (std::ptrdiff_t) index);
@@ -538,227 +594,7 @@ private:
     uint64_t next_serial_ = 1, guarded_ = 0;
     bool guard_blocked_ = false;
     ConversationKvReuse reuse_;
+    std::function<bool(SavedConversation&&)> sink_;
 };
 
 } // namespace strata::core
-
-#else
-// CPU-only ownership and matching policy for --serve's parked conversations.
-// Token equality, image identity, and steering mode are all required for reuse.
-#pragma once
-
-#include "strata/core/conversation_buffer.hpp"
-
-#include <algorithm>
-#include <array>
-#include <cstddef>
-#include <cstdint>
-#include <deque>
-#include <utility>
-#include <vector>
-
-namespace strata::core {
-
-struct ConversationImageKey {
-    int64_t start = 0;
-    uint64_t hash = 0;
-    bool operator==(const ConversationImageKey&) const = default;
-};
-
-struct ConversationCheckpoint {
-    std::vector<int32_t> ids;
-    std::vector<ConversationImageKey> imgs;
-    std::vector<uint8_t> gdn, ple, tails, dead, block_pos;
-    uint64_t used = 0; // upstream root-pinned/LRU checkpoint retention
-    // Ordinary layer-split checkpoints retain each device's running state.
-    // Whole-session parking is currently single-GPU and rejects these parts.
-    std::vector<ConversationCheckpoint> stage_parts;
-
-    size_t bytes() const {
-        size_t n = ids.capacity() * sizeof(int32_t) + imgs.capacity() * sizeof(ConversationImageKey) +
-               gdn.capacity() + ple.capacity() + tails.capacity() + dead.capacity() + block_pos.capacity() +
-               stage_parts.capacity() * sizeof(ConversationCheckpoint);
-        for (const auto& part : stage_parts) n += part.bytes();
-        return n;
-    }
-};
-
-// Identity-layout K/V pages and completed indexer rows. For streamed layers the
-// source is the authoritative host pool, NOT the replaceable VRAM slots.
-struct ConversationKv {
-    int format = 0;
-    int64_t cells = 0, heads = 0, head_dim = 0, page_size = 0, pooled_rows = 0, idx_dim = 0;
-    ConversationBuffer k, v, k_scale, v_scale, pooled;
-    size_t bytes() const {
-        return k.bytes() + v.bytes() + k_scale.bytes() + v_scale.bytes() + pooled.bytes();
-    }
-};
-
-struct ConversationKvReuse {
-    std::vector<ConversationKv> kv;
-    // Original image extent for validation, and the earliest subsequent rewrite.
-    int64_t captured_tokens = 0, unchanged_tokens = 0;
-    size_t bytes() const {
-        size_t n = kv.capacity() * sizeof(ConversationKv);
-        for (const auto& layer : kv) n += layer.bytes();
-        return n;
-    }
-};
-
-struct SavedConversation {
-    // Runtime compatibility only; NOT a model/weights identity or disk schema.
-    std::array<int64_t, 18> geometry{};
-    // The session's layer carve the image was captured from ([0, n_layers) on one GPU); restore requires the same.
-    int64_t layer_lo = 0, layer_hi = 0;
-    ConversationCheckpoint live;
-    std::vector<ConversationCheckpoint> checkpoints;
-    std::vector<ConversationKv> kv; // main layers followed by the draft layer
-    bool cvec = true;
-
-    size_t bytes() const {
-        size_t n = live.bytes() + checkpoints.capacity() * sizeof(ConversationCheckpoint) +
-                   kv.capacity() * sizeof(ConversationKv);
-        for (const auto& c : checkpoints) n += c.bytes();
-        for (const auto& k : kv) n += k.bytes();
-        return n;
-    }
-};
-
-template<class Token>
-int64_t conversation_prefix(const ConversationCheckpoint& c, const std::vector<Token>& prompt,
-                            const std::vector<ConversationImageKey>& images) {
-    const size_t n = c.ids.size();
-    // The last prompt token always starts the next verify window.
-    if (n == 0 || n >= prompt.size() || !std::equal(c.ids.begin(), c.ids.end(), prompt.begin())) return 0;
-    size_t j = 0;
-    for (const auto& image : images) {
-        if (image.start >= (int64_t) n) continue;
-        if (j == c.imgs.size() || !(c.imgs[j++] == image)) return 0;
-    }
-    if (j != c.imgs.size()) return 0;
-    return (int64_t) n;
-}
-
-class ConversationCache {
-public:
-    struct Match {
-        size_t index = 0;
-        int64_t tokens = 0;
-        bool live = false;
-    };
-
-    ConversationCache(size_t budget, size_t slots) : budget_(budget), slots_(slots) {}
-    bool enabled() const { return budget_ != 0 && slots_ != 0; }
-    size_t bytes() const { return bytes_ + reuse_.bytes(); }
-    size_t size() const { return entries_.size(); }
-    size_t evictions() const { return evictions_; }
-
-    // Retain only the restored K/V buffers, not duplicate running checkpoints.
-    // This optimization never evicts a parked conversation to make itself fit.
-    void retain(std::vector<ConversationKv>&& kv, int64_t tokens) {
-        reuse_ = {};
-        ConversationKvReuse candidate{std::move(kv), tokens, tokens};
-        if (enabled() && candidate.bytes() <= budget_ - bytes_) reuse_ = std::move(candidate);
-    }
-    void limit_reuse(int64_t first_dirty) {
-        reuse_.unchanged_tokens = std::min(reuse_.unchanged_tokens, first_dirty);
-        if (reuse_.unchanged_tokens <= 0) reuse_ = {};
-    }
-    ConversationKvReuse take_reuse() { return std::exchange(reuse_, {}); }
-    size_t retained_bytes() const { return reuse_.bytes(); }
-    bool can_fit(size_t incoming, size_t held = 0) const {
-        return enabled() && held <= budget_ && incoming <= budget_ - held &&
-               entries_.size() < slots_ && bytes() <= budget_ - held - incoming;
-    }
-
-    template<class Token>
-    Match best(const std::vector<Token>& prompt, const std::vector<ConversationImageKey>& images, bool cvec) const {
-        Match best;
-        // Ties prefer the most recently parked branch. The caller prefers its
-        // already-active state when that offers the same prefix length.
-        for (size_t i = entries_.size(); i-- > 0;) {
-            const auto& e = entries_[i];
-            if (e.cvec != cvec) continue;
-            auto consider = [&](const ConversationCheckpoint& c, bool live) {
-                const int64_t n = conversation_prefix(c, prompt, images);
-                if (n > best.tokens) best = {i, n, live};
-            };
-            consider(e.live, true);
-            for (const auto& c : e.checkpoints) consider(c, false);
-        }
-        return best;
-    }
-
-    SavedConversation take(size_t index) {
-        SavedConversation out = std::move(entries_.at(index));
-        bytes_ -= out.bytes();
-        entries_.erase(entries_.begin() + (std::ptrdiff_t) index);
-        return out;
-    }
-
-    // Reserve before allocating a snapshot. held is an incoming image removed
-    // with take() but still alive during the exchange; count it against RAM too.
-    bool make_room(size_t incoming, size_t held = 0) {
-        if (!enabled() || held > budget_ || incoming > budget_ - held) return false;
-        if (bytes() > budget_ - held - incoming) reuse_ = {};
-        while (!entries_.empty() && (entries_.size() >= slots_ || bytes_ > budget_ - held - incoming)) {
-            bytes_ -= entries_.front().bytes();
-            entries_.pop_front();
-            ++evictions_;
-        }
-        return true;
-    }
-
-    // #342: drop the parked entries an outgoing conversation (its live tokens and checkpoint chain) supersedes:
-    // the same conversation a turn back, whose DEEPEST checkpoint the outgoing chain still holds, so all it adds
-    // is the tail the client rewrote (the reply as it was generated, before the next request re-rendered it) and
-    // checkpoints older than that one.  A subagent's successive turns parked one such copy each, and make_room's
-    // oldest-first eviction then pushed the parent conversation out after `slots` turns.  An entry without
-    // checkpoints, or whose deepest checkpoint the outgoing chain does not hold (another conversation that only
-    // shares the system prompt's root with it), is kept.  Returns how many were dropped.
-    size_t drop_superseded(const std::vector<int32_t>& ids, const std::vector<ConversationImageKey>& images,
-                           const std::vector<ConversationCheckpoint>& checkpoints, bool cvec) {
-        auto held = [&](const ConversationCheckpoint& c) {
-            if (c.ids == ids && c.imgs == images) return true;
-            for (const auto& k : checkpoints)
-                if (k.ids == c.ids && k.imgs == c.imgs) return true;
-            return false;
-        };
-        size_t dropped = 0;
-        for (size_t i = 0; i < entries_.size();) {
-            const auto& e = entries_[i];
-            const ConversationCheckpoint* deepest = nullptr;
-            for (const auto& c : e.checkpoints)
-                if (!deepest || c.ids.size() > deepest->ids.size()) deepest = &c;
-            if (e.cvec == cvec && deepest && !deepest->ids.empty() && held(*deepest)) {
-                bytes_ -= e.bytes();
-                entries_.erase(entries_.begin() + (std::ptrdiff_t) i);
-                ++dropped;
-                continue;
-            }
-            ++i;
-        }
-        superseded_ += dropped;
-        return dropped;
-    }
-    size_t superseded() const { return superseded_; }
-
-    bool put(SavedConversation&& image, size_t held = 0) {
-        const size_t n = image.bytes();
-        if (!enabled() || held > budget_ || n > budget_ - held) return false;   // make_room's refusal, first
-        drop_superseded(image.live.ids, image.live.imgs, image.checkpoints, image.cvec);
-        if (!make_room(n, held)) return false;
-        entries_.push_back(std::move(image));
-        bytes_ += n;
-        return true;
-    }
-
-private:
-    size_t budget_ = 0, slots_ = 0, bytes_ = 0, evictions_ = 0, superseded_ = 0;
-    std::deque<SavedConversation> entries_; // least recently active first
-    ConversationKvReuse reuse_;
-};
-
-} // namespace strata::core
-
-#endif

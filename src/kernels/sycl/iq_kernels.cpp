@@ -54,6 +54,7 @@ inline int swar_ne4(unsigned x) {
     x = (x | (x >> 1)) & 0x01010101u;
     return (int)(x * 0xFFu);
 }
+inline uint32_t sgn01(uint32_t n) { return (n * 0x00204081u) & 0x01010101u; }
 inline int swar_sub4(unsigned a, unsigned s) {
     return (int)(((a & 0x7F7F7F7Fu) + (s & 0x01010101u)) ^ (a & 0x80808080u));
 }
@@ -188,17 +189,28 @@ inline float vec_dot_q2_0_q8_1(const void* __restrict__ vbq, const block_q8_1* _
     return d2 * d8 * sumi;
 }
 
+#ifndef STRATA_IQ_XXS_SGNMUL
+#define STRATA_IQ_XXS_SGNMUL 1
+#endif
+
 inline float vec_dot_iq2_xxs_q8_1(const void* __restrict__ vbq, const block_q8_1* __restrict__ bq8_1, const int& kbx,
                                   const int& iqs) {
     const block_iq2_xxs* bq2 = (const block_iq2_xxs*)vbq + kbx;
-    const int q2 = get_int_b2(bq2->qs, iqs);
-    const uint8_t* aux8 = (const uint8_t*)&q2;
-    const uint32_t aux32 = get_int_b2(bq2->qs, iqs + 1);
+    const sycl::int2 qq = load8_a2((const uint8_t*)bq2->qs + 4 * iqs);
+    const uint32_t q2 = (uint32_t)qq.x(), aux32 = (uint32_t)qq.y();
     int sumi = 0;
 #pragma unroll
-    for (int k0 = 0; k0 < 8; k0 += 2) {
-        const sycl::uint2 grid_pos = ((const sycl::uint2*)iq2xxs_grid)[aux8[k0 / 2]];
-        const uint32_t signs = unpack_ksigns(aux32 >> (7 * k0 / 2));
+    for (int k = 0; k < 4; ++k) {
+        const uint32_t gi = (q2 >> (8 * k)) & 0xFF;
+        const sycl::uint2 grid_pos = ((const sycl::uint2*)iq2xxs_grid)[gi];
+#if STRATA_IQ_XXS_SGNMUL
+        const uint32_t c7 = (aux32 >> (7 * k)) & 0x7F;
+        const uint32_t sb = c7 | ((sycl::popcount(c7) & 1u) << 7);
+        const uint32_t t0 = sgn01(sb & 0x0F), t1 = sgn01(sb >> 4);
+        const int grid0 = (int)((grid_pos.x() ^ (t0 * 0xFFu)) + t0);
+        const int grid1 = (int)((grid_pos.y() ^ (t1 * 0xFFu)) + t1);
+#else
+        const uint32_t signs = unpack_ksigns(aux32 >> (7 * k));
 #if STRATA_IQ3S_SIGN_FAST
         const int signs0 = iq3s_sign_mask(signs);
         const int signs1 = iq3s_sign_mask(signs >> 4);
@@ -207,10 +219,11 @@ inline float vec_dot_iq2_xxs_q8_1(const void* __restrict__ vbq, const block_q8_1
         const int signs1 = vectorized_binary<sycl::uchar4>(signs & 0x80402010, 0, std::not_equal_to<>());
 #endif
         const int grid0 = iq3s_apply_sign(grid_pos.x(), signs0);
-        const int u0 = get_int_b4(bq8_1[iqs / 2].qs, k0 + 0);
-        sumi = ggml_cuda_dp4a(grid0, u0, sumi);
         const int grid1 = iq3s_apply_sign(grid_pos.y(), signs1);
-        const int u1 = get_int_b4(bq8_1[iqs / 2].qs, k0 + 1);
+#endif
+        const int u0 = get_int_b4(bq8_1[iqs / 2].qs, 2 * k + 0);
+        sumi = ggml_cuda_dp4a(grid0, u0, sumi);
+        const int u1 = get_int_b4(bq8_1[iqs / 2].qs, 2 * k + 1);
         sumi = ggml_cuda_dp4a(grid1, u1, sumi);
     }
     const int ls = aux32 >> 27 | 1;
@@ -971,21 +984,29 @@ struct Split<16> {  // IQ2_XXS
     template <bool STAGE_GRID = false>
     static W load(const void* __restrict__ vbq, int kbx, int iqs, const uint32_t* __restrict__ s_grid = nullptr) {
         const block_iq2_xxs* bq2 = (const block_iq2_xxs*)vbq + kbx;
-        const int q2 = get_int_b2(bq2->qs, iqs);
-        const uint8_t* aux8 = (const uint8_t*)&q2;
-        const uint32_t aux32 = get_int_b2(bq2->qs, iqs + 1);
+        const sycl::int2 qq = load8_a2((const uint8_t*)bq2->qs + 4 * iqs);
+        const uint32_t q2 = (uint32_t)qq.x(), aux32 = (uint32_t)qq.y();
         const sycl::uint2* grid_lut;
         if constexpr (STAGE_GRID) grid_lut = (const sycl::uint2*)s_grid;
         else grid_lut = (const sycl::uint2*)iq2xxs_grid;
         W r;
 #pragma unroll
-        for (int k0 = 0; k0 < 8; k0 += 2) {
-            const sycl::uint2 grid_pos = grid_lut[aux8[k0 / 2]];
-            const uint32_t signs = unpack_ksigns(aux32 >> (7 * k0 / 2));
+        for (int k = 0; k < 4; ++k) {
+            const uint32_t gi = (q2 >> (8 * k)) & 0xFF;
+            const sycl::uint2 grid_pos = grid_lut[gi];
+#if STRATA_IQ_XXS_SGNMUL
+            const uint32_t c7 = (aux32 >> (7 * k)) & 0x7F;
+            const uint32_t sb = c7 | ((sycl::popcount(c7) & 1u) << 7);
+            const uint32_t t0 = sgn01(sb & 0x0F), t1 = sgn01(sb >> 4);
+            r.g[2 * k + 0] = (int)((grid_pos.x() ^ (t0 * 0xFFu)) + t0);
+            r.g[2 * k + 1] = (int)((grid_pos.y() ^ (t1 * 0xFFu)) + t1);
+#else
+            const uint32_t signs = unpack_ksigns(aux32 >> (7 * k));
             const int signs0 = vectorized_binary<sycl::uchar4>(signs & 0x08040201, 0, std::not_equal_to<>());
-            r.g[k0 + 0] = vectorized_binary<sycl::uchar4>(grid_pos.x() ^ signs0, signs0, std::minus<>());
+            r.g[2 * k + 0] = vectorized_binary<sycl::uchar4>(grid_pos.x() ^ signs0, signs0, std::minus<>());
             const int signs1 = vectorized_binary<sycl::uchar4>(signs & 0x80402010, 0, std::not_equal_to<>());
-            r.g[k0 + 1] = vectorized_binary<sycl::uchar4>(grid_pos.y() ^ signs1, signs1, std::minus<>());
+            r.g[2 * k + 1] = vectorized_binary<sycl::uchar4>(grid_pos.y() ^ signs1, signs1, std::minus<>());
+#endif
         }
         r.ls = aux32 >> 27 | 1;
         r.dw = sycl::vec<sycl::half, 1>(bq2->d).convert<float, sycl::rounding_mode::automatic>()[0];
@@ -3379,10 +3400,848 @@ void launch_mmvq(const uint8_t* W, size_t rb, const block_q8_1* X, float* y, int
                         });  // 8 at a time past 8
 }
 
+// ---------------------------------------------------------------- SYCL port: STRATA_IQ_DECODE_FAST=1 (opt-in)
+#include "iq_decode_tables.inc"
+#ifndef STRATA_IQ_SGNMUL
+#define STRATA_IQ_SGNMUL 1
+#endif
+constexpr bool kIqSgnMul = STRATA_IQ_SGNMUL != 0;
+
+namespace iq_fast {
+inline sycl::uint4 ks_mask(uint32_t code7) { return reinterpret_cast<const sycl::uint4*>(kIqKsignMask)[code7 & 0x7F]; }
+inline int sgn(uint32_t g, uint32_t m, uint32_t m1) { return (int) ((g ^ m) + m1); }   // m1 = m & 0x01010101
+inline float h2f(const sycl::half& h) {
+    return sycl::vec<sycl::half, 1>(h).convert<float, sycl::rounding_mode::automatic>()[0];
+}
+inline uint32_t q2_spread4(uint32_t b) {
+    uint32_t t = (b | (b << 12)) & 0x000F000Fu;
+    t = (t | (t << 6)) & 0x03030303u;
+    return (t + 0x7F7F7F7Fu) ^ 0x80808080u;   // no carry: c + 0x7F <= 0x82
+}
+inline uint32_t sgn01(uint32_t n) { return (n * 0x00204081u) & 0x01010101u; }
+inline void acts8(const block_q8_1* y, int iqs, int* u, float& ds) {
+#pragma unroll
+    for (int j = 0; j < 8; ++j) u[j] = get_int_b4(y[iqs / 2].qs, j);
+    ds = y[iqs / 2].ds[0];
+}
+inline sycl::int4 ld_i4(const int* p) {
+    sycl::int4 v;
+    v.load(0, sycl::address_space_cast<sycl::access::address_space::global_space, sycl::access::decorated::no>(p));
+    return v;
+}
+inline void acts8v(const block_q8_1* b, int* u, float& ds) {
+    const int* p = reinterpret_cast<const int*>(b->qs);
+    const sycl::int4 lo = ld_i4(p), hi = ld_i4(p + 4);
+    u[0] = lo.x(); u[1] = lo.y(); u[2] = lo.z(); u[3] = lo.w();
+    u[4] = hi.x(); u[5] = hi.y(); u[6] = hi.z(); u[7] = hi.w();
+    ds = b->ds[0];
+}
+inline sycl::int2 load8_a2v(const uint8_t* p) {
+    const uintptr_t a = reinterpret_cast<uintptr_t>(p);
+    const int* q = reinterpret_cast<const int*>(a & ~uintptr_t(3));
+    sycl::int2 w;
+    w.load(0, sycl::address_space_cast<sycl::access::address_space::global_space, sycl::access::decorated::no>(q));
+    if (!(a & 2)) return w;
+    const uint32_t w0 = (uint32_t) w.x(), w1 = (uint32_t) w.y(), w2 = (uint32_t) q[2];
+    return sycl::int2((int) ((w0 >> 16) | (w1 << 16)), (int) ((w1 >> 16) | (w2 << 16)));
+}
+}  // namespace iq_fast
+
+struct MultiW { int w[8]; int a = 0, b = 0; float d = 0.f; };
+
+template <int TY> struct IqFast { static constexpr bool has = false; };
+
+template <> struct IqFast<16> {   // iq2_xxs
+    static constexpr bool has = true; static constexpr int NW = 8, BS = sizeof(block_iq2_xxs);
+    inline static void prep(const uint8_t* blk, int iqs, MultiW& m) { prep_t<false>(blk, iqs, m, nullptr); }
+    template <bool TS, bool V2 = false, bool SM = false>
+    inline static void prep_t(const uint8_t* blk, int iqs, MultiW& m, const uint64_t* tab) {
+        const block_iq2_xxs* bq2 = (const block_iq2_xxs*) blk;
+        const sycl::int2 qq = V2 ? iq_fast::load8_a2v((const uint8_t*) bq2->qs + 4 * iqs)
+                                 : load8_a2((const uint8_t*) bq2->qs + 4 * iqs);
+        const uint32_t q2 = (uint32_t) qq.x(), aux32 = (uint32_t) qq.y();
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            const uint32_t gi = (q2 >> (8 * k)) & 0xFF;
+            sycl::uint2 g;
+            sycl::uint4 s;
+            if constexpr (TS) {
+                const uint64_t v = tab[gi];
+                g = sycl::uint2((uint32_t) v, (uint32_t) (v >> 32));
+                if constexpr (SM) {
+                    const uint32_t c7 = (aux32 >> (7 * k)) & 0x7F;
+                    const uint32_t sb = c7 | ((sycl::popcount(c7) & 1u) << 7);
+                    const uint32_t t0 = iq_fast::sgn01(sb & 0x0F), t1 = iq_fast::sgn01(sb >> 4);
+                    s = sycl::uint4(t0 * 0xFFu, t1 * 0xFFu, t0, t1);
+                } else {
+                    s = reinterpret_cast<const sycl::uint4*>(tab + 256)[(aux32 >> (7 * k)) & 0x7F];
+                }
+            } else {
+                g = ((const sycl::uint2*) iq2xxs_grid)[gi];
+                s = iq_fast::ks_mask(aux32 >> (7 * k));
+            }
+            m.w[2 * k + 0] = iq_fast::sgn(g.x(), s.x(), s.z());
+            m.w[2 * k + 1] = iq_fast::sgn(g.y(), s.y(), s.w());
+        }
+        m.a = (int) (aux32 >> 27 | 1);
+        m.d = iq_fast::h2f(bq2->d);
+    }
+    inline static void acts(const block_q8_1* y, int iqs, int* u, float& ds) { iq_fast::acts8(y, iqs, u, ds); }
+    inline static float finish(int s0, int s1, const MultiW& m, float ds) {
+        const int sumi = (s0 + s1) * m.a / 8;
+        const float d = m.d * ds;
+        return d * sumi;
+    }
+};
+
+template <> struct IqFast<17> {   // iq2_xs
+    static constexpr bool has = true; static constexpr int NW = 8, BS = sizeof(block_iq2_xs);
+    inline static void prep(const uint8_t* blk, int iqs, MultiW& m) {
+        const block_iq2_xs* bq2 = (const block_iq2_xs*) blk;
+        const sycl::int2 qq = load8_a2((const uint8_t*) bq2->qs + 4 * iqs);
+        const uint32_t lo = (uint32_t) qq.x(), hi = (uint32_t) qq.y();
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            const uint32_t q = ((k < 2 ? lo : hi) >> (16 * (k & 1))) & 0xFFFF;
+            const sycl::uint2 g = ((const sycl::uint2*) iq2xs_grid)[q & 0x1FF];
+            const sycl::uint4 s = iq_fast::ks_mask(q >> 9);
+            m.w[2 * k + 0] = iq_fast::sgn(g.x(), s.x(), s.z());
+            m.w[2 * k + 1] = iq_fast::sgn(g.y(), s.y(), s.w());
+        }
+        m.a = bq2->scales[iqs / 2] & 0x0F;
+        m.b = bq2->scales[iqs / 2] >> 4;
+        m.d = iq_fast::h2f(bq2->d);
+    }
+    inline static void acts(const block_q8_1* y, int iqs, int* u, float& ds) { iq_fast::acts8(y, iqs, u, ds); }
+    inline static float finish(int s0, int s1, const MultiW& m, float ds) {
+        const int sumi = (s0 * m.a + s1 * m.b + (s0 + s1) / 2) / 4;
+        const float d = m.d * ds;
+        return d * sumi;
+    }
+};
+
+template <> struct IqFast<18> {   // iq3_xxs
+    static constexpr bool has = true; static constexpr int NW = 8, BS = sizeof(block_iq3_xxs);
+    inline static void prep(const uint8_t* blk, int iqs, MultiW& m) {
+        const block_iq3_xxs* bq3 = (const block_iq3_xxs*) blk;
+        const sycl::int2 qq = load8_a2(bq3->qs + 4 * iqs);
+        const uint32_t aux32 = (uint32_t) load4_a2(bq3->qs + 4 * (QK_K / 16 + iqs / 2));
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            const uint32_t w = (uint32_t) (k < 2 ? qq.x() : qq.y());
+            const uint32_t i0 = (w >> (16 * (k & 1))) & 0xFF, i1 = (w >> (16 * (k & 1) + 8)) & 0xFF;
+            const uint32_t signs = unpack_ksigns(aux32 >> (7 * k));
+            const uint32_t s0 = (uint32_t) swar_ne4(signs & 0x08040201), s1 = (uint32_t) swar_ne4(signs & 0x80402010);
+            m.w[2 * k + 0] = iq_fast::sgn(iq3xxs_grid[i0], s0, s0 & 0x01010101u);
+            m.w[2 * k + 1] = iq_fast::sgn(iq3xxs_grid[i1], s1, s1 & 0x01010101u);
+        }
+        m.a = (int) (aux32 >> 28);
+        m.d = iq_fast::h2f(bq3->d);
+    }
+    inline static void acts(const block_q8_1* y, int iqs, int* u, float& ds) { iq_fast::acts8(y, iqs, u, ds); }
+    inline static float finish(int s0, int s1, const MultiW& m, float ds) {
+        const int sumi = s0 + s1;
+        return m.d * ds * (float) ((m.a * sumi + sumi / 2) / 2);
+    }
+};
+
+template <> struct IqFast<21> {   // iq3_s
+    static constexpr bool has = true; static constexpr int NW = 8, BS = sizeof(block_iq3_s);
+    inline static void prep(const uint8_t* blk, int iqs, MultiW& m) {
+        const block_iq3_s* bq3 = (const block_iq3_s*) blk;
+        const sycl::int2 qq = load8_a2(bq3->qs + 4 * iqs);
+        const uint32_t sp = (uint32_t) load4_a2(bq3->signs + 4 * (iqs / 2));
+        const int qh = bq3->qh[iqs / 2];
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            const uint32_t w = (uint32_t) (k < 2 ? qq.x() : qq.y());
+            const int l0 = 2 * k;
+            const int i0 = (int) ((w >> (16 * (k & 1))) & 0xFF) | ((qh << (8 - l0)) & 0x100);
+            const int i1 = (int) ((w >> (16 * (k & 1) + 8)) & 0xFF) | ((qh << (7 - l0)) & 0x100);
+            const uint32_t b = (sp >> (8 * k)) & 0xFF;
+            const uint32_t s0 = (uint32_t) swar_ne4(((b & 0x03) << 7) | ((b & 0x0C) << 21));
+            const uint32_t s1 = (uint32_t) swar_ne4(((b & 0x30) << 3) | ((b & 0xC0) << 17));
+            m.w[2 * k + 0] = iq_fast::sgn(iq3s_grid[i0], s0, s0 & 0x01010101u);
+            m.w[2 * k + 1] = iq_fast::sgn(iq3s_grid[i1], s1, s1 & 0x01010101u);
+        }
+        m.a = 1 + 2 * ((bq3->scales[iqs / 4] >> ((iqs << 1) & 0x04)) & 0x0F);
+        m.d = iq_fast::h2f(bq3->d);
+    }
+    inline static void acts(const block_q8_1* y, int iqs, int* u, float& ds) { iq_fast::acts8(y, iqs, u, ds); }
+    inline static float finish(int s0, int s1, const MultiW& m, float ds) {
+        return m.d * ds * (float) ((s0 + s1) * m.a);
+    }
+};
+
+template <> struct IqFast<22> {   // iq2_s
+    static constexpr bool has = true; static constexpr int NW = 8, BS = sizeof(block_iq2_s);
+    inline static void prep(const uint8_t* blk, int iqs, MultiW& m) { prep_t<false>(blk, iqs, m, nullptr); }
+    template <bool TS>
+    inline static void prep_t(const uint8_t* blk, int iqs, MultiW& m, const uint64_t* tab) {
+        const block_iq2_s* bq2 = (const block_iq2_s*) blk;
+        const uint32_t qs = (uint32_t) load4_a2(bq2->qs + 4 * (iqs / 2));
+        const uint32_t sp = (uint32_t) load4_a2(bq2->qs + 4 * (QK_K / 32 + iqs / 2));
+        const int qh = bq2->qh[iqs / 2];
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            const int gi = (int) ((qs >> (8 * k)) & 0xFF) | ((qh << (8 - 2 * k)) & 0x300);
+            sycl::uint2 g;
+            if constexpr (TS) { const uint64_t v = tab[gi]; g = sycl::uint2((uint32_t) v, (uint32_t) (v >> 32)); }
+            else g = ((const sycl::uint2*) iq2s_grid)[gi];
+            if constexpr (kIqSgnMul) {
+                const uint32_t t0 = iq_fast::sgn01((sp >> (8 * k)) & 0x0F), t1 = iq_fast::sgn01((sp >> (8 * k + 4)) & 0x0F);
+                m.w[2 * k + 0] = iq_fast::sgn(g.x(), t0 * 0xFFu, t0);
+                m.w[2 * k + 1] = iq_fast::sgn(g.y(), t1 * 0xFFu, t1);
+            } else {
+                const uint32_t b = (sp >> (8 * k)) & 0xFF;
+                const uint32_t s0 = (uint32_t) swar_ne4(((b & 0x03) << 7) | ((b & 0x0C) << 21));
+                const uint32_t s1 = (uint32_t) swar_ne4(((b & 0x30) << 3) | ((b & 0xC0) << 17));
+                m.w[2 * k + 0] = iq_fast::sgn(g.x(), s0, s0 & 0x01010101u);
+                m.w[2 * k + 1] = iq_fast::sgn(g.y(), s1, s1 & 0x01010101u);
+            }
+        }
+        m.a = bq2->scales[iqs / 2] & 0x0F;
+        m.b = bq2->scales[iqs / 2] >> 4;
+        m.d = iq_fast::h2f(bq2->d);
+    }
+    inline static void acts(const block_q8_1* y, int iqs, int* u, float& ds) { iq_fast::acts8(y, iqs, u, ds); }
+    inline static float finish(int s0, int s1, const MultiW& m, float ds) {
+        return m.d * ds * (float) ((s0 * m.a + s1 * m.b + (s0 + s1) / 2) / 4);
+    }
+};
+
+template <> struct IqFast<42> {   // q2_0 (down)
+    static constexpr bool has = true; static constexpr int NW = 8, BS = sizeof(block_q2_0);
+    inline static void prep(const uint8_t* blk, int iqs, MultiW& m) {
+        const block_q2_0* bq = (const block_q2_0*) blk;
+        const sycl::int2 qq = load8_a2(bq->qs + 8 * iqs);
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const uint32_t q = ((uint32_t) (j < 2 ? qq.x() : qq.y()) >> (16 * (j & 1))) & 0xFFFF;
+            m.w[2 * j + 0] = (int) iq_fast::q2_spread4(q & 0xFF);
+            m.w[2 * j + 1] = (int) iq_fast::q2_spread4(q >> 8);
+        }
+        m.d = bq->d;
+    }
+    inline static void acts(const block_q8_1* y, int iqs, int* u, float& ds) {
+        const block_q8_1* chunk = y + iqs;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            u[2 * j + 0] = get_int_b4(chunk->qs, j * 2 + 0);
+            u[2 * j + 1] = get_int_b4(chunk->qs, j * 2 + 1);
+        }
+        ds = chunk->ds[0];
+    }
+    inline static float finish(int s0, int s1, const MultiW& m, float ds) {
+        return m.d * ds * (float) (s0 + s1);
+    }
+};
+
+template <> struct IqFast<20> {   // iq4_nl (down)
+    static constexpr bool has = true; static constexpr int NW = 4, BS = sizeof(block_iq4_nl);
+    inline static void prep(const uint8_t* blk, int iqs, MultiW& m) {
+        const block_iq4_nl* bq4 = (const block_iq4_nl*) blk;
+        const sycl::int2 qq = load8_a2(bq4->qs + 4 * iqs);
+        const sycl::uint2* T = reinterpret_cast<const sycl::uint2*>(kIqNlPos);
+#pragma unroll
+        for (int l = 0; l < 2; ++l) {
+            const uint32_t aux = (uint32_t) (l ? qq.y() : qq.x());
+            const sycl::uint2 t0 = T[0 * 256 + (aux & 0xFF)], t1 = T[1 * 256 + ((aux >> 8) & 0xFF)];
+            const sycl::uint2 t2 = T[2 * 256 + ((aux >> 16) & 0xFF)], t3 = T[3 * 256 + (aux >> 24)];
+            m.w[2 * l + 0] = (int) (t0.x() | t1.x() | t2.x() | t3.x());
+            m.w[2 * l + 1] = (int) (t0.y() | t1.y() | t2.y() | t3.y());
+        }
+        m.d = iq_fast::h2f(bq4->d);
+    }
+    inline static void acts(const block_q8_1* y, int iqs, int* u, float& ds) {
+        const int* q8 = (const int*) y->qs + iqs;
+#pragma unroll
+        for (int l = 0; l < 2; ++l) { u[2 * l + 0] = q8[l + 0]; u[2 * l + 1] = q8[l + 4]; }
+        ds = y->ds[0];
+    }
+    inline static float finish(int s0, int s1, const MultiW& m, float ds) {
+        return m.d * ds * (float) (s0 + s1);
+    }
+};
+
+template <int LANES>
+inline float lanes_sum_iq(float v) {
+    if constexpr (LANES == 8) return sub8_sum(v);
+    else if constexpr (LANES == 16) return sub16_sum(v);
+    else return warp_sum(v);
+}
+
+template <int TY, int LANES, int R, int E, bool TS = false, bool VL = false, bool SM = false>
+inline void rows_dot_fast(const uint8_t* const* rows, const block_q8_1* const* xs, int nb, int sub,
+                          float (&out)[R][E], const uint64_t* tab = nullptr) {
+    using M = IqFast<TY>;
+    using F = Fmt<TY>;
+    static_assert(LANES % F::ipb == 0, "a lane's part index must be fixed");
+    constexpr int KSTEP = LANES / F::ipb, XB = F::qk / 32;
+    const int iqs = F::step * (sub % F::ipb);
+    const int kb0 = sub / F::ipb;
+    float s[R][E];
+#pragma unroll
+    for (int r = 0; r < R; ++r)
+#pragma unroll
+        for (int e = 0; e < E; ++e) s[r][e] = 0.f;
+    const uint8_t* wp[R];
+#pragma unroll
+    for (int r = 0; r < R; ++r) wp[r] = rows[r] + (size_t) kb0 * M::BS;
+    const block_q8_1* xp[E];
+#pragma unroll
+    for (int e = 0; e < E; ++e) xp[e] = xs[e] + (size_t) kb0 * XB;
+    for (int kbx = kb0; kbx < nb; kbx += KSTEP) {
+        int u[E][8];
+        float ds[E];
+#pragma unroll
+        for (int e = 0; e < E; ++e) {
+            if constexpr (VL) iq_fast::acts8v(xp[e] + iqs / 2, u[e], ds[e]);
+            else M::acts(xp[e], iqs, u[e], ds[e]);
+            xp[e] += KSTEP * XB;
+        }
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            MultiW m;
+            if constexpr (VL && TY == 16) M::template prep_t<true, true>(wp[r], iqs, m, tab);
+            else if constexpr (SM && TS && TY == 16) M::template prep_t<true, false, true>(wp[r], iqs, m, tab);
+            else if constexpr (TS && (TY == 16 || TY == 22)) M::template prep_t<true>(wp[r], iqs, m, tab);
+            else M::prep(wp[r], iqs, m);
+            wp[r] += KSTEP * M::BS;
+#pragma unroll
+            for (int e = 0; e < E; ++e) {
+                int s0 = 0, s1 = 0;
+#pragma unroll
+                for (int j = 0; j < M::NW / 2; ++j) s0 = ggml_cuda_dp4a(m.w[j], u[e][j], s0);
+#pragma unroll
+                for (int j = M::NW / 2; j < M::NW; ++j) s1 = ggml_cuda_dp4a(m.w[j], u[e][j], s1);
+                s[r][e] += M::finish(s0, s1, m, ds[e]);
+            }
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < R; ++r)
+#pragma unroll
+        for (int e = 0; e < E; ++e) out[r][e] = lanes_sum_iq<LANES>(s[r][e]);
+}
+
+template <int TG, int LN, int RPL, bool TS = false, bool XE = false, bool SM = false>
+inline void native_gu_kernel_fast(
+    sycl::nd_item<3> item_ct1,
+    const unsigned long long *__restrict__ grp_ptr,
+    const int32_t *__restrict__ grp_start, const int32_t *__restrict__ n_groups,
+    const int32_t *__restrict__ ent_tok, const block_q8_1 *__restrict__ xq,
+    NativeExpertLayout L, float *__restrict__ gate, float *__restrict__ up) {
+    const int ng = *n_groups;
+    if ((int) item_ct1.get_group(1) >= ng) return;
+    const uint64_t* tab = nullptr;
+    if constexpr (TS && (TG == 16 || TG == 22)) {
+        constexpr int GN = TG == 22 ? 1024 : 256, TN = TG == 22 ? 1024 : (SM ? 256 : 512);
+        auto& sg = *sycl::ext::oneapi::group_local_memory_for_overwrite<uint64_t[TN]>(item_ct1.get_group());
+        const uint64_t* src = TG == 22 ? (const uint64_t*) iq2s_grid : (const uint64_t*) iq2xxs_grid;
+        const int t = (int) item_ct1.get_local_id(2), nt = (int) item_ct1.get_local_range(2);
+        for (int i = t; i < GN; i += nt) sg[i] = src[i];
+        if constexpr (TG == 16 && !SM)
+            for (int i = t; i < TN - GN; i += nt) sg[GN + i] = reinterpret_cast<const uint64_t*>(kIqKsignMask)[i];
+        item_ct1.barrier(sycl::access::fence_space::local_space);
+        tab = &sg[0];
+    }
+    constexpr int RB = 256 / LN;
+    const int lid = (int) item_ct1.get_local_id(2);
+    const int rib = lid / LN, sub = lid % LN;
+    const int row0 = (int) item_ct1.get_group(2) * RB * RPL + rib;
+    const int nrows = (int) (2 * L.n_ff);
+    if (row0 >= nrows) return;
+    const int nb = (int) (L.n_embd / Fmt<TG>::qk), xb = (int) (L.n_embd / 32);
+    size_t off[RPL];
+    float* dst[RPL];
+    bool live[RPL];
+    bool is_up_arr[RPL];
+#pragma unroll
+    for (int i = 0; i < RPL; ++i) {
+        const int v = row0 + i * RB;
+        live[i] = v < nrows;
+        const int vv = live[i] ? v : row0;
+        const bool is_up = vv >= L.n_ff;
+        is_up_arr[i] = is_up;
+        const int r = is_up ? vv - (int) L.n_ff : vv;
+        off[i] = (is_up ? L.up_off : 0) + (size_t) r * L.gu_row;
+        dst[i] = (is_up ? up : gate) + r;
+    }
+    for (int g = (int) item_ct1.get_group(1); g < ng; g += (int) item_ct1.get_group_range(1)) {
+        const uint8_t* base = (const uint8_t*) grp_ptr[g];
+        const uint8_t* rows[RPL];
+        float sc[RPL];
+#pragma unroll
+        for (int i = 0; i < RPL; ++i) {
+            rows[i] = base + off[i];
+            sc[i] = L.tail_off ? ((const float*)(base + L.tail_off))[is_up_arr[i] ? 1 : 0] : 1.0f;
+        }
+        const int e0 = grp_start[g], e1 = grp_start[g + 1];
+        int e = e0;
+        auto pass = [&](auto ec) {
+            constexpr int EC = decltype(ec)::value;
+            const block_q8_1* xs[EC];
+#pragma unroll
+            for (int j = 0; j < EC; ++j) xs[j] = xq + (size_t) ent_tok[e + j] * xb;
+            float o[RPL][EC];
+            rows_dot_fast<TG, LN, RPL, EC, TS, XE, SM>(rows, xs, nb, sub, o, tab);
+            if (sub == 0)
+#pragma unroll
+                for (int i = 0; i < RPL; ++i)
+                    if (live[i])
+#pragma unroll
+                        for (int j = 0; j < EC; ++j) dst[i][(size_t) (e + j) * L.n_ff] = o[i][j] * sc[i];
+        };
+        for (; e + 4 <= e1; e += 4) pass(std::integral_constant<int, 4>{});
+        if constexpr (XE) {
+            if (e + 3 == e1) { pass(std::integral_constant<int, 3>{}); e += 3; }
+        }
+        if (e + 2 <= e1) { pass(std::integral_constant<int, 2>{}); e += 2; }
+        if (e < e1) { pass(std::integral_constant<int, 1>{}); e += 1; }
+    }
+}
+
+constexpr int kDtEnt = 8, kDtW = 10, kDtMaxHb = 32;
+inline void iq_tr4x4(uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t* t) {
+    const uint32_t p0 = (a0 & 0x00FF00FFu) | ((a1 & 0x00FF00FFu) << 8);
+    const uint32_t p1 = ((a0 >> 8) & 0x00FF00FFu) | (a1 & 0xFF00FF00u);
+    const uint32_t p2 = (a2 & 0x00FF00FFu) | ((a3 & 0x00FF00FFu) << 8);
+    const uint32_t p3 = ((a2 >> 8) & 0x00FF00FFu) | (a3 & 0xFF00FF00u);
+    t[0] = (p0 & 0xFFFFu) | (p2 << 16);
+    t[1] = (p1 & 0xFFFFu) | (p3 << 16);
+    t[2] = (p0 >> 16) | (p2 & 0xFFFF0000u);
+    t[3] = (p1 >> 16) | (p3 & 0xFFFF0000u);
+}
+template <int R, int E>
+inline void rows_dot_dt(const uint8_t* const* rows, const uint32_t* ta, int hb, int nb, int sub, float (&out)[R][E]) {
+    constexpr int LANES = 8, KSTEP = 4, BS = sizeof(block_q2_0);
+    const int iqs = sub % 2, kb0 = sub / 2;
+    float s[R][E];
+#pragma unroll
+    for (int r = 0; r < R; ++r)
+#pragma unroll
+        for (int e = 0; e < E; ++e) s[r][e] = 0.f;
+    const uint8_t* wp[R];
+#pragma unroll
+    for (int r = 0; r < R; ++r) wp[r] = rows[r] + kb0 * BS;
+    for (int kbx = kb0; kbx < nb; kbx += KSTEP) {
+        uint32_t U[E][8];
+        float ds[E];
+        int c[E];
+#pragma unroll
+        for (int e = 0; e < E; ++e) {
+            const uint32_t* t = ta + (e * hb + 2 * kbx + iqs) * kDtW;
+#pragma unroll
+            for (int k = 0; k < 8; ++k) U[e][k] = t[k];
+            ds[e] = iq_fast::h2f(sycl::bit_cast<sycl::half>((uint16_t) (t[8] & 0xFFFFu)));
+            c[e] = (int) t[9];
+        }
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            const block_q2_0* bq = (const block_q2_0*) wp[r];
+            const sycl::int2 qq = load8_a2(bq->qs + 8 * iqs);
+            MultiW m;
+            m.d = bq->d;
+            wp[r] += KSTEP * BS;
+            uint32_t A[8];
+#pragma unroll
+            for (int k = 0; k < 4; ++k) {
+                A[k] = ((uint32_t) qq.x() >> (2 * k)) & 0x03030303u;
+                A[4 + k] = ((uint32_t) qq.y() >> (2 * k)) & 0x03030303u;
+            }
+#pragma unroll
+            for (int e = 0; e < E; ++e) {
+                int s0 = c[e], s1 = 0;
+#pragma unroll
+                for (int k = 0; k < 4; ++k) s0 = ggml_cuda_dp4a((int) A[k], (int) U[e][k], s0);
+#pragma unroll
+                for (int k = 4; k < 8; ++k) s1 = ggml_cuda_dp4a((int) A[k], (int) U[e][k], s1);
+                s[r][e] += IqFast<42>::finish(s0, s1, m, ds[e]);
+            }
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < R; ++r)
+#pragma unroll
+        for (int e = 0; e < E; ++e) out[r][e] = lanes_sum_iq<LANES>(s[r][e]);
+}
+
+template <int RPL>
+inline void native_down_kernel_dt(
+    sycl::nd_item<3> item_ct1,
+    const unsigned long long *__restrict__ grp_ptr,
+    const int32_t *__restrict__ grp_start, const int32_t *__restrict__ n_groups,
+    const int32_t *__restrict__ ent_dst, const block_q8_1 *__restrict__ hq,
+    NativeExpertLayout L, float *__restrict__ out) {
+    constexpr int LN = 8, RB = 256 / LN;
+    const int ng = *n_groups;
+    if ((int) item_ct1.get_group(1) >= ng) return;
+    auto& ta = *sycl::ext::oneapi::group_local_memory_for_overwrite<uint32_t[kDtEnt * kDtMaxHb * kDtW]>(item_ct1.get_group());
+    const int lid = (int) item_ct1.get_local_id(2);
+    const int rib = lid / LN, sub = lid % LN;
+    const int r0 = (int) item_ct1.get_group(2) * RB * RPL + rib;
+    const int nb = (int) (L.n_ff / Fmt<42>::qk), hb = (int) (L.n_ff / 32);
+    int rr[RPL];
+#pragma unroll
+    for (int i = 0; i < RPL; ++i) rr[i] = r0 + i * RB;
+    for (int g = (int) item_ct1.get_group(1); g < ng; g += (int) item_ct1.get_group_range(1)) {
+        const uint8_t* blob = (const uint8_t*) grp_ptr[g];
+        const uint8_t* base = blob + L.down_off;
+        const float sd = L.tail_off ? ((const float*)(blob + L.tail_off))[2] : 1.0f;
+        const uint8_t* rows[RPL];
+#pragma unroll
+        for (int i = 0; i < RPL; ++i) rows[i] = base + (size_t) rr[i] * L.d_row;
+        const int e0 = grp_start[g], e1 = grp_start[g + 1];
+        for (int ec = e0; ec < e1; ec += kDtEnt) {
+            const int n = e1 - ec < kDtEnt ? e1 - ec : kDtEnt;
+            item_ct1.barrier(sycl::access::fence_space::local_space);
+            for (int x = lid; x < n * hb; x += 256) {
+                const int j = x / hb, b = x - j * hb;
+                const block_q8_1* y = hq + (size_t) (ec + j) * hb + b;
+                uint32_t a[8];
+#pragma unroll
+                for (int i = 0; i < 8; ++i) a[i] = (uint32_t) get_int_b4(y->qs, i);
+                int c = 0;
+#pragma unroll
+                for (int i = 0; i < 8; ++i) c = ggml_cuda_dp4a(-1, (int) a[i], c);
+                uint32_t t[8];
+                iq_tr4x4(a[0], a[1], a[2], a[3], t);
+                iq_tr4x4(a[4], a[5], a[6], a[7], t + 4);
+                uint32_t* d = &ta[(j * hb + b) * kDtW];
+#pragma unroll
+                for (int i = 0; i < 8; ++i) d[i] = t[i];
+                d[8] = *reinterpret_cast<const uint32_t*>(&y->ds);
+                d[9] = (uint32_t) c;
+            }
+            item_ct1.barrier(sycl::access::fence_space::local_space);
+            int e = ec;
+            const int ee = ec + n;
+            auto pass = [&](auto ecn) {
+                constexpr int EC = decltype(ecn)::value;
+                float o[RPL][EC];
+                rows_dot_dt<RPL, EC>(rows, &ta[(e - ec) * hb * kDtW], hb, nb, sub, o);
+                if (sub == 0)
+#pragma unroll
+                    for (int i = 0; i < RPL; ++i)
+#pragma unroll
+                        for (int j = 0; j < EC; ++j) out[(size_t) ent_dst[e + j] * L.n_embd + rr[i]] = o[i][j] * sd;
+            };
+            for (; e + 4 <= ee; e += 4) pass(std::integral_constant<int, 4>{});
+            if (e + 2 <= ee) { pass(std::integral_constant<int, 2>{}); e += 2; }
+            if (e < ee) { pass(std::integral_constant<int, 1>{}); e += 1; }
+        }
+    }
+}
+
+constexpr int kDtV = 3;
+template <int R, int E>
+inline void rows_dot_dtx(const uint8_t* const* rows, const sycl::uint4* tv, int hb, int nb, int sub, float (&out)[R][E]) {
+    constexpr int LANES = 8, KSTEP = 4, BS = sizeof(block_q2_0);
+    const int iqs = sub % 2, kb0 = sub / 2;
+    float s[R][E];
+#pragma unroll
+    for (int r = 0; r < R; ++r)
+#pragma unroll
+        for (int e = 0; e < E; ++e) s[r][e] = 0.f;
+    const uint8_t* wp[R];
+#pragma unroll
+    for (int r = 0; r < R; ++r) wp[r] = rows[r] + kb0 * BS;
+    for (int kbx = kb0; kbx < nb; kbx += KSTEP) {
+        uint32_t U[E][8];
+        float ds[E];
+        int c[E];
+#pragma unroll
+        for (int e = 0; e < E; ++e) {
+            const sycl::uint4* t = tv + (e * hb + 2 * kbx + iqs) * kDtV;
+            const sycl::uint4 t0 = t[0], t1 = t[1], t2 = t[2];
+            U[e][0] = t0.x(); U[e][1] = t0.y(); U[e][2] = t0.z(); U[e][3] = t0.w();
+            U[e][4] = t1.x(); U[e][5] = t1.y(); U[e][6] = t1.z(); U[e][7] = t1.w();
+            ds[e] = iq_fast::h2f(sycl::bit_cast<sycl::half>((uint16_t) (t2.x() & 0xFFFFu)));
+            c[e] = (int) t2.y();
+        }
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            const block_q2_0* bq = (const block_q2_0*) wp[r];
+            const sycl::int2 qq = load8_a2(bq->qs + 8 * iqs);
+            MultiW m;
+            m.d = bq->d;
+            wp[r] += KSTEP * BS;
+            uint32_t A[8];
+#pragma unroll
+            for (int k = 0; k < 4; ++k) {
+                A[k] = ((uint32_t) qq.x() >> (2 * k)) & 0x03030303u;
+                A[4 + k] = ((uint32_t) qq.y() >> (2 * k)) & 0x03030303u;
+            }
+#pragma unroll
+            for (int e = 0; e < E; ++e) {
+                int s0 = c[e], s1 = 0;
+#pragma unroll
+                for (int k = 0; k < 4; ++k) s0 = ggml_cuda_dp4a((int) A[k], (int) U[e][k], s0);
+#pragma unroll
+                for (int k = 4; k < 8; ++k) s1 = ggml_cuda_dp4a((int) A[k], (int) U[e][k], s1);
+                s[r][e] += IqFast<42>::finish(s0, s1, m, ds[e]);
+            }
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < R; ++r)
+#pragma unroll
+        for (int e = 0; e < E; ++e) out[r][e] = lanes_sum_iq<LANES>(s[r][e]);
+}
+
+template <int RPL>
+inline void native_down_kernel_dtx(
+    sycl::nd_item<3> item_ct1,
+    const unsigned long long *__restrict__ grp_ptr,
+    const int32_t *__restrict__ grp_start, const int32_t *__restrict__ n_groups,
+    const int32_t *__restrict__ ent_dst, const block_q8_1 *__restrict__ hq,
+    NativeExpertLayout L, float *__restrict__ out) {
+    constexpr int LN = 8, RB = 256 / LN;
+    const int ng = *n_groups;
+    if ((int) item_ct1.get_group(1) >= ng) return;
+    auto& tv = *sycl::ext::oneapi::group_local_memory_for_overwrite<sycl::uint4[kDtEnt * kDtMaxHb * kDtV]>(item_ct1.get_group());
+    const int lid = (int) item_ct1.get_local_id(2);
+    const int rib = lid / LN, sub = lid % LN;
+    const int r0 = (int) item_ct1.get_group(2) * RB * RPL + rib;
+    const int nb = (int) (L.n_ff / Fmt<42>::qk), hb = (int) (L.n_ff / 32);
+    int rr[RPL];
+#pragma unroll
+    for (int i = 0; i < RPL; ++i) rr[i] = r0 + i * RB;
+    for (int g = (int) item_ct1.get_group(1); g < ng; g += (int) item_ct1.get_group_range(1)) {
+        const uint8_t* blob = (const uint8_t*) grp_ptr[g];
+        const uint8_t* base = blob + L.down_off;
+        const float sd = L.tail_off ? ((const float*)(blob + L.tail_off))[2] : 1.0f;
+        const uint8_t* rows[RPL];
+#pragma unroll
+        for (int i = 0; i < RPL; ++i) rows[i] = base + (size_t) rr[i] * L.d_row;
+        const int e0 = grp_start[g], e1 = grp_start[g + 1];
+        for (int ec = e0; ec < e1; ec += kDtEnt) {
+            const int n = e1 - ec < kDtEnt ? e1 - ec : kDtEnt;
+            item_ct1.barrier(sycl::access::fence_space::local_space);
+            for (int x = lid; x < n * hb; x += 256) {
+                const int j = x / hb, b = x - j * hb;
+                const block_q8_1* y = hq + (size_t) (ec + j) * hb + b;
+                const int* yq = reinterpret_cast<const int*>(y->qs);
+                const sycl::int4 q0 = iq_fast::ld_i4(yq), q1 = iq_fast::ld_i4(yq + 4);
+                const uint32_t a[8] = {(uint32_t) q0.x(), (uint32_t) q0.y(), (uint32_t) q0.z(), (uint32_t) q0.w(),
+                                       (uint32_t) q1.x(), (uint32_t) q1.y(), (uint32_t) q1.z(), (uint32_t) q1.w()};
+                int c = 0;
+#pragma unroll
+                for (int i = 0; i < 8; ++i) c = ggml_cuda_dp4a(-1, (int) a[i], c);
+                uint32_t t[8];
+                iq_tr4x4(a[0], a[1], a[2], a[3], t);
+                iq_tr4x4(a[4], a[5], a[6], a[7], t + 4);
+                sycl::uint4* d = &tv[(j * hb + b) * kDtV];
+                d[0] = sycl::uint4(t[0], t[1], t[2], t[3]);
+                d[1] = sycl::uint4(t[4], t[5], t[6], t[7]);
+                d[2] = sycl::uint4(*reinterpret_cast<const uint32_t*>(&y->ds), (uint32_t) c, 0u, 0u);
+            }
+            item_ct1.barrier(sycl::access::fence_space::local_space);
+            int e = ec;
+            const int ee = ec + n;
+            auto pass = [&](auto ecn) {
+                constexpr int EC = decltype(ecn)::value;
+                float o[RPL][EC];
+                rows_dot_dtx<RPL, EC>(rows, &tv[(e - ec) * hb * kDtV], hb, nb, sub, o);
+                if (sub == 0)
+#pragma unroll
+                    for (int i = 0; i < RPL; ++i)
+#pragma unroll
+                        for (int j = 0; j < EC; ++j) out[(size_t) ent_dst[e + j] * L.n_embd + rr[i]] = o[i][j] * sd;
+            };
+            for (; e + 4 <= ee; e += 4) pass(std::integral_constant<int, 4>{});
+            if (e + 3 == ee) { pass(std::integral_constant<int, 3>{}); e += 3; }
+            if (e + 2 <= ee) { pass(std::integral_constant<int, 2>{}); e += 2; }
+            if (e < ee) { pass(std::integral_constant<int, 1>{}); e += 1; }
+        }
+    }
+}
+
+template <int TD, int LN, int RPL>
+inline void native_down_kernel_fast(
+    sycl::nd_item<3> item_ct1,
+    const unsigned long long *__restrict__ grp_ptr,
+    const int32_t *__restrict__ grp_start, const int32_t *__restrict__ n_groups,
+    const int32_t *__restrict__ ent_dst, const block_q8_1 *__restrict__ hq,
+    NativeExpertLayout L, float *__restrict__ out) {
+    const int ng = *n_groups;
+    if ((int) item_ct1.get_group(1) >= ng) return;
+    constexpr int RB = 256 / LN;
+    const int lid = (int) item_ct1.get_local_id(2);
+    const int rib = lid / LN, sub = lid % LN;
+    const int r0 = (int) item_ct1.get_group(2) * RB * RPL + rib;
+    if (r0 >= L.n_embd) return;
+    const int nb = (int) (L.n_ff / Fmt<TD>::qk), hb = (int) (L.n_ff / 32);
+    int rr[RPL];
+    bool live[RPL];
+#pragma unroll
+    for (int i = 0; i < RPL; ++i) {
+        const int r = r0 + i * RB;
+        live[i] = r < L.n_embd;
+        rr[i] = live[i] ? r : r0;
+    }
+    for (int g = (int) item_ct1.get_group(1); g < ng; g += (int) item_ct1.get_group_range(1)) {
+        const uint8_t* blob = (const uint8_t*) grp_ptr[g];
+        const uint8_t* base = blob + L.down_off;
+        const float sd = L.tail_off ? ((const float*)(blob + L.tail_off))[2] : 1.0f;
+        const uint8_t* rows[RPL];
+#pragma unroll
+        for (int i = 0; i < RPL; ++i) rows[i] = base + (size_t) rr[i] * L.d_row;
+        const int e0 = grp_start[g], e1 = grp_start[g + 1];
+        int e = e0;
+        auto pass = [&](auto ec) {
+            constexpr int EC = decltype(ec)::value;
+            const block_q8_1* xs[EC];
+#pragma unroll
+            for (int j = 0; j < EC; ++j) xs[j] = hq + (size_t) (e + j) * hb;
+            float o[RPL][EC];
+            rows_dot_fast<TD, LN, RPL, EC>(rows, xs, nb, sub, o);
+            if (sub == 0)
+#pragma unroll
+                for (int i = 0; i < RPL; ++i)
+                    if (live[i])
+#pragma unroll
+                        for (int j = 0; j < EC; ++j) out[(size_t) ent_dst[e + j] * L.n_embd + rr[i]] = o[i][j] * sd;
+        };
+        for (; e + 4 <= e1; e += 4) pass(std::integral_constant<int, 4>{});
+        if (e + 2 <= e1) { pass(std::integral_constant<int, 2>{}); e += 2; }
+        if (e < e1) { pass(std::integral_constant<int, 1>{}); e += 1; }
+    }
+}
+
+constexpr int kIqFastRows = 2;
+
+inline bool iq_fast_on(int ty, const sycl::queue& q) {
+    static const bool env = [&] {
+        const char* v = std::getenv("STRATA_IQ_DECODE_FAST");
+        bool b = false;
+        if (v != nullptr && v[0] != '\0') {
+            b = v[0] != '0';
+        } else {
+            namespace ex = sycl::ext::oneapi::experimental;
+            try {
+                const auto a = q.get_device().get_info<ex::info::device::architecture>();
+                b = (a == ex::architecture::intel_gpu_bmg_g21 || 
+                     a == ex::architecture::intel_gpu_bmg_g31 ||
+                     a == ex::architecture::intel_gpu_lnl_m);
+            } catch (...) {}
+        }
+        return b;
+    }();
+    static const uint64_t fmts = [] {
+        const char* v = std::getenv("STRATA_IQ_DECODE_FAST_FMTS");
+        if (v == nullptr || v[0] == '\0') return ~(uint64_t) 0;
+        uint64_t m = 0;
+        for (const char* p = v; *p != '\0';) {
+            char* end = nullptr;
+            const long t = std::strtol(p, &end, 10);
+            if (end == p) break;
+            if (t >= 0 && t < 64) m |= (uint64_t) 1 << t;
+            p = *end == ',' ? end + 1 : end;
+        }
+        return m;
+    }();
+    return env && ty >= 0 && ty < 64 && ((fmts >> ty) & 1) != 0;
+}
+
+inline bool xe2_iq_on() {
+    static const bool env = [] {
+        const char* v = std::getenv("STRATA_XE2_IQ");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
+    return env;
+}
+
+template <int TG, int LN>
+bool launch_gu_fast(unsigned groups, sycl::queue* s, const unsigned long long *grp_ptr, const int32_t *grp_start,
+                    const int32_t *n_groups, const int32_t *ent_tok, const block_q8_1 *X,
+                    const NativeExpertLayout &L, float *gate, float *up) {
+    if (g_old_kernels) return false;
+    if constexpr (!(TG == 16 || TG == 17 || TG == 18 || TG == 21 || TG == 22) || LN != 8) { return false; }
+    else {
+        if (!iq_fast_on(TG, *s)) return false;
+        constexpr int ROWS = (256 / LN) * kIqFastRows;
+        const unsigned gx = (unsigned) ((2 * L.n_ff + ROWS - 1) / ROWS);
+        static const bool ts = [] { const char* v = std::getenv("STRATA_IQ_GRID"); return !(v && v[0] == '0'); }();
+        auto go = [&](auto tc) {
+            constexpr bool TS = decltype(tc)::value;
+            s->parallel_for(
+                sycl::nd_range<3>(sycl::range<3>(1, groups, (size_t) gx * 256), sycl::range<3>(1, 1, 256)),
+                [=](sycl::nd_item<3> item) [[sycl::reqd_sub_group_size(16)]] {
+                    native_gu_kernel_fast<TG, LN, kIqFastRows, TS>(item, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
+                });
+        };
+        if constexpr (TG == 16 || TG == 22) {
+            if (ts && xe2_iq_on()) {
+                s->parallel_for(
+                    sycl::nd_range<3>(sycl::range<3>(1, groups, (size_t) gx * 256), sycl::range<3>(1, 1, 256)),
+                    [=](sycl::nd_item<3> item) [[sycl::reqd_sub_group_size(16)]] {
+                        native_gu_kernel_fast<TG, LN, kIqFastRows, true, true>(item, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
+                    });
+                return true;
+            }
+            if constexpr (TG == 16) {
+                static const bool sm = [] { const char* v = std::getenv("STRATA_IQ_XXS_SGNMUL"); return v ? (v[0] != '0') : (STRATA_IQ_XXS_SGNMUL != 0); }();
+                if (ts && sm) {
+                    s->parallel_for(
+                        sycl::nd_range<3>(sycl::range<3>(1, groups, (size_t) gx * 256), sycl::range<3>(1, 1, 256)),
+                        [=](sycl::nd_item<3> item) [[sycl::reqd_sub_group_size(16)]] {
+                            native_gu_kernel_fast<TG, LN, kIqFastRows, true, false, true>(item, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
+                        });
+                    return true;
+                }
+            }
+            if (ts) { go(std::true_type{}); return true; }
+        }
+        go(std::false_type{});
+        return true;
+    }
+}
+
+template <int TD, int LN>
+bool launch_down_fast(unsigned groups, sycl::queue* s, const unsigned long long *grp_ptr, const int32_t *grp_start,
+                      const int32_t *n_groups, const int32_t *ent_dst, const block_q8_1 *hq,
+                      const NativeExpertLayout &L, float *out) {
+    if (g_old_kernels) return false;
+    if constexpr (!(TD == 20 || TD == 42) || LN != 8) { return false; }
+    else {
+        if (!iq_fast_on(TD, *s)) return false;
+        constexpr int ROWS = (256 / LN) * kIqFastRows;
+        const unsigned gx = (unsigned) ((L.n_embd + ROWS - 1) / ROWS);
+        if constexpr (TD == 42) {
+            static const bool dt = [] { const char* e = std::getenv("STRATA_IQ_DT"); return !(e && e[0] == '0'); }();
+            if (dt && L.n_embd % ROWS == 0 && L.n_ff % 64 == 0 && L.n_ff / 32 <= kDtMaxHb) {
+                if (xe2_iq_on()) {
+                    s->parallel_for(
+                        sycl::nd_range<3>(sycl::range<3>(1, groups, (size_t) gx * 256), sycl::range<3>(1, 1, 256)),
+                        [=](sycl::nd_item<3> item) [[sycl::reqd_sub_group_size(16)]] {
+                            native_down_kernel_dtx<kIqFastRows>(item, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+                        });
+                    return true;
+                }
+                s->parallel_for(
+                    sycl::nd_range<3>(sycl::range<3>(1, groups, (size_t) gx * 256), sycl::range<3>(1, 1, 256)),
+                    [=](sycl::nd_item<3> item) [[sycl::reqd_sub_group_size(16)]] {
+                        native_down_kernel_dt<kIqFastRows>(item, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+                    });
+                return true;
+            }
+        }
+        s->parallel_for(
+            sycl::nd_range<3>(sycl::range<3>(1, groups, (size_t) gx * 256), sycl::range<3>(1, 1, 256)),
+            [=](sycl::nd_item<3> item) [[sycl::reqd_sub_group_size(16)]] {
+                native_down_kernel_fast<TD, LN, kIqFastRows>(item, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+            });
+        return true;
+    }
+}
+
 template <int TG>
 void launch_gu(sycl::range<3> grid, sycl::queue* s, const unsigned long long* grp_ptr, const int32_t* grp_start,
                const int32_t* n_groups, const int32_t* ent_tok, const block_q8_1* X, const NativeExpertLayout& L,
                float* gate, float* up) {
+    if (launch_gu_fast<TG, 8>((unsigned)grid[1], s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up)) return;
     constexpr bool is_kq = (TG == 12 || TG == 13 || TG == 14 || TG == 7 || TG == 8);
     if constexpr (!kSplit<TG>)
         s->parallel_for(sycl::nd_range<3>(grid * sycl::range<3>(1, 1, 256), sycl::range<3>(1, 1, 256)),
@@ -3410,6 +4269,7 @@ template <int TD>
 void launch_down(sycl::range<3> grid, sycl::queue* s, const unsigned long long* grp_ptr, const int32_t* grp_start,
                  const int32_t* n_groups, const int32_t* ent_dst, const block_q8_1* hq, const NativeExpertLayout& L,
                  float* out) {
+    if (launch_down_fast<TD, 8>((unsigned)grid[1], s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out)) return;
     constexpr bool is_kq = (TD == 12 || TD == 13 || TD == 14 || TD == 7 || TD == 8);
     if constexpr (!kSplit<TD>)
         s->parallel_for(sycl::nd_range<3>(grid * sycl::range<3>(1, 1, 256), sycl::range<3>(1, 1, 256)),

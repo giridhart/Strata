@@ -4,6 +4,7 @@
 // elementwise.cu) with the same operation order, so a verify window reproduces plain decode bit for bit.
 #include <sycl/sycl.hpp>
 #include "strata/kernels/verify_kernels.hpp"
+#include "strata/kernels/resident_plan_mirror.hpp"
 #include "strata/kernels/dp4a.hpp"
 #include "strata/core/sycl_doorbell.hpp"
 
@@ -13,6 +14,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <limits>
+#include <string>
 
 namespace strata::kernels {
 namespace {
@@ -396,32 +398,83 @@ void window_ids_kernel(int32_t* steps, int window, int32_t* ids, long long strid
     if (item.get_local_id(1) == 0) st[3] = width;
 }
 
-void resident_plan_kernel(const int32_t* __restrict__ ids, int n, int k, const int32_t* __restrict__ res, int n_expert,
-                          const uint8_t* cache_base, const unsigned long long* slot_off, long long blob,
-                          int32_t* __restrict__ pl, long long capx, uint32_t* skip, uint32_t ring,
-                          int32_t* s_ids, unsigned long long* s_ptr, int32_t* s_first, int32_t* s_cnt,
-                          int32_t* s_gstart, int* s_bad, sycl::nd_item<1> item, uint32_t* plan_err = nullptr) {
+namespace {
+constexpr int kResidentPlanNarrow = 128;
+constexpr int kResidentPlanMax = 256;
+static_assert(kVerifyNarrowT * 10 <= kResidentPlanNarrow, "resident_plan: one thread per entry");
+static_assert(kVerifyMaxT * 10 <= kResidentPlanMax, "resident_plan: one thread per entry");
+static_assert(kResidentPlanMax <= 256 && kResidentPlanMax % 32 == 0, "resident_plan: at most 8 warps");
+static_assert(kResidentPlanMax < 32768, "resident_plan: the packed entry count must stay below 2^15");
+
+const int32_t* g_mirror_res = nullptr;
+const unsigned long long* g_mirror_table = nullptr;
+int32_t* g_usage = nullptr;
+uint8_t* g_stage_base = nullptr;           // STRATA_MIRROR_STAGE: the next plans' VRAM staging blobs (resident_plan_set_stage)
+long long g_stage_stride = 0;
+unsigned long long* g_stage_src = nullptr; // and where their copies come from
+uint8_t* g_ring_base = nullptr;            // STRATA_MIRROR_RING: the ring's blobs (stride g_stage_stride)
+bool g_ring_on = false;                    // the next plans use it (resident_plan_set_stage's `ring`)
+int32_t* g_rof = nullptr;                  // per (layer, expert): its ring slot or -1
+int32_t* g_rtag = nullptr;                 // per ring slot: its (layer, expert) or -1
+uint8_t* g_rref = nullptr;                 // per ring slot: the clock's count (0..2)
+int32_t* g_rhand = nullptr;                // the clock hand
+int g_ring_n = 0;
+uint32_t* g_mstat = nullptr;               // STRATA_MIRROR_STATS: [n_layers][8] device counters (mirror_stats_*)
+long long g_mirror_entries = 0;            // 0: unchecked
+int g_ring_grant = 0;
+
+bool in_mirror_table(const int32_t* res_layer) {
+    if (g_mirror_res == nullptr || res_layer < g_mirror_res) return false;
+    return g_mirror_entries <= 0 || res_layer - g_mirror_res < g_mirror_entries;
+}
+
+template <int NT>
+void resident_plan_kernel(const int32_t* __restrict__ ids, int n, int k,
+                          const int32_t* __restrict__ res, int n_expert,
+                          const uint8_t* cache_base,
+                          const unsigned long long* slot_off, long long blob,
+                          int32_t* __restrict__ pl, long long capx, uint32_t* skip,
+                          uint32_t ring, const unsigned long long* __restrict__ mir,
+                          volatile uint32_t* plan_err, int32_t* usage, bool mfirst,
+                          uint8_t* stage, long long sstride, unsigned long long* msrc, uint8_t* rbase, int32_t* rof,
+                          int32_t* rof_g, int32_t* rtag, uint8_t* rref, int32_t* rhand, int R, int key_base,
+                          uint32_t* mstat, sycl::nd_item<1> item) {
+    constexpr int NW = NT / 32;
+    auto& s_ids = *sycl::ext::oneapi::group_local_memory_for_overwrite<int32_t[NT]>(item.get_group());
+    auto& s_excl = *sycl::ext::oneapi::group_local_memory_for_overwrite<int32_t[NT]>(item.get_group());
+    auto& s_wsum = *sycl::ext::oneapi::group_local_memory_for_overwrite<int32_t[NW]>(item.get_group());
+    auto& s_exclm = *sycl::ext::oneapi::group_local_memory_for_overwrite<int32_t[NT]>(item.get_group());
+    auto& s_wsumm = *sycl::ext::oneapi::group_local_memory_for_overwrite<int32_t[NW]>(item.get_group());
+    auto& s_bad = *sycl::ext::oneapi::group_local_memory_for_overwrite<int>(item.get_group());
+
     const int tid = item.get_local_id(0);
-    if (tid == 0) *s_bad = 0;
+    if (tid == 0) s_bad = 0;
     item.barrier(sycl::access::fence_space::local_space);
 
     int32_t eid = -1;
+    int32_t slot = -1;
+    unsigned long long maddr = 0;   // SYCL port: a host-mirrored expert (not in VRAM): its pinned mirror, read over PCIe
     if (tid < n) {
         eid = ids[tid];
         s_ids[tid] = eid;
-        const int32_t slot = (eid >= 0 && eid < n_expert) ? res[eid] : -1;
-        if (slot < 0) {
+        slot = (eid >= 0 && eid < n_expert) ? res[eid] : -1;
+        if (slot < 0 && eid >= 0 && eid < n_expert && mir != nullptr) maddr = mir[eid];
+        if (usage != nullptr && eid >= 0 && eid < n_expert)
+            sycl::atomic_ref<int32_t, sycl::memory_order::relaxed, sycl::memory_scope::device,
+                             sycl::access::address_space::global_space>(usage[eid]).fetch_add(1);
+        if (slot < 0 && maddr == 0)
             sycl::atomic_ref<int, sycl::memory_order::relaxed, sycl::memory_scope::work_group,
-                             sycl::access::address_space::local_space>(*s_bad).fetch_or(1);
-        } else {
-            s_ptr[tid] = (unsigned long long)(cache_base + (slot_off ? (size_t)slot_off[slot] : (size_t)slot * (size_t)blob));
-        }
+                             sycl::access::address_space::local_space>(s_bad).fetch_or(1);
     }
     item.barrier(sycl::access::fence_space::local_space);
-    if (*s_bad) {
-        if (tid == 0) {
-            if (skip != nullptr) *skip = 0;
-            if (plan_err != nullptr) *plan_err = 1;
+    if (s_bad) {
+        if (tid == 0 && skip != nullptr) *skip = 0;
+        if (tid == 0 && skip == nullptr) {
+            pl[0] = 0; pl[1] = 0; pl[2] = 0; pl[3] = 0;
+            if (plan_err != nullptr) {
+                *plan_err = 1;
+                sycl::atomic_fence(sycl::memory_order::seq_cst, sycl::memory_scope::system);
+            }
         }
         return;
     }
@@ -430,6 +483,7 @@ void resident_plan_kernel(const int32_t* __restrict__ ids, int n, int k, const i
     int rank_in_group = 0;
     int count_same = 0;
     if (tid < n) {
+#pragma unroll
         for (int j = 0; j < n; ++j) {
             if (s_ids[j] == eid) {
                 if (j < first_j) first_j = j;
@@ -437,11 +491,94 @@ void resident_plan_kernel(const int32_t* __restrict__ ids, int n, int k, const i
                 ++count_same;
             }
         }
-        const bool is_first = (first_j == tid);
-        s_first[tid] = is_first ? 1 : 0;
-        s_cnt[tid] = is_first ? count_same : 0;
+    }
+    const bool is_first = (tid < n && first_j == tid && (slot >= 0 || maddr != 0));
+    const int my_cnt = is_first ? count_same : 0;
+
+    int rslot = -1;
+    bool rnew = false;
+    if (rbase != nullptr) {
+        auto& s_cand = *sycl::ext::oneapi::group_local_memory_for_overwrite<int32_t[NT]>(item.get_group());
+        auto& s_pick = *sycl::ext::oneapi::group_local_memory_for_overwrite<int32_t[NT]>(item.get_group());
+        auto& s_rn = *sycl::ext::oneapi::group_local_memory_for_overwrite<int32_t[3]>(item.get_group());
+        if (tid == 0) { s_rn[0] = 0; s_rn[1] = 0; s_rn[2] = -1; }
+        item.barrier(sycl::access::fence_space::global_and_local);
+        int myj = -1;
+        if (is_first && slot < 0) {
+            const int rs = rof[eid];
+            if (rs >= 0) { rslot = rs; rref[rs] = 2; }
+            else myj = sycl::atomic_ref<int, sycl::memory_order::relaxed, sycl::memory_scope::work_group,
+                                        sycl::access::address_space::local_space>(s_rn[0]).fetch_add(1);
+        }
+        item.barrier(sycl::access::fence_space::global_and_local);
+        const int nm = s_rn[0];
+        if (nm > 0) {
+            const int h = *rhand;
+            const int c = (h + tid) % R;
+            s_cand[tid] = rref[c];
+            item.barrier(sycl::access::fence_space::local_space);
+            if (tid == 0) {
+                int got = 0, last = -1;
+                for (int t = 0; t < NT && got < nm; ++t) if (s_cand[t] == 0) { s_pick[got++] = t; last = t > last ? t : last; s_cand[t] = 3; }
+                for (int t = 0; t < NT && got < nm; ++t) if (s_cand[t] == 1) { s_pick[got++] = t; last = t > last ? t : last; s_cand[t] = 3; }
+                s_rn[1] = got;
+                s_rn[2] = last;
+                *rhand = (h + last + 1) % R;
+            }
+            item.barrier(sycl::access::fence_space::local_space);
+            const int cv = s_cand[tid];
+            if (tid <= s_rn[2] && (cv == 1 || cv == 2)) rref[c] = (uint8_t)(cv - 1);
+            if (myj >= 0 && myj < s_rn[1]) {
+                const int cs = (h + s_pick[myj]) % R;
+                const int old = rtag[cs];
+                if (old >= 0) rof_g[old] = -1;
+                rtag[cs] = key_base + eid;
+                rof[eid] = cs;
+                rref[cs] = 1;
+                rslot = cs;
+                rnew = true;
+            }
+        }
+    }
+
+    if (mstat != nullptr) {
+        using aref = sycl::atomic_ref<uint32_t, sycl::memory_order::relaxed, sycl::memory_scope::device,
+                                      sycl::access::address_space::global_space>;
+        if (tid == 0) { aref(mstat[0]).fetch_add(1u); aref(mstat[1]).fetch_add((uint32_t)n); }
+        if (is_first) {
+            aref(mstat[2]).fetch_add(1u);
+            aref(mstat[slot >= 0 ? 3 : rnew ? 5 : rslot >= 0 ? 4 : 6]).fetch_add(1u);
+        }
+    }
+
+    const bool msplit = mfirst || stage != nullptr;
+    const bool in_m = msplit && slot < 0;
+    const int my_pack = in_m ? 0 : (my_cnt << 16) | (is_first ? 1 : 0);
+    const int my_packm = in_m ? (my_cnt << 16) | (is_first ? 1 : 0) : 0;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    const int pref = sycl::inclusive_scan_over_group(item.get_sub_group(), my_pack, sycl::plus<int>());
+    s_excl[tid] = pref - my_pack;
+    if (lane == 31) {
+        s_wsum[warp] = pref;
+    }
+    if (msplit) {
+        const int prefm = sycl::inclusive_scan_over_group(item.get_sub_group(), my_packm, sycl::plus<int>());
+        s_exclm[tid] = prefm - my_packm;
+        if (lane == 31) s_wsumm[warp] = prefm;
     }
     item.barrier(sycl::access::fence_space::local_space);
+    int mtot = 0;
+    if (msplit) {
+#pragma unroll
+        for (int w = 0; w < NW; ++w) mtot += s_wsumm[w];
+    }
+    int vtot = 0;
+    if (stage != nullptr) {
+#pragma unroll
+        for (int w = 0; w < NW; ++w) vtot += s_wsum[w];
+    }
+    const int off_v = stage != nullptr ? 0 : mtot, off_m = stage != nullptr ? vtot : 0;
 
     int32_t* counts = pl;
     int32_t* start = pl + 4;
@@ -451,38 +588,60 @@ void resident_plan_kernel(const int32_t* __restrict__ ids, int n, int k, const i
     unsigned long long* ptr = (unsigned long long*)(pl + ptr_off);
     int32_t* start2 = pl + ptr_off + 4 * capx;
 
-    if (tid < n && first_j == tid) {
-        int grp_idx = 0;
-        int ent_start = 0;
-        for (int j = 0; j < tid; ++j) {
-            grp_idx += s_first[j];
-            ent_start += s_cnt[j];
+    if (is_first) {
+        int tot = in_m ? s_exclm[tid] + off_m : s_excl[tid] + off_v;
+#pragma unroll
+        for (int w = 0; w < NW; ++w) {
+            if (w < warp) tot += in_m ? s_wsumm[w] : s_wsum[w];
         }
-        ptr[grp_idx] = s_ptr[tid];
+        const int grp_idx = tot & 0xffff;
+        const int ent_start = tot >> 16;
+        const int mj = grp_idx - (vtot & 0xffff);
+        const unsigned long long sa = rslot >= 0 ? (unsigned long long)(rbase + (size_t)rslot * (size_t)sstride)
+                                    : stage != nullptr ? (unsigned long long)(stage + (size_t)mj * (size_t)sstride) : 0ull;
+        ptr[grp_idx] = slot >= 0 ? (unsigned long long)(cache_base + (slot_off ? (size_t)slot_off[slot] : (size_t)slot * (size_t)blob))
+                     : stage != nullptr ? sa : maddr;
         start[grp_idx] = ent_start;
-        s_gstart[tid] = ent_start;
+        if (stage != nullptr && slot < 0) {
+            ptr[capx + mj] = sa;
+            start2[mj] = ent_start;
+            msrc[mj] = (rslot >= 0 && !rnew) ? 0ull : maddr;
+        }
     }
-    item.barrier(sycl::access::fence_space::local_space);
-
     if (tid < n) {
-        const int out_idx = s_gstart[first_j] + rank_in_group;
+        const int fj_warp = first_j >> 5;
+        int fj_tot = in_m ? s_exclm[first_j] + off_m : s_excl[first_j] + off_v;
+#pragma unroll
+        for (int w = 0; w < NW; ++w) {
+            if (w < fj_warp) fj_tot += in_m ? s_wsumm[w] : s_wsum[w];
+        }
+        const int out_idx = (fj_tot >> 16) + rank_in_group;
         dst[out_idx] = tid;
         tok[out_idx] = tid / k;
     }
     if (tid == 0) {
-        int groups = 0;
-        for (int j = 0; j < n; ++j) groups += s_first[j];
+        int groups;
+        if constexpr (NW == 4) groups = (s_wsum[0] + s_wsum[1] + s_wsum[2] + s_wsum[3] + mtot) & 0xffff;
+        else {
+            groups = mtot;
+#pragma unroll
+            for (int w = 0; w < NW; ++w) groups += s_wsum[w];
+            groups &= 0xffff;
+        }
         start[groups] = n;
-        start2[0] = n;
+        const int gm = stage != nullptr ? (mtot & 0xffff) : 0;
+        start2[gm] = n;
         counts[0] = groups;
         counts[1] = n;
-        counts[2] = 0;
+        counts[2] = gm;
+        counts[3] = stage != nullptr ? (vtot & 0xffff) : groups;
         if (skip != nullptr) {
-            sycl::atomic_fence(sycl::memory_order::acq_rel, sycl::memory_scope::system);
+            sycl::atomic_fence(sycl::memory_order::seq_cst, sycl::memory_scope::device);
             strata::sys_store(skip, ring);
         }
     }
 }
+}  // namespace
 
 void wait_flag_ge_kernel(const volatile uint32_t* flag, uint32_t value, uint32_t spin_max) {
     for (uint32_t spin = 0; spin < spin_max && strata::sys_load(flag) < value; ++spin)
@@ -869,56 +1028,153 @@ void gdn_step_norm_groups(const GdnGroups& groups, const float* h, int conv_chan
     });
 }
 
+void resident_plan_set_mirror(const int32_t* d_res, const unsigned long long* mirror_table, int32_t* usage, long long entries) {
+    g_mirror_entries = entries;
+    g_usage = usage;
+    g_mirror_res = d_res;
+    g_mirror_table = mirror_table;
+}
+
+int mirror_ring_slots() {
+    static const int n = [] {
+        auto set_nonzero = [](const char* k) { const char* e = std::getenv(k); return e != nullptr && e[0] != '\0' && e[0] != '0'; };
+        const char* st = std::getenv("STRATA_MIRROR_STAGE");
+        if ((st != nullptr && st[0] == '0') || !set_nonzero("STRATA_VERIFY_DEVICE_PLAN") || !set_nonzero("STRATA_VERIFY_NO_HOST")) return 0;
+        const char* v = std::getenv("STRATA_MIRROR_RING");
+        return v != nullptr && *v ? std::max(0, std::atoi(v)) : 1024;
+    }();
+    return n;
+}
+
+void mirror_ring_grant(int slots) { g_ring_grant = std::max(0, slots); }
+int mirror_ring_granted() { return g_ring_grant; }
+
+bool mirror_ring_create(int slots, long long stride, std::string& err) {
+    if (g_ring_base != nullptr) return true;
+    if (g_mirror_entries <= 0 || slots < kResidentPlanMax) { err = "no mirror table, or fewer slots than a plan's entries"; return false; }
+    sycl::queue& q = default_queue();
+    try {
+        g_ring_base = sycl::malloc_device<uint8_t>((size_t)slots * (size_t)stride, q);
+        g_rof = sycl::malloc_device<int32_t>((size_t)g_mirror_entries, q);
+        g_rtag = sycl::malloc_device<int32_t>((size_t)slots, q);
+        g_rref = sycl::malloc_device<uint8_t>((size_t)slots, q);
+        g_rhand = sycl::malloc_device<int32_t>(1, q);
+    } catch (const sycl::exception& e) { err = e.what(); }
+    if (!g_ring_base || !g_rof || !g_rtag || !g_rref || !g_rhand) { if (err.empty()) err = "out of VRAM"; g_ring_base = nullptr; return false; }
+    q.memset(g_rof, 0xff, (size_t)g_mirror_entries * 4);
+    q.memset(g_rtag, 0xff, (size_t)slots * 4);
+    q.memset(g_rref, 0, (size_t)slots);
+    q.memset(g_rhand, 0, 4).wait();
+    g_ring_n = slots;
+    return true;
+}
+
+void resident_plan_set_stage(uint8_t* base, long long stride, unsigned long long* src, bool ring) {
+    g_ring_on = ring && g_ring_base != nullptr && src != nullptr;
+    g_stage_base = src != nullptr ? base : nullptr;
+    g_stage_stride = stride;
+    g_stage_src = src;
+}
+
+void mirror_stage(const int32_t* plan, long long capx, long long blob_bytes, const unsigned long long* src, void* stream) {
+    static const int nwg = [] { const char* v = std::getenv("STRATA_MIRROR_STAGE_WG"); return v && std::atoi(v) > 0 ? std::atoi(v) : 64; }();
+    constexpr int WG = 256, U = 4;
+    const long long ptr_off = ((4 + (capx + 1) + 2 * capx) + 1) & ~1ll;
+    const unsigned long long* dstp = (const unsigned long long*)(plan + ptr_off) + capx;
+    const int32_t* counts = plan;
+    const long long n16 = blob_bytes / 16, tail = blob_bytes - n16 * 16;
+    sycl::queue* q = stream ? static_cast<sycl::queue*>(stream) : &default_queue();
+    q->parallel_for(
+        sycl::nd_range<1>(sycl::range<1>((size_t)nwg * WG), sycl::range<1>(WG)),
+        [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
+            const int m = counts[2];
+            const long long T = (long long)it.get_global_range(0);
+            const long long g0 = (long long)it.get_global_id(0);
+            for (int j = 0; j < m; ++j) {
+                if (src[j] == 0) continue;   // STRATA_MIRROR_RING: already in the ring
+                const sycl::uint4* s4 = (const sycl::uint4*)src[j];
+                sycl::uint4* d4 = (sycl::uint4*)dstp[j];
+                long long i = g0;
+                for (; i + (U - 1) * T < n16; i += U * T) {
+                    sycl::uint4 v[U];
+#pragma unroll
+                    for (int u = 0; u < U; ++u) v[u] = s4[i + u * T];
+#pragma unroll
+                    for (int u = 0; u < U; ++u) d4[i + u * T] = v[u];
+                }
+                for (; i < n16; i += T) d4[i] = s4[i];
+                if (g0 < tail) ((uint8_t*)d4)[n16 * 16 + g0] = ((const uint8_t*)s4)[n16 * 16 + g0];
+            }
+        });
+}
+
+bool mirror_stats_enable(int n_layers) {
+    if (g_mstat != nullptr) return true;
+    if (n_layers <= 0) return false;
+    sycl::queue& q = default_queue();
+    try { g_mstat = sycl::malloc_device<uint32_t>((size_t)n_layers * 8, q); } catch (const sycl::exception&) { g_mstat = nullptr; }
+    if (g_mstat == nullptr) return false;
+    q.memset(g_mstat, 0, (size_t)n_layers * 8 * 4).wait();
+    return true;
+}
+
+bool mirror_stats_read(uint32_t* out, int n_layers, bool reset) {
+    if (g_mstat == nullptr) return false;
+    sycl::queue& q = default_queue();
+    q.memcpy(out, g_mstat, (size_t)n_layers * 8 * 4).wait();
+    if (reset) q.memset(g_mstat, 0, (size_t)n_layers * 8 * 4).wait();
+    return true;
+}
+
 void resident_plan(const int32_t* ids, int n_entries, int k, const int32_t* res_layer, int n_expert,
                    const uint8_t* cache_base, const unsigned long long* slot_off, long long blob, int32_t* plan,
                    long long capx, uint32_t* skip, uint32_t ring, void* stream, uint32_t* plan_err) {
+    const unsigned long long* mir = nullptr;   // SYCL port: the layer's slice of the host-mirror table, if any
+    int32_t* use = nullptr;                    // the layer's slice of the device routing counts, if on
+    if (g_mirror_table != nullptr && in_mirror_table(res_layer)) mir = g_mirror_table + (res_layer - g_mirror_res);
+    if (g_usage != nullptr && in_mirror_table(res_layer)) use = g_usage + (res_layer - g_mirror_res);
+    static const bool mfirst_env = [] {
+        const char* v = std::getenv("STRATA_PLAN_MIRROR_FIRST");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
+    const bool mfirst = mfirst_env && mir != nullptr;
+    uint8_t* stg = mir != nullptr ? g_stage_base : nullptr;
+    const long long sstr = g_stage_stride;
+    unsigned long long* ssrc = stg != nullptr ? g_stage_src : nullptr;
+    const int kb = mir != nullptr ? (int)(res_layer - g_mirror_res) : 0;
+    uint8_t* rng = stg != nullptr && g_ring_on ? g_ring_base : nullptr;
+    int32_t* rof = rng != nullptr ? g_rof + kb : nullptr;
+    int32_t* rofg = g_rof;
+    int32_t* rtg = g_rtag;
+    uint8_t* rrf = g_rref;
+    int32_t* rhd = g_rhand;
+    const int rn = g_ring_n;
+    uint32_t* mst = g_mstat != nullptr && mir != nullptr ? g_mstat + (size_t)(kb / n_expert) * 8 : nullptr;
+
     sycl::queue* q = stream ? static_cast<sycl::queue*>(stream) : &default_queue();
-    if (n_entries > 128) {
-        if (n_entries > 256) {
-            std::fprintf(stderr, "resident_plan: %d entries, at most 256\n", n_entries);
+    if (n_entries > kResidentPlanNarrow) {
+        if (kResidentPlanMax > kResidentPlanNarrow && n_entries <= kResidentPlanMax) {
+            q->parallel_for(
+                sycl::nd_range<1>(sycl::range<1>(kResidentPlanMax), sycl::range<1>(kResidentPlanMax)),
+                [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(32)]] {
+                    resident_plan_kernel<kResidentPlanMax>(
+                        ids, n_entries, k, res_layer, n_expert,
+                        cache_base, slot_off, blob, plan, capx, skip,
+                        ring, mir, plan_err, use, mfirst, stg, sstr, ssrc, rng, rof, rofg, rtg, rrf, rhd, rn, kb, mst, item);
+                });
+        } else {
+            std::fprintf(stderr, "resident_plan: %d entries, at most %d\n", n_entries, kResidentPlanMax);
             std::exit(1);
         }
-        q->submit([&](sycl::handler& cgh) {
-            sycl::local_accessor<int32_t, 1> s_ids(sycl::range<1>(256), cgh);
-            sycl::local_accessor<unsigned long long, 1> s_ptr(sycl::range<1>(256), cgh);
-            sycl::local_accessor<int32_t, 1> s_first(sycl::range<1>(256), cgh);
-            sycl::local_accessor<int32_t, 1> s_cnt(sycl::range<1>(256), cgh);
-            sycl::local_accessor<int32_t, 1> s_gstart(sycl::range<1>(256), cgh);
-            sycl::local_accessor<int, 0> s_bad(cgh);
-            cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(256), sycl::range<1>(256)),
-                             [=](sycl::nd_item<1> item) {
-                                 resident_plan_kernel(ids, n_entries, k, res_layer, n_expert, cache_base, slot_off, blob,
-                                                      plan, capx, skip, ring,
-                                                      s_ids.get_multi_ptr<sycl::access::decorated::no>().get(),
-                                                      s_ptr.get_multi_ptr<sycl::access::decorated::no>().get(),
-                                                      s_first.get_multi_ptr<sycl::access::decorated::no>().get(),
-                                                      s_cnt.get_multi_ptr<sycl::access::decorated::no>().get(),
-                                                      s_gstart.get_multi_ptr<sycl::access::decorated::no>().get(),
-                                                      s_bad.get_multi_ptr<sycl::access::decorated::no>().get(),
-                                                      item, plan_err);
-                             });
-        });
     } else {
-        q->submit([&](sycl::handler& cgh) {
-            sycl::local_accessor<int32_t, 1> s_ids(sycl::range<1>(128), cgh);
-            sycl::local_accessor<unsigned long long, 1> s_ptr(sycl::range<1>(128), cgh);
-            sycl::local_accessor<int32_t, 1> s_first(sycl::range<1>(128), cgh);
-            sycl::local_accessor<int32_t, 1> s_cnt(sycl::range<1>(128), cgh);
-            sycl::local_accessor<int32_t, 1> s_gstart(sycl::range<1>(128), cgh);
-            sycl::local_accessor<int, 0> s_bad(cgh);
-            cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(128), sycl::range<1>(128)),
-                             [=](sycl::nd_item<1> item) {
-                                 resident_plan_kernel(ids, n_entries, k, res_layer, n_expert, cache_base, slot_off, blob,
-                                                      plan, capx, skip, ring,
-                                                      s_ids.get_multi_ptr<sycl::access::decorated::no>().get(),
-                                                      s_ptr.get_multi_ptr<sycl::access::decorated::no>().get(),
-                                                      s_first.get_multi_ptr<sycl::access::decorated::no>().get(),
-                                                      s_cnt.get_multi_ptr<sycl::access::decorated::no>().get(),
-                                                      s_gstart.get_multi_ptr<sycl::access::decorated::no>().get(),
-                                                      s_bad.get_multi_ptr<sycl::access::decorated::no>().get(),
-                                                      item, plan_err);
-                             });
-        });
+        q->parallel_for(
+            sycl::nd_range<1>(sycl::range<1>(kResidentPlanNarrow), sycl::range<1>(kResidentPlanNarrow)),
+            [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(32)]] {
+                resident_plan_kernel<kResidentPlanNarrow>(
+                    ids, n_entries, k, res_layer, n_expert,
+                    cache_base, slot_off, blob, plan, capx, skip,
+                    ring, mir, plan_err, use, mfirst, stg, sstr, ssrc, rng, rof, rofg, rtg, rrf, rhd, rn, kb, mst, item);
+            });
     }
 }
 

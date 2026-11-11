@@ -325,10 +325,16 @@ elseif(STRATA_ENABLE_SYCL)
     add_compile_definitions(STRATA_XMX_SG16=1)
     message(STATUS "Strata: Xe2 16-lane subgroup XMX tile dimensions ENABLED")
   endif()
+  set(STRATA_AOT_DEVICE "bmg" CACHE STRING "AOT target device (e.g. bmg, lnl)")
   if(STRATA_AOT_BMG)
     add_compile_definitions(STRATA_TARGET_BMG)
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsycl-targets=spir64_gen -Xs \"-device bmg\" -Qunused-arguments")
-    message(STATUS "Strata: Intel Battlemage (bmg) Ahead-of-Time compilation ENABLED")
+    if(STRATA_AOT_DEVICE MATCHES "^(bmg|lnl)")
+      set(_aot_opts "-cl-fp32-correctly-rounded-divide-sqrt -doubleGRF")
+    else()
+      set(_aot_opts "-cl-fp32-correctly-rounded-divide-sqrt")
+    endif()
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsycl-targets=spir64_gen -Xs \"-device ${STRATA_AOT_DEVICE} -options '${_aot_opts}'\" -Qunused-arguments")
+    message(STATUS "Strata: Intel Xe2 Ahead-of-Time compilation (${STRATA_AOT_DEVICE}) with -doubleGRF ENABLED")
   endif()
 
   add_library(strata_sycl INTERFACE)
@@ -486,6 +492,14 @@ if(STRATA_BUILD_TESTS)
   target_link_libraries(routed_stream_test PRIVATE Threads::Threads)
   add_test(NAME routed_stream_test COMMAND routed_stream_test)
 
+  # Next-Layer Speculative MoE Routing & Copy Overlap test (STRATA_PF_PREDICT)
+  if(STRATA_ENABLE_SYCL)
+    add_executable(predict_route_test tests/prefill/predict_route_test.cpp)
+    target_include_directories(predict_route_test PRIVATE include)
+    target_link_libraries(predict_route_test PRIVATE strata_prefill)
+    add_test(NAME predict_route_test COMMAND predict_route_test)
+  endif()
+
   # PR #4006: STRATA_PREFILL_TIMING does not record a mark in the phase already running (header-only, no GPU)
   add_executable(timer_marks_test tests/prefill/timer_marks_test.cpp)
   target_include_directories(timer_marks_test PRIVATE include)
@@ -624,6 +638,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP OR STRATA_ENABLE_SYCL)
                           src/kernels/sycl/fused_gdn.cpp
                           src/kernels/sycl/dequant_bf16.cpp
                           src/kernels/sycl/qsa_select.cpp
+                          src/kernels/sycl/qsa_select_xmx.cpp
                           src/kernels/sycl/verify_kernels.cpp
                           src/kernels/sycl/iq_kernels.cpp
                           src/kernels/sycl/tq_gemv.cpp
@@ -903,13 +918,13 @@ endif()
   # library is the honest shape of the dependency graph: core knows about devices and weights, kernels know
   # about arithmetic, and this one knows the ORDER the arithmetic happens in.
   if(STRATA_ENABLE_SYCL)
-    add_library(strata_engine STATIC src/core/sycl/layer.cpp src/core/sycl/session.cpp src/core/sycl/expert_source.cpp src/core/sycl/remote_experts.cpp src/core/sycl/expert_cache.cpp src/core/sycl/native_head.cpp src/core/sycl/native_dense.cpp src/core/sycl/verify.cpp src/core/sycl/mtp.cpp src/core/sycl/draft_head.cpp src/core/sycl/conversation_snapshot.cpp src/core/sycl/conversation_state.cpp src/core/sycl/conversation_memory.cpp src/core/arch_defaults.cpp src/core/nv_defaults.cpp src/core/vmm.cpp src/core/conversation_file.cpp)
+    add_library(strata_engine STATIC src/core/sycl/layer.cpp src/core/sycl/session.cpp src/core/sycl/expert_source.cpp src/core/sycl/remote_experts.cpp src/core/sycl/expert_cache.cpp src/core/sycl/native_head.cpp src/core/sycl/native_dense.cpp src/core/sycl/verify.cpp src/core/sycl/mtp.cpp src/core/sycl/draft_head.cpp src/core/sycl/conversation_snapshot.cpp src/core/sycl/conversation_state.cpp src/core/sycl/conversation_memory.cpp src/core/arch_defaults.cpp src/core/nv_defaults.cpp src/core/vmm.cpp src/core/conversation_file.cpp src/core/conversation_kv_store.cpp)
   else()
     add_library(strata_engine STATIC src/core/layer.cpp src/core/session.cpp src/core/expert_source.cpp src/core/remote_experts.cpp
       src/core/remote_expert_opt.cu
       src/core/expert_cache.cpp src/core/native_head.cpp src/core/native_dense.cpp src/core/verify.cpp src/core/mtp.cpp src/core/dflash2.cpp
       src/core/conversation_snapshot.cpp src/core/conversation_state.cpp src/core/conversation_memory.cpp src/core/peer_experts.cpp
-      src/core/arch_defaults.cpp src/core/nv_defaults.cpp src/core/vmm.cpp src/core/conversation_file.cpp)
+      src/core/arch_defaults.cpp src/core/nv_defaults.cpp src/core/vmm.cpp src/core/conversation_file.cpp src/core/conversation_kv_store.cpp)
   endif()
   target_include_directories(strata_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_link_libraries(strata_engine PUBLIC strata_core strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target})
@@ -1082,11 +1097,12 @@ endif()
   # against llama.cpp on the SAME ids and a tokenizer on one side of that comparison is a second variable.
   # plan v0.3 P5: batched prompt processing (tensor-core GEMMs through cuBLAS).
   if(STRATA_ENABLE_SYCL)
-    add_library(strata_prefill STATIC src/prefill/sycl/gemm.cpp src/prefill/sycl/kernels.cpp src/prefill/sycl/moe_mmq.cpp src/prefill/sycl/gdn_chunk.cpp src/prefill/sycl/prefill.cpp)
+    add_library(strata_prefill STATIC src/prefill/sycl/gemm.cpp src/prefill/sycl/kernels.cpp src/prefill/sycl/moe_mmq.cpp src/prefill/sycl/gdn_chunk.cpp src/prefill/sycl/prefill.cpp src/prefill/sycl/esimd_moe.cpp)
     target_compile_options(strata_prefill PUBLIC "-fsycl")
     target_link_options(strata_prefill PUBLIC "-fsycl")
     target_compile_definitions(strata_prefill PUBLIC STRATA_PREFILL_MMQ=1)
     target_include_directories(strata_prefill PRIVATE
+      "${CMAKE_CURRENT_SOURCE_DIR}/src/prefill/sycl"
       "${CMAKE_CURRENT_SOURCE_DIR}/third_party/llama.cpp/ggml/include"
       "${CMAKE_CURRENT_SOURCE_DIR}/third_party/llama.cpp/ggml/src")
   else()
@@ -1648,6 +1664,14 @@ endif()
   target_include_directories(iq_multi_parity PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(iq_multi_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
   add_test(NAME iq_multi_parity COMMAND iq_multi_parity)
+
+  if(STRATA_ENABLE_SYCL AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/sycl/mmvq_kreg_parity.cpp")
+    add_executable(mmvq_kreg_parity src/kernels/sycl/mmvq_kreg_parity.cpp)
+    target_include_directories(mmvq_kreg_parity PRIVATE ${_strata_gpu_include_directories})
+    target_link_libraries(mmvq_kreg_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+    add_test(NAME mmvq_kreg_parity COMMAND mmvq_kreg_parity --selftest)
+    set_tests_properties(mmvq_kreg_parity PROPERTIES TIMEOUT 180 RESOURCE_LOCK gpu)
+  endif()
   # the Gyro trellis decode kernels (TQ2_T / TQK6 / TQK7) on synthetic blocks: decode-once vs per-column bitwise, output
   # checksums to compare two builds byte for byte, --bench for timings (GPU, no model)
   if(STRATA_ENABLE_CUDA)
@@ -2492,6 +2516,13 @@ endif()
     set_tests_properties(sycl_level_zero_memory_test PROPERTIES RESOURCE_LOCK gpu TIMEOUT 60)
   endif()
 
+  if(STRATA_ENABLE_SYCL AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/sycl/esimd_moe_parity.cpp")
+    add_executable(esimd_moe_parity src/kernels/sycl/esimd_moe_parity.cpp)
+    target_include_directories(esimd_moe_parity PRIVATE ${_strata_gpu_include_directories} "${CMAKE_CURRENT_SOURCE_DIR}/src/prefill/sycl")
+    target_link_libraries(esimd_moe_parity PRIVATE strata_prefill strata_kernels ${_strata_gpu_runtime_target})
+    add_test(NAME esimd_moe_parity COMMAND esimd_moe_parity 60 8 2)
+  endif()
+
 
 
 
@@ -2808,6 +2839,21 @@ if(STRATA_BUILD_TESTS OR STRATA_BUILD_CONVERSATION_TESTS)
   add_executable(conv_cache_test src/program/conv_cache_test.cpp)
   target_include_directories(conv_cache_test PRIVATE include)
   add_test(NAME conv_cache_test COMMAND conv_cache_test)
+  add_executable(conversation_spill_test
+                 src/core/conversation_spill_test.cpp
+                 src/core/conversation_file.cpp
+                 src/core/conversation_kv_store.cpp
+                 src/platform/direct_file.cpp)
+  target_include_directories(conversation_spill_test PRIVATE include)
+  target_link_libraries(conversation_spill_test PRIVATE Threads::Threads)
+  add_test(NAME conversation_spill_test COMMAND conversation_spill_test)
+  add_executable(bench_delta_spill
+                 tools/bench_delta_spill.cpp
+                 src/core/conversation_file.cpp
+                 src/core/conversation_kv_store.cpp
+                 src/platform/direct_file.cpp)
+  target_include_directories(bench_delta_spill PRIVATE include)
+  target_link_libraries(bench_delta_spill PRIVATE Threads::Threads)
   # --adapt-decay outside 0..1 falls back to 0.7 with a line (#1284; header-only, CPU)
   add_executable(adapt_decay_test src/program/adapt_decay_test.cpp)
   target_include_directories(adapt_decay_test PRIVATE include)

@@ -20,6 +20,7 @@ inline sycl::queue& get_default_queue() {
 #include "strata/core/native_head.hpp"
 #include "strata/core/on_device.hpp"
 #include "strata/kernels/iq_kernels.hpp"
+#include "strata/kernels/resident_plan_mirror.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/bf16_gemv.hpp"
 #include "strata/kernels/native_router.hpp"
@@ -455,6 +456,16 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         sink_.ctx = this;
     }
 
+    // STRATA_MIRROR_STAGE (default on with the native pack; =0 off): the device plan's host-mirrored groups are copied into
+    // VRAM by a streaming kernel before the expert launch, which then reads every group from VRAM.
+    {
+        const char* v = std::getenv("STRATA_MIRROR_STAGE");
+        auto set_nonzero = [](const char* k) { const char* e = std::getenv(k); return e != nullptr && e[0] != '\0' && e[0] != '0'; };
+        // (only the lean window plans on the device without a host: STRATA_VERIFY_DEVICE_PLAN + STRATA_VERIFY_NO_HOST)
+        mstage_on_ = strata::kernels::cpu::expert_layout().native && !(v != nullptr && v[0] == '0') &&
+                     set_nonzero("STRATA_VERIFY_DEVICE_PLAN") && set_nonzero("STRATA_VERIFY_NO_HOST");
+    }
+
     // ---- the device arena: the same sequence counted, then carved
     auto carve = [&](Bump& b) {
         tok_ = b.take<int32_t>(T);
@@ -504,6 +515,11 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         hit_count_ = b.take<int32_t>(4);
         plan_ = b.take<int32_t>(2 * ((uint64_t)plan_i32_ + 16));
         staging_ = b.take<uint8_t>((uint64_t)kStagingBlobs * strata::kernels::cpu::expert_layout().max_blob);
+        if (mstage_on_) {   // STRATA_MIRROR_STAGE: a blob per possible group, and each plan group's copy sources
+            mstage_stride_ = (long long)((strata::kernels::cpu::expert_layout().max_blob + 255) / 256 * 256);
+            mstage_ = b.take<uint8_t>(T * K * (uint64_t)mstage_stride_);
+            msrc_ = b.take<unsigned long long>(2 * T * K);
+        }
         hit_xq_ = b.take<uint8_t>(T * (N / 32) * 34);
         hit_xs_ = b.take<float>(T * (N / 32));
         nat_xq_ = b.take<uint8_t>(T * (N / 32) * 36);
@@ -615,6 +631,22 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
             res_graph_ = false;
         }
     }
+    if (mstage_ != nullptr && !device_plan_) mstage_ = nullptr;   // (only the device plan stages)
+    if (mstage_ != nullptr && !split_) {   // STRATA_MIRROR_RING=R (blobs): keep the fetched mirrored experts in VRAM
+        const int rn = strata::kernels::mirror_ring_granted();
+        const int r_try = rn > 0 ? rn : strata::kernels::mirror_ring_slots();
+        if (r_try > 0) {
+            std::string rerr;
+            mring_ = strata::kernels::mirror_ring_create(r_try, mstage_stride_, rerr);
+            if (!mring_) std::fprintf(stderr, "strata verify: the mirrored experts' VRAM ring is off (%s)\n", rerr.c_str());
+            else std::fprintf(stderr, "strata verify: a VRAM ring of %d blobs (%.1f MiB) keeps the mirrored experts the windows fetch "
+                                      "(STRATA_MIRROR_RING=N sets it, 0 turns it off)\n", r_try, (double)r_try * (double)mstage_stride_ / 1048576.0);
+        }
+    }
+    if (mstage_ != nullptr)
+        std::fprintf(stderr, "strata verify: host-mirrored experts staged in VRAM (%.1f MiB) by a 16-byte-load copy before "
+                             "the expert kernels read them (STRATA_MIRROR_STAGE=0 turns it off)\n",
+                     (double)max_t * (double)ss.k * (double)mstage_stride_ / 1048576.0);
     std::fprintf(stderr, "strata verify: window up to %d tokens, %.1f MiB of device buffers\n", max_t,
                  (double)count.used / 1048576.0);
     VDBG("init complete: max_t=%d, N=%lld, HC=%lld, K=%lld, n_layers=%lld, device_plan=%d, is_lean=%d, h_seq=%p, m_seq=%p, h_flag=%p, h_flagA=%p, h_flagB=%p, cs=%p, copy=%p\n",
@@ -1145,10 +1177,14 @@ bool Verifier::record_layer_pre(int T, int64_t l, int grp, sycl::queue* cs, std:
         }
         if ((device_plan_ || recording_res_) && hits_.d_res != nullptr) {
             VDBG("layer_pre (l=%lld, grp=%d): resident_plan\n", (long long)l, grp);
+            if (lean && mstage_ != nullptr)
+                resident_plan_set_stage(mstage_, mstage_stride_, msrc_ + (size_t)grp * (size_t)(max_t_ * K), mring_ && G == 1);
             resident_plan(ids_ + tb * K, n * (int)K, (int)K, hits_.d_res + l * g.n_expert, (int)g.n_expert,
                           hits_.cache_base, slot_off_d_, (long long)hits_.blob,
                           plan_ + (size_t)grp * (size_t)(plan_i32_ + 16), (long long)max_t_ * K, skip_ + grp,
                           (uint32_t)((l - lb_) * G + grp + 1), cs);
+            if (lean && mstage_ != nullptr)
+                resident_plan_set_stage(nullptr, 0, nullptr);
         }
         if (!lean && !recording_res_) {
             const uint32_t want = (uint32_t)((l - lb_) * G + grp + 1);
@@ -1280,6 +1316,8 @@ bool Verifier::record_layer_post(int T, int64_t l, int grp, sycl::queue* cs, std
                                hit_xs_ + (size_t)tb * (N / 32), hit_scratch_, hit_out, cs);
             }
         };
+        if (lean && mstage_ != nullptr)   // STRATA_MIRROR_STAGE: the plan's mirrored list into VRAM first
+            mirror_stage(pl, capx, (long long)lay.blob_bytes(l), msrc_ + (size_t)grp * (size_t)capx, cs);
         VDBG("layer_post (l=%lld, grp=%d): grouped 0 (VRAM) start\n", (long long)l, grp);
         grouped(p_ptr, p_start, p_counts);
         VDBG("layer_post (l=%lld, grp=%d): grouped 0 (VRAM) done\n", (long long)l, grp);
