@@ -41,6 +41,7 @@
 #include "strata/kernels/s2_expert_grouped.hpp"
 #include "strata/kernels/sampler.hpp"
 #include "strata/kernels/verify_kernels.hpp"
+#include "strata/kernels/resident_plan_mirror.hpp"
 #include "strata/kernels/shared_expert.hpp"
 #include "strata/kernels/native_moe.hpp"
 #include "strata/kernels/native_gdn.hpp"
@@ -3445,6 +3446,57 @@ int main(int argc, char** argv) try {
             o.expert_cache = (int)fit;
         }
     }
+    // STRATA_MIRROR_RING: the lean window's VRAM ring of the mirrored experts it fetched (one largest blob a slot,
+    // strata/kernels/resident_plan_mirror.hpp) is part of the cache's budget - auto-sized or --expert-cache N - when the
+    // cache cannot hold every expert anyway, so the VRAM in use stays what it was.  The experts the ring's slots held then
+    // have to fit the pinned mirror too (with the device plan an expert in neither refuses the start, below): when the
+    // mirror's cap (STRATA_MIRROR_MIB, or the free RAM less 4 GiB) cannot take them, the cache keeps its slots, no ring.
+    if (const int64_t ring = strata::kernels::mirror_ring_slots();
+        ring > 0 && native_pack && !multi_gpu && !profile.empty() && o.expert_cache > 0 &&
+        o.expert_cache < (int64_t)profile.size() && o.expert_cache - ring >= 256) {
+        const auto& xl = strata::kernels::cpu::expert_layout();
+        auto miss_bytes = [&](int64_t slots) {  // the profile-order fill of `slots` largest-blob slots, and what stays out
+            const uint64_t budget = (uint64_t)slots * xl.max_blob;
+            uint64_t used = 0, miss = 0;
+            for (const auto& pr : profile) {
+                const uint64_t b = xl.blob_bytes(pr.first);
+                if (used + b <= budget)
+                    used += b;
+                else
+                    miss += b;
+            }
+            return miss;
+        };
+        uint64_t avail = 0;
+        if (FILE* f = std::fopen("/proc/meminfo", "r")) {
+            char key[64];
+            unsigned long long kb = 0;
+            while (std::fscanf(f, "%63s %llu kB", key, &kb) == 2)
+                if (std::strcmp(key, "MemAvailable:") == 0) {
+                    avail = kb << 10;
+                    break;
+                }
+            std::fclose(f);
+        }
+        const char* mv = std::getenv("STRATA_MIRROR_MIB");
+        const char* mg = std::getenv("STRATA_MIRROR_MARGIN_MIB");
+        const uint64_t margin = (uint64_t)(mg ? std::max<long long>(0, std::atoll(mg)) : 4096) << 20;
+        const uint64_t cap = mv ? (uint64_t)std::atoll(mv) << 20 : (avail > margin ? avail - margin : 0);
+        const uint64_t need = miss_bytes(o.expert_cache - ring);
+        if (need <= cap) {
+            o.expert_cache -= (int)ring;
+            strata::kernels::mirror_ring_grant((int)ring);
+            std::fprintf(stderr,
+                         "strata generate: expert cache: %lld of its largest-blob slots go to the mirrored experts' "
+                         "VRAM ring -> %d (STRATA_MIRROR_RING=N sets the ring, 0 turns it off)\n",
+                         (long long)ring, o.expert_cache);
+        } else {
+            std::fprintf(stderr,
+                         "strata generate: no VRAM ring for the mirrored experts: the experts it would move out of "
+                         "VRAM need %.1f GiB of mirror, the cap is %.1f GiB (STRATA_MIRROR_MIB)\n",
+                         (double)need / 1073741824.0, (double)cap / 1073741824.0);
+        }
+    }
     // plan v0.3 P6: a native pack's blobs differ per layer, so with a profile its slots are sized per pair: the
     // same VRAM holds ~30% more IQ3_XXS experts than slots of the largest blob would
     // #369: not with --expert-cache-per-layer - its per-layer slot ranges ignore the profile rank a sized slot was cut
@@ -4664,6 +4716,14 @@ int main(int argc, char** argv) try {
     // streamed during a prompt and copied back after it, so those are kept in RAM too as far as RAM allows.  The
     // bytes are the file's bytes and the placement is the same, so the answers are the plain mmap mode's; the
     // share-of-pinned figure above (which sizes the prompt path) is left as the mmap mode's for the same reason.
+    const bool no_host_env = [] {
+        const char* v = std::getenv("STRATA_VERIFY_NO_HOST");
+        return v && *v && std::strcmp(v, "0") != 0;
+    }();
+    if (no_host_env && o.mmap_experts && !o.resident_cpu_experts) {
+        o.resident_cpu_experts = true;
+        o.resident_pin = true;
+    }
     if (o.resident_cpu_experts) {
         int64_t lend_from = -1;
         if (o.prefill_chunk > 0 && !o.no_prefill_borrow && d_res != nullptr && xcache.slots() > 0) {
@@ -4724,6 +4784,58 @@ int main(int argc, char** argv) try {
         } else {
             std::fprintf(stderr, "strata generate: CPU expert residency: %s\n", err.c_str());
             return 1;
+        }
+    }
+    unsigned long long* mirror_table_d = nullptr;
+    if (no_host_env && srcp != nullptr) {
+        std::vector<unsigned long long> tab((size_t)(g.n_layers * g.n_expert), 0ull);
+        int64_t mirrored_count = 0;
+        for (int64_t l = 0; l < g.n_layers; ++l) {
+            for (int64_t e = 0; e < g.n_expert; ++e) {
+                if (srcp->pinned(l, e)) {
+                    if (const void* alias = srcp->device_alias(l, e); alias != nullptr) {
+                        tab[(size_t)(l * g.n_expert + e)] = (unsigned long long)(uintptr_t)alias;
+                        ++mirrored_count;
+                   }
+                }
+            }
+        }
+        if (mirrored_count > 0) {
+            mirror_table_d = sycl::malloc_device<unsigned long long>(tab.size(), dpct::get_in_order_queue());
+            if (mirror_table_d != nullptr) {
+                dpct::get_in_order_queue()
+                    .memcpy(mirror_table_d, tab.data(), tab.size() * sizeof(unsigned long long))
+                    .wait();
+            }
+        }
+    }
+    if (no_host_env) {
+        const int64_t mirror_end = split_at.empty() ? g.n_layers : split_at[0];
+        int64_t n_true_miss = 0;
+        int64_t unmirrored_misses = 0;
+        for (int64_t l = 0; l < mirror_end; ++l) {
+            for (int64_t e = 0; e < g.n_expert; ++e) {
+                if (xcache.slot_of(l, e) == strata::core::kNotResident) {
+                    ++n_true_miss;
+                    if (srcp == nullptr || !srcp->pinned(l, e) || srcp->device_alias(l, e) == nullptr) {
+                        ++unmirrored_misses;
+                    }
+                }
+            }
+        }
+        if (unmirrored_misses > 0) {
+            std::fprintf(stderr,
+                         "strata generate: REFUSED: %lld experts are neither in VRAM nor mirrored in pinned host "
+                         "memory; with STRATA_VERIFY_NO_HOST the device plan cannot run them and generation would "
+                         "lack a safe host fallback\n",
+                         (long long)unmirrored_misses);
+            return 2;
+        }
+        if (n_true_miss > 0 && o.adapt_every > 0 && o.adapt_swaps > 0) {
+            std::fprintf(stderr,
+                         "strata generate: adaptive swaps off: with STRATA_VERIFY_NO_HOST an expert they move out "
+                         "of VRAM would be neither there nor mirrored\n");
+            o.adapt_every = 0;
         }
     }
     if (o.serve) {
@@ -5198,6 +5310,9 @@ int main(int argc, char** argv) try {
         strata::core::Verifier ver;
         strata::core::VerifyHits vh;
         vh.d_res = thits.d_res;
+        if (mirror_table_d)
+            strata::kernels::resident_plan_set_mirror(thits.d_res, mirror_table_d, nullptr,
+                                                      (long long)(g.n_layers * g.n_expert));
         vh.h_res = host_res.empty() ? nullptr : host_res.data();
         vh.cache_base = thits.cache_base;
         vh.blob = thits.blob;
@@ -7587,6 +7702,9 @@ int main(int argc, char** argv) try {
         strata::core::Verifier ver;
         strata::core::VerifyHits vh;
         vh.d_res = thits.d_res;
+        if (mirror_table_d)
+            strata::kernels::resident_plan_set_mirror(thits.d_res, mirror_table_d, nullptr,
+                                                      (long long)(g.n_layers * g.n_expert));
         vh.h_res = host_res.empty() ? nullptr : host_res.data();
         vh.cache_base = thits.cache_base;
         vh.blob = thits.blob;

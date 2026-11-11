@@ -461,9 +461,9 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     {
         const char* v = std::getenv("STRATA_MIRROR_STAGE");
         auto set_nonzero = [](const char* k) { const char* e = std::getenv(k); return e != nullptr && e[0] != '\0' && e[0] != '0'; };
-        // (only the lean window plans on the device without a host: STRATA_VERIFY_DEVICE_PLAN + STRATA_VERIFY_NO_HOST)
+        // (only the lean window plans on the device without a host: STRATA_VERIFY_NO_HOST implies device_plan_)
         mstage_on_ = strata::kernels::cpu::expert_layout().native && !(v != nullptr && v[0] == '0') &&
-                     set_nonzero("STRATA_VERIFY_DEVICE_PLAN") && set_nonzero("STRATA_VERIFY_NO_HOST");
+                     set_nonzero("STRATA_VERIFY_NO_HOST");
     }
 
     // ---- the device arena: the same sequence counted, then carved
@@ -633,14 +633,13 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     }
     if (mstage_ != nullptr && !device_plan_) mstage_ = nullptr;   // (only the device plan stages)
     if (mstage_ != nullptr && !split_) {   // STRATA_MIRROR_RING=R (blobs): keep the fetched mirrored experts in VRAM
-        const int rn = strata::kernels::mirror_ring_granted();
-        const int r_try = rn > 0 ? rn : strata::kernels::mirror_ring_slots();
-        if (r_try > 0) {
+        const int rn = strata::kernels::mirror_ring_granted();   // (what the expert cache left it: generate.cpp)
+        if (rn > 0) {
             std::string rerr;
-            mring_ = strata::kernels::mirror_ring_create(r_try, mstage_stride_, rerr);
+            mring_ = strata::kernels::mirror_ring_create(rn, mstage_stride_, rerr);
             if (!mring_) std::fprintf(stderr, "strata verify: the mirrored experts' VRAM ring is off (%s)\n", rerr.c_str());
             else std::fprintf(stderr, "strata verify: a VRAM ring of %d blobs (%.1f MiB) keeps the mirrored experts the windows fetch "
-                                      "(STRATA_MIRROR_RING=N sets it, 0 turns it off)\n", r_try, (double)r_try * (double)mstage_stride_ / 1048576.0);
+                                      "(STRATA_MIRROR_RING=N sets it, 0 turns it off)\n", rn, (double)rn * (double)mstage_stride_ / 1048576.0);
         }
     }
     if (mstage_ != nullptr)
