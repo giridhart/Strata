@@ -65,6 +65,10 @@ std::optional<HostMemoryReading> sample_host_memory();
 
 std::optional<uint64_t> available_host_bytes();
 
+inline std::optional<uint64_t> conversation_available_memory() {
+    return available_host_bytes();
+}
+
 /// #3493: the conversation cache budget (MiB) --serve uses when --conversation-cache-mib was not given, from the RAM that is available
 /// once the model is loaded: 40% of what is left above the parking floor, at most 8192 (four 100K-token agent conversations were
 /// parked in 8 GiB in the report), in steps of 256, and 0 (off) when less than 1024 would be left to give.  Unknown telemetry: 0.
