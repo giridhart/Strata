@@ -27,9 +27,10 @@ class FakeStrata(ThreadingHTTPServer):
     previous prompt (4 characters = 1 token)."""
     daemon_threads = True
 
-    def __init__(self, ctx=32768, fail_after=None):
+    def __init__(self, ctx=32768, fail_after=None, runtime_payload=None):
         super().__init__(("127.0.0.1", 0), Handler)
         self.ctx, self.prev, self.requests, self.fail_after = ctx, "", 0, fail_after
+        self.runtime_payload = runtime_payload
         self.lock = threading.Lock()
         threading.Thread(target=self.serve_forever, daemon=True).start()
 
@@ -63,8 +64,16 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path == "/props":
             self.send_json({"total_slots": 4, "model_alias": "fake-model", "build_info": "Strata 9.9.9"})
         elif self.path == "/v1/status":
-            self.send_json({"machine": {"gpu": {"name": "NVIDIA GeForce RTX 9999", "total_mib": 12288}, "ram": {"total_gib": 64.0}},
-                            "engine": "9.9.9", "vram": {"free_mib": 1000}})
+            st = {"machine": {"gpu": {"name": "NVIDIA GeForce RTX 9999", "total_mib": 12288}, "ram": {"total_gib": 64.0}},
+                  "engine": "9.9.9", "vram": {"free_mib": 1000}}
+            if s.runtime_payload is not None:
+                st["runtime"] = s.runtime_payload
+            self.send_json(st)
+        elif self.path == "/v1/runtime":
+            if s.runtime_payload is not None:
+                self.send_json(s.runtime_payload)
+            else:
+                self.send_json({}, 404)
         elif self.path == "/metrics":
             self.send_json({"engine": {"version": "9.9.9", "max_context": s.ctx, "model_path": r"C:\Users\Someone\models\x.gguf"},
                             "hardware_static": {"gpu_name": "NVIDIA GeForce RTX 9999", "cpu_name": "Fake CPU 9", "cores": 8, "threads": 16}})
@@ -428,6 +437,287 @@ class MachineDetailTests(unittest.TestCase):
             g = B.gpu_info_local()["gpus"][0]
         self.assertEqual((g["name"], g["vram_mib"], g["driver"]), ("NVIDIA GeForce RTX 4060 Ti", 16380, "616.92"))
         self.assertEqual((g["power_limit_w"], g["pcie"], g["pstate"], g["temp_c"]), ("165.00", "gen4 x8", "P3", "45"))
+
+
+class RuntimeInfoAndBenchTests(unittest.TestCase):
+    """Tests for serve/runtime_info.py, GET /v1/runtime, and benchmark report/compare integration."""
+
+    def test_runtime_info_snapshot_parses_cli_wrapper_info_and_env_defaults(self):
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+        from serve import runtime_info as RI
+
+        wrapper_path = str(Path(__file__).resolve().parents[1] / "sycl" / "serve" / "strata-sycl.sh")
+        cfg = {
+            "backend": "sycl",
+            "model_name": "Qwen3.8-Flash-Next-AWQ",
+            "exe": wrapper_path,
+            "args": ["--native", "/home/user/models/model-00001-of-00003.gguf", "--kv", "q4_0", "--spec", "4", "--prefill", "auto"],
+            "env": {"STRATA_XE2_SPLIT_K": "0", "SECRET_API_TOKEN": "hidden"},
+        }
+        eng_info = {
+            "context": 32768,
+            "kv": "q4_0",
+            "expert_slots": 4560,
+            "spec": 4,
+            "prefill_cap": 2048,
+            "vram_reserve_mib": 700,
+            "adapt_every": 4,
+            "adapt_swaps": 96,
+            "ple_io": "direct",
+            "pipeline_windows": 2,
+            "no_prefill_borrow": 0,
+            "mmap_experts": 1,
+            "stream_experts": 0,
+            "short_read": 64,
+            "prompt_cache": 6,
+            "prompt_cache_every": 16384,
+            "adapt_async": 1,
+        }
+        fake_eng = mock.Mock()
+        fake_eng.spawn = (
+            wrapper_path,
+            cfg["args"],
+            "/home/user/projects/Strata",
+            "/tmp/strata.log",
+            {
+                "STRATA_XE2_SPLIT_K": "0",
+                "STRATA_MMVQ_SG": "32",
+                "STRATA_API_KEY": "super-secret",
+                "NEOReadDebugKeys": "1",
+                "HOME": "/home/user",
+            },
+            False,
+            None,
+        )
+        fake_eng.info = eng_info
+        fake_svc = mock.Mock()
+        fake_svc.engine = fake_eng
+        fake_svc.runtime_cfg = cfg
+        fake_svc.launch_argv = ["--engine", "strata", "--config", "/home/user/strata-qwen.json", "--port", "8080", "--api-key", "secret123"]
+        fake_svc.launch_script = "/home/user/projects/Strata/sycl/serve/server_intel.py"
+        fake_svc.parsed_args = {"engine": "strata", "config": "/home/user/strata-qwen.json", "port": 8080, "host": "127.0.0.1"}
+        fake_svc.max_queue = None
+        fake_svc.queue_timeout_s = None
+        fake_svc.fit_max_tokens = True
+        fake_svc.offline = False
+
+        snap = RI.snapshot(fake_svc)
+
+        # Server CLI & redacted config
+        self.assertEqual(snap["server"]["script"], "sycl/serve/server_intel.py")
+        self.assertIn("<redacted>", snap["server"]["argv"])
+        self.assertNotIn("secret123", json.dumps(snap))
+        self.assertNotIn("super-secret", json.dumps(snap))
+        self.assertNotIn("hidden", json.dumps(snap))
+        self.assertEqual(snap["server"]["config_path"], "strata-qwen.json")
+        self.assertEqual(snap["server"]["options"]["--port"], 8080)
+
+        # Engine CLI: combines defaults + --native preset + explicit CLI + INFO overrides
+        self.assertEqual(snap["engine"]["exe"], "sycl/serve/strata-sycl.sh")
+        self.assertEqual(snap["engine"]["sycl_bin"], "build-sycl-aot/strata")
+        self.assertEqual(snap["engine"]["options"]["--kv"], "q4_0")
+        self.assertEqual(snap["engine"]["options"]["--native-bf16"], True)   # from --native preset
+        self.assertEqual(snap["engine"]["options"]["--prefill"], 2048)       # resolved from INFO prefill_cap=2048
+        self.assertEqual(snap["engine"]["options"]["--pipeline-windows"], 2) # resolved from INFO pipeline_windows=2
+        self.assertEqual(snap["engine"]["options"]["--mmap-experts"], True)  # resolved from INFO mmap_experts=1
+        self.assertEqual(snap["engine"]["options"]["--adapt-async"], 1)
+
+        # Environment variables: explicit, config, wrapper defaults, and code defaults
+        env = snap["env"]
+        self.assertEqual(env["explicit"]["STRATA_XE2_SPLIT_K"], "0")
+        self.assertEqual(env["explicit"]["STRATA_MMVQ_SG"], "32")
+        self.assertEqual(env["explicit"]["NEOReadDebugKeys"], "1")
+        self.assertNotIn("HOME", env["explicit"])
+        self.assertEqual(env["wrapper_defaults"].get("STRATA_VERIFY_DEVICE_PLAN"), "1")
+        self.assertEqual(env["wrapper_defaults"].get("STRATA_VERIFY_NO_HOST"), "1")
+        self.assertEqual(env["wrapper_defaults"].get("STRATA_STAGER_THREADS"), "12")
+        self.assertEqual(env["defaults"].get("STRATA_XE2_XMX_MOE"), "1")
+        self.assertEqual(env["effective"]["STRATA_XE2_SPLIT_K"], "0")
+        self.assertEqual(env["effective"]["STRATA_STAGER_THREADS"], "12")
+        self.assertEqual(env["sources"]["STRATA_XE2_SPLIT_K"], "config")
+        self.assertEqual(env["sources"]["STRATA_MMVQ_SG"], "env")
+        self.assertEqual(env["sources"]["STRATA_STAGER_THREADS"], "wrapper_default")
+        self.assertEqual(env["sources"]["STRATA_XE2_XMX_MOE"], "default")
+
+    def test_collect_machine_populates_from_v1_runtime_when_no_local_config(self):
+        runtime_payload = {
+            "server": {
+                "script": "sycl/serve/server_intel.py",
+                "argv": ["--engine", "strata", "--config", "strata-b580.json", "--port", "8080"],
+                "explicit_options": {"--engine": "strata", "--config": "strata-b580.json", "--port": 8080},
+                "defaults": {"--port": 8095},
+                "options": {"--engine": "strata", "--config": "strata-b580.json", "--port": 8080, "--gpu": "0"},
+                "config_path": "strata-b580.json",
+                "config": {
+                    "backend": "sycl",
+                    "model_name": "Qwen3.8-Flash-Next",
+                    "exe": "sycl/serve/strata-sycl.sh",
+                    "args": ["--native", "Qwen3.8-Flash-Next-IQ2_XS.gguf", "--kv", "q4_0", "--spec", "4"],
+                    "env": {"STRATA_MMVQ_SG": "16"},
+                },
+            },
+            "engine": {
+                "exe": "sycl/serve/strata-sycl.sh",
+                "sycl_bin": "build-sycl/strata",
+                "argv": ["--native", "Qwen3.8-Flash-Next-IQ2_XS.gguf", "--kv", "q4_0", "--spec", "4"],
+                "explicit_options": {"--native": "Qwen3.8-Flash-Next-IQ2_XS.gguf", "--kv": "q4_0", "--spec": 4},
+                "defaults": {"--kv": "fp16", "--prefill": 0, "--vram-reserve-mib": 700},
+                "options": {"--native": "Qwen3.8-Flash-Next-IQ2_XS.gguf", "--kv": "q4_0", "--spec": 4, "--prefill": 2048, "--vram-reserve-mib": 700},
+                "info": {"context": 32768, "prefill_cap": 2048},
+            },
+            "env": {
+                "explicit": {"STRATA_MMVQ_SG": "16"},
+                "config_env": {"STRATA_MMVQ_SG": "16"},
+                "wrapper_defaults": {"SYCL_PI_LEVEL_ZERO_USE_IMMEDIATE_COMMANDLISTS": "1"},
+                "defaults": {"STRATA_XE2_SPLIT_K": "1", "STRATA_MMVQ_SG": "16"},
+                "effective": {"STRATA_MMVQ_SG": "16", "STRATA_XE2_SPLIT_K": "1", "SYCL_PI_LEVEL_ZERO_USE_IMMEDIATE_COMMANDLISTS": "1"},
+                "sources": {"STRATA_MMVQ_SG": "config", "STRATA_XE2_SPLIT_K": "default", "SYCL_PI_LEVEL_ZERO_USE_IMMEDIATE_COMMANDLISTS": "wrapper_default"},
+            },
+        }
+        srv = FakeStrata(runtime_payload=runtime_payload)
+        self.addCleanup(srv.stop)
+        mc = B.collect_machine(srv.base, "", None)
+        self.assertEqual(mc["model"], "Qwen3.8-Flash-Next")
+        self.assertEqual(mc["quant"], "IQ2_XS")
+        self.assertIn("strata-sycl.sh --native Qwen3.8-Flash-Next-IQ2_XS.gguf", mc["launch"])
+        self.assertEqual(mc["runtime"]["engine"]["sycl_bin"], "build-sycl/strata")
+
+        # Verify README renders config file, server command, engine binary, effective options, and env vars
+        fake_res = {
+            "date": "2026-11-12",
+            "elapsed_s": 10.0,
+            "params": {"runs": 1, "think": False, "command": "python tools/strata_bench.py --url ...", "started_server": False},
+            "machine": mc,
+            "results": {"chat": {}, "prompts": {}, "agent": {}, "clients": None, "skipped": {}, "failures": []},
+        }
+        readme = B.render_readme(fake_res)
+        self.assertIn("Config file: `strata-b580.json`", readme)
+        self.assertIn("Server command: `sycl/serve/server_intel.py --engine strata --config strata-b580.json --port 8080`", readme)
+        self.assertIn("Engine binary: `build-sycl/strata`", readme)
+        self.assertIn("Effective engine options (including defaults):", readme)
+        self.assertIn("`--prefill=2048`", readme)
+        self.assertIn("Explicit runtime environment: `STRATA_MMVQ_SG=16`", readme)
+        self.assertIn("Wrapper default environment: `SYCL_PI_LEVEL_ZERO_USE_IMMEDIATE_COMMANDLISTS=1`", readme)
+        self.assertIn("Code default environment: `STRATA_XE2_SPLIT_K=1`", readme)
+
+        # Verify compare_table surfaces differences in both explicit options/env and code defaults
+        mc2 = json.loads(json.dumps(mc))
+        mc2["runtime"]["engine"]["options"]["--prefill"] = 4096
+        mc2["runtime"]["env"]["effective"]["STRATA_XE2_SPLIT_K"] = "0"
+        mc2["runtime"]["env"]["sources"]["STRATA_XE2_SPLIT_K"] = "default"
+        mc2["runtime"]["env"]["effective"]["STRATA_MMVQ_SG"] = "32"
+        mc2["runtime"]["env"]["sources"]["STRATA_MMVQ_SG"] = "env"
+        fake_res2 = {**fake_res, "machine": mc2}
+        diff_out = B.compare_table(fake_res, fake_res2)
+        self.assertIn("engine --prefill: 2048 -> 4096 (default -> default)", diff_out)
+        self.assertIn("env STRATA_XE2_SPLIT_K: 1 -> 0 (default -> default)", diff_out)
+        self.assertIn("env STRATA_MMVQ_SG: 16 -> 32 (config -> env)", diff_out)
+
+    def test_start_server_uses_server_intel_for_sycl_backend(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as d:
+            sycl_cfg = Path(d) / "strata-sycl.json"
+            sycl_cfg.write_text(json.dumps({"backend": "sycl", "exe": "sycl/serve/strata-sycl.sh", "args": ["--spec", "4"]}))
+            cuda_cfg = Path(d) / "strata-cuda.json"
+            cuda_cfg.write_text(json.dumps({"backend": "cuda", "exe": "build/strata", "args": ["--spec", "4"]}))
+            with mock.patch.object(B.subprocess, "Popen") as popen:
+                B.start_server(sycl_cfg, 8080, None, Path(d) / "sycl.log")
+                sycl_cmd = popen.call_args[0][0]
+                B.start_server(cuda_cfg, 8080, None, Path(d) / "cuda.log")
+                cuda_cmd = popen.call_args[0][0]
+            self.assertTrue(sycl_cmd[1].endswith("sycl/serve/server_intel.py"))
+            self.assertTrue(cuda_cmd[1].endswith("serve/server.py"))
+            self.assertFalse(cuda_cmd[1].endswith("sycl/serve/server_intel.py"))
+
+    def test_live_server_intel_exposes_v1_runtime_endpoint(self):
+        import socket
+        import subprocess
+        import time
+
+        root = Path(__file__).resolve().parents[1]
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
+
+        env = dict(os.environ)
+        env["STRATA_XE2_SPLIT_K"] = "0"
+        env["STRATA_MMVQ_SG"] = "32"
+        env["STRATA_SECRET_TOKEN"] = "do-not-expose"
+        proc = subprocess.Popen(
+            [
+                sys.executable,
+                str(root / "sycl" / "serve" / "server_intel.py"),
+                "--engine",
+                "mock",
+                "--port",
+                str(port),
+                "--max-queue",
+                "12",
+                "--no-fit-max-tokens",
+            ],
+            cwd=str(root),
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        self.addCleanup(lambda: (proc.terminate(), proc.wait(5)) if proc.poll() is None else None)
+
+        base = f"http://127.0.0.1:{port}"
+        self.assertTrue(B.wait_ready(base, "", proc, 15.0, log=lambda *a: None))
+
+        rt = B.try_json(base, "/v1/runtime", "")
+        st = B.try_json(base, "/v1/status", "")
+        self.assertIsInstance(rt, dict)
+        self.assertEqual(rt["server"]["script"], "sycl/serve/server_intel.py")
+        self.assertEqual(rt["server"]["options"]["--port"], port)
+        self.assertEqual(rt["server"]["options"]["--max-queue"], 12)
+        self.assertEqual(rt["server"]["options"]["--fit-max-tokens"], False)
+        self.assertEqual(rt["env"]["explicit"]["STRATA_XE2_SPLIT_K"], "0")
+        self.assertEqual(rt["env"]["explicit"]["STRATA_MMVQ_SG"], "32")
+        self.assertEqual(rt["env"]["explicit"]["STRATA_WATCHDOG_S"], "180")
+        self.assertNotIn("STRATA_SECRET_TOKEN", rt["env"]["explicit"])
+        self.assertNotIn("do-not-expose", json.dumps(rt))
+        self.assertEqual(st.get("runtime", {}).get("server", {}).get("script"), "sycl/serve/server_intel.py")
+
+    def test_running_server_runtime_config_overrides_local_newest_config(self):
+        runtime_payload = {
+            "server": {
+                "script": "sycl/serve/server_intel.py",
+                "argv": ["--engine", "strata", "--config", "strata-actual.json"],
+                "config_path": "strata-actual.json",
+                "config": {
+                    "backend": "sycl",
+                    "model_name": "Actual-Running-Model",
+                    "exe": "build_sycl/strata",
+                    "args": ["--native", "actual-IQ3_S.gguf", "--spec", "4"],
+                    "env": {"STRATA_MMVQ_SG": "32"},
+                },
+            },
+            "engine": {"exe": "build_sycl/strata", "argv": ["--native", "actual-IQ3_S.gguf", "--spec", "4"]},
+            "env": {"explicit": {"STRATA_MMVQ_SG": "32"}, "effective": {"STRATA_MMVQ_SG": "32"}, "sources": {"STRATA_MMVQ_SG": "config"}},
+        }
+        srv = FakeStrata(runtime_payload=runtime_payload)
+        self.addCleanup(srv.stop)
+        port = srv.server_address[1]
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            wrong1 = root / "strata-wrong-old.json"
+            wrong2 = root / "strata-wrong-newest.json"
+            wrong1.write_text(json.dumps({"model_name": "Wrong-Old", "port": port, "exe": "strata", "args": ["old.gguf"]}))
+            wrong2.write_text(json.dumps({"model_name": "Wrong-Newest", "port": port, "exe": "strata", "args": ["newest.gguf"], "env": {"STRATA_MMVQ_SG": "8"}}))
+            out_dir = root / "out"
+            buf = io.StringIO()
+            with mock.patch.object(B, "ROOT", root), mock.patch.object(B, "find_configs", return_value=[wrong2, wrong1]), \
+                    contextlib.redirect_stdout(buf):
+                rc = B.main(["--port", str(port), "--runs", "1", "--out", str(out_dir)])
+            self.assertEqual(rc, 0)
+            stdout_text = buf.getvalue()
+            self.assertNotIn("the one used last", stdout_text)
+            self.assertIn("Using the Strata server already running", stdout_text)
+            self.assertIn("config: strata-actual.json", stdout_text)
+            res_file = next(out_dir.iterdir()) / "results.json"
+            saved = json.loads(res_file.read_text(encoding="utf-8"))
+            self.assertEqual(saved["machine"]["model"], "Actual-Running-Model")
+            self.assertEqual(saved["machine"]["config"]["env"], {"STRATA_MMVQ_SG": "32"})
 
 
 if __name__ == "__main__":

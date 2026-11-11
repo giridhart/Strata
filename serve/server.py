@@ -88,6 +88,7 @@ from serve.structured import StructuredOutputError, prepare_format, validated_js
 from serve import responses as responses_api  # noqa: E402
 from serve.responses import ResponsesError, error_body as responses_error_body  # noqa: E402
 from serve import images as images_api  # noqa: E402
+from serve import runtime_info  # noqa: E402
 
 IM_END = "<|im_end|>"
 IMAGE_PAD = "<|image_pad|>"
@@ -5800,7 +5801,12 @@ class Service:
                         "total_mib": scaled(hw.get("gpu_mem_total"), 2 ** 20), "util_pct": hw.get("gpu_util"),
                         "temp_c": hw.get("gpu_temp"), "power_w": hw.get("gpu_power")} if static.get("gpu_name") else None,
                 "ram": {"used_gib": scaled(hw.get("ram_used"), 2 ** 30, 1),
-                        "total_gib": scaled(hw.get("ram_total"), 2 ** 30, 1)} if hw.get("ram_total") else None}}
+                        "total_gib": scaled(hw.get("ram_total"), 2 ** 30, 1)} if hw.get("ram_total") else None},
+            "runtime": self.runtime()}
+
+    def runtime(self) -> dict:
+        """Runtime CLI options, defaults and environment snapshot for GET /v1/runtime."""
+        return runtime_info.snapshot(self)
 
     def render_prompt(self, messages, tools, kwargs) -> str:
         """The template rendered.  #458: with `effort_end`, a request with a non-default effort (low, medium or no
@@ -8304,6 +8310,9 @@ def make_handler(svc: Service):
             elif path == "/v1/status":
                 if self._authorized():
                     self._json(200, svc.v1_status())
+            elif path == "/v1/runtime":
+                if self._authorized():
+                    self._json(200, svc.runtime())
             else:
                 self._json(404, {"error": {"message": "not found"}})
 
@@ -10452,6 +10461,11 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
                   sampling_defaults=sampling_defaults,
                   fit_max_tokens=a.fit_max_tokens or (not a.no_fit_max_tokens and cfg.get("fit_max_tokens") is not False))
     svc.launch_attestation = launch_attestation
+    svc.launch_argv = list(launch_args)
+    svc.launch_script = getattr(sys.modules[__name__], "LAUNCH_SCRIPT", None) or (sys.argv[0] if sys.argv else "serve/server.py")
+    svc.parsed_args = {k: v for k, v in vars(a).items() if k != "api_key"}
+    svc.runtime_cfg = cfg
+    svc.engine_env = env if a.engine == "strata" else dict(os.environ)
     if (cfg.get("arch") or "") == "deepseek41" and vision is None and a.engine == "strata":
         # DeepSeek-V4.1 reads pictures with the engine's own tower (--vision on, the default): no separate reader process.
         # `--vision off` in the config's args, or a pack without a tower, leaves svc.vision None: pictures are refused with the 400 as before.

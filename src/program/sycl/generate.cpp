@@ -5826,7 +5826,9 @@ int main(int argc, char** argv) try {
                 "expert_slots_primary=%lld expert_cache_primary_mib=%lld spec=%d "
                 "mtp_max=%d lookup=%d vram_free_mib=%lld cvec=%s arena_mib=%lld pool_workers=%d pcie_frac=%.2f "
                 "spec_min_p=%.2f conversation_cache_mib=%lld conversation_cache_slots=%d "
-                "conversation_cache_min_free_mib=%lld engine=" STRATA_VERSION "\n",
+                "conversation_cache_min_free_mib=%lld prefill_cap=%lld vram_reserve_mib=%d adapt_every=%d "
+                "adapt_swaps=%d ple_io=%s pipeline_windows=%d no_prefill_borrow=%d mmap_experts=%d "
+                "short_read=%lld prompt_cache=%d prompt_cache_every=%lld engine=" STRATA_VERSION "\n",
                 (long long)o.max_context, o.kv.c_str(),
                 (long long)(g.n_qsa_layers() > 0 && ss.qsa_states[ss.qsa_primary()].kv_mode == 1
                                 ? ss.qsa_states[ss.qsa_primary()].n_slots * 4
@@ -5836,7 +5838,10 @@ int main(int argc, char** argv) try {
                 (long long)((o.mmap_experts ? src.resident_bytes() : strata::kernels::cpu::expert_layout().total) >>
                             20),
                 pool.workers(), o.pcie_frac, o.spec_min_p, (long long)o.conversation_cache_mib,
-                o.conversation_cache_slots, (long long)o.conversation_cache_min_free_mib);
+                o.conversation_cache_slots, (long long)o.conversation_cache_min_free_mib,
+                (long long)o.prefill_chunk, o.vram_reserve_mib, o.adapt_every, o.adapt_swaps, o.ple_io.c_str(),
+                o.pipeline_windows, o.no_prefill_borrow ? 1 : 0, o.mmap_experts ? 1 : 0,
+                (long long)o.short_read, o.prompt_cache, (long long)o.prompt_cache_every);
         }
         // issue #29: a request whose heartbeat (tokens, prompt chunks, verify windows) stops for this long is stuck on
         // a flag nobody will raise - end the engine with where it was, so the server starts it again instead of the

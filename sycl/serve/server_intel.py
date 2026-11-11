@@ -36,6 +36,8 @@ import serve.server as S  # noqa: E402
 import serve.telemetry as T  # noqa: E402
 from xe_telemetry import _XeGpu  # noqa: E402
 
+S.LAUNCH_SCRIPT = "sycl/serve/server_intel.py"
+
 
 def install_xe_reader():
     """telemetry.gpu_reader -> the xe reader whenever an Intel Arc is there.  #2001: this server runs the SYCL engine,

@@ -684,17 +684,25 @@ def gpu_selection(cfg: dict | None, gpu_arg: str | None = None) -> list[int]:
 
 def collect_machine(base: str, key: str, cfg: dict | None, gpu_arg: str | None = None) -> dict:
     status = try_json(base, "/v1/status", key) or {}
+    runtime = try_json(base, "/v1/runtime", key)
+    if not isinstance(runtime, dict) or not runtime:
+        runtime = status.get("runtime") if isinstance(status.get("runtime"), dict) else {}
     metrics = try_json(base, "/metrics", key, 30) or {}
     props = try_json(base, "/props", key) or {}
     models = try_json(base, "/v1/models", key) or {}
     static = metrics.get("hardware_static") or {}
     eng = metrics.get("engine") or {}
     local = gpu_info_local()
-    view = config_view(cfg) if cfg else {}
+    rt_srv = (runtime.get("server") or {}) if isinstance(runtime, dict) else {}
+    rt_eng = (runtime.get("engine") or {}) if isinstance(runtime, dict) else {}
+    rt_cfg = (rt_srv.get("config") or {}) if isinstance(rt_srv, dict) else {}
+    eff_cfg = (rt_cfg if isinstance(rt_cfg, dict) and rt_cfg else None) or cfg
+    view = config_view(eff_cfg) if eff_cfg else {}
     # #1985: only the GPUs the engine uses - the config's / --gpu selection; with none given the engine runs on one card
     # (the one the server reports), not on every card the PC has
     used = local["gpus"]
-    sel = gpu_selection(cfg, gpu_arg)
+    rt_gpu = (rt_srv.get("options") or {}).get("--gpu") if isinstance(rt_srv, dict) else None
+    sel = gpu_selection(eff_cfg, gpu_arg or (str(rt_gpu) if rt_gpu is not None else None))
     if sel:
         used = [local["gpus"][i] for i in sel if 0 <= i < len(local["gpus"])] or used
     elif len(used) > 1 and static.get("gpu_name"):
@@ -720,10 +728,13 @@ def collect_machine(base: str, key: str, cfg: dict | None, gpu_arg: str | None =
     for d in models.get("data") or []:
         n_ctx = (d.get("meta") or {}).get("n_ctx") or n_ctx
     n_ctx = n_ctx or (props.get("default_generation_settings") or {}).get("n_ctx")
+    launch = launch_line(view) if view and view.get("exe") else None
+    if not launch and isinstance(rt_eng, dict) and rt_eng.get("exe"):
+        launch = " ".join([str(rt_eng["exe"]), "--serve", *[str(x) for x in (rt_eng.get("argv") or [])]]).strip()
     return {
         "gpu": gpu_names, "gpu_vram_mib": vram_mib, "gpu_driver": (used[0].get("driver") if used else local.get("rocm_driver")),
         "gpu_detail": [{k: v for k, v in g.items() if k not in ("name", "vram_mib", "driver")} for g in used] or None,
-        "cuda": local.get("cuda"), "engine_build": engine_build(cfg),
+        "cuda": local.get("cuda"), "engine_build": engine_build(cfg or eff_cfg),
         "cpu": static.get("cpu_name") or cpu_name(), "cpu_cores": static.get("cores"),
         "storage": storage_info(),
         "cpu_threads": static.get("threads") or os.cpu_count(), "ram_gib": total_ram_gib(),
@@ -734,9 +745,10 @@ def collect_machine(base: str, key: str, cfg: dict | None, gpu_arg: str | None =
         "model": view.get("model_name") or status.get("model") or props.get("model_alias"),
         "quant": detect_quant(view) if view else None,
         "context": n_ctx or eng.get("max_context"), "parallel_slots": props.get("total_slots"),
-        "config": view, "launch": launch_line(view) if view else None,
+        "config": view, "launch": launch,
         "engine_info": {k: v for k, v in eng.items() if isinstance(v, (str, int, float, bool, dict)) and k not in ("model_path",)},
         "vram_after": (status.get("vram") or {}),
+        "runtime": runtime or {},
     }
 
 
@@ -789,7 +801,10 @@ def start_server(cfg_path: Path, port: int, gpu: str | None, log_path: Path):
             tmp = log_path.with_suffix(".config.json")
             tmp.write_text(json.dumps(safe), encoding="utf-8")
             cfg_path = tmp
-    cmd = [sys.executable, str(ROOT / "serve" / "server.py"), "--engine", "strata", "--config", str(cfg_path), "--port", str(port)]
+    sycl_server = ROOT / "sycl" / "serve" / "server_intel.py"
+    server_script = (sycl_server if isinstance(cfg, dict) and str(cfg.get("backend") or "").lower() == "sycl"
+                     and sycl_server.is_file() else ROOT / "serve" / "server.py")
+    cmd = [sys.executable, str(server_script), "--engine", "strata", "--config", str(cfg_path), "--port", str(port)]
     if gpu:
         cmd += ["--gpu", gpu]
     logf = open(log_path, "w", encoding="utf-8", errors="replace")
@@ -929,6 +944,41 @@ def render_readme(res: dict) -> str:
     env = (mc.get("config") or {}).get("env")
     if env:
         L += ["Environment of the config: " + ", ".join(f"`{k}={v}`" for k, v in env.items()), ""]
+    rt = mc.get("runtime") if isinstance(mc.get("runtime"), dict) else {}
+    if rt:
+        rt_srv = rt.get("server") or {}
+        rt_eng = rt.get("engine") or {}
+        rt_env = rt.get("env") or {}
+        if rt_srv.get("config_path"):
+            L += [f"- Config file: `{base_if_path(str(rt_srv['config_path']))}`"]
+        if rt_srv.get("script") or rt_srv.get("argv"):
+            srv_cmd = " ".join([str(rt_srv.get("script") or "serve/server.py"), *[str(x) for x in (rt_srv.get("argv") or [])]]).strip()
+            L += [f"- Server command: `{srv_cmd}`"]
+        if rt_eng.get("sycl_bin"):
+            L += [f"- Engine binary: `{rt_eng['sycl_bin']}` (via `{rt_eng.get('exe')}`)"]
+        eng_opts = rt_eng.get("options") or {}
+        if eng_opts:
+            key_flags = (
+                "--max-context", "--kv", "--expert-cache", "--prefill", "--no-prefill-borrow",
+                "--vram-reserve-mib", "--spec", "--adapt-every", "--adapt-swaps", "--adapt-async",
+                "--ple-io", "--pipeline-windows", "--short-read", "--prompt-cache",
+                "--prompt-cache-every", "--mmap-experts", "--stream-experts", "--batch", "--batch-groups",
+            )
+            shown_opts = [f"`{k}={eng_opts[k]}`" for k in key_flags if k in eng_opts]
+            if shown_opts:
+                L += ["- Effective engine options (including defaults): " + ", ".join(shown_opts)]
+        exp_env = rt_env.get("explicit") or {}
+        if exp_env:
+            L += ["- Explicit runtime environment: " + ", ".join(f"`{k}={v}`" for k, v in sorted(exp_env.items()))]
+        wrap_env = rt_env.get("wrapper_defaults") or {}
+        if wrap_env:
+            L += ["- Wrapper default environment: " + ", ".join(f"`{k}={v}`" for k, v in sorted(wrap_env.items()))]
+        eff_env = rt_env.get("effective") or {}
+        sources = rt_env.get("sources") or {}
+        def_env = {k: v for k, v in eff_env.items() if sources.get(k) == "default"}
+        if def_env:
+            L += ["- Code default environment: " + ", ".join(f"`{k}={v}`" for k, v in sorted(def_env.items()))]
+        L.append("")
     L += ["## Method", "",
           f"Run by `{p['command']}` against the HTTP API of a Strata server "
           f"({'started by the benchmark from the install configuration' if p['started_server'] else 'already running'}); model loading is not "
@@ -972,6 +1022,57 @@ def render_readme(res: dict) -> str:
     return "\n".join(L)
 
 
+def _runtime_diffs(ho: dict, hn: dict) -> list[str]:
+    """Compare server/engine CLI options, config args, and environment variables (explicit + defaults) between two runs."""
+    diffs: list[str] = []
+    ro = ho.get("runtime") if isinstance(ho.get("runtime"), dict) else {}
+    rn = hn.get("runtime") if isinstance(rn := hn.get("runtime"), dict) else {}
+
+    so, sn = (ro.get("server") or {}), (rn.get("server") or {})
+    if so.get("script") != sn.get("script") and (so.get("script") or sn.get("script")):
+        diffs.append(f"  server script: {so.get('script')} -> {sn.get('script')}")
+    s_opts_o, s_opts_n = (so.get("options") or {}), (sn.get("options") or {})
+    for k in sorted(set(s_opts_o) | set(s_opts_n)):
+        if s_opts_o.get(k) != s_opts_n.get(k):
+            diffs.append(f"  server {k}: {s_opts_o.get(k)} -> {s_opts_n.get(k)}")
+
+    eo, en = (ro.get("engine") or {}), (rn.get("engine") or {})
+    for field, label in (("exe", "engine exe"), ("sycl_bin", "engine sycl_bin")):
+        if eo.get(field) != en.get(field) and (eo.get(field) or en.get(field)):
+            diffs.append(f"  {label}: {eo.get(field)} -> {en.get(field)}")
+    e_opts_o, e_opts_n = (eo.get("options") or {}), (en.get("options") or {})
+    if e_opts_o or e_opts_n:
+        e_exp_o, e_exp_n = (eo.get("explicit_options") or {}), (en.get("explicit_options") or {})
+        for k in sorted(set(e_opts_o) | set(e_opts_n)):
+            vo, vn = e_opts_o.get(k), e_opts_n.get(k)
+            if vo != vn:
+                src_o = "explicit" if k in e_exp_o else "default"
+                src_n = "explicit" if k in e_exp_n else "default"
+                tag = f" ({src_o} -> {src_n})" if (src_o != "explicit" or src_n != "explicit") else ""
+                diffs.append(f"  engine {k}: {vo} -> {vn}{tag}")
+    else:
+        ao = (ho.get("config") or {}).get("args")
+        an = (hn.get("config") or {}).get("args")
+        if ao != an and (ao or an):
+            diffs.append(f"  config args: {ao} -> {an}")
+
+    envo, envn = (ro.get("env") or {}), (rn.get("env") or {})
+    eff_o = dict((ho.get("config") or {}).get("env") or {})
+    eff_n = dict((hn.get("config") or {}).get("env") or {})
+    eff_o.update(envo.get("effective") or envo.get("explicit") or {})
+    eff_n.update(envn.get("effective") or envn.get("explicit") or {})
+    src_o = envo.get("sources") or {}
+    src_n = envn.get("sources") or {}
+    for k in sorted(set(eff_o) | set(eff_n)):
+        vo, vn = eff_o.get(k), eff_n.get(k)
+        if vo != vn:
+            so_k = src_o.get(k, "unset" if k not in eff_o else "env")
+            sn_k = src_n.get(k, "unset" if k not in eff_n else "env")
+            tag = f" ({so_k} -> {sn_k})" if (so_k != "env" or sn_k != "env") else ""
+            diffs.append(f"  env {k}: {vo} -> {vn}{tag}")
+    return diffs
+
+
 def compare_table(old: dict, new: dict) -> str:
     a, b = summary_metrics(old["results"]), summary_metrics(new["results"])
     rows = [f"{'':32s} {'old':>12s} {'new':>12s} {'change':>9s}"]
@@ -984,6 +1085,7 @@ def compare_table(old: dict, new: dict) -> str:
     ho, hn = old["machine"], new["machine"]
     notes = [f"  {n}: {ho.get(f)} -> {hn.get(f)}" for n, f in (("GPU", "gpu"), ("engine", "engine_version"), ("model", "model"), ("quant", "quant"),
                                                               ("context", "context")) if ho.get(f) != hn.get(f)]
+    notes.extend(_runtime_diffs(ho, hn))
     return "\n".join(rows + (["", "differences:"] + notes if notes else []))
 
 
@@ -1051,37 +1153,60 @@ def main(argv=None) -> int:
         return 0
 
     cfg_path, cfg, proc, log_path = None, None, None, None
-    if a.config or not a.url:
-        if a.config:
-            cfg_path = Path(a.config)
-            if not cfg_path.is_absolute() and not cfg_path.exists():
-                cfg_path = ROOT / a.config
-        else:
-            found = find_configs()
-            if found:
-                cfg_path = found[0]
-                if len(found) > 1:
-                    say(f"Several models are installed; using {cfg_path.name} (the one used last). Pick another with --config FILE.")
-        if cfg_path is None or not cfg_path.is_file():
-            print("No Strata model is set up in this folder: run START-HERE.bat (Windows) or ./setup.sh (Linux) first, "
-                  "or give --url of a running server.", file=sys.stderr)
+    found = []
+    if a.config:
+        cfg_path = Path(a.config)
+        if not cfg_path.is_absolute() and not cfg_path.exists():
+            cfg_path = ROOT / a.config
+        if not cfg_path.is_file():
+            print(f"Config file not found: {a.config}", file=sys.stderr)
             return 2
         cfg = json.loads(cfg_path.read_text(encoding="utf-8-sig"))
+    elif not a.url:
+        found = find_configs()
+        if found:
+            cfg_path = found[0]
+            cfg = json.loads(cfg_path.read_text(encoding="utf-8-sig"))
+
     key = usable_key(a.api_key) or usable_key((cfg or {}).get("api_key"))
     if a.url:
         base = a.url.rstrip("/")
     else:
-        port = a.port or int(cfg.get("port", 8080))
-        base = server_base(cfg.get("host"), port)
+        port = a.port or int((cfg or {}).get("port", 8080))
+        base = server_base((cfg or {}).get("host"), port)
+        if not a.port and port != 8080 and not is_strata(base, key):
+            alt_base = server_base("127.0.0.1", 8080)
+            if is_strata(alt_base, key):
+                port, base = 8080, alt_base
     red = redactor(key=key)
     started = False
     try:
         if is_strata(base, key):
-            say(f"Using the Strata server already running at {base}.")
+            rt = try_json(base, "/v1/runtime", key)
+            if not isinstance(rt, dict) or not rt:
+                st = try_json(base, "/v1/status", key) or {}
+                rt = st.get("runtime") if isinstance(st.get("runtime"), dict) else {}
+            rt_srv = (rt.get("server") or {}) if isinstance(rt, dict) else {}
+            rt_cfg = (rt_srv.get("config") or {}) if isinstance(rt_srv, dict) else {}
+            rt_cfg_path = rt_srv.get("config_path") if isinstance(rt_srv, dict) else None
+            if isinstance(rt_cfg, dict) and rt_cfg:
+                cfg = rt_cfg
+            elif isinstance(rt_srv, dict) and rt_srv and not a.config:
+                cfg = None
+            if rt_cfg_path:
+                say(f"Using the Strata server already running at {base} (config: {rt_cfg_path}).")
+            else:
+                say(f"Using the Strata server already running at {base}.")
         elif a.url:
             print(f"No Strata server answers at {base}.", file=sys.stderr)
             return 2
         else:
+            if cfg_path is None or not cfg_path.is_file():
+                print("No Strata model is set up in this folder: run START-HERE.bat (Windows) or ./setup.sh (Linux) first, "
+                      "or give --url of a running server.", file=sys.stderr)
+                return 2
+            if not a.config and len(found) > 1:
+                say(f"Several models are installed; using {cfg_path.name} (the one used last). Pick another with --config FILE.")
             if try_json(base, "/health", key, 3) is not None:
                 print(f"Port {port} is used by something that is not Strata: pass --port N.", file=sys.stderr)
                 return 2
