@@ -14,6 +14,7 @@ inline sycl::queue& default_queue() {
 }  // namespace strata::core
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <filesystem>
 #include <utility>
@@ -206,7 +207,21 @@ bool ExpertCache::open(int64_t n_slots, int64_t n_layers, int64_t n_expert, int6
         DeviceInfo d = device_info(0);
         free_b = d.free_bytes;
         total_b = d.total_bytes;
+    } catch (const std::exception& exc) {
+        free_b = 0;
+        static std::atomic<bool> warned{false};
+        if (!warned.exchange(true))
+            std::fprintf(stderr,
+                         "strata: [DRAFT #5708] the GPU's free memory could not be read (device_info: %s); "
+                         "it is counted as 0 free\n",
+                         exc.what());
     } catch (...) {
+        free_b = 0;
+        static std::atomic<bool> warned{false};
+        if (!warned.exchange(true))
+            std::fprintf(stderr,
+                         "strata: [DRAFT #5708] the GPU's free memory could not be read (device_info: unknown error); "
+                         "it is counted as 0 free\n");
     }
     if (free_b > 0 && (uint64_t)free_b < want) {
         char buf[320];

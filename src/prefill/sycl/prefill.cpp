@@ -16,6 +16,7 @@ inline sycl::queue& default_queue() {
 #include "strata/platform/aux_cpus.hpp"
 #include "strata/core/mtp.hpp"
 #include "strata/core/progress.hpp"
+#include "strata/core/stream_watch.hpp"
 #include "strata/core/on_device.hpp"
 
 #include "strata/core/layout.hpp"
@@ -1390,7 +1391,7 @@ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t
     }();
     const bool q8 = !f16_only && mmq::built() && mmq::fits(kQ8_0, Nn) && mmq::fits(kQ8_0, KV);  // #420
     const uint64_t per_row = 4 * (2 * Nn + 4 * HCN + LR + HC + Nn + 2 * KV + 1) + 2 * (Nn + 2 * HCN + LR + Nn) + 64 +
-                             (q8 ? (uint64_t)mmq::q8_bytes(g.hc, Nn) + 4 * g.hc : 0);
+                             (q8 ? (uint64_t)mmq::q8_bytes(g.hc, Nn) + 8 * g.hc : 0);  // (8 * hc: the row table twice, see its margin below)
     const int64_t B = std::min<int64_t>(n - r0, (int64_t)(m.region_bytes / per_row) & ~(int64_t)63);
     if (B < 64) return false;
     uint8_t* q = m.region;
@@ -1417,7 +1418,10 @@ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t
     float* Vc = (float*)carve((size_t)B * KV * 4);
     int32_t* tok = (int32_t*)carve((size_t)B * 4);
     void* xq = q8 ? carve(mmq::q8_bytes(B * g.hc, Nn)) : nullptr;
-    int32_t* ident = q8 ? (int32_t*)carve((size_t)B * g.hc * 4) : nullptr;
+    // The row table is read past its end by llama.cpp's MMQ (a whole J-column tile from the start of each tile; the stream-k fixup up to roundup(max_rows, J)
+    // from the expert's first row; J up to 128): rows + the margin of mmq_ids_margin.hpp, max_rows <= B * hc (one expert, p.n = 1), the identity over all of it.
+    const uint64_t ids_rows = q8 ? mmq::mmq_ids_table_rows((uint64_t)(B * g.hc), (uint64_t)(B * g.hc)) : 0;
+    int32_t* ident = q8 ? (int32_t*)carve((size_t)ids_rows * 4) : nullptr;
     int32_t* bnd = q8 ? (int32_t*)carve(16) : nullptr;
     if ((uint64_t)(q - m.region) > m.region_bytes) return false;
     if (!mtp.idle(err)) return false;  // the drafter's own stream (its graph uploads) before this writes its K/V
@@ -1430,7 +1434,7 @@ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t
     std::vector<int32_t> tk((size_t)B);
     if (q8) {
         if (!m.mmq_ctx) m.mmq_ctx = std::make_unique<mmq::Context>();
-        mmq::iota(ident, B * g.hc, m.cs);
+        mmq::iota(ident, (int64_t)ids_rows, m.cs);
     }
     // y[rows, n_out] = x[rows, k] . w^T for a Q8_0 matrix: MMQ from the FP32 rows (bounds slot 0: rows, 1: rows*hc)
     auto proj = [&](const float* x, const uint16_t* x16, const void* w, float* y, int64_t rows, int64_t n_out,
@@ -1787,6 +1791,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     err.clear();
     Impl& m = *impl_;
     const core::OnDevice on_device(m.device);
+    // the stall report asks this queue (the one the waits below block on) whether its work is done (#5718 follow-up)
+    const core::WatchedStream watched("the prompt path's compute stream", (void*)m.cs, m.device);
     const core::ModelGeometry& g = *m.g;
     core::SessionState& ss = *m.ss;
     const auto t_start = Clock::now();
@@ -3744,6 +3750,8 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
     err.clear();
     Impl& m = *impl_;
     const core::OnDevice on_device(m.device);
+    // the stall report asks this queue (the one the waits below block on) whether its work is done (#5718 follow-up)
+    const core::WatchedStream watched("the prompt path's compute stream", (void*)m.cs, m.device);
     const core::ModelGeometry& g = *m.g;
     core::SessionState& ss = *m.ss;
     const auto t_start = Clock::now();

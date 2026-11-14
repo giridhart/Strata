@@ -540,7 +540,19 @@ DeviceInfo device_info(int ordinal) {
         if (dev.has(sycl::aspect::ext_intel_free_memory)) {
             d.free_bytes = dev.get_info<sycl::ext::intel::info::device::free_memory>();
         }
+    } catch (const std::exception& exc) {
+        static std::atomic<bool> warned{false};
+        if (!warned.exchange(true))
+            std::fprintf(stderr,
+                         "strata: [DRAFT #5708] the GPU's free memory could not be read (free_memory: %s); "
+                         "it is counted as 0 free\n",
+                         exc.what());
     } catch (...) {
+        static std::atomic<bool> warned{false};
+        if (!warned.exchange(true))
+            std::fprintf(stderr,
+                         "strata: [DRAFT #5708] the GPU's free memory could not be read (unknown error); "
+                         "it is counted as 0 free\n");
     }
 #endif
     if (d.free_bytes == 0) {

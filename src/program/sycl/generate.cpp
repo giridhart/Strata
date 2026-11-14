@@ -16,6 +16,7 @@
 
 #include <sycl/sycl.hpp>
 #include "strata/core/device.hpp"
+#include "strata/core/geometry.hpp"
 #include "strata/platform/memory.hpp"
 #include "strata/core/emulate.hpp"
 #include "strata/core/sycl_doorbell.hpp"
@@ -63,8 +64,11 @@
 #include "strata/spec/suffix_drafter.hpp"
 #include "strata/spec/spec_tree.hpp"
 #include "strata/kernels/cvec.hpp"
+#include "strata/core/resident_ram_copy.hpp"
 #include "strata/core/progress.hpp"
+#include "strata/core/stream_watch.hpp"
 #include "strata/core/device.hpp"
+#include "strata/core/geometry.hpp"
 #include "strata/platform/memory.hpp"
 #include "strata/core/emulate.hpp"
 #ifndef NOMINMAX
@@ -121,8 +125,20 @@ inline void get_device_mem_info(size_t& free_b, size_t& total_b) {
             free_b = dev.get_info<sycl::ext::intel::info::device::free_memory>();
         }
 #endif
+    } catch (const std::exception& exc) {
+        free_b = total_b = 0;
+        static std::atomic<bool> warned{false};
+        if (!warned.exchange(true))
+            std::fprintf(stderr,
+                         "strata: [DRAFT #5708] the GPU's free memory could not be read (%s); it is counted as 0 free\n",
+                         exc.what());
     } catch (...) {
         free_b = total_b = 0;
+        static std::atomic<bool> warned{false};
+        if (!warned.exchange(true))
+            std::fprintf(stderr,
+                         "strata: [DRAFT #5708] the GPU's free memory could not be read (unknown error); "
+                         "it is counted as 0 free\n");
     }
 }
 
@@ -1012,6 +1028,26 @@ void stall_report(std::FILE* f, uint64_t layers_during) {
             std::this_thread::sleep_for(std::chrono::seconds(2));
             std::fprintf(f, "  2 s later:\n");
         }
+        // #5718 follow-up: the queues a host may be blocked on (the prompt path's), asked without blocking - before the
+        // release below, so "finished" here means the GPU was done and the waiting host was not woken
+        strata::core::stream_watch().report(f, [](void* s, int dev, std::string& why) {
+            if (!s) {
+                why = "null queue";
+                return strata::core::StreamState::failed;
+            }
+            const strata::core::OnDevice on(dev);
+            try {
+                auto* q = static_cast<sycl::queue*>(s);
+                return q->ext_oneapi_empty() ? strata::core::StreamState::finished
+                                             : strata::core::StreamState::working;
+            } catch (const std::exception& exc) {
+                why = exc.what();
+                return strata::core::StreamState::failed;
+            } catch (...) {
+                why = "unknown SYCL error";
+                return strata::core::StreamState::failed;
+            }
+        });
         if (auto fn = strata::core::diag_pool_fn().load()) fn(f);
         if (auto fn = strata::core::diag_verify_fn().load()) fn(f);
         const MemSample m = mem_sample();
@@ -1268,6 +1304,25 @@ int main(int argc, char** argv) try {
     // pipe or a file is block-buffered, so a program that dies loses every line it had already printed - which
     // turns "it crashed at step 7" into "it crashed somewhere", and the difference is a debugging session.
     std::setvbuf(stdout, nullptr, _IONBF, 0);
+    // `strata --version` / `-V`, `--families`, `--geometry` before any GPU is touched
+    for (int i = 1; i < argc && i < 3; ++i) {
+        if (std::strcmp(argv[i], "--version") == 0 || std::strcmp(argv[i], "-V") == 0) {
+            std::printf("strata %s\n", STRATA_VERSION);
+            return 0;
+        }
+        // `strata --families`: the GGUF architectures this build runs (setup asks before it installs one). The Intel engine has no
+        // qwen35moe path (src/qwen35 is CUDA and HIP only), so it names Flash-Next's alone, as the CUDA build without STRATA_HAVE_QWEN35.
+        if (std::strcmp(argv[i], "--families") == 0) {
+            std::printf("qwen4exp\n");
+            return 0;
+        }
+        // `strata --geometry`: the name of the model shape the kernels are compiled for (the geometry header's kGeometryName: flash_next for the default build);
+        // Control checks it against the shape of the package's signed manifest (strata_control/shape_engine.py)
+        if (std::strcmp(argv[i], "--geometry") == 0) {
+            std::printf("%s\n", strata::core::kGeometryName);
+            return 0;
+        }
+    }
     // Load every CUDA kernel when the context is created, before the expert cache takes the free VRAM.  With the
     // default lazy loading, a kernel first used mid-prompt (MMQ for IQ3_XXS at 64K+ on a 12 GB card) found no VRAM
     // left for its code and the engine ended ("out of memory: cudaFuncSetAttribute").  Costs ~30 MB of VRAM.
@@ -1653,12 +1708,11 @@ int main(int argc, char** argv) try {
             else if (a == "--resident-cpu-experts")
                 o.resident_cpu_experts = o.resident_cpu_explicit = true;
             else if (a == "--resident-experts") {
-                o.mmap_experts = o.resident_cpu_experts = o.resident_pin = o.resident_soft = true;
+                o.mmap_experts = o.resident_cpu_experts = o.resident_soft = true;
+                o.resident_pin = strata::core::resident_pin_from_env(std::getenv("STRATA_RESIDENT_PIN"));
                 o.resident_headroom = 4ull << 30;
                 // A/B arms: STRATA_RESIDENT_PIN=0 keeps the copy pageable (the --resident-cpu-experts form);
                 // STRATA_RESIDENT_HEADROOM_GIB=N leaves N GiB of the available RAM free instead of 4
-                if (const char* v = std::getenv("STRATA_RESIDENT_PIN"); v != nullptr && std::string(v) == "0")
-                    o.resident_pin = false;
                 if (const char* v = std::getenv("STRATA_RESIDENT_HEADROOM_GIB"); v != nullptr && std::atof(v) >= 0.0)
                     o.resident_headroom = (uint64_t)(std::atof(v) * 1073741824.0);
             } else if (a == "--resident-budget-gib") {
@@ -1668,10 +1722,9 @@ int main(int argc, char** argv) try {
                     return 2;
                 }
                 o.resident_budget = (uint64_t)(gib * 1073741824.0);
-                o.mmap_experts = o.resident_cpu_experts = o.resident_pin = true;
+                o.mmap_experts = o.resident_cpu_experts = true;
+                o.resident_pin = strata::core::resident_pin_from_env(std::getenv("STRATA_RESIDENT_PIN"));
                 o.resident_headroom = 4ull << 30;
-                if (const char* v = std::getenv("STRATA_RESIDENT_PIN"); v != nullptr && std::string(v) == "0")
-                    o.resident_pin = false;
                 if (const char* v = std::getenv("STRATA_RESIDENT_HEADROOM_GIB"); v != nullptr && std::atof(v) >= 0.0)
                     o.resident_headroom = (uint64_t)(std::atof(v) * 1073741824.0);
             } else if (a == "--stats")
@@ -5494,14 +5547,31 @@ int main(int argc, char** argv) try {
             try {
                 const uint64_t floor = (uint64_t)o.conversation_cache_min_free_mib * 1024 * 1024;
                 const size_t additional = estimate - reuse.bytes();
-                if (!strata::core::conversation_memory_admit(strata::core::conversation_available_memory(), additional,
-                                                             floor)) {
+                size_t evicted = 0;
+                auto admit = [&] {
+                    return strata::core::conversation_memory_admit(strata::core::conversation_available_memory(),
+                                                                  additional, floor);
+                };
+                bool fits = admit() || (strata::core::release_free_heap() && admit());
+                while (!fits && conversations.size() > 0 && evicted < conversations.slots() &&
+                       conversations.evict_oldest()) {
+                    ++evicted;
+                    fits = admit();
+                }
+                if (!fits) {
                     std::fprintf(stderr,
                                  "strata serve: conversation cache: skip parking (physical RAM admission; need %zu MiB "
-                                 "plus %lld MiB floor, or telemetry unavailable)\n",
-                                 additional >> 20, (long long)o.conversation_cache_min_free_mib);
+                                 "plus %lld MiB floor, or telemetry unavailable; evicted %zu, %zu still parked)\n",
+                                 additional >> 20, (long long)o.conversation_cache_min_free_mib, evicted,
+                                 conversations.size());
                     return true;
                 }
+                if (evicted)
+                    std::fprintf(stderr,
+                                 "strata serve: conversation cache: evicted %zu parked conversation%s to admit this "
+                                 "snapshot (%zu MiB plus %lld MiB floor)\n",
+                                 evicted, evicted == 1 ? "" : "s", additional >> 20,
+                                 (long long)o.conversation_cache_min_free_mib);
                 strata::core::SavedConversation image;
                 size_t reused_bytes = 0;
                 if (!strata::core::conversation_snapshot_save(image, view, ss, g, mtp.kv_state(), err, std::move(reuse),
