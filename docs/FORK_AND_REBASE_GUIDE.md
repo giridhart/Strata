@@ -155,6 +155,9 @@ git apply strata-sycl-b580.patch
 ## 5. Status & Next Session Work Plan
 
 ### Current Status (Completed & Tested)
+- **Commit `9b352762`**: Added SYCL expert cache and Arc B580 optimization guide (`docs/SYCL_B580_EXPERT_CACHE_GUIDE.md`).
+- **Commit `2c52ddee`**: Wired up host-mirror table (`table_host_mirror`, `seed_host_mirrors`, `apply_swaps_host`) and ring budget calculation for `STRATA_VERIFY_NO_HOST` in `src/core/sycl/verify.cpp` and `src/program/sycl/generate.cpp`.
+- **Commit `55599055`**: Ported Intel Xe2 B70 optimizations and benchmarks (`xmx_prefill_gemm_kernel`, native MMQ SYCL prefill, batched KV/indexer appends, and cache-conditioned routing prior).
 - **Commit `3c964b13`**: Upstream Merge v0.2.12 (`146df3c4`), bringing 95 upstream commits (DeepSeek-V4.1-Flash presets, run manifest telemetry, MMQ margin over-read protection, QSA two-pass scorer bounds, prompt chunk split rules, and frontend tool alias extensions).
 - **Commit `3537f122`**: SYCL Port of v0.2.12 optimizations:
   - Ordered DMA completion via `raise_flag_b_ordered` in `Verifier` (`verify.hpp`, `verify.cpp`) preventing Flag B from racing ahead of in-flight DMA on empty/lean steps.
@@ -166,37 +169,54 @@ git apply strata-sycl-b580.patch
 - **Commit `0962e1bc`**: MoE 16-Lane Subgroup GEMV (`s2_expert_grouped.cpp`, Xe2 SIMD16 subgroup matrix multiplication).
 - **Commit `03aaa697`**: Fused Per-Head RMSNorm + RoPE (`src/kernels/sycl/native_rope.cpp`, `rope_parity.cpp`, benchmarks).
 - **Commit `a576809e`**: Multi-Token Router (`native_router_top10_multi`, 256 threads / 8 subgroups) and Residency-Biased Routing (`native_route_resident`, `route_resident_k`).
+- **Commit `dde46cd1`**: Batched KV/indexer appends (`kv_append_q8_steps`, `kv_append_q4_steps`, `native_qsa_indexer_append_steps`) and cache-conditioned routing prior (`route_prior_top10`).
 - **All Host/Emulation & SYCL Native Tests Pass**: Verified 100% pass rate via `./tools/test_sycl.sh cpu` (93/93 passed) and `./tools/build_sycl.sh sycl-test` (36/36 passed).
 
-### Next Session Kernel Porting Tasks
+---
 
-#### Priority 5: Batched K/V and Indexer Appends
-In speculative verification and multi-token drafting (MTP), tokens are verified in batches ($T = 4$ to $8$). Currently, SYCL executes a sequential `for (int t = tb; t < te; ++t)` loop submitting individual kernel commands.
+### Next Session: Upstream `v0.2.13` / `v0.2.13.1+` (`13eedf552`) Porting Plan
 
-1. **`src/kernels/sycl/kv_q8.cpp`**:
-   - Add template `kv_append_q8_kernel<bool MULTI = false>` supporting `step_stride` and `cur_stride`.
-   - Implement `kv_append_q8_steps(int8_t* k_q, int8_t* v_q, uint16_t* k_scale, uint16_t* v_scale, const int32_t* page_table, const int32_t* step, int step_stride, const float* kcur, const float* vcur, int cur_stride, int n_tok, const QsaShapes& s, void* stream, const KvHostPools* host)`.
-2. **`src/kernels/sycl/kv_q4.cpp`**:
-   - Update `kv_append_q4_kernel` with `step_stride` and `planes` (`planes = 1` for hybrid/folded, `2` for paired K/V).
-   - Implement `kv_append_q4_steps(...)`.
-3. **`src/kernels/sycl/native_qsa_indexer.cpp`**:
-   - Update `append` kernel to loop over `n_steps` with `pos_stride`.
-   - Implement `native_qsa_indexer_append_steps(...)`.
-4. **Wire into `src/core/sycl/verify.cpp` & `src/core/sycl/mtp.cpp`**:
-   - Replace token loops with single batched kernel invocations:
-     - `kv_append_q8_steps`
-     - `kv_append_q4_steps`
-     - `native_qsa_indexer_append_steps`
-5. **Parity & Benchmarks**:
-   - Add SYCL version of `kv_steps_parity.cpp`.
-   - Add benchmark in `perf/sycl/perf_speculative_verify.cpp` comparing batched vs unbatched append times.
+Upstream `main` has advanced by 379 commits since `v0.2.12` (`146df3c46` -> `13eedf552`, engine `0.1.59`).
 
-#### Priority 6: Cache-Conditioned Routing Prior (`STRATA_ROUTE_PRIOR`)
-1. **`src/kernels/sycl/route_prior.cpp`**:
-   - Implement `route_prior_top10` (MoCCE arXiv:2412.00099) using SYCL subgroups and warp shuffles.
-2. **`src/core/sycl/verify.cpp`**:
-   - Wire `route_prior_top10` when `STRATA_ROUTE_PRIOR > 0.0f`.
-3. **Register in `CMakeLists.txt`**.
+#### B580 Safety Guardrails (MUST FOLLOW)
+1. **Never overwrite `src/*/sycl/` with upstream `sycl/` DPCT files**:
+   - Upstream maintains a separate DPCT-migrated tree under `sycl/`. Our native B580 Xe2 implementation lives under `src/core/sycl/`, `src/kernels/sycl/`, `src/prefill/sycl/`, and `src/program/sycl/`.
+2. **Preserve `CMakeLists.txt` Native SYCL Targets During Modular CMake Merge (`067b4dda5`, `8b1667701`)**:
+   - Upstream split `CMakeLists.txt` into `cmake/strata_ggml.cmake`, `cmake/strata_gpu_engine.cmake`, and `cmake/backends/{cpu,cuda,hip,sycl,metal}.cmake`, and moved vendored ggml sources into `third_party/strata-ggml/`.
+   - When merging `CMakeLists.txt`, ensure our `STRATA_ENABLE_SYCL` target definitions (`strata_sycl_kernels`, `strata`, `sycl-test`, `perf-sycl`) remain intact and link against `third_party/strata-ggml/`.
+3. **Verify Every Step on B580 / SYCL Test Suite**:
+   - Run `./tools/build_sycl.sh strata && ./tools/build_sycl.sh sycl-test` after each ported commit.
+
+#### Priority 1: Safe Bug Fixes & Memory/CLI Guardrails (Low Risk, High Value for B580)
+1. **Additional MMQ Row-ID Over-Read Margins (`697b6d67a`, `14dd746f6`)**:
+   - **Files**: `src/prefill/sycl/prefill.cpp`, `src/prefill/sycl/gemm.cpp`
+   - **Change**: Size the DeepSeek MTP draft step's MMQ `ident` row-id table (`B * hc` rows) and dense MMQ row-id table with `mmq_ids_table_rows(...)` margin (`include/strata/prefill/mmq_ids_margin.hpp`) so `mul_mat_q` and `mul_mat_q_stream_k_fixup` never read past the end of the scratch allocation.
+2. **PLE Direct Probe Buffer Overflow Fix (`dcaf4755c`)**:
+   - **File**: `src/program/sycl/generate.cpp`
+   - **Change**: In `ple_direct_rows_per_s`, size the probe output buffer as `PLE_N_HEADS * PLE_HEAD_DIM` floats per token instead of hardcoded `2560`, preventing a 24 KB heap overflow on hidden > 2560 models.
+3. **CLI `--geometry` and `--families` Support (`77f7835a8`, `febc0226f`)**:
+   - **File**: `src/program/sycl/generate.cpp`
+   - **Change**: Handle `--geometry` (prints `kGeometryName`, `flash_next` by default) and `--families` in the SYCL `main()` entry point so `strata launch` and control-plane checks can inspect the SYCL binary.
+4. **Q5_K / Q6_K Down Expert Format Entries (`cd14b976a`)**:
+   - **Files**: `src/kernels/sycl/iq_kernels.cpp`, `src/kernels/sycl/native_grouped_parity.cpp`
+   - **Change**: Add format IDs `13` (`Q5_K`) and `14` (`Q6_K`) to `STRATA_D_FMTS` so Unsloth UD packs with Q5_K/Q6_K down projections pass `native_expert_supported` on Intel Arc. Does not alter `IQ3_S` execution paths.
+5. **Explicit Error on Failed Free-Memory Query & Parked Conversation Cache Release (`e008709d7`, `8c71c4927`, `feaa928f9`, `28bd0185f`)**:
+   - **Files**: `src/core/sycl/expert_cache.cpp`, `src/program/sycl/generate.cpp`, `include/strata/core/conversation_cache.hpp`, `include/strata/core/ple_residency.hpp`
+   - **Change**: Report Level Zero free-memory query failures explicitly instead of silently returning `0 free`, release RAM back to the OS when parked conversations are evicted, and apply Linux file-cache credit in `ple_residency.hpp`.
+
+#### Priority 2: Diagnostics & Non-Flash-Next Shape Support (Medium Priority)
+1. **FP32 Generic Router Fallback for GPUs without FP64 (`3801ec40a`)**:
+   - **Files**: `src/kernels/sycl/router_top10.cpp`, `src/kernels/sycl/router_top10_parity.cpp`
+   - **Change**: Query `q->get_device().has(sycl::aspect::fp64)` in the generic router (`router_top10_generic`, used by non-Flash-Next shapes such as top-8 / 256-expert models) and dispatch an FP32 kernel when FP64 is unavailable on Intel Arc. Keep the Flash-Next `top-10` fast path untouched.
+2. **Watchdog Prefill Compute Stream Stall Reporting (`711a7e937`)**:
+   - **Files**: `include/strata/core/stream_watch.hpp`, `src/prefill/sycl/prefill.cpp`, `src/program/sycl/generate.cpp`
+   - **Change**: Register the prefill compute queue with `stream_watch` during prompt processing so `stall_report` logs whether the prefill queue has completed or is still executing if a watchdog timeout occurs.
+
+#### Priority 3: Low Priority / Skip (Do Not Risk B580 Regressions)
+1. **oneMKL Skinny BF16 GEMM Workaround (`0f3ae296b`, `646826312`) — LOW PRIORITY / NOT NEEDED**:
+   - **Why**: Upstream's `sycl/src/prefill/gemm.dp.cpp` uses `oneapi::mkl::blas::gemm`, which is non-deterministic across launches for skinny shapes ($M \le 64$) on Arc. Our native B580 port (`src/prefill/sycl/gemm.cpp`) **does not use oneMKL at all** — it already uses deterministic native kernels (`bf16_gemv` for $T=1$, Xe2 hardware XMX DPAS `xmx_gemm` / `xmx_prefill_gemm_kernel` for $T>1$, and scalar FMA fallback). Neither `IQ3_S` nor BF16 projections on B580 invoke oneMKL.
+2. **Full `kCompiledGeometry` Template Refactor Across All Native SYCL Kernels (`af7759b69` .. `c59866283`) — LOW PRIORITY / CAUTION**:
+   - **Why**: Upstream parameterized kernel constants via `kCompiledGeometry` for multi-shape builds (`q4_lite`, `q4_mid`, `q4_big`, `q4_deep`), which stay identical to Flash-Next for the default build. Avoid mass-editing our B580-tuned kernel templates in `src/kernels/sycl/` until multi-shape SYCL builds are explicitly needed, and validate each kernel individually against `sycl-test` and `perf-sycl`.
 
 ---
 
