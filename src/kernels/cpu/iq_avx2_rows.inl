@@ -38,6 +38,10 @@ STRATA_ROWS_FN inline float ggml_hsum8(__m256 x) {
 template <int NT, bool GGML = false> STRATA_ROWS_FN
 inline void row_dot_iq2xs(const uint8_t* row, int nblocks, const block_q8_K* const* y, float* res);
 
+template <int NT, bool GGML = false> STRATA_ROWS_FN
+inline void rows2_dot_iq2xs(const uint8_t* row0, const uint8_t* row1, int nblocks, const block_q8_K* const* y,
+                            float* res0, float* res1);
+
 template <int TY> STRATA_ROWS_FN
 inline float row_dot_ggml_one(const uint8_t* row, int nblocks, const block_q8_K* y) {
     if constexpr (TY == 17) {
@@ -71,6 +75,16 @@ inline float row_dot_ggml_one(const uint8_t* row, int nblocks, const block_q8_K*
 template <int TY> STRATA_ROWS_FN
 void gu_ggml_one(const uint8_t* blob, size_t gu_row, size_t up_off, int n, const block_q8_K* y, float* ff,
                  int r0, int r1) {
+    if constexpr (TY == 17) {
+        const block_q8_K* act[1] = {y};
+        const int nb = n / QK_K;
+        for (int r = r0; r < r1; ++r) {
+            float g = 0.0f, u = 0.0f;
+            rows2_dot_iq2xs<1, true>(blob + (size_t) r * gu_row, blob + up_off + (size_t) r * gu_row, nb, act, &g, &u);
+            ff[r] = (g / (1.f + std::exp(-g))) * u;
+        }
+        return;
+    }
     for (int r = r0; r < r1; ++r) {
         const float g = row_dot_ggml_one<TY>(blob + (size_t) r * gu_row, n / QK_K, y);
         const float u = row_dot_ggml_one<TY>(blob + up_off + (size_t) r * gu_row, n / QK_K, y);
@@ -122,35 +136,36 @@ inline void row_dot(const uint8_t* row, int nblocks, const block_q8_K* const* y,
 // 32-byte load.  The 8 scale bytes become all 16 half-scales with ggml's unpack trick.  The grid lookups
 // stay scalar loads into set_epi64x (ggml does the same).  Every token still only pays a load, a sign,
 // a maddubs, a madd and an add per half, into alternating accumulators.
+static constexpr uint8_t kIq2xsBitSel[32] = {
+    1, 2, 4, 8, 16, 32, 64, (uint8_t) 0x80, 1, 2, 4, 8, 16, 32, 64, (uint8_t) 0x80,
+    1, 2, 4, 8, 16, 32, 64, (uint8_t) 0x80, 1, 2, 4, 8, 16, 32, 64, (uint8_t) 0x80 };
+static constexpr char kIq2xsShufEven[32] = {   // sign bits of u16 0,1,2,3 (even bytes of the sign register)
+    0, 0, 0, 0, 0, 0, 0, 0, 2, 2, 2, 2, 2, 2, 2, 2,
+    4, 4, 4, 4, 4, 4, 4, 4, 6, 6, 6, 6, 6, 6, 6, 6 };
+static constexpr char kIq2xsShufOdd[32] = {    // sign bits of u16 4,5,6,7
+    8, 8, 8, 8, 8, 8, 8, 8, 10, 10, 10, 10, 10, 10, 10, 10,
+    12, 12, 12, 12, 12, 12, 12, 12, 14, 14, 14, 14, 14, 14, 14, 14 };
+static constexpr uint8_t kIq2xsBitHelp[32] = {  // 0x80 when the 4-bit index has odd popcount (parity bit 7)
+    0x00, (uint8_t) 0x80, (uint8_t) 0x80, 0x00, (uint8_t) 0x80, 0x00, 0x00, (uint8_t) 0x80,
+    (uint8_t) 0x80, 0x00, 0x00, (uint8_t) 0x80, 0x00, (uint8_t) 0x80, (uint8_t) 0x80, 0x00,
+    0x00, (uint8_t) 0x80, (uint8_t) 0x80, 0x00, (uint8_t) 0x80, 0x00, 0x00, (uint8_t) 0x80,
+    (uint8_t) 0x80, 0x00, 0x00, (uint8_t) 0x80, 0x00, (uint8_t) 0x80, (uint8_t) 0x80, 0x00 };
+static constexpr uint8_t kIq2xsScShuffle[128] = {  // half h -> scale bytes 2h (lanes 0-7), 2h+1 (lanes 8-15)
+    0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1,
+    2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3,
+    4, 4, 4, 4, 4, 4, 4, 4, 5, 5, 5, 5, 5, 5, 5, 5,
+    6, 6, 6, 6, 6, 6, 6, 6, 7, 7, 7, 7, 7, 7, 7, 7,
+    8, 8, 8, 8, 8, 8, 8, 8, 9, 9, 9, 9, 9, 9, 9, 9,
+    10, 10, 10, 10, 10, 10, 10, 10, 11, 11, 11, 11, 11, 11, 11, 11,
+    12, 12, 12, 12, 12, 12, 12, 12, 13, 13, 13, 13, 13, 13, 13, 13,
+    14, 14, 14, 14, 14, 14, 14, 14, 15, 15, 15, 15, 15, 15, 15, 15 };
+
 template <int NT, bool GGML> STRATA_ROWS_FN
 inline void row_dot_iq2xs(const uint8_t* row, int nblocks, const block_q8_K* const* y, float* res) {
-    static const uint8_t bit_sel[32] = {
-        1, 2, 4, 8, 16, 32, 64, (uint8_t) 0x80, 1, 2, 4, 8, 16, 32, 64, (uint8_t) 0x80,
-        1, 2, 4, 8, 16, 32, 64, (uint8_t) 0x80, 1, 2, 4, 8, 16, 32, 64, (uint8_t) 0x80 };
-    static const char shuf_even[32] = {   // sign bits of u16 0,1,2,3 (even bytes of the sign register)
-        0, 0, 0, 0, 0, 0, 0, 0, 2, 2, 2, 2, 2, 2, 2, 2,
-        4, 4, 4, 4, 4, 4, 4, 4, 6, 6, 6, 6, 6, 6, 6, 6 };
-    static const char shuf_odd[32] = {    // sign bits of u16 4,5,6,7
-        8, 8, 8, 8, 8, 8, 8, 8, 10, 10, 10, 10, 10, 10, 10, 10,
-        12, 12, 12, 12, 12, 12, 12, 12, 14, 14, 14, 14, 14, 14, 14, 14 };
-    static const uint8_t bit_help[32] = {  // 0x80 when the 4-bit index has odd popcount (parity bit 7)
-        0x00, (uint8_t) 0x80, (uint8_t) 0x80, 0x00, (uint8_t) 0x80, 0x00, 0x00, (uint8_t) 0x80,
-        (uint8_t) 0x80, 0x00, 0x00, (uint8_t) 0x80, 0x00, (uint8_t) 0x80, (uint8_t) 0x80, 0x00,
-        0x00, (uint8_t) 0x80, (uint8_t) 0x80, 0x00, (uint8_t) 0x80, 0x00, 0x00, (uint8_t) 0x80,
-        (uint8_t) 0x80, 0x00, 0x00, (uint8_t) 0x80, 0x00, (uint8_t) 0x80, (uint8_t) 0x80, 0x00 };
-    static const uint8_t k_sc_shuffle[128] = {  // half h -> scale bytes 2h (lanes 0-7), 2h+1 (lanes 8-15)
-        0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1,
-        2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3,
-        4, 4, 4, 4, 4, 4, 4, 4, 5, 5, 5, 5, 5, 5, 5, 5,
-        6, 6, 6, 6, 6, 6, 6, 6, 7, 7, 7, 7, 7, 7, 7, 7,
-        8, 8, 8, 8, 8, 8, 8, 8, 9, 9, 9, 9, 9, 9, 9, 9,
-        10, 10, 10, 10, 10, 10, 10, 10, 11, 11, 11, 11, 11, 11, 11, 11,
-        12, 12, 12, 12, 12, 12, 12, 12, 13, 13, 13, 13, 13, 13, 13, 13,
-        14, 14, 14, 14, 14, 14, 14, 14, 15, 15, 15, 15, 15, 15, 15, 15 };
-    const __m256i bsel = _mm256_loadu_si256((const __m256i*) bit_sel);
-    const __m256i shev = _mm256_loadu_si256((const __m256i*) shuf_even);
-    const __m256i shod = _mm256_loadu_si256((const __m256i*) shuf_odd);
-    const __m256i bhelp = _mm256_loadu_si256((const __m256i*) bit_help);
+    const __m256i bsel = _mm256_loadu_si256((const __m256i*) kIq2xsBitSel);
+    const __m256i shev = _mm256_loadu_si256((const __m256i*) kIq2xsShufEven);
+    const __m256i shod = _mm256_loadu_si256((const __m256i*) kIq2xsShufOdd);
+    const __m256i bhelp = _mm256_loadu_si256((const __m256i*) kIq2xsBitHelp);
     const __m256i m511 = _mm256_set1_epi16(511);
     const __m128i m4 = _mm_set1_epi8(0xf), m1 = _mm_set1_epi8(1);
     const __m256i one8 = _mm256_set1_epi8(1);
@@ -189,7 +204,7 @@ inline void row_dot_iq2xs(const uint8_t* row, int nblocks, const block_q8_K* con
                 const __m256i sgn = _mm256_or_si256(
                     _mm256_cmpeq_epi8(_mm256_and_si256(sb, bsel), bsel), one8);
                 const __m256i sc = _mm256_cvtepi8_epi16(
-                    _mm_shuffle_epi8(scales, _mm_loadu_si128((const __m128i*) k_sc_shuffle + H)));
+                    _mm_shuffle_epi8(scales, _mm_loadu_si128((const __m128i*) kIq2xsScShuffle + H)));
                 const int off = 128 * jj + 32 * h;
                 for (int t = 0; t < NT; ++t) {
                     const __m256i yv = _mm256_loadu_si256((const __m256i*) (y[t][i].qs + off));
@@ -211,6 +226,116 @@ inline void row_dot_iq2xs(const uint8_t* row, int nblocks, const block_q8_K* con
         }
     }
     for (int t = 0; t < NT; ++t) res[t] = GGML ? 0.125f * ggml_hsum8(accf[t]) : hsum8(accf[t]);
+}
+
+// Dual-row lockstep IQ2_XS dot: decodes two rows side by side and loads y[t][i].qs once per half.
+template <int NT, bool GGML> STRATA_ROWS_FN
+inline void rows2_dot_iq2xs(const uint8_t* row0, const uint8_t* row1, int nblocks, const block_q8_K* const* y,
+                            float* res0, float* res1) {
+    const __m256i bsel = _mm256_loadu_si256((const __m256i*) kIq2xsBitSel);
+    const __m256i shev = _mm256_loadu_si256((const __m256i*) kIq2xsShufEven);
+    const __m256i shod = _mm256_loadu_si256((const __m256i*) kIq2xsShufOdd);
+    const __m256i bhelp = _mm256_loadu_si256((const __m256i*) kIq2xsBitHelp);
+    const __m256i m511 = _mm256_set1_epi16(511);
+    const __m128i m4 = _mm_set1_epi8(0xf), m1 = _mm_set1_epi8(1);
+    const __m256i one8 = _mm256_set1_epi8(1);
+    const int pf = prefetch_distance();
+
+    __m256 accf0[NT], accf1[NT];
+    for (int t = 0; t < NT; ++t) {
+        accf0[t] = _mm256_setzero_ps();
+        accf1[t] = _mm256_setzero_ps();
+    }
+    for (int i = 0; i < nblocks; ++i) {
+        const uint8_t* blk0 = row0 + (size_t) i * 74;
+        const uint8_t* blk1 = row1 + (size_t) i * 74;
+        rows_ahead(blk0, pf);
+        rows_ahead(blk1, pf);
+        __m128i st0 = _mm_set1_epi64x((long long) u64(blk0 + 66));
+        st0 = _mm_unpacklo_epi8(_mm_and_si128(st0, m4), _mm_and_si128(_mm_srli_epi16(st0, 4), m4));
+        const __m128i scales0 = _mm_add_epi8(_mm_slli_epi16(st0, 1), m1);
+
+        __m128i st1 = _mm_set1_epi64x((long long) u64(blk1 + 66));
+        st1 = _mm_unpacklo_epi8(_mm_and_si128(st1, m4), _mm_and_si128(_mm_srli_epi16(st1, 4), m4));
+        const __m128i scales1 = _mm_add_epi8(_mm_slli_epi16(st1, 1), m1);
+
+        // Two rows interleaved already provide 2*NT independent madd+add chains; CH=2 at NT=1 gives 4 chains in 4 YMMs.
+        constexpr int CH = (NT == 1) ? 2 : 1;
+        __m256i acc0[NT][CH], acc1[NT][CH];
+        for (int t = 0; t < NT; ++t)
+            for (int c = 0; c < CH; ++c) {
+                acc0[t][c] = _mm256_setzero_si256();
+                acc1[t][c] = _mm256_setzero_si256();
+            }
+        for (int jj = 0; jj < 2; ++jj) {
+            const __m256i qa = _mm256_loadu_si256((const __m256i*) (blk0 + 2 + 32 * jj));
+            const __m256i p7a = _mm256_srli_epi16(qa, 9);
+            const __m256i p3a = _mm256_srli_epi16(qa, 13);
+            const __m256i fsba = _mm256_or_si256(p7a, _mm256_shuffle_epi8(bhelp, _mm256_xor_si256(p7a, p3a)));
+
+            const __m256i qb = _mm256_loadu_si256((const __m256i*) (blk1 + 2 + 32 * jj));
+            const __m256i p7b = _mm256_srli_epi16(qb, 9);
+            const __m256i p3b = _mm256_srli_epi16(qb, 13);
+            const __m256i fsbb = _mm256_or_si256(p7b, _mm256_shuffle_epi8(bhelp, _mm256_xor_si256(p7b, p3b)));
+
+            alignas(32) uint16_t gia[16], gib[16];
+            _mm256_store_si256((__m256i*) gia, _mm256_and_si256(qa, m511));
+            _mm256_store_si256((__m256i*) gib, _mm256_and_si256(qb, m511));
+
+            for (int h = 0; h < 4; ++h) {
+                const int H = 4 * jj + h;
+                const __m128i sc_shuf = _mm_loadu_si128((const __m128i*) kIq2xsScShuffle + H);
+                const __m256i sh = (h & 1) ? shod : shev;
+
+                const __m256i sa_src = (h < 2)
+                    ? _mm256_broadcastsi128_si256(_mm256_castsi256_si128(fsba))
+                    : _mm256_broadcastsi128_si256(_mm256_extracti128_si256(fsba, 1));
+                const __m256i g0 = _mm256_set_epi64x((long long) iq2xs_grid[gia[4 * h + 3]],
+                                                     (long long) iq2xs_grid[gia[4 * h + 2]],
+                                                     (long long) iq2xs_grid[gia[4 * h + 1]],
+                                                     (long long) iq2xs_grid[gia[4 * h]]);
+                const __m256i sgn0 = _mm256_or_si256(
+                    _mm256_cmpeq_epi8(_mm256_and_si256(_mm256_shuffle_epi8(sa_src, sh), bsel), bsel), one8);
+                const __m256i sc0 = _mm256_cvtepi8_epi16(_mm_shuffle_epi8(scales0, sc_shuf));
+
+                const __m256i sb_src = (h < 2)
+                    ? _mm256_broadcastsi128_si256(_mm256_castsi256_si128(fsbb))
+                    : _mm256_broadcastsi128_si256(_mm256_extracti128_si256(fsbb, 1));
+                const __m256i g1 = _mm256_set_epi64x((long long) iq2xs_grid[gib[4 * h + 3]],
+                                                     (long long) iq2xs_grid[gib[4 * h + 2]],
+                                                     (long long) iq2xs_grid[gib[4 * h + 1]],
+                                                     (long long) iq2xs_grid[gib[4 * h]]);
+                const __m256i sgn1 = _mm256_or_si256(
+                    _mm256_cmpeq_epi8(_mm256_and_si256(_mm256_shuffle_epi8(sb_src, sh), bsel), bsel), one8);
+                const __m256i sc1 = _mm256_cvtepi8_epi16(_mm_shuffle_epi8(scales1, sc_shuf));
+
+                const int off = 128 * jj + 32 * h;
+                for (int t = 0; t < NT; ++t) {
+                    const __m256i yv = _mm256_loadu_si256((const __m256i*) (y[t][i].qs + off));
+                    acc0[t][h % CH] = madd_add(acc0[t][h % CH], _mm256_maddubs_epi16(g0, _mm256_sign_epi8(yv, sgn0)), sc0);
+                    acc1[t][h % CH] = madd_add(acc1[t][h % CH], _mm256_maddubs_epi16(g1, _mm256_sign_epi8(yv, sgn1)), sc1);
+                }
+            }
+        }
+        const float h0 = h2f(u16(blk0)), h1 = h2f(u16(blk1));
+        for (int t = 0; t < NT; ++t) {
+            const float d0 = h0 * (GGML ? y[t][i].d : 0.125f);
+            const float scale0 = GGML ? d0 : d0 * y[t][i].d;
+            __m256i sum0 = acc0[t][0];
+            if constexpr (CH == 2) sum0 = _mm256_add_epi32(sum0, acc0[t][1]);
+            accf0[t] = _mm256_fmadd_ps(_mm256_set1_ps(scale0), _mm256_cvtepi32_ps(sum0), accf0[t]);
+
+            const float d1 = h1 * (GGML ? y[t][i].d : 0.125f);
+            const float scale1 = GGML ? d1 : d1 * y[t][i].d;
+            __m256i sum1 = acc1[t][0];
+            if constexpr (CH == 2) sum1 = _mm256_add_epi32(sum1, acc1[t][1]);
+            accf1[t] = _mm256_fmadd_ps(_mm256_set1_ps(scale1), _mm256_cvtepi32_ps(sum1), accf1[t]);
+        }
+    }
+    for (int t = 0; t < NT; ++t) {
+        res0[t] = GGML ? 0.125f * ggml_hsum8(accf0[t]) : hsum8(accf0[t]);
+        res1[t] = GGML ? 0.125f * ggml_hsum8(accf1[t]) : hsum8(accf1[t]);
+    }
 }
 
 // ---- IQ1_M (29): 56-byte blocks (qs[32], qh[16], scales[8] holding the 3-bit sub-scales and, in their top nibbles, the
@@ -327,8 +452,12 @@ void gu_rows(const uint8_t* blob, size_t gu_row, size_t up_off, int n, const voi
     }
     float g[NT], u[NT];
     for (int r = r0; r < r1; ++r) {
-        row_dot_any<TY, NT, EX>(blob + (size_t) r * gu_row, nb, y, g, aux);
-        row_dot_any<TY, NT, EX>(blob + up_off + (size_t) r * gu_row, nb, y, u, aux);
+        if constexpr (TY == 17 && NT <= 4) {
+            rows2_dot_iq2xs<NT, EX>(blob + (size_t) r * gu_row, blob + up_off + (size_t) r * gu_row, nb, y, g, u);
+        } else {
+            row_dot_any<TY, NT, EX>(blob + (size_t) r * gu_row, nb, y, g, aux);
+            row_dot_any<TY, NT, EX>(blob + up_off + (size_t) r * gu_row, nb, y, u, aux);
+        }
         for (int t = 0; t < NT; ++t) ff[t][r] = (g[t] / (1.f + std::exp(-g[t]))) * u[t];
     }
 }
@@ -346,6 +475,22 @@ void dot_rows(const uint8_t* w, size_t row_bytes, int n, const void* const* act,
             iq1m_pre_build(y[t], nb, pre.data() + (size_t) t * nb * 128);
             aux[t] = pre.data() + (size_t) t * nb * 128;
         }
+    }
+    if constexpr (TY == 17 && NT <= 4) {
+        int r = r0;
+        float res0[NT], res1[NT];
+        for (; r + 2 <= r1; r += 2) {
+            rows2_dot_iq2xs<NT, EX>(w + (size_t) r * row_bytes, w + (size_t) (r + 1) * row_bytes, nb, y, res0, res1);
+            for (int t = 0; t < NT; ++t) {
+                out[t][r] = res0[t];
+                out[t][r + 1] = res1[t];
+            }
+        }
+        for (; r < r1; ++r) {
+            row_dot_iq2xs<NT, EX>(w + (size_t) r * row_bytes, nb, y, res0);
+            for (int t = 0; t < NT; ++t) out[t][r] = res0[t];
+        }
+        return;
     }
     float res[NT];
     for (int r = r0; r < r1; ++r) {

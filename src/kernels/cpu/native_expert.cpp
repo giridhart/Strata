@@ -249,7 +249,7 @@ bool iq512_supported(int type) noexcept {
 }
 
 bool iq256_supported(int type) noexcept {
-    return type == 16 || type == 17 || type == 18 || type == 21 || type == 22 || type == 23;
+    return type == 16 || type == 17 || type == 18 || type == 21 || type == 22 || type == 23 || type == 29;
 }
 
 bool kq256_supported(int type) noexcept { return type == 12 || type == 7 || type == 8; }
@@ -504,7 +504,8 @@ void native_gu_rows_impl(const NativeFmt& f, const uint8_t* blob, const void* co
     // only where ggml's dot runs today (below the #152 multi-token rule): with STRATA_IQ_MT_MIN=1 a lone token keeps the
     // multi-token kernel, so a token's rows still do not depend on how many tokens share its expert
     if (exact_one && nt == 1 && nt < native_gu_mt_min(f.gu_type) && avx2 && !cpu_avx512_ok() &&
-        (f.gu_type == 16 || f.gu_type == 17 || f.gu_type == 18 || f.gu_type == 21 || f.gu_type == 22)) {
+        (f.gu_type == 16 || f.gu_type == 17 || f.gu_type == 18 || f.gu_type == 21 || f.gu_type == 22 ||
+         f.gu_type == 29)) {
         static std::once_flag announced;
         std::call_once(announced, [] { std::fprintf(stderr, "strata ab: GATE=STRATA_CPU_IQ_ALL_EXACT1 active=1\n"); });
         iq256_gu_rows_exact_one(f.gu_type, blob, f.gu_row, f.up_off, (int) f.n_embd, act[0], ff[0], r0, r1);

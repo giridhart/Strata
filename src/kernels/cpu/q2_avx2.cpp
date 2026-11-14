@@ -128,13 +128,65 @@ inline __m128 reduce4(__m256 a0, __m256 a1, __m256 a2, __m256 a3) {
     return _mm_add_ps(_mm256_castps256_ps128(h), _mm256_extractf128_ps(h, 1));
 }
 
+// Single-pass 4-row bitplane dot for NT == 1, keeping ActQ q/psum/pscale in YMMs across all four rows.
+inline void rows_bp4_nt1(const uint8_t* w, size_t row_bytes, int npairs, const ActQ* a0, float* out, int r) {
+    __m256 acc0 = _mm256_setzero_ps(), acc1 = _mm256_setzero_ps();
+    __m256 acc2 = _mm256_setzero_ps(), acc3 = _mm256_setzero_ps();
+    const __m256i m3 = _mm256_set1_epi8(3);
+    const __m256i ones = _mm256_set1_epi16(1);
+    const __m256i didx = _mm256_setr_epi32(0, 0, 0, 0, 1, 1, 1, 1);
+    const uint8_t* r0 = w + (size_t) r * row_bytes;
+    const uint8_t* r1 = r0 + row_bytes;
+    const uint8_t* r2 = r1 + row_bytes;
+    const uint8_t* r3 = r2 + row_bytes;
+    for (int p = 0; p < npairs; ++p) {
+        const int8_t* q = a0->qp + (size_t) p * 128;
+        const __m256i q0 = _mm256_load_si256((const __m256i*) q);
+        const __m256i q1 = _mm256_load_si256((const __m256i*) (q + 32));
+        const __m256i q2 = _mm256_load_si256((const __m256i*) (q + 64));
+        const __m256i q3 = _mm256_load_si256((const __m256i*) (q + 96));
+        const __m256i ps = _mm256_load_si256((const __m256i*) (a0->psum + p * 8));
+        const __m256 psc = _mm256_load_ps(a0->pscale + p * 8);
+        auto step = [&](const uint8_t* blk, __m256& acc) {
+            uint16_t d0, d1;
+            std::memcpy(&d0, blk, 2);
+            std::memcpy(&d1, blk + 18, 2);
+            const __m128 d01 = _mm_cvtph_ps(_mm_cvtsi32_si128((int) ((uint32_t) d0 | ((uint32_t) d1 << 16))));
+            const __m256 dp = _mm256_permutevar8x32_ps(_mm256_castps128_ps256(d01), didx);
+            const __m256i c = _mm256_inserti128_si256(_mm256_castsi128_si256(_mm_loadu_si128((const __m128i*) (blk + 2))),
+                                                      _mm_loadu_si128((const __m128i*) (blk + 20)), 1);
+            __m256i s = _mm256_maddubs_epi16(_mm256_and_si256(c, m3), q0);
+            s = _mm256_add_epi16(s, _mm256_maddubs_epi16(_mm256_and_si256(_mm256_srli_epi16(c, 2), m3), q1));
+            s = _mm256_add_epi16(s, _mm256_maddubs_epi16(_mm256_and_si256(_mm256_srli_epi16(c, 4), m3), q2));
+            s = _mm256_add_epi16(s, _mm256_maddubs_epi16(_mm256_and_si256(_mm256_srli_epi16(c, 6), m3), q3));
+            const __m256i i32 = _mm256_sub_epi32(_mm256_madd_epi16(s, ones), ps);
+            acc = _mm256_fmadd_ps(dp, _mm256_mul_ps(_mm256_cvtepi32_ps(i32), psc), acc);
+        };
+        const size_t boff = (size_t) p * 36;
+        step(r0 + boff, acc0);
+        step(r1 + boff, acc1);
+        step(r2 + boff, acc2);
+        step(r3 + boff, acc3);
+    }
+    _mm_storeu_ps(out + r, reduce4(acc0, acc1, acc2, acc3));
+}
+
 template <int NT>
 void rows_bp(const uint8_t* w, size_t row_bytes, int npairs, const ActQ* const* a, float* const* out, int r0, int r1) {
     int r = r0;
     for (; r + 4 <= r1; r += 4) {
-        __m256 acc[4][NT];
-        for (int k = 0; k < 4; ++k) row_bp_acc<NT>(w + (size_t) (r + k) * row_bytes, a, npairs, acc[k]);
-        for (int t = 0; t < NT; ++t) _mm_storeu_ps(out[t] + r, reduce4(acc[0][t], acc[1][t], acc[2][t], acc[3][t]));
+        if (r + 16 <= r1) {
+            const uint8_t* pf = w + (size_t) (r + 12) * row_bytes;
+            for (size_t off = 0; off < 4 * row_bytes; off += 64)
+                _mm_prefetch((const char*) (pf + off), _MM_HINT_T0);
+        }
+        if constexpr (NT == 1) {
+            rows_bp4_nt1(w, row_bytes, npairs, a[0], out[0], r);
+        } else {
+            __m256 acc[4][NT];
+            for (int k = 0; k < 4; ++k) row_bp_acc<NT>(w + (size_t) (r + k) * row_bytes, a, npairs, acc[k]);
+            for (int t = 0; t < NT; ++t) _mm_storeu_ps(out[t] + r, reduce4(acc[0][t], acc[1][t], acc[2][t], acc[3][t]));
+        }
     }
     for (; r < r1; ++r) {
         __m256 acc[NT];
