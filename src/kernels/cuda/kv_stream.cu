@@ -283,4 +283,45 @@ KvStreamCounters kv_stream_counters(const KvStreamMap& m) {
     return r;
 }
 
+namespace {
+__global__ void kv_copy_cell_kernel(Runs r, const int32_t* __restrict__ page_table, bool has_host,
+                                    long long src_pos, long long dst_pos, int kv_heads, int page_size) {
+    const long long sb = src_pos / page_size, soff = src_pos % page_size;
+    const long long db = dst_pos / page_size, doff = dst_pos % page_size;
+    const int ssl = page_table[sb];
+    const int dsl = page_table[db];
+    const int rows = kv_heads * page_size;
+    for (int a = 0; a < r.n; ++a) {
+        const int cb = r.len[a] / rows;
+        const int words = cb / 4;
+        for (int h = 0; h < kv_heads; ++h) {
+            const uint8_t* sbase = (ssl >= 0 ? (const uint8_t*) r.dst[a] + (long long) ssl * r.len[a]
+                                             : r.src[a] + sb * r.len[a]) +
+                                   ((long long) h * page_size + soff) * cb;
+            const uint32_t* s32 = reinterpret_cast<const uint32_t*>(sbase);
+            uint32_t* d_slot = dsl >= 0
+                ? reinterpret_cast<uint32_t*>(r.dst[a] + (long long) dsl * r.len[a] + ((long long) h * page_size + doff) * cb)
+                : nullptr;
+            uint32_t* d_host = (has_host && r.src[a] != nullptr)
+                ? reinterpret_cast<uint32_t*>(const_cast<uint8_t*>(r.src[a]) + db * r.len[a] + ((long long) h * page_size + doff) * cb)
+                : nullptr;
+            for (int w = (int) threadIdx.x; w < words; w += (int) blockDim.x) {
+                const uint32_t v = s32[w];
+                if (d_slot != nullptr) d_slot[w] = v;
+                if (d_host != nullptr) d_host[w] = v;
+            }
+        }
+    }
+}
+}  // namespace
+
+void kv_copy_cell(const QsaAttnPools& slots, const KvHostPools& host, const int32_t* page_table, int fmt,
+                  int64_t src_pos, int64_t dst_pos, const QsaShapes& s, void* stream) {
+    if (src_pos == dst_pos || src_pos < 0 || dst_pos < 0) return;
+    kv_copy_cell_kernel<<<1, 128, 0, (cudaStream_t) stream>>>(
+        runs_of(slots, host, fmt, s), page_table, host.present(), (long long) src_pos, (long long) dst_pos,
+        (int) s.n_head_kv, (int) s.page_size);
+    check("kv_copy_cell");
+}
+
 }  // namespace strata::kernels

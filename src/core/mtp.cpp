@@ -1,5 +1,6 @@
 // src/core/mtp.cpp - see include/strata/core/mtp.hpp.
 #include "strata/core/mtp.hpp"
+#include "strata/core/mtp_kv_ring.hpp"
 #include "strata/core/pin_budget.hpp"
 #include "strata/kernels/qsa_prompt_attn.hpp"
 #include "strata/core/coupled_draft.hpp"
@@ -179,7 +180,7 @@ MtpDrafter::~MtpDrafter() {
     if (owns_draft_head_ && dvocab_) cudaFree(dvocab_);
     if (ev_chain_) cudaEventDestroy(ev_chain_);
     for (cudaEvent_t e : ev_step_) if (e) cudaEventDestroy(e);
-    void* hosts[] = {h_tok_, h_step_, h_pos_, h_row_, h_out_, h_prob_, h_force_, h_floor_};
+    void* hosts[] = {h_tok_, h_step_, h_pos_, h_row_, h_out_, h_prob_, h_out2_, h_prob2_, h_force_, h_floor_};
     for (void* h : hosts) if (h) cudaFreeHost(h);
 }
 
@@ -381,7 +382,9 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
     // KV streaming: the drafter only reads its last `window` cells, so with streaming on its K/V is a ring of the
     // window (plus the cells a round writes ahead of its queries) over a host copy, refilled on a resume. The host copy
     // is pinned after the expert arena has pinned what it could: if it does not fit, the K/V stays whole in VRAM.
-    int64_t ring = (window > 0 && window < max_cells) ? window + 4 * (int64_t) max_t + 64 : 0;
+    // When no `--mtp-window` is given (`window <= 0`), pass `ring = -1` so `--kv-resident` keeps the dense drafter K/V
+    // fully resident (`kv_mode = 0`) instead of assigning un-resolved Clock-LRU paging (`kv_mode = 1`).
+    int64_t ring = mtp_kv_ring_cells(window, max_cells, max_t);
     // K8V4 never applies to the drafter: its own attention paths (below, and verify.cpp) handle whole formats
     // only, whatever ring shape it takes (0, a window, or the -1 fully-resident fallback).
     const bool kv_hybrid_was = qsa_kv_hybrid();
@@ -421,8 +424,11 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
               mapped(64, (void**) &h_row_, (void**) &m_row_) &&
               mapped(T * 4 + 64, (void**) &h_out_, (void**) &m_out_) &&
               mapped(T * 4 + 64, (void**) &h_prob_, (void**) &m_prob_) &&
+              (!top2_fast_on_ || (mapped(T * 4 + 64, (void**) &h_out2_, (void**) &m_out2_) &&
+                                  mapped(T * 4 + 64, (void**) &h_prob2_, (void**) &m_prob2_))) &&
               (!force_on_ || mapped(64, (void**) &h_force_, (void**) &m_force_));
     if (!ok) { err = "mtp: mapped staging failed"; return false; }
+    if (h_out2_ != nullptr) for (uint64_t j = 0; j < T; ++j) { h_out2_[j] = -1; h_prob2_[j] = 0.0f; }
     if (h_force_ != nullptr) for (int j = 0; j < 16; ++j) h_force_[j] = -1;
     auto carve = [&](Bump& b) {
         tok_ = b.take<int32_t>(T); step_ = b.take<int32_t>(R2 * 4); pos_ = b.take<int32_t>(R2 * NH); row_ = b.take<int32_t>(4);
@@ -1377,6 +1383,9 @@ bool MtpDrafter::record_rest(int step_row, cudaStream_t cs, std::string& err) {
         }
         if (multi_block_head_ops()) row_top_prob_split(head_logits_, T, (int) nv, out_ids_, probs_, top_scratch_, cs);
         else row_top_prob(head_logits_, T, (int) nv, out_ids_, probs_, cs);
+        if (top2_fast_on_ && !coupled_rec_ && T == 1 && top2_j_ >= 0 && m_out2_ != nullptr && m_prob2_ != nullptr)
+            row_top2_mapped(head_logits_, (int) nv, out_ids_, probs_, sub ? dvocab_ : nullptr,
+                            m_out2_ + top2_j_, m_prob2_ + top2_j_, cs);
         if (sub) map_ids(out_ids_, dvocab_, T, cs);
         g_mp.stamp(15, cs);
     } catch (const std::exception& e) {
@@ -1458,7 +1467,9 @@ bool MtpDrafter::capture_round(int T, bool coupled, std::string& err) {
         }
         coupled_rec_ = coupled;
         coupled_j_ = 0;
+        top2_j_ = 0;
         ok = record_rest(ra, cs_, err);
+        top2_j_ = -1;
         coupled_rec_ = false;
     }
     if (ok) mtp_select(R_, HCN, out_ids_, row_ + 1, Rin_, tok_, m_out_, 0, cs_, probs_, m_prob_);
@@ -1483,8 +1494,10 @@ bool MtpDrafter::capture_step(int j, bool coupled, std::string& err) {
     copy_from_mapped_multi(in, 2, cs_);
     coupled_rec_ = coupled;
     coupled_j_ = j;
+    top2_j_ = j;
     g_mp.base = j < kMpGraphs ? j : -1;
     bool ok = record_forward(1, row, cs_, err);
+    top2_j_ = -1;
     coupled_rec_ = false;
     if (ok) mtp_select(R_, HCN, out_ids_, row_ + 1, Rin_, tok_, m_out_, j, cs_, probs_, m_prob_);
     if (ok) g_mp.stamp(16, cs_);
@@ -1748,6 +1761,12 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
     for (int j = 1; j < max_steps; ++j)
         put(max_t_ + j - 1, coupled_draft_cell(p, a, j));
     for (int j = 0; j < max_steps; ++j) ((volatile int32_t*) h_out_)[j] = -1;
+    if (h_out2_ != nullptr && h_prob2_ != nullptr) {
+        for (int j = 0; j < max_t_; ++j) {
+            ((volatile int32_t*) h_out2_)[j] = -1;
+            ((volatile float*) h_prob2_)[j] = 0.0f;
+        }
+    }
     h_row_[0] = a;
     h_row_[1] = 0;
     if (h_force_ != nullptr) for (int j = 0; j < 16; ++j) h_force_[j] = -1;   // the forcing kernels: no-ops here

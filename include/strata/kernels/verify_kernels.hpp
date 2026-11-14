@@ -30,6 +30,21 @@ inline constexpr int kVerifyMaxT = kWindowMaxT;
 /// Batch and pipelined windows stay at kVerifyMaxT.
 inline constexpr int kVerifyLongT = kVerifyMaxT > kVerifyNarrowT ? kVerifyMaxT : 2 * kVerifyMaxT;
 
+/// Device-readable topology of a speculative verify tree (`T <= kVerifyMaxT`, trunk-first layout).
+/// Slots `0 .. T - 1` have causal ancestor masks and slot `t` writes K/V at `pos0 + t` while running attention/RoPE
+/// at logical depth `pos0 + depth[t]`.
+struct VerifyTreeMap {
+    int64_t pos0 = 0;
+    int32_t n_tok = 0;
+    uint32_t branch_mask = 0;
+    int32_t parent[kVerifyMaxT] = {};
+    int32_t depth[kVerifyMaxT] = {};
+    int32_t anc_slot[kVerifyMaxT][kVerifyMaxT] = {};
+    int32_t anc_conv[kVerifyMaxT][4] = {};
+    int32_t pad[3] = {};
+};
+static_assert(sizeof(VerifyTreeMap) % 16 == 0, "VerifyTreeMap alignment");
+
 /// For token t of T: conv over [history(3) | qkv_0 .. qkv_t] -> SiLU -> L2 norm of the q/k heads -> h[t].
 /// `history` is NOT written, but with `commit` (one token): it then keeps the token, as gdn_conv_commit.  Bitwise
 /// `fused_gdn_conv_l2` per token.
@@ -65,6 +80,21 @@ void gdn_step_norm_groups(const GdnGroups& groups, const float* h, int conv_chan
 void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const float* gate, const float* beta,
                          const float* z, const float* gamma, float eps, float* y, int h_k, int h_v, int n_tok,
                          const int32_t* n_keep, void* stream, int t_out_begin = 0, void* xq_out = nullptr);
+/// Causal-tree variants (`STRATA_SPEC_TREE` / `--spec-tree`):
+///   * `gdn_conv_l2_tree`: conv over each slot `t`'s ancestor chain `[history | qkv[anc_conv[t][j]]]`.
+///   * `gdn_conv_ab_tree`: fused `gdn_conv_l2_tree` + alpha/beta gates for `n_tok` tree slots.
+///   * `gdn_step_norm_tree`: replays each slot's ancestor path sequentially from `state` (`snap == nullptr` for the final
+///     path if read-only, or `snap` holding `[T][state_floats]` when `tree->branch_mask != 0` so sibling branches fork
+///     from their parent's post-step GDN state without mutating `state`).
+void gdn_conv_l2_tree(const float* history, const float* qkv, const float* conv_w, float* h, int channels, int qk_heads,
+                      float eps, int n_tok, const VerifyTreeMap* tree, void* stream, int t_begin = 0);
+void gdn_conv_ab_tree(const float* history, const float* qkv, const float* conv_w, float* h, int channels, int qk_heads,
+                      float eps, int n_tok, int t_begin, const VerifyTreeMap* tree, const float* x,
+                      const uint16_t* w_alpha, const uint16_t* w_beta, const float* dt, const float* ssm_a, float* gate,
+                      float* beta, int n_embd, int h_v, void* stream);
+void gdn_step_norm_tree(const float* state, float* snap, const float* h, int conv_channels, const float* gate,
+                        const float* beta, const float* z, const float* gamma, float eps, float* y, int h_k, int h_v,
+                        int n_tok, const VerifyTreeMap* tree, void* stream, void* xq_out = nullptr);
 /// The commit of `n_layers` GDN layers in two launches (engine-latency): layer i's conv history is
 /// `state + i * state_stride + conv_off` and its qkv rows `qkv + i * qkv_stride`, as gdn_conv_commit; its recurrence
 /// state `state + i * state_stride` over the first *n_keep rows of `h + i * h_stride` / `gate|beta + i * gb_stride`, as
@@ -214,5 +244,19 @@ void window_ids(int32_t* steps, int n, int window, int32_t* ids, int64_t ids_str
 /// selects exactly what window_ids selects.  CUDA / HIP only.
 void window_ids_floor(int32_t* steps, int n, int window, int32_t* ids, int64_t ids_stride, const int32_t* floor_cell,
                       void* stream);
+
+/// Tree attention selection remap (`sel[q * cap ..]`, width `steps[q * 4 + 3]`): replaces any selected window cell
+/// `id >= tree->pos0` (slot depth `d = id - tree->pos0`) with the physical K/V slot `tree->pos0 + tree->anc_slot[q][d]`
+/// so query `q` attends strictly along its own ancestor chain in the speculative tree.
+void qsa_remap_tree_sel(int32_t* sel, const int32_t* steps, int n_tok, int64_t cap, const VerifyTreeMap* tree,
+                        void* stream);
+/// Compact one non-trunk row across `n_layers` verify staging buffers (`dst_row < src_row`): copies
+/// `base[l * layer_stride + src_row * row_floats ..]` -> `base[l * layer_stride + dst_row * row_floats ..]`.
+void verify_compact_row(float* base, int64_t layer_stride, int n_layers, int src_row, int dst_row, int64_t row_floats,
+                        void* stream);
+/// Single-row argmax runner-up (`!= top1_raw[0]`) and its calibrated softmax probability relative to `top1_prob[0]`.
+/// Writes to mapped host outputs `out_id2`/`out_prob2` with zero extra host sync.
+void row_top2_mapped(const float* logits, int n_vocab, const int32_t* top1_raw, const float* top1_prob,
+                     const int32_t* dvocab, int32_t* out_id2, float* out_prob2, void* stream);
 
 }  // namespace strata::kernels

@@ -86,6 +86,10 @@ public:
     /// window's commit (`tail`) and the window's pick at its last accepted row (`next`, the next window's row 0).
     void set_draft_history(const int32_t* tail, int64_t n_tail, int32_t next);
     bool coupled() const { return coupled_active_; }
+    /// Zero-sync device-side Top-2 runner-up extraction for the first 2 draft steps (`STRATA_SPEC_TREE`).
+    void set_top2_fast(bool on) { top2_fast_on_ = on; }
+    int32_t top2_fast(int j) const { return (j >= 0 && j < 2 && h_out2_ != nullptr) ? h_out2_[j] : -1; }
+    float top2_prob(int j) const { return (j >= 0 && j < 2 && h_prob2_ != nullptr) ? h_prob2_[j] : 0.0f; }
 
     double ms_draft = 0, ms_prefill = 0;
     int64_t rounds = 0;
@@ -188,6 +192,10 @@ private:
     int32_t *h_pos_ = nullptr, *m_pos_ = nullptr, *h_row_ = nullptr, *m_row_ = nullptr;
     int32_t *h_out_ = nullptr, *m_out_ = nullptr;
     float *h_prob_ = nullptr, *m_prob_ = nullptr;   // each draft's probability under the draft layer
+    bool top2_fast_on_ = false;
+    int top2_j_ = -1;
+    int32_t *h_out2_ = nullptr, *m_out2_ = nullptr;
+    float *h_prob2_ = nullptr, *m_prob2_ = nullptr;
     // the draft head: the main head's rows for a token subset (rt/draft_vocab.bin), or the whole head
     uint8_t* dhead_ = nullptr;
     std::shared_ptr<DraftHeadInt2> int2_;
@@ -303,6 +311,10 @@ public:
     /// STRATA_MTP_TOP2=1 (diagnostic): draft j's runner-up token in the last draft() (-1 = unknown)
     static bool top2_env();
     int32_t top2(int j) const { return j >= 0 && j < (int) top2_.size() ? top2_[(size_t) j] : -1; }
+    /// Zero-sync device-side Top-2 runner-up extraction for the first 2 draft steps (`STRATA_SPEC_TREE`).
+    void set_top2_fast(bool on) { top2_fast_on_ = on; }
+    int32_t top2_fast(int j) const { return (j >= 0 && j < 2 && h_out2_ != nullptr) ? h_out2_[j] : -1; }
+    float top2_prob(int j) const { return (j >= 0 && j < 2 && h_prob2_ != nullptr) ? h_prob2_[j] : 0.0f; }
     int max_t() const { return max_t_; }
     uint64_t vram_bytes() const { return vram_; }
 
@@ -559,6 +571,10 @@ private:
     int32_t *h_pos_ = nullptr, *m_pos_ = nullptr, *h_row_ = nullptr, *m_row_ = nullptr;
     int32_t *h_out_ = nullptr, *m_out_ = nullptr;
     float *h_prob_ = nullptr, *m_prob_ = nullptr;   // each draft's probability under the draft layer
+    bool top2_fast_on_ = false;
+    int top2_j_ = -1;
+    int32_t *h_out2_ = nullptr, *m_out2_ = nullptr;
+    float *h_prob2_ = nullptr, *m_prob2_ = nullptr;
     // the draft head: the main head's rows for a token subset (rt/draft_vocab.bin), or the whole head
     uint8_t* dhead_ = nullptr;
     std::shared_ptr<DraftHeadInt2> int2_;

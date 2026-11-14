@@ -58,6 +58,36 @@ void gdn_conv_l2_multi_kernel(const float* __restrict__ hist, const float* __res
     h[(size_t)t * C + c] = y;
 }
 
+void gdn_conv_l2_tree_kernel(const float* __restrict__ hist, const float* __restrict__ qkv,
+                             const float* __restrict__ w, float* __restrict__ h, int C, int qk_heads, float eps,
+                             int t_begin, const VerifyTreeMap* __restrict__ tree, float* part,
+                             sycl::nd_item<2> item) {
+    const int t = t_begin + (int)item.get_group(0);
+    const int qk_group = (int)item.get_group(1);
+    const int local_id = (int)item.get_local_id(1);
+    const int c = qk_group * S + local_id;
+
+    float win[3];
+#pragma unroll
+    for (int j = 0; j < 3; ++j) {
+        const int anc = tree->anc_conv[t][j];
+        win[j] = anc < 0 ? hist[c * 3 + (anc + 3)] : qkv[(size_t)anc * C + c];
+    }
+    const float v0 = win[0], v1 = win[1], v2 = win[2], x = qkv[(size_t)t * C + c];
+    float sum = v0 * w[c * 4] + v1 * w[c * 4 + 1] + v2 * w[c * 4 + 2] + x * w[c * 4 + 3];
+    float y = sum / (1.0f + sycl::native::exp(-sum));
+    if (qk_group < qk_heads) {
+        float sq = y * y;
+        auto sg = item.get_sub_group();
+        sq = sycl::reduce_over_group(sg, sq, sycl::plus<float>());
+        if ((local_id & 31) == 0) part[local_id >> 5] = sq;
+        item.barrier(sycl::access::fence_space::local_space);
+        const float ss = part[0] + part[1] + part[2] + part[3];
+        y *= sycl::rsqrt(ss + eps);
+    }
+    h[(size_t)t * C + c] = y;
+}
+
 void gdn_conv_commit_kernel(float* __restrict__ hist, const float* __restrict__ qkv, int C,
                             const int32_t* __restrict__ n_keep, sycl::nd_item<1> item) {
     const int c = item.get_global_id(0);
@@ -251,6 +281,98 @@ void gdn_step_norm_multi_kernel(float* __restrict__ state, const float* __restri
 #pragma unroll
         for (int r = 0; r < RPG; ++r)
             base[r * row_stride] = s[r];
+    }
+}
+
+void gdn_step_norm_tree_kernel(const float* __restrict__ state, float* __restrict__ snap,
+                               const float* __restrict__ hbuf, int C, const float* __restrict__ gate,
+                               const float* __restrict__ beta, const float* __restrict__ z,
+                               const float* __restrict__ gamma, float eps, float* __restrict__ y, int h_k, int h_v,
+                               int T, const VerifyTreeMap* __restrict__ tree,
+                               sycl::local_accessor<float, 2> sk, sycl::local_accessor<float, 2> sq,
+                               sycl::local_accessor<float, 2> red_kv, sycl::local_accessor<float, 2> red_o,
+                               sycl::local_accessor<float, 1> wsum, sycl::nd_item<2> item) {
+    const int head = (int)item.get_group(0);
+    const int rg = (int)item.get_local_id(0);
+    const int col = (int)item.get_local_id(1);
+    const int tid_flat = rg * S + col;
+    const int qh = head % h_k;
+    const int qk = S * h_k;
+    const int value_dim = S * h_v;
+    if (T > 0) {
+        if (rg == 0) sk[0][col] = hbuf[qk + qh * S + col];
+        else if (rg == 1) sq[0][col] = hbuf[qh * S + col];
+    }
+    const float gam = (rg == 0) ? gamma[col] : 0.0f;
+    float s[RPG];
+    const size_t col_off = ((size_t)(rg * RPG) * h_v + head) * S + col;
+    const size_t row_stride = (size_t)h_v * S;
+    {
+        const float* base = state + col_off;
+#pragma unroll
+        for (int r = 0; r < RPG; ++r) s[r] = base[r * row_stride];
+    }
+    int cur_owner = -1;
+    const uint32_t bmask = tree->branch_mask;
+    for (int t = 0; t < T; ++t) {
+        const int cur = t & 1, nxt = (t + 1) & 1;
+        const float* ht = hbuf + (size_t)t * C;
+        item.barrier(sycl::access::fence_space::local_space);
+        if (t + 1 < T) {
+            const float* ht_next = ht + C;
+            if (rg == 0) sk[nxt][col] = ht_next[qk + qh * S + col];
+            else if (rg == 1) sq[nxt][col] = ht_next[qh * S + col];
+        }
+        const int par = tree->parent[t];
+        if (par != cur_owner) {
+            if (par >= 0) {
+                const float* sb = snap + (((size_t)par * (size_t)h_v + (size_t)head) * (size_t)(S * S) + (size_t)tid_flat);
+#pragma unroll
+                for (int r = 0; r < RPG; ++r) s[r] = sb[r * (RG * S)];
+            } else {
+                const float* base = state + col_off;
+#pragma unroll
+                for (int r = 0; r < RPG; ++r) s[r] = base[r * row_stride];
+            }
+        }
+        const float g = sycl::native::exp(gate[(size_t)t * h_v + head]);
+        float kv = 0.0f;
+#pragma unroll
+        for (int r = 0; r < RPG; ++r) kv = sycl::fma(s[r], sk[cur][rg * RPG + r], kv);
+        red_kv[rg][col] = kv;
+        item.barrier(sycl::access::fence_space::local_space);
+        const float kv_col = red_kv[0][col] + red_kv[1][col] + red_kv[2][col] + red_kv[3][col];
+        const float delta = (ht[2 * qk + head * S + col] - g * kv_col) * beta[(size_t)t * h_v + head];
+        float o = 0.0f;
+#pragma unroll
+        for (int r = 0; r < RPG; ++r) {
+            s[r] = sycl::fma(g, s[r], sk[cur][rg * RPG + r] * delta);
+            o = sycl::fma(s[r], sq[cur][rg * RPG + r], o);
+        }
+        if ((bmask >> (unsigned)t) & 1u) {
+            float* db = snap + (((size_t)t * (size_t)h_v + (size_t)head) * (size_t)(S * S) + (size_t)tid_flat);
+#pragma unroll
+            for (int r = 0; r < RPG; ++r) db[r * (RG * S)] = s[r];
+        }
+        cur_owner = t;
+        red_o[rg][col] = o;
+        item.barrier(sycl::access::fence_space::local_space);
+        float oc = 0.0f, sq_part = 0.0f;
+        if (rg == 0) {
+            oc = (red_o[0][col] + red_o[1][col] + red_o[2][col] + red_o[3][col]) * sycl::rsqrt((float)S);
+            sq_part = oc * oc;
+        }
+        auto sg = item.get_sub_group();
+        sq_part = sycl::reduce_over_group(sg, sq_part, sycl::plus<float>());
+        if ((tid_flat & 31) == 0) wsum[tid_flat >> 5] = sq_part;
+        item.barrier(sycl::access::fence_space::local_space);
+        if (rg == 0) {
+            const float ss = wsum[0] + wsum[1] + wsum[2] + wsum[3];
+            const float scale = sycl::rsqrt(ss / (float)S + eps);
+            const float zz = z[(size_t)t * value_dim + head * S + col];
+            y[(size_t)t * value_dim + head * S + col] =
+                oc * scale * gam * (1.0f / (1.0f + sycl::native::exp(-zz)));
+        }
     }
 }
 
@@ -1355,6 +1477,109 @@ void gdn_conv_ab_multi(const float* history, const float* qkv, const float* conv
     gdn_ab_multi(x, w_alpha, w_beta, dt, ssm_a, gate, beta, n_embd, h_v, n_tok, stream);
 }
 
+void gdn_conv_l2_tree(const float* history, const float* qkv, const float* conv_w, float* h, int channels, int qk_heads,
+                      float eps, int n_tok, const VerifyTreeMap* tree, void* stream, int t_begin) {
+    if (!history || !qkv || !conv_w || !h || !tree || channels % S != 0 || n_tok < 1 || n_tok > kVerifyMaxT) {
+        std::fprintf(stderr, "gdn_conv_l2_tree: invalid arguments\n");
+        std::exit(1);
+    }
+    sycl::queue* q = stream ? static_cast<sycl::queue*>(stream) : &default_queue();
+    q->submit([&](sycl::handler& cgh) {
+        sycl::local_accessor<float, 1> part(sycl::range<1>(S / 32), cgh);
+        const size_t qk_groups = channels / S;
+        cgh.parallel_for(sycl::nd_range<2>(sycl::range<2>((size_t)n_tok, qk_groups * S), sycl::range<2>(1, S)),
+                         [=](sycl::nd_item<2> item) [[sycl::reqd_sub_group_size(32)]] {
+                             gdn_conv_l2_tree_kernel(history, qkv, conv_w, h, channels, qk_heads, eps, t_begin, tree,
+                                                     part.get_multi_ptr<sycl::access::decorated::no>().get(), item);
+                         });
+    });
+}
+
+void gdn_conv_ab_tree(const float* history, const float* qkv, const float* conv_w, float* h, int channels, int qk_heads,
+                      float eps, int n_tok, int t_begin, const VerifyTreeMap* tree, const float* x,
+                      const uint16_t* w_alpha, const uint16_t* w_beta, const float* dt, const float* ssm_a, float* gate,
+                      float* beta, int n_embd, int h_v, void* stream) {
+    gdn_conv_l2_tree(history, qkv, conv_w, h, channels, qk_heads, eps, n_tok, tree, stream, t_begin);
+    gdn_ab_multi(x, w_alpha, w_beta, dt, ssm_a, gate, beta, n_embd, h_v, n_tok, stream);
+}
+
+void gdn_step_norm_tree(const float* state, float* snap, const float* h, int conv_channels, const float* gate,
+                        const float* beta, const float* z, const float* gamma, float eps, float* y, int h_k, int h_v,
+                        int n_tok, const VerifyTreeMap* tree, void* stream, void* xq_out) {
+    (void)xq_out;
+    if (!state || !snap || !h || !gate || !beta || !z || !gamma || !y || !tree || h_k <= 0 || h_v % h_k ||
+        n_tok < 1 || n_tok > kVerifyNarrowT) {
+        std::fprintf(stderr, "gdn_step_norm_tree: invalid arguments\n");
+        std::exit(1);
+    }
+    sycl::queue* q = stream ? static_cast<sycl::queue*>(stream) : &default_queue();
+    q->submit([&](sycl::handler& cgh) {
+        sycl::local_accessor<float, 2> sk(sycl::range<2>(2, S), cgh);
+        sycl::local_accessor<float, 2> sq(sycl::range<2>(2, S), cgh);
+        sycl::local_accessor<float, 2> red_kv(sycl::range<2>(RG, S), cgh);
+        sycl::local_accessor<float, 2> red_o(sycl::range<2>(RG, S), cgh);
+        sycl::local_accessor<float, 1> wsum(sycl::range<1>(S * RG / 32), cgh);
+
+        cgh.parallel_for(sycl::nd_range<2>(sycl::range<2>((size_t)h_v * RG, S), sycl::range<2>(RG, S)),
+                         [=](sycl::nd_item<2> item) [[sycl::reqd_sub_group_size(32)]] {
+                             gdn_step_norm_tree_kernel(state, snap, h, conv_channels, gate, beta, z, gamma, eps, y,
+                                                       h_k, h_v, n_tok, tree, sk, sq, red_kv, red_o, wsum, item);
+                         });
+    });
+}
+
+void qsa_remap_tree_sel(int32_t* sel, const int32_t* steps, int n_tok, int64_t cap, const VerifyTreeMap* tree,
+                        void* stream) {
+    if (n_tok <= 0 || !sel || !steps || !tree) return;
+    sycl::queue* q = stream ? static_cast<sycl::queue*>(stream) : &default_queue();
+    q->parallel_for(sycl::nd_range<2>(sycl::range<2>((size_t)n_tok, 8 * 256), sycl::range<2>(1, 256)),
+                    [=](sycl::nd_item<2> item) {
+                        const int qi = (int)item.get_group(0);
+                        const int width = steps[qi * 4 + 3];
+                        const int32_t pos0 = (int32_t)tree->pos0;
+                        const int j0 = (int)item.get_local_id(1) + (int)item.get_group(1) * 256;
+                        const int stride = (int)item.get_global_range(1);
+                        for (int j = j0; j < width; j += stride) {
+                            const int32_t id = sel[(long long)qi * cap + j];
+                            if (id >= pos0) {
+                                const int d = (int)(id - pos0);
+                                if (d < kVerifyMaxT) sel[(long long)qi * cap + j] = pos0 + tree->anc_slot[qi][d];
+                            }
+                        }
+                    });
+}
+
+void verify_compact_row(float* base, int64_t layer_stride, int n_layers, int src_row, int dst_row, int64_t row_floats,
+                        void* stream) {
+    if (!base || n_layers <= 0 || src_row == dst_row || row_floats <= 0) return;
+    sycl::queue* q = stream ? static_cast<sycl::queue*>(stream) : &default_queue();
+    if (row_floats % 4 == 0) {
+        const int64_t vec4 = row_floats / 4;
+        const size_t gx = (size_t)((vec4 + 255) / 256) * 256;
+        q->parallel_for(sycl::nd_range<2>(sycl::range<2>((size_t)n_layers, gx), sycl::range<2>(1, 256)),
+                        [=](sycl::nd_item<2> item) {
+                            const int64_t i = (int64_t)item.get_global_id(1);
+                            if (i >= vec4) return;
+                            const int64_t off = (int64_t)item.get_group(0) * layer_stride;
+                            const sycl::float4* s4 =
+                                reinterpret_cast<const sycl::float4*>(base + off + (int64_t)src_row * vec4 * 4);
+                            sycl::float4* d4 =
+                                reinterpret_cast<sycl::float4*>(base + off + (int64_t)dst_row * vec4 * 4);
+                            d4[i] = s4[i];
+                        });
+    } else {
+        const size_t gx = (size_t)((row_floats + 255) / 256) * 256;
+        q->parallel_for(sycl::nd_range<2>(sycl::range<2>((size_t)n_layers, gx), sycl::range<2>(1, 256)),
+                        [=](sycl::nd_item<2> item) {
+                            const int64_t i = (int64_t)item.get_global_id(1);
+                            if (i >= row_floats) return;
+                            const int64_t off = (int64_t)item.get_group(0) * layer_stride;
+                            base[off + (int64_t)dst_row * row_floats + i] =
+                                base[off + (int64_t)src_row * row_floats + i];
+                        });
+    }
+}
+
 namespace {
 constexpr int kArgMaxBlocks = 128;
 constexpr int kArgThreads = 256;
@@ -1496,6 +1721,36 @@ void row_top_prob_split(const float* logits, int n_rows, int n_vocab, const int3
                 for (int w = 0; w < 32; ++w) tot += parts[w];
                 probs[row] = 1.0f / tot;
                 rows[row].counter = 0;
+            });
+    });
+}
+
+void row_top2_mapped(const float* logits, int n_vocab, const int32_t* top1_raw, const float* top1_prob,
+                     const int32_t* dvocab, int32_t* out_id2, float* out_prob2, void* stream) {
+    if (n_vocab <= 1 || !logits || !top1_raw || !top1_prob || !out_id2 || !out_prob2) return;
+    sycl::queue* q = stream ? static_cast<sycl::queue*>(stream) : &default_queue();
+    q->submit([&](sycl::handler& cgh) {
+        sycl::local_accessor<float, 1> sv(sycl::range<1>(32), cgh);
+        sycl::local_accessor<int, 1> si(sycl::range<1>(32), cgh);
+        cgh.parallel_for(
+            sycl::nd_range<2>(sycl::range<2>(1, kArgThreads), sycl::range<2>(1, kArgThreads)),
+            [=](sycl::nd_item<2> item) [[sycl::reqd_sub_group_size(32)]] {
+                const int tid = (int)item.get_local_id(1);
+                const int b1 = top1_raw[0];
+                float bv = -std::numeric_limits<float>::infinity();
+                int bi = n_vocab;
+                for (int v = tid; v < n_vocab; v += kArgThreads) {
+                    if (v == b1) continue;
+                    arg_take(logits[v], v, bv, bi);
+                }
+                arg_block(bv, bi, n_vocab, item, sv.get_multi_ptr<sycl::access::decorated::no>().get(),
+                          si.get_multi_ptr<sycl::access::decorated::no>().get());
+                if (tid == 0) {
+                    const bool ok = bi < n_vocab && b1 >= 0 && b1 < n_vocab;
+                    *out_prob2 = ok ? top1_prob[0] * sycl::native::exp(bv - logits[b1]) : 0.0f;
+                    sycl::atomic_fence(sycl::memory_order::acq_rel, sycl::memory_scope::system);
+                    *out_id2 = ok ? (dvocab != nullptr ? dvocab[bi] : bi) : -1;
+                }
             });
     });
 }

@@ -300,6 +300,14 @@ Verifier::~Verifier() {
         if (e) cudaGraphExecDestroy_mock(e);
     for (auto& e : exec_res_)
         if (e) cudaGraphExecDestroy_mock(e);
+    for (auto& e : exec_tree_)
+        if (e) cudaGraphExecDestroy_mock(e);
+    for (auto& e : exec_tree_res_)
+        if (e) cudaGraphExecDestroy_mock(e);
+    if (tree_gdn_snap_) {
+        sycl::free(tree_gdn_snap_, get_default_queue());
+        tree_gdn_snap_ = nullptr;
+    }
     for (auto& chunks : exec_chunks_) {
         for (void* e : chunks)
             if (e) cudaGraphExecDestroy_mock(e);
@@ -324,7 +332,7 @@ Verifier::~Verifier() {
         sycl::free(arena_, get_default_queue());
         arena_ = nullptr;
     }
-    void* hosts[] = {h_tok_, h_step_, h_pos_,  h_commit_, h_ple_,   h_out_,       h_x_,
+    void* hosts[] = {h_tok_, h_step_, h_step_append_, h_tree_, h_pos_,  h_commit_, h_ple_,   h_out_,       h_x_,
                      h_ids_, h_w_,    h_seq_,  h_flag_,   h_ymiss_, h_flagA_,     h_plan_,
                      h_flagB_, h_plan_err_, h_nf_};
     for (void* h : hosts)
@@ -418,6 +426,8 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     // ---- mapped staging
     bool ok = mapped(T * 4, (void**)&h_tok_, (void**)&m_tok_) &&
               mapped(T * strata::kernels::kStepCount * 4, (void**)&h_step_, (void**)&m_step_) &&
+              mapped(T * strata::kernels::kStepCount * 4, (void**)&h_step_append_, (void**)&m_step_append_) &&
+              mapped(sizeof(strata::kernels::VerifyTreeMap) + 64, (void**)&h_tree_, (void**)&m_tree_) &&
               mapped(T * (NH + NKV + IQ) * 4, (void**)&h_pos_, (void**)&m_pos_) &&
               mapped((2 + T) * 4 + 16, (void**)&h_commit_, (void**)&m_commit_) &&
               mapped(T * N * 4, (void**)&h_ple_, (void**)&m_ple_) &&
@@ -470,6 +480,8 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     auto carve = [&](Bump& b) {
         tok_ = b.take<int32_t>(T);
         step_ = b.take<int32_t>(T * strata::kernels::kStepCount);
+        step_append_ = b.take<int32_t>(T * strata::kernels::kStepCount);
+        tree_d_ = (strata::kernels::VerifyTreeMap*)b.take<uint8_t>(sizeof(strata::kernels::VerifyTreeMap));
         pos_ = b.take<int32_t>(T * (NH + NKV + IQ));
         commit_ = b.take<int32_t>(2 + T);
         ple_ = b.take<float>(T * N);
@@ -702,14 +714,18 @@ bool Verifier::record_window_prologue(int T, sycl::queue* cs, std::string& err) 
     const int64_t N = g.n_embd, HC = g.hc, MT = max_t_;
     const int64_t NH = g.n_head, NKV = g.n_head_kv, IQ = g.idx_q_heads;
     const bool ple_on = ss.ple.ready() && ple_stage();
-    const int G = (split_ && T >= 2) ? 2 : 1;
-    groups_[T] = G;
+    const int G = (!tree_rec_ && split_ && T >= 2) ? 2 : 1;
+    if (!tree_rec_) groups_[T] = G;
 
     // ---- the window's inputs, from mapped staging
     VDBG("prologue: copy tok_\n");
     copy_i32_from_mapped(tok_, m_tok_, T, cs);
+    if (tree_rec_)
+        copy_from_mapped((float*)tree_d_, (const float*)m_tree_,
+                         (int64_t)(sizeof(VerifyTreeMap) / sizeof(float)), cs);
     VDBG("prologue: copy step_\n");
     copy_i32_from_mapped(step_, m_step_, (int64_t)T * kStepCount, cs);
+    if (tree_rec_) copy_i32_from_mapped(step_append_, m_step_append_, (int64_t)T * kStepCount, cs);
     VDBG("prologue: copy pos_\n");
     copy_i32_from_mapped(pos_, m_pos_, (int64_t)MT * (NH + NKV + IQ), cs);
     if (ple_on) {
@@ -777,7 +793,7 @@ bool Verifier::record_layer_pre(int T, int64_t l, int grp, sycl::queue* cs, std:
     const int64_t HS = (int64_t)NG_HIST * NG_HC_DIM;
     const int64_t TS = (s.idx_block - 1) * ID;
     const bool ple_on = ss.ple.ready() && ple_stage();
-    const int G = (split_ && T >= 2) ? 2 : 1;
+    const int G = (!tree_rec_ && split_ && T >= 2) ? 2 : 1;
     static const bool dec_batch = [] {
         const char* v = std::getenv("STRATA_DEC_BATCH");
         return v == nullptr || std::atoi(v) != 0;
@@ -808,6 +824,7 @@ bool Verifier::record_layer_pre(int T, int64_t l, int grp, sycl::queue* cs, std:
             float* normalized = (float*)((uint8_t*)ss.ple.scratch + ple_block_scratch_bytes());
             for (int t = tb; t < te; ++t) {
                 gr_write(Rt(t), bo_ + t * N, inj2_ + t * HC, gs, Rt(t), cs);
+                if (tree_rec_ && t > 0) copy_indexed(ss.ple.hist, hist_snap_, HS, &tree_d_->parent[t], HS, cs);
                 PleOut po;
                 po.normalized = normalized;
                 po.result = Rt(t);
@@ -887,7 +904,11 @@ bool Verifier::record_layer_pre(int T, int64_t l, int grp, sycl::queue* cs, std:
                 native_mmvq(wqkv->native_type, wqkv->native_data, xq_, qkv + (size_t)tb * C, (int)N, (int)C, n, cs);
                 stamp(l, 2, grp, cs);
                 VDBG("layer_pre (l=%lld, grp=%d): GDN conv\n", (long long)l, grp);
-                gdn_conv_l2_multi(conv, qkv, (const float*)wc->data, hb, (int)C, (int)(2 * HK), EPS, n, cs, tb);
+                if (tree_rec_)
+                    gdn_conv_l2_tree(conv, qkv, (const float*)wc->data, hb, (int)C, (int)(2 * HK), EPS, n, tree_d_,
+                                     cs, tb);
+                else
+                    gdn_conv_l2_multi(conv, qkv, (const float*)wc->data, hb, (int)C, (int)(2 * HK), EPS, n, cs, tb);
                 stamp(l, 3, grp, cs);
                 VDBG("layer_pre (l=%lld, grp=%d): GDN ab\n", (long long)l, grp);
                 gdn_ab_multi(xm, (const uint16_t*)wa->data, (const uint16_t*)wb->data, (const float*)wdt->data,
@@ -899,8 +920,12 @@ bool Verifier::record_layer_pre(int T, int64_t l, int grp, sycl::queue* cs, std:
                 stamp(l, 5, grp, cs);
                 VDBG("layer_pre (l=%lld, grp=%d): GDN step norm\n", (long long)l, grp);
                 // the recurrence from the untouched state over tokens [0, te); outputs only for this group's
-                gdn_step_norm_multi(state, hb, (int)C, gate, beta, z_, (const float*)wnm->data, EPS, y_, (int)HK,
-                                    (int)HV, te, nullptr, cs, tb);
+                if (tree_rec_)
+                    gdn_step_norm_tree(state, tree_gdn_snap_, hb, (int)C, gate, beta, z_, (const float*)wnm->data, EPS,
+                                       y_, (int)HK, (int)HV, te, tree_d_, cs);
+                else
+                    gdn_step_norm_multi(state, hb, (int)C, gate, beta, z_, (const float*)wnm->data, EPS, y_, (int)HK,
+                                        (int)HV, te, nullptr, cs, tb);
                 stamp(l, 6, grp, cs);
                 VDBG("layer_pre (l=%lld, grp=%d): GDN native_quantize_q8_1 y_\n", (long long)l, grp);
                 native_quantize_q8_1(y_ + (size_t)tb * ZV, xq_, (int)ZV, n, cs);
@@ -974,8 +999,9 @@ bool Verifier::record_layer_pre(int T, int64_t l, int grp, sycl::queue* cs, std:
                 }
                 stamp(l, 8, grp, cs);
                 if (grp == 0) copy_from_mapped(tail_snap_ + (size_t)qi * TS, st.idx_tail, TS, cs);
+                const int32_t* const step_kv_base = tree_rec_ ? step_append_ : step_;
                 if (dec_batch && !g_no_batch_kv) {
-                    const int32_t* step_b = step_ + tb * kStepCount;
+                    const int32_t* step_b = step_kv_base + tb * kStepCount;
                     const float* kc_b = kcur_ + tb * NKV * HD;
                     const float* vc_b = vcur_ + tb * NKV * HD;
                     if (st.kv_hybrid) {  // K8V4: the unused half's lanes folded onto the used pool (layer.cpp)
@@ -993,11 +1019,11 @@ bool Verifier::record_layer_pre(int T, int64_t l, int grp, sycl::queue* cs, std:
                                            kc_b, vc_b, (int)(NKV * HD), n, s, cs, &st.host);
                     else
                         for (int t = tb; t < te; ++t)
-                            kv_append_step(st.k_pool, st.v_pool, st.page_table, step_ + t * kStepCount,
+                            kv_append_step(st.k_pool, st.v_pool, st.page_table, step_kv_base + t * kStepCount,
                                            kcur_ + t * NKV * HD, vcur_ + t * NKV * HD, s, cs, &st.host);
                 } else {
                     for (int t = tb; t < te; ++t) {
-                        const int32_t* step_t = step_ + t * kStepCount;
+                        const int32_t* step_t = step_kv_base + t * kStepCount;
                         if (st.kv_hybrid) {  // K8V4: the unused half's lanes folded onto the used pool (layer.cpp)
                             const KvHostPools hk = kv_hybrid_k_half(st.host), hv = kv_hybrid_v_half(st.host);
                             const bool mirror = st.host.present();
@@ -1017,14 +1043,19 @@ bool Verifier::record_layer_pre(int T, int64_t l, int grp, sycl::queue* cs, std:
                     }
                 }
                 const QsaIndexerBuffers ib{st.idx_tail, st.idx_dead, st.idx_pooled, st.idx_block_pos};
-                if (dec_batch && !g_no_batch_kv) {
-                    native_qsa_indexer_append_steps(idx_raw + tb * ID, step_ + tb * kStepCount + kStepPos, kStepCount,
-                                                    n, 0, (const float*)wikn->data, EPS, ib, s, st.max_cells,
-                                                    rope_scaling(), cs);
-                } else {
-                    for (int t = tb; t < te; ++t)
-                        native_qsa_indexer_append(idx_raw + t * ID, step_ + t * kStepCount + kStepPos, 0,
-                                                  (const float*)wikn->data, EPS, ib, s, st.max_cells, rope_scaling(), cs);
+                const int n_idx = tree_rec_ ? (tb == 0 ? 1 : 0) : n;
+                if (n_idx > 0) {
+                    if (dec_batch && !g_no_batch_kv) {
+                        native_qsa_indexer_append_steps(idx_raw + tb * ID, step_ + tb * kStepCount + kStepPos,
+                                                        kStepCount, n_idx, 0, (const float*)wikn->data, EPS, ib, s,
+                                                        st.max_cells, rope_scaling(), cs);
+                    } else {
+                        const int te_idx = tb + n_idx;
+                        for (int t = tb; t < te_idx; ++t)
+                            native_qsa_indexer_append(idx_raw + t * ID, step_ + t * kStepCount + kStepPos, 0,
+                                                      (const float*)wikn->data, EPS, ib, s, st.max_cells,
+                                                      rope_scaling(), cs);
+                    }
                 }
                 stamp(l, 9, grp, cs);
                 native_mmvq(wq->native_type, wq->native_data, xq_, qfull_ + tb * NH * 2 * HD, (int)N,
@@ -1088,6 +1119,7 @@ bool Verifier::record_layer_pre(int T, int64_t l, int grp, sycl::queue* cs, std:
                     qsa_block_topk(scores_ + (size_t)tb * max_blocks_, step_ + tb * kStepCount, n, max_blocks_, cap_, s,
                                    sel_ + (size_t)tb * cap_, cs);
                 }
+                if (tree_rec_) qsa_remap_tree_sel(sel_ + (size_t)tb * cap_, step_ + tb * kStepCount, n, cap_, tree_d_, cs);
                 stamp(l, 11, grp, cs);
                 // KV streaming: the n selections' blocks resident (device-side, inside the graph)
                 qsa_kv_resolve(st, *g_, sel_ + (size_t)tb * cap_, step_ + tb * kStepCount, n, cap_, cs);
@@ -1261,7 +1293,7 @@ bool Verifier::record_layer_post(int T, int64_t l, int grp, sycl::queue* cs, std
     SessionState& ss = *ss_;
     const int64_t N = g.n_embd, HC = g.hc, K = ss.k;
     const GrShapes gs{g.n_embd, g.hc, g.hc_lr};
-    const int G = (split_ && T >= 2) ? 2 : 1;
+    const int G = (!tree_rec_ && split_ && T >= 2) ? 2 : 1;
     static const bool dec_batch = [] {
         const char* v = std::getenv("STRATA_DEC_BATCH");
         return v == nullptr || std::atoi(v) != 0;
@@ -1557,9 +1589,9 @@ bool Verifier::record_window(int T, sycl::queue* cs, std::string& err, void* chu
         err = "verify: begin prologue capture failed";
         return false;
     }
-    groups_[T] = (split_ && T >= 2) ? 2 : 1;
+    const int G = (!tree_rec_ && split_ && T >= 2) ? 2 : 1;
+    if (!tree_rec_) groups_[T] = G;
     if (!record_window_prologue(T, cs, err)) return false;
-    const int G = groups_[T];
     for (int grp = 0; grp < G; ++grp) {
         if (!record_layer_pre(T, lb_, grp, cs, err)) return false;
     }
@@ -1780,6 +1812,94 @@ bool Verifier::capture_res(int T, std::string& err) try {
     return false;
 }
 
+bool Verifier::capture_tree(int T, std::string& err) try {
+    if (T < 1 || T > strata::kernels::kVerifyNarrowT) {
+        err = "verify: tree window size out of range";
+        return false;
+    }
+    if (tree_gdn_snap_ == nullptr) {
+        const size_t snap_bytes = (size_t)strata::kernels::kVerifyNarrowT * (size_t)g_->ssm_state_size *
+                                  (size_t)g_->ssm_v_heads * (size_t)g_->ssm_state_size * sizeof(float);
+        try {
+            tree_gdn_snap_ = (float*)sycl::malloc_device(snap_bytes, get_default_queue());
+        } catch (...) {
+            tree_gdn_snap_ = nullptr;
+        }
+        if (tree_gdn_snap_ == nullptr) {
+            err = "verify: out of memory allocating tree GDN snapshot scratch";
+            return false;
+        }
+        get_default_queue().memset(tree_gdn_snap_, 0, snap_bytes).wait();
+    }
+    const bool res = res_graph_ && all_resident();
+    void*& exec_t = res ? exec_tree_res_[T] : exec_tree_[T];
+    if (exec_t != nullptr) return true;
+    const VerifyGraphMode mode = verify_graph_mode();
+    if (!res && mode == VerifyGraphMode::Direct) {
+        VDBG("capture_tree bypassed: direct execution mode active for T=%d (STRATA_VERIFY_GRAPH=direct)\n", T);
+        return true;
+    }
+    const Clock::time_point t_start = Clock::now();
+    strata::core::progress_at(res ? "verify window: capturing resident tree graph" : "verify window: capturing tree graph",
+                              (int64_t)T);
+    strata::core::progress_beat();
+    if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != 0) {
+        err = "verify: begin tree capture failed";
+        return false;
+    }
+    struct TreeScope {
+        bool& tree;
+        bool& rec_res;
+        TreeScope(bool& t, bool& rr, bool rval) : tree(t), rec_res(rr) {
+            tree = true;
+            rec_res = rval;
+        }
+        ~TreeScope() {
+            tree = false;
+            rec_res = false;
+        }
+    } tree_scope(tree_rec_, recording_res_, res);
+    std::string rerr;
+    bool ok = false;
+    try {
+        ok = record_window(T, cs_, rerr, nullptr);
+    } catch (const std::exception& e) {
+        rerr = std::string("verify: tree window capture: ") + e.what();
+    }
+    cudaGraph_t graph = nullptr;
+    const int ce = cudaStreamEndCapture(cs_, &graph);
+    if (!ok) {
+        if (graph) cudaGraphDestroy(graph);
+        err = rerr;
+        return false;
+    }
+    if (ce != 0) {
+        err = "verify: end tree capture error: " + std::to_string(ce);
+        return false;
+    }
+    const int ie = cudaGraphInstantiate(&exec_t, graph, 0);
+    cudaGraphDestroy(graph);
+    if (ie != 0) {
+        std::fprintf(stderr, "strata verify: tree graph instantiation failed (code %d), falling back to direct execution\n", ie);
+        exec_t = nullptr;
+        return true;
+    }
+    cs_->wait();
+    strata::core::progress_beat();
+    std::fprintf(stderr, "strata verify: captured %s %d-token tree window in %.2f ms\n",
+                 res ? "resident" : "whole", T, ms_since(t_start));
+    return true;
+} catch (const std::exception& exc) {
+    tree_rec_ = false;
+    recording_res_ = false;
+    err = std::string("Verifier::capture_tree exception: ") + exc.what();
+    return false;
+} catch (...) {
+    tree_rec_ = false;
+    recording_res_ = false;
+    return false;
+}
+
 bool Verifier::record_commit(sycl::queue* cs, std::string& err) {
     VDBG("record_commit: begin\n");
     using namespace strata::kernels;
@@ -1849,9 +1969,20 @@ bool Verifier::capture_commit(std::string& err) try {
 bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool, void* user, int32_t* out,
                    std::string& err) try {
     using namespace strata::kernels;
+    const VerifyTreeMap* const tspec = tree_spec_;
+    struct TreeSpecClear {
+        const VerifyTreeMap*& ptr;
+        ~TreeSpecClear() { ptr = nullptr; }
+    } tree_spec_clear{tree_spec_};
     const OnDevice on_device(device_);
+    const bool is_tree = tspec != nullptr;
+    last_tree_ = is_tree;
     if (T < 1 || T > max_t_) {
         err = "verify: window size out of range";
+        return false;
+    }
+    if (is_tree && (!can_tree_verify() || T < 2 || T > kVerifyNarrowT || tspec->n_tok != T || tspec->pos0 != pos0)) {
+        err = "verify: invalid tree window state or topology";
         return false;
     }
     if (released_.load()) {
@@ -1864,32 +1995,62 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         err = "verify: the window runs past the context";
         return false;
     }
-    VDBG("run start: T=%d, pos0=%lld, tokens=[%d%s], exec=%p\n",
-         T, (long long)pos0, tokens ? tokens[0] : -1, T > 1 ? ", ..." : "", (void*)exec_[T]);
+    VDBG("run start: T=%d, pos0=%lld, tokens=[%d%s], exec=%p, is_tree=%d\n",
+         T, (long long)pos0, tokens ? tokens[0] : -1, T > 1 ? ", ..." : "", (void*)exec_[T], (int)is_tree);
     const bool res = res_graph_ && all_resident();
-    if (!(res ? capture_res(T, err) : capture(T, err)) || !capture_commit(err)) return false;
-    VDBG("captured; staging (res=%d)\n", (int)res);
+    if (!(is_tree ? capture_tree(T, err) : (res ? capture_res(T, err) : capture(T, err))) || !capture_commit(err))
+        return false;
+    VDBG("captured; staging (res=%d, is_tree=%d)\n", (int)res, (int)is_tree);
     const Clock::time_point t0 = Clock::now();
     const QsaShapes s = shapes_of(g);
-    for (int t = 0; t < T; ++t) {
-        h_tok_[t] = tokens[t];
-        qsa_step_fill(h_step_ + t * kStepCount, pos0 + t, s);
-        for (int64_t h = 0; h < g.n_head; ++h)
-            h_pos_[t * g.n_head + h] = (int32_t)(pos0 + t);
-        int32_t* pk = h_pos_ + (size_t)max_t_ * g.n_head;
-        int32_t* pi = pk + (size_t)max_t_ * g.n_head_kv;
-        for (int64_t h = 0; h < g.n_head_kv; ++h)
-            pk[t * g.n_head_kv + h] = (int32_t)(pos0 + t);
-        for (int64_t h = 0; h < g.idx_q_heads; ++h)
-            pi[t * g.idx_q_heads + h] = (int32_t)(pos0 + t);
+    int32_t* const pk = h_pos_ + (size_t)max_t_ * g.n_head;
+    int32_t* const pi = pk + (size_t)max_t_ * g.n_head_kv;
+    if (is_tree) {
+        *h_tree_ = *tspec;
+        for (int t = 0; t < T; ++t) {
+            h_tok_[t] = tokens[t];
+            const int64_t lpos = pos0 + tspec->depth[t];
+            qsa_step_fill(h_step_ + t * kStepCount, lpos, s);
+            qsa_step_fill(h_step_append_ + t * kStepCount, pos0 + t, s);
+            const int32_t pos_t = (int32_t)lpos;
+            for (int64_t h = 0; h < g.n_head; ++h) h_pos_[t * g.n_head + h] = pos_t;
+            for (int64_t h = 0; h < g.n_head_kv; ++h) pk[t * g.n_head_kv + h] = pos_t;
+            for (int64_t h = 0; h < g.idx_q_heads; ++h) pi[t * g.idx_q_heads + h] = pos_t;
+        }
+    } else {
+        for (int t = 0; t < T; ++t) {
+            h_tok_[t] = tokens[t];
+            qsa_step_fill(h_step_ + t * kStepCount, pos0 + t, s);
+            for (int64_t h = 0; h < g.n_head; ++h) h_pos_[t * g.n_head + h] = (int32_t)(pos0 + t);
+            for (int64_t h = 0; h < g.n_head_kv; ++h) pk[t * g.n_head_kv + h] = (int32_t)(pos0 + t);
+            for (int64_t h = 0; h < g.idx_q_heads; ++h) pi[t * g.idx_q_heads + h] = (int32_t)(pos0 + t);
+        }
     }
     if (ss.ple.ready() && ple_stage()) {
         uint32_t rows[kVerifyMaxT * PLE_N_HEADS];
-        int32_t prev[2] = {ss.ple_prev[0], ss.ple_prev[1]};
-        for (int t = 0; t < T; ++t) {
-            ngram_rows(&tokens[t], prev, 1, ss.ple.consts, rows + t * PLE_N_HEADS);
-            prev[0] = prev[1];
-            prev[1] = tokens[t];
+        if (is_tree) {
+            int32_t node_prev[kVerifyMaxT][2] = {};
+            for (int t = 0; t < T; ++t) {
+                int32_t prev[2];
+                if (t == 0) {
+                    prev[0] = ss.ple_prev[0];
+                    prev[1] = ss.ple_prev[1];
+                } else {
+                    const int par = tspec->parent[t];
+                    prev[0] = node_prev[par][0];
+                    prev[1] = node_prev[par][1];
+                }
+                ngram_rows(&tokens[t], prev, 1, ss.ple.consts, rows + t * PLE_N_HEADS);
+                node_prev[t][0] = prev[1];
+                node_prev[t][1] = tokens[t];
+            }
+        } else {
+            int32_t prev[2] = {ss.ple_prev[0], ss.ple_prev[1]};
+            for (int t = 0; t < T; ++t) {
+                ngram_rows(&tokens[t], prev, 1, ss.ple.consts, rows + t * PLE_N_HEADS);
+                prev[0] = prev[1];
+                prev[1] = tokens[t];
+            }
         }
         if (!ss.ple.table->gather_batch(rows, (size_t)T, h_ple_, err)) return false;
     }
@@ -1905,18 +2066,29 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     for (int t = 0; t < T; ++t)
         last_tokens_[t] = tokens[t];
     ms_host += ms_since(t0);
-    const int G = (split_ && T >= 2) ? 2 : 1;
-    groups_[T] = G;
-    const bool progressive = !res && (exec_[T] == nullptr && exec_chunks_[T].empty());
-    VDBG("staged in %.2f ms; launching (exec=%p, chunks=%zu, progressive=%d, G=%d, res=%d)\n",
-         ms_since(t0), res ? exec_res_[T] : exec_[T], exec_chunks_[T].size(), (int)progressive, G, (int)res);
+    const int G = is_tree ? 1 : ((split_ && T >= 2) ? 2 : 1);
+    if (!is_tree) groups_[T] = G;
+    void* to_launch = is_tree ? (res ? exec_tree_res_[T] : exec_tree_[T]) : (res ? exec_res_[T] : exec_[T]);
+    const bool run_res = res && to_launch != nullptr;
+    const bool progressive = (to_launch == nullptr) && (is_tree || res || exec_chunks_[T].empty());
+    struct DirectTreeScope {
+        bool& flag;
+        bool active;
+        DirectTreeScope(bool& f, bool a) : flag(f), active(a) {
+            if (active) flag = true;
+        }
+        ~DirectTreeScope() {
+            if (active) flag = false;
+        }
+    } direct_tree_scope(tree_rec_, progressive && is_tree);
+    VDBG("staged in %.2f ms; launching (exec=%p, chunks=%zu, progressive=%d, G=%d, res=%d, is_tree=%d)\n",
+         ms_since(t0), to_launch, exec_chunks_[T].size(), (int)progressive, G, (int)res, (int)is_tree);
     progress_at("verify window: launching", (int64_t)T);
     struct AllowScope {
         explicit AllowScope(int64_t seconds) { progress_allow(seconds); }
         ~AllowScope() { progress_allow(0); }
     } allow_scope(300);  // Allow up to 300 s for cold JIT compilation of SPIR-V modules on Intel Arc
     progress_beat();
-    void* to_launch = res ? exec_res_[T] : exec_[T];
     if (to_launch != nullptr) {
         VDBG("launching %s graph exec=%p\n", res ? "resident" : "whole", to_launch);
         const int le = cudaGraphLaunch_mock(to_launch, cs_);
@@ -1924,7 +2096,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
             err = std::string("verify: launch: error ") + std::to_string(le);
             return false;
         }
-    } else if (!exec_chunks_[T].empty() && !res) {
+    } else if (!is_tree && !exec_chunks_[T].empty() && !res) {
         VDBG("launching %zu graph chunks for T=%d\n", exec_chunks_[T].size(), T);
         for (void* ch : exec_chunks_[T]) {
             const int le = cudaGraphLaunch_mock(ch, cs_);
@@ -1964,7 +2136,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     const bool test_stall = g_test_stall > 0 && windows + 1 == g_test_stall;  // #267 test hook (off: false)
     const bool lean = is_lean();
     VDBG("waiting loop starting: lean=%d, test_stall=%d, steps=%lld, G=%d\n", (int)lean, (int)test_stall, (long long)steps, G);
-    for (int64_t k = 0; (!res && (!lean || test_stall)) && k < steps; ++k) {
+    for (int64_t k = 0; (!run_res && (!lean || test_stall)) && k < steps; ++k) {
         const int64_t l = lb_ + k / G;
         const int grp = (int)(k % G);
         const uint32_t want = (uint32_t)(k + 1);
@@ -2087,7 +2259,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         }
         VDBG("direct epilogue done\n");
     }
-    if ((res || lean) && !test_stall) {
+    if ((run_res || lean) && !test_stall) {
         cur_layer_ = (uint32_t)(steps > 0 ? steps - 1 : 0);
     }
     progress_at("verify window: waiting for the GPU to finish the window (flags A/B/M raised)", (int64_t)T);
@@ -2226,7 +2398,7 @@ void Verifier::set_plan_slot(int grp) {
     sink_.ptr = (unsigned long long*)(base + ptr_off);
     sink_.ptr2 = sink_.ptr + cap;
     sink_.start2 = base + ptr_off + 4 * cap;
-    const int G = groups_[last_t_] > 0 ? groups_[last_t_] : 1;
+    const int G = last_tree_ ? 1 : (groups_[last_t_] > 0 ? groups_[last_t_] : 1);
     const int64_t per = G == 2 ? kStagingBlobs / 2 : kStagingBlobs;
     sink_.staging =
         (unsigned long long)(staging_ + (size_t)(grp * per) * strata::kernels::cpu::expert_layout().max_blob);
@@ -2376,6 +2548,55 @@ namespace {
 bool g_commit_async = false;
 }
 void Verifier::set_commit_async(bool on) { g_commit_async = on && std::getenv("STRATA_COMMIT_SYNC") == nullptr; }
+
+bool Verifier::compact_tree_path(const int* path, int n_keep, std::string& err) try {
+    using namespace strata::kernels;
+    if (path == nullptr || n_keep < 1 || n_keep > last_t_) {
+        err = "verify: tree compaction count out of range";
+        return false;
+    }
+    const OnDevice on_device(device_);
+    const ModelGeometry& g = *g_;
+    SessionState& ss = *ss_;
+    const QsaShapes s = shapes_of(g);
+    const int64_t N = g.n_embd, HC = g.hc, C = g.ssm_conv_channels, HV = g.ssm_v_heads, ID = g.idx_key_dim;
+    const int64_t MT = max_t_;
+    const int nG = (int)g.n_gdn_layers(), nQ = (int)g.n_qsa_layers();
+    const int64_t HS = (int64_t)NG_HIST * NG_HC_DIM;
+    const bool ple_on = ss.ple.ready() && ple_stage();
+    bool any = false;
+    for (int i = 1; i < n_keep; ++i) {
+        const int src = path[i];
+        if (src == i) continue;
+        if (src < i || src >= last_t_) {
+            err = "verify: non-monotonic tree path in compaction";
+            return false;
+        }
+        any = true;
+        last_tokens_[i] = last_tokens_[src];
+        if (nG > 0) {
+            verify_compact_row(qkv_L_, MT * C, nG, src, i, C, cs_);
+            verify_compact_row(h_L_, MT * C, nG, src, i, C, cs_);
+            verify_compact_row(gate_L_, MT * HV, nG, src, i, HV, cs_);
+            verify_compact_row(beta_L_, MT * HV, nG, src, i, HV, cs_);
+        }
+        if (nQ > 0) {
+            verify_compact_row(idx_raw_L_, MT * ID, nQ, src, i, ID, cs_);
+            for (int qi = 0; qi < nQ; ++qi) {
+                const QsaState& st = ss.qsa_states[qi];
+                kv_copy_cell(qsa_attn_pools(st), st.host, st.page_table, qsa_kv_format(st),
+                             last_pos0_ + src, last_pos0_ + i, s, cs_);
+            }
+        }
+        verify_compact_row(R_, 0, 1, src, i, HC * N, cs_);
+        if (ple_on) verify_compact_row(hist_snap_, 0, 1, src, i, HS, cs_);
+    }
+    if (any) cs_->wait_and_throw();
+    return true;
+} catch (const std::exception& exc) {
+    err = std::string("verify: tree compaction failed: ") + exc.what();
+    return false;
+}
 
 bool Verifier::commit(int n_keep, std::string& err) try {
     const OnDevice on_device(device_);

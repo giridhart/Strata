@@ -118,4 +118,8 @@ KvStreamCounters kv_stream_counters(const KvStreamMap& m);
 /// Bytes of one block (page) of K and V together.
 uint64_t kv_block_bytes(const QsaShapes& s, int fmt);
 
+/// Copy one K/V cell from physical position `src_pos` to `dst_pos` across all resident and/or paged QSA pools.
+void kv_copy_cell(const QsaAttnPools& slots, const KvHostPools& host, const int32_t* page_table, int fmt,
+                  int64_t src_pos, int64_t dst_pos, const QsaShapes& s, void* stream);
+
 }  // namespace strata::kernels

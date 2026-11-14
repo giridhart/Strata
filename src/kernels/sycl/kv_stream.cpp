@@ -333,4 +333,56 @@ KvStreamCounters kv_stream_counters(const KvStreamMap& m) {
     return r;
 }
 
+void kv_copy_cell(const QsaAttnPools& slots, const KvHostPools& host, const int32_t* page_table, int fmt,
+                  int64_t src_pos, int64_t dst_pos, const QsaShapes& s, void* stream) {
+    if (src_pos == dst_pos || src_pos < 0 || dst_pos < 0) return;
+    sycl::queue* q_ptr = stream ? reinterpret_cast<sycl::queue*>(stream) : &default_queue();
+    const Runs r = runs_of(slots, host, fmt, s);
+    const bool has_host = host.present();
+    const int kv_heads = (int)s.n_head_kv;
+    const int page_size = (int)s.page_size;
+    q_ptr->parallel_for(sycl::nd_range<1>(128, 128), [=](sycl::nd_item<1> item) {
+        const long long sb = src_pos / page_size, soff = src_pos % page_size;
+        const long long db = dst_pos / page_size, doff = dst_pos % page_size;
+        const int ssl = page_table ? page_table[sb] : (int)sb;
+        const int dsl = page_table ? page_table[db] : (int)db;
+        const int rows = kv_heads * page_size;
+        const int tid = (int)item.get_local_id(0);
+        const int bdim = (int)item.get_local_range(0);
+        for (int a = 0; a < r.n; ++a) {
+            const int cb = r.len[a] / rows;
+            const uint8_t* src_pool = ssl >= 0 ? (const uint8_t*)r.dst[a] + (long long)ssl * r.len[a]
+                                               : (r.src[a] != nullptr ? r.src[a] + sb * r.len[a] : nullptr);
+            if (src_pool == nullptr) continue;
+            for (int h = 0; h < kv_heads; ++h) {
+                const uint8_t* sbase = src_pool + ((long long)h * page_size + soff) * cb;
+                uint8_t* d_slot_b = dsl >= 0
+                    ? (r.dst[a] + (long long)dsl * r.len[a] + ((long long)h * page_size + doff) * cb)
+                    : nullptr;
+                uint8_t* d_host_b = (has_host && r.src[a] != nullptr)
+                    ? (const_cast<uint8_t*>(r.src[a]) + db * r.len[a] + ((long long)h * page_size + doff) * cb)
+                    : nullptr;
+                if (cb % 4 == 0) {
+                    const int words = cb / 4;
+                    const uint32_t* s32 = reinterpret_cast<const uint32_t*>(sbase);
+                    uint32_t* d_slot = reinterpret_cast<uint32_t*>(d_slot_b);
+                    uint32_t* d_host = reinterpret_cast<uint32_t*>(d_host_b);
+                    for (int w = tid; w < words; w += bdim) {
+                        const uint32_t v = s32[w];
+                        if (d_slot != nullptr) d_slot[w] = v;
+                        if (d_host != nullptr) d_host[w] = v;
+                    }
+                } else {
+                    for (int b = tid; b < cb; b += bdim) {
+                        const uint8_t v = sbase[b];
+                        if (d_slot_b != nullptr) d_slot_b[b] = v;
+                        if (d_host_b != nullptr) d_host_b[b] = v;
+                    }
+                }
+            }
+        }
+    });
+    if (stream == nullptr) q_ptr->wait();
+}
+
 }  // namespace strata::kernels

@@ -61,6 +61,7 @@
 #include "strata/program/conv_cache.hpp"
 #include "strata/spec/draft_policy.hpp"
 #include "strata/spec/suffix_drafter.hpp"
+#include "strata/spec/spec_tree.hpp"
 #include "strata/kernels/cvec.hpp"
 #include "strata/core/progress.hpp"
 #include "strata/core/device.hpp"
@@ -615,6 +616,7 @@ struct Options {
     int suffix_draft = 3;
     /// The MTP's own window cap (0 = --spec): with --spec 6 --mtp-max-t 4 the long windows come from suffix matches.
     int mtp_max_t = 0;
+    int spec_tree = strata::spec::spec_tree_env();  ///< --spec-tree 0|1|2|3 (STRATA_SPEC_TREE): multi-branch tree verify
     /// A control vector on the residual stream (strata/kernels/cvec.hpp), with llama.cpp's flags: the
     /// `experimental-speed-projection` profile passes `--control-vector-scaled FILE:1.0 --control-vector-layer-range
     /// 4 44 --cvec-mode project --cvec-dir per-layer`.  None by default; --serve switches a loaded one per request.
@@ -720,6 +722,7 @@ void usage() {
         "  --suffix-draft N     prompt lookup: draft from an earlier repeat of the last N+ tokens of context\n"
         "                       when it pays (default 3; 0 = MTP only)\n"
         "  --mtp-max-t M        cap the MTP's windows at M tokens (0 = --spec; longer ones come from suffixes)\n"
+        "  --spec-tree 0|1|2|3  multi-branch causal-tree verification (0 = off; STRATA_SPEC_TREE)\n"
         "  --control-vector-scaled FILE:SCALE[,...]  a control vector GGUF on the residual stream (llama.cpp's\n"
         "                       format; --control-vector FILE = scale 1).  --serve: requests switch it (cvec=0|1)\n"
         "  --control-vector-layer-range A B  the layers it follows (inclusive; default 1 .. the last)\n"
@@ -1577,6 +1580,8 @@ int main(int argc, char** argv) try {
                 o.suffix_draft = std::max(0, std::atoi(next("--suffix-draft")));
             else if (a == "--mtp-max-t")
                 o.mtp_max_t = std::max(0, std::atoi(next("--mtp-max-t")));
+            else if (a == "--spec-tree")
+                o.spec_tree = std::max(0, std::atoi(next("--spec-tree")));
             else if (a == "--control-vector")
                 o.cvec_files.push_back({next("--control-vector"), 1.0f});
             else if (a == "--control-vector-scaled") {
@@ -2014,6 +2019,14 @@ int main(int argc, char** argv) try {
     if (o.suffix_draft > 0 && o.spec >= 2 && o.mtp_max_t == 0) {
         o.mtp_max_t = o.spec;
         o.spec = std::min(o.spec + 2, 8);  // kVerifyMaxT
+    }
+    if (o.spec_tree > 0 && o.spec >= 2) {
+        if (o.mtp_max_t == 0) o.mtp_max_t = o.spec;
+        const int tree_base = o.mtp_max_t;
+        const int tree_want = o.spec_tree == 1 ? std::min(std::max(tree_base + 2, 4), 6)
+                            : o.spec_tree == 2 ? std::min(std::max(tree_base + 4, 6), (int)strata::kernels::kVerifyNarrowT)
+                                               : std::max(tree_base, 4);
+        o.spec = std::max(o.spec, std::min(tree_want, (int)strata::kernels::kVerifyNarrowT));
     }
     strata::core::layer_set_shared_early(!o.shared_late);
     if (!o.native_preset.empty()) {
@@ -3176,6 +3189,7 @@ int main(int argc, char** argv) try {
         static const strata::core::ModelGeometry draft_geometry{};
         // with a layer split across GPUs the drafter reads the last stage's residual: it lives on that device
         const strata::core::OnDevice on_mtp(last_st ? last_st->dev : -1);
+        if (!o.mtp.empty() && o.spec_tree > 0) mtp.set_top2_fast(true);
         if (!o.mtp.empty() && !mtp.load(o.mtp, draft_geometry, last_st ? last_st->ss : ss, o.spec, err, o.mtp_window)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
@@ -6893,6 +6907,8 @@ int main(int argc, char** argv) try {
             const uint64_t file_bytes0 = src.file_read_bytes();
             const int64_t decode_look0 = drive.d.cache_hits + drive.d.cache_admitted + drive.d.cache_refused;
             if (cancelled) finish = "cancel";
+            int mtp_n = 0;
+            int64_t tree_windows = 0, tree_branch_hits = 0, tree_compacts = 0;
             while (!cancelled && produced_n < max_new) {
                 int T = S_mtp;
                 if (req_spec_min_p > 0.0) {
@@ -6905,9 +6921,11 @@ int main(int argc, char** argv) try {
                 // it when its expected tokens per ms, from the measured acceptance and window costs, beat the MTP
                 // window's
                 bool from_sfx = false;
+                int sfx_k = 0;
                 int sfx_match = 0;
                 if (o.suffix_draft > 0 && !first_window) {
                     const int k = sfx.propose(S - 1, sbuf.data());
+                    sfx_k = k;
                     sfx_match = sfx.last_match();
                     if (k > 0 && sbuf[0] == drafts[0]) {
                         const strata::spec::DraftPolicy::Pick pk = policy.choose(T, k, sfx_match);
@@ -6923,6 +6941,36 @@ int main(int argc, char** argv) try {
                 window[0] = x;
                 for (int i = 1; i < T; ++i)
                     window[(size_t)i] = from_sfx ? sbuf[(size_t)i - 1] : drafts[(size_t)i - 1];
+                const int T_trunk_orig = T;
+                bool tree_ran = false;
+                strata::kernels::VerifyTreeMap tree_map{};
+                if (o.spec_tree > 0 && ver.can_tree_verify() && !first_window && req_temperature <= 0.0f) {
+                    strata::spec::SpecTreeInput tin;
+                    tin.mode = o.spec_tree;
+                    tin.pos0 = p;
+                    tin.T_base = T;
+                    tin.max_room =
+                        (int)std::min<int64_t>(std::min<int>((int)window.size(), (int)strata::kernels::kVerifyNarrowT),
+                                               o.max_context - p);
+                    tin.from_sfx = from_sfx;
+                    tin.draft_on = use_mtp;
+                    tin.mtp_n = mtp_n;
+                    tin.drafts = drafts.data();
+                    tin.dprob = dprob.data();
+                    tin.mtp_top2_0 = mtp.top2_fast(0);
+                    tin.mtp_top2_p0 = mtp.top2_prob(0);
+                    tin.mtp_top2_1 = mtp.top2_fast(1);
+                    tin.mtp_top2_p1 = mtp.top2_prob(1);
+                    tin.sfx_k = sfx_k;
+                    tin.sfx_match = sfx_match;
+                    tin.sbuf = sbuf.data();
+                    int T_tree = T;
+                    if (strata::spec::build_spec_tree(tin, window.data(), T_tree, tree_map)) {
+                        T = T_tree;
+                        tree_ran = true;
+                        ver.set_tree_spec(&tree_map);
+                    }
+                }
                 drive.d.layers = 0;
                 drive.d.experts = 0;
                 drive.d.failed = false;
@@ -6930,10 +6978,14 @@ int main(int argc, char** argv) try {
                 if (hist_n > 0) {
                     // the tails the penalties count over, ONE PER ROW: the tokens the state has consumed, the
                     // fed-back head `x` (it joins `consumed` only after this window commits), then the drafts
-                    // before that row - what plain decode would have counted there.  (Until 0.1.19 only row 0
-                    // was staged, and the drafted rows read unwritten slots.)
-                    strata::kernels::penalty_rows(consumed.data(), (int64_t)consumed.size(), window.data(), T, hist_n,
-                                                  hist_stage.data());
+                    // (or ancestor path in a tree window) before that row - what plain decode would have counted there.
+                    if (tree_ran) {
+                        strata::spec::penalty_rows_tree(consumed.data(), (int64_t)consumed.size(), window.data(),
+                                                        tree_map, hist_n, hist_stage.data());
+                    } else {
+                        strata::kernels::penalty_rows(consumed.data(), (int64_t)consumed.size(), window.data(), T,
+                                                      hist_n, hist_stage.data());
+                    }
                     const strata::core::OnDevice on_h(hist_dev);
                     dpct::get_in_order_queue()
                         .memcpy(d_hist, hist_stage.data(), (size_t)T * (size_t)hist_n * sizeof(int32_t))
@@ -6950,11 +7002,28 @@ int main(int argc, char** argv) try {
                 GDBG("speculative: ver.run succeeded in %.2f ms\n",
                      std::chrono::duration<double, std::milli>(Clock::now() - tw0).count());
                 int a = 0;
-                while (a < T - 1 && window[(size_t)a + 1] == outv[(size_t)a])
-                    ++a;
+                int tree_path[strata::kernels::kVerifyMaxT] = {};
+                bool tree_compact = false, tree_branch_hit = false;
+                if (tree_ran) {
+                    const int k_acc = strata::spec::walk_accepted_tree(tree_map, window.data(), outv.data(), tree_path,
+                                                                       tree_compact, tree_branch_hit);
+                    a = k_acc - 1;
+                    ++tree_windows;
+                    if (tree_branch_hit) ++tree_branch_hits;
+                    if (tree_compact) {
+                        ++tree_compacts;
+                        for (int i = 1; i <= a; ++i) {
+                            window[(size_t)i] = window[(size_t)tree_path[i]];
+                            outv[(size_t)i] = outv[(size_t)tree_path[i]];
+                        }
+                    }
+                } else {
+                    while (a < T - 1 && window[(size_t)a + 1] == outv[(size_t)a])
+                        ++a;
+                }
                 if (from_sfx) {
                     ++sfx_windows;
-                    sfx_drafts += T - 1;
+                    sfx_drafts += (tree_ran ? T_trunk_orig : T) - 1;
                     sfx_ok += a;
                 }
                 const Clock::time_point tw1 = Clock::now();
@@ -6962,6 +7031,11 @@ int main(int argc, char** argv) try {
                 bool adapt_ok = true;
                 if (!drive.d.usage.empty() && ((rounds + 1) % o.adapt_every) == 0)
                     adapt_thr = std::thread([&] { adapt_ok = adapt(); });
+                if (tree_compact && !ver.compact_tree_path(tree_path, a + 1, err)) {
+                    if (adapt_thr.joinable()) adapt_thr.join();
+                    std::printf("ERR %s\n", err.c_str());
+                    return 1;
+                }
                 if (!ver.commit(a + 1, err)) {
                     if (adapt_thr.joinable()) adapt_thr.join();
                     std::printf("ERR %s\n", err.c_str());
@@ -6999,7 +7073,8 @@ int main(int argc, char** argv) try {
                     mtp.set_draft_history(consumed.data(), (int64_t)consumed.size(), outv[(size_t)a]);
                 const bool drafted =
                     eos || produced_n >= max_new ||
-                    mtp.draft(T, outv.data(), p, a, drafts.data(), err, dprob.data(), (float)req_spec_min_p);
+                    mtp.draft(tree_ran ? (a + 1) : T, outv.data(), p, a, drafts.data(), err, dprob.data(),
+                              (float)req_spec_min_p, &mtp_n);
                 {
                     const Clock::time_point tw3 = Clock::now();
                     auto msd = [](Clock::time_point a0, Clock::time_point b0) {
@@ -7020,7 +7095,7 @@ int main(int argc, char** argv) try {
                     std::printf("ERR %s\n", err.c_str());
                     return 1;
                 }
-                if (timed_round && !eos)
+                if (timed_round && !eos && !tree_ran)
                     policy.observe(from_sfx, T, a, sfx_match,
                                    std::chrono::duration<double, std::milli>(Clock::now() - round0).count());
                 if (eos) {
@@ -7054,6 +7129,10 @@ int main(int argc, char** argv) try {
                              (d1.host - ds0.host) / w, dt_commit / w, dt_draft / w, (d1.misses - ds0.misses) / (w * L),
                              (d1.entries - ds0.entries) / (w * L), (d1.hits - ds0.hits) / (w * L),
                              (d1.pcie - ds0.pcie) / (w * L));
+                if (o.spec_tree > 0)
+                    std::fprintf(stderr, "strata decode spec tree: mode %d, %lld tree windows, %lld branch hits, %lld compactions\n",
+                                 o.spec_tree, (long long)tree_windows, (long long)tree_branch_hits,
+                                 (long long)tree_compacts);
                 const std::string pr = ver.profile_report();
                 if (!pr.empty()) std::fprintf(stderr, "strata decode GPU stages (ms/window):%s\n", pr.c_str());
             }
@@ -7849,8 +7928,9 @@ int main(int argc, char** argv) try {
         // plan v0.3 P6: with a native pack the first window is the last prompt token alone (it produces the first
         // generated token and the MTP's first cell); otherwise the token loop already did that.
         bool first_window = native_pack;
+        int mtp_n = 0;
         if (use_mtp && !first_window &&
-            !mtp.draft_first(o.spec, ss.R, x, p - 1, drafts.data(), err, dprob.data(), (float)o.spec_min_p)) {
+            !mtp.draft_first(o.spec, ss.R, x, p - 1, drafts.data(), err, dprob.data(), (float)o.spec_min_p, &mtp_n)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }
@@ -7863,6 +7943,7 @@ int main(int argc, char** argv) try {
         strata::spec::DraftPolicy policy(o.spec);  // MTP or lookup window (see draft_policy.hpp)
         std::vector<int32_t> sbuf((size_t)o.spec, 0);
         int64_t sfx_windows = 0, sfx_drafts = 0, sfx_ok = 0;
+        int64_t tree_windows = 0, tree_branch_hits = 0, tree_compacts = 0;
         if (o.suffix_draft > 0) {
             for (int64_t t : o.tokens)
                 sfx.append((int32_t)t);
@@ -7881,9 +7962,11 @@ int main(int argc, char** argv) try {
             }
             if (first_window) T = 1;
             bool from_sfx = false;
+            int sfx_k = 0;
             int sfx_match = 0;
             if (o.suffix_draft > 0 && !first_window) {
                 const int k = sfx.propose(o.spec - 1, sbuf.data());
+                sfx_k = k;
                 sfx_match = sfx.last_match();
                 if (k > 0 && (!use_mtp || sbuf[0] == drafts[0])) {
                     const strata::spec::DraftPolicy::Pick pk = policy.choose(T, k, sfx_match);
@@ -7894,7 +7977,6 @@ int main(int argc, char** argv) try {
                 }
             }
             const bool timed_round = !first_window;
-            ++window_hist[(size_t)T];
             if (p + T > o.max_context) {
                 std::fprintf(stderr, "strata generate: ran out of context at position %lld\n", (long long)p);
                 return 2;
@@ -7909,6 +7991,36 @@ int main(int argc, char** argv) try {
                 if (o.spec_corrupt > 0 && (++corrupt_counter % o.spec_corrupt) == 0) d = (d + 1) % (int32_t)n_vocab;
                 window[(size_t)i] = d;
             }
+            const int T_trunk_orig = T;
+            bool tree_ran = false;
+            strata::kernels::VerifyTreeMap tree_map{};
+            if (o.spec_tree > 0 && ver.can_tree_verify() && !first_window && o.spec_corrupt <= 0) {
+                strata::spec::SpecTreeInput tin;
+                tin.mode = o.spec_tree;
+                tin.pos0 = p;
+                tin.T_base = T;
+                tin.max_room = (int)std::min<int64_t>(
+                    std::min<int>((int)window.size(), (int)strata::kernels::kVerifyNarrowT), o.max_context - p);
+                tin.from_sfx = from_sfx;
+                tin.draft_on = use_mtp;
+                tin.mtp_n = mtp_n;
+                tin.drafts = drafts.data();
+                tin.dprob = dprob.data();
+                tin.mtp_top2_0 = mtp.top2_fast(0);
+                tin.mtp_top2_p0 = mtp.top2_prob(0);
+                tin.mtp_top2_1 = mtp.top2_fast(1);
+                tin.mtp_top2_p1 = mtp.top2_prob(1);
+                tin.sfx_k = sfx_k;
+                tin.sfx_match = sfx_match;
+                tin.sbuf = sbuf.data();
+                int T_tree = T;
+                if (strata::spec::build_spec_tree(tin, window.data(), T_tree, tree_map)) {
+                    T = T_tree;
+                    tree_ran = true;
+                    ver.set_tree_spec(&tree_map);
+                }
+            }
+            ++window_hist[(size_t)T];
             drive.d.layers = 0;
             drive.d.experts = 0;
             drive.d.failed = false;
@@ -7929,8 +8041,25 @@ int main(int argc, char** argv) try {
                 return 1;
             }
             int a = 0;
-            while (a < T - 1 && window[(size_t)a + 1] == outv[(size_t)a])
-                ++a;
+            int tree_path[strata::kernels::kVerifyMaxT] = {};
+            bool tree_compact = false, tree_branch_hit = false;
+            if (tree_ran) {
+                const int k_acc = strata::spec::walk_accepted_tree(tree_map, window.data(), outv.data(), tree_path,
+                                                                   tree_compact, tree_branch_hit);
+                a = k_acc - 1;
+                ++tree_windows;
+                if (tree_branch_hit) ++tree_branch_hits;
+                if (tree_compact) {
+                    ++tree_compacts;
+                    for (int i = 1; i <= a; ++i) {
+                        window[(size_t)i] = window[(size_t)tree_path[i]];
+                        outv[(size_t)i] = outv[(size_t)tree_path[i]];
+                    }
+                }
+            } else {
+                while (a < T - 1 && window[(size_t)a + 1] == outv[(size_t)a])
+                    ++a;
+            }
             if (first_window) {
                 first_window = false;
                 ttft_ms = std::chrono::duration<double, std::milli>(Clock::now() - t_start).count();
@@ -7951,6 +8080,11 @@ int main(int argc, char** argv) try {
             bool adapt_ok = true;
             if (!drive.d.usage.empty() && ((rounds + 1) % o.adapt_every) == 0)
                 adapt_thr = std::thread([&] { adapt_ok = adapt(); });
+            if (tree_compact && !ver.compact_tree_path(tree_path, a + 1, err)) {
+                if (adapt_thr.joinable()) adapt_thr.join();
+                std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+                return 1;
+            }
             if (!ver.commit(a + 1, err)) {
                 if (adapt_thr.joinable()) adapt_thr.join();
                 std::fprintf(stderr, "strata generate: %s\n", err.c_str());
@@ -7959,10 +8093,10 @@ int main(int argc, char** argv) try {
             ++rounds;
             drafts_total += T - 1;
             drafts_ok += a;
-            ++accepted_hist[(size_t)a];
+            if ((size_t)a < accepted_hist.size()) ++accepted_hist[(size_t)a];
             if (from_sfx) {
                 ++sfx_windows;
-                sfx_drafts += T - 1;
+                sfx_drafts += (tree_ran ? T_trunk_orig : T) - 1;
                 sfx_ok += a;
             }
             bool eos = false;
@@ -7978,7 +8112,8 @@ int main(int argc, char** argv) try {
                 break;
             }
             const bool drafted = !use_mtp || (int64_t)produced.size() >= o.max_new ||
-                                 mtp.draft(T, outv.data(), p, a, drafts.data(), err, dprob.data(), (float)o.spec_min_p);
+                                 mtp.draft(tree_ran ? (a + 1) : T, outv.data(), p, a, drafts.data(), err, dprob.data(),
+                                           (float)o.spec_min_p, &mtp_n);
             if (adapt_thr.joinable()) adapt_thr.join();
             if (!adapt_ok) return 1;
             if (!drafted) {
@@ -7989,7 +8124,7 @@ int main(int argc, char** argv) try {
             p += a + 1;
             const double round_ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
             total_ms += round_ms;
-            if (timed_round) policy.observe(from_sfx, T, a, sfx_match, round_ms);
+            if (timed_round && !tree_ran) policy.observe(from_sfx, T, a, sfx_match, round_ms);
             if (rounds % 64 == 0)
                 std::fprintf(stderr, "strata generate: position %lld, %lld tokens, %lld rounds\n", (long long)p,
                              (long long)produced.size(), (long long)rounds);
@@ -8016,6 +8151,9 @@ int main(int argc, char** argv) try {
         for (size_t i = 0; i < accepted_hist.size(); ++i)
             std::printf(" %zu:%lld", i, (long long)accepted_hist[i]);
         std::printf("\n");
+        if (o.spec_tree > 0)
+            std::printf("%-24s mode %d: %lld tree windows, %lld branch hits, %lld compactions\n", "spec tree",
+                        o.spec_tree, (long long)tree_windows, (long long)tree_branch_hits, (long long)tree_compacts);
         if (rounds > 0)
             std::printf(
                 "%-24s wait for rings %.3f  pool %.3f  host %.3f  commit %.3f ms/round; CPU experts %.2f "

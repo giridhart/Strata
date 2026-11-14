@@ -29,6 +29,7 @@
 #include "strata/core/layer.hpp"
 #include "strata/core/session.hpp"
 #include "strata/kernels/sampler.hpp"
+#include "strata/kernels/verify_kernels.hpp"
 
 #include <atomic>
 #include <cstdint>
@@ -130,6 +131,17 @@ public:
 
     /// Keep the first `n_keep` (1..T) tokens of the last window; advances `ss.ple_prev` by them.
     bool commit(int n_keep, std::string& err);
+    /// Causal-tree verification (`STRATA_SPEC_TREE` / `--spec-tree`): true when this verifier can run a tree window.
+    bool can_tree_verify() const {
+        return lb_ == 0 && next_ == nullptr && (le_ < 0 || (g_ != nullptr && le_ == g_->n_layers)) &&
+               head_sampling_ && (sampling_.greedy || sampling_.temperature <= 0.0f) &&
+               sampling_.logit_bias == nullptr;
+    }
+    /// Arm causal-tree mode for the NEXT `run()` call only (cleared by `run()`). Null runs linear verification.
+    void set_tree_spec(const strata::kernels::VerifyTreeMap* spec) { tree_spec_ = spec; }
+    /// Compact an accepted non-trunk path (`path[0 .. n_keep - 1]`, monotonically increasing with `path[0] == 0`)
+    /// into dense slots `0 .. n_keep - 1` (staging buffers + session K/V cells) before `commit(n_keep, err)`.
+    bool compact_tree_path(const int* path, int n_keep, std::string& err);
     /// commit() returns without waiting for its graph (a single-GPU session sets it): the next window follows it on
     /// the same stream and the drafter reads nothing it writes, so it overlaps the draft. Whoever reads or writes
     /// the session from another stream or the host afterwards (a new request, a checkpoint, a snapshot, the prompt
@@ -173,6 +185,10 @@ public:
 
 private:
     bool capture(int T, std::string& err);
+    bool capture_tree(int T, std::string& err);
+    bool tree_rec_ = false;
+    bool last_tree_ = false;
+    const strata::kernels::VerifyTreeMap* tree_spec_ = nullptr;
     strata::kernels::SamplerParams sampling_ = [] {
         strata::kernels::SamplerParams s;
         s.greedy = true;
@@ -227,6 +243,8 @@ private:
     sycl::queue* cs_ = nullptr;
     void* exec_[9] = {};
     void* exec_res_[9] = {};
+    void* exec_tree_[9] = {};
+    void* exec_tree_res_[9] = {};
     bool res_graph_ = false;
     bool recording_res_ = false;
     std::vector<void*> exec_chunks_[9] = {};
@@ -235,8 +253,11 @@ private:
     // mapped staging (host pointer, device alias)
     int32_t* h_tok_ = nullptr;   int32_t* m_tok_ = nullptr;     // T
     int32_t* h_step_ = nullptr;  int32_t* m_step_ = nullptr;    // T * kStepCount
+    int32_t* h_step_append_ = nullptr; int32_t* m_step_append_ = nullptr; // T * kStepCount (physical pos0 + t for tree K/V append)
     int32_t* h_pos_ = nullptr;   int32_t* m_pos_ = nullptr;     // T * n_head
     int32_t* h_commit_ = nullptr; int32_t* m_commit_ = nullptr; // [n_keep, n_keep-1, pos_0 .. pos_{T-1}]
+    strata::kernels::VerifyTreeMap* h_tree_ = nullptr;
+    strata::kernels::VerifyTreeMap* m_tree_ = nullptr;
     float* h_ple_ = nullptr;     float* m_ple_ = nullptr;       // T * n_embd
     int32_t* h_out_ = nullptr;   int32_t* m_out_ = nullptr;     // T argmax ids
     uint32_t* h_nf_ = nullptr;   uint32_t* m_nf_ = nullptr;     // #879: kVerifyMaxT * kNonfiniteBlocks flags
@@ -277,7 +298,9 @@ private:
 
     // device
     void* arena_ = nullptr;
-    int32_t *tok_ = nullptr, *step_ = nullptr, *pos_ = nullptr, *commit_ = nullptr;
+    int32_t *tok_ = nullptr, *step_ = nullptr, *step_append_ = nullptr, *pos_ = nullptr, *commit_ = nullptr;
+    strata::kernels::VerifyTreeMap* tree_d_ = nullptr;
+    float* tree_gdn_snap_ = nullptr;
     float *ple_ = nullptr, *emb_ = nullptr, *R_ = nullptr, *mixed_ = nullptr, *bo_ = nullptr;
     float *inj_ = nullptr, *inj2_ = nullptr, *lo_ = nullptr, *rs_ = nullptr, *xn_ = nullptr;
     uint8_t* xq_ = nullptr;                                   // T columns of q8_1
@@ -345,8 +368,8 @@ private:
 #include "strata/core/layer.hpp"
 #include "strata/core/session.hpp"
 #include "strata/kernels/sampler.hpp"
-#include "strata/kernels/window_limits.hpp"
 #include "strata/kernels/verify_kernels.hpp"
+#include "strata/kernels/window_limits.hpp"
 
 #include <cuda_runtime.h>
 
@@ -545,6 +568,17 @@ public:
 
     /// Keep the first `n_keep` (1..T) tokens of the last window; advances `ss.ple_prev` by them.
     bool commit(int n_keep, std::string& err);
+    /// Causal-tree verification (`STRATA_SPEC_TREE` / `--spec-tree`): true when this verifier can run a tree window.
+    bool can_tree_verify() const {
+        return lb_ == 0 && next_ == nullptr && (le_ < 0 || (g_ != nullptr && le_ == g_->n_layers)) &&
+               head_sampling_ && (sampling_.greedy || sampling_.temperature <= 0.0f) &&
+               sampling_.logit_bias == nullptr && !spec_measure_ && spec_q_ == nullptr && !always_publish_;
+    }
+    /// Arm causal-tree mode for the NEXT `run()` call only (cleared by `run()`). Null runs linear verification.
+    void set_tree_spec(const strata::kernels::VerifyTreeMap* spec) { tree_spec_ = spec; }
+    /// Compact an accepted non-trunk path (`path[0 .. n_keep - 1]`, monotonically increasing with `path[0] == 0`)
+    /// into dense slots `0 .. n_keep - 1` (staging buffers + session K/V cells) before `commit(n_keep, err)`.
+    bool compact_tree_path(const int* path, int n_keep, std::string& err);
 
     // ================================ SEVERAL SEQUENCES IN ONE WINDOW ================================
     //
@@ -764,6 +798,10 @@ public:
 private:
     RemoteExpertOpt* remote_opt_ = nullptr;
     bool capture(int T, std::string& err);
+    bool capture_tree(int T, std::string& err);
+    bool tree_rec_ = false;
+    bool last_tree_ = false;
+    const strata::kernels::VerifyTreeMap* tree_spec_ = nullptr;
     // batch windows (see init_slots)
     std::vector<SessionState*> slots_;
     bool batch_rec_ = false;               ///< record_window is capturing a batch window
@@ -975,6 +1013,9 @@ private:
     cudaGraphExec_t exec_[2][strata::kernels::kVerifyLongT + 1] = {};
     cudaGraphExec_t exec_nr_[2][strata::kernels::kVerifyLongT + 1] = {};   // #871: the doorbell variant of a stage that is all-resident otherwise
     bool launched_[2][strata::kernels::kVerifyLongT + 1] = {}, launched_nr_[2][strata::kernels::kVerifyLongT + 1] = {};   ///< this graph has been launched once (early_ple_flag: a cold first launch raises the PLE flag first)
+    cudaGraphExec_t exec_tree_[strata::kernels::kVerifyLongT + 1] = {};
+    cudaGraphExec_t exec_tree_nr_[strata::kernels::kVerifyLongT + 1] = {};
+    bool launched_tree_[strata::kernels::kVerifyLongT + 1] = {}, launched_tree_nr_[strata::kernels::kVerifyLongT + 1] = {};
     int sel_long_ = 0;
     // fork 34a35db (STRATA_SIDE_MIXER=1): the GDN gates and the QSA indexer on a branch of the window's graph beside the
     // mixer's projections, joined before the recurrence / the attention
@@ -989,8 +1030,11 @@ private:
     // mapped staging (host pointer, device alias)
     int32_t* h_tok_ = nullptr;   int32_t* m_tok_ = nullptr;     // T
     int32_t* h_step_ = nullptr;  int32_t* m_step_ = nullptr;    // T * kStepCount
+    int32_t* h_step_append_ = nullptr; int32_t* m_step_append_ = nullptr; // T * kStepCount
     int32_t* h_pos_ = nullptr;   int32_t* m_pos_ = nullptr;     // T * n_head
     int32_t* h_commit_ = nullptr; int32_t* m_commit_ = nullptr; // [n_keep, n_keep-1, pos_0 .. pos_{T-1}]
+    strata::kernels::VerifyTreeMap* h_tree_ = nullptr;
+    strata::kernels::VerifyTreeMap* m_tree_ = nullptr;
     float* h_ple_ = nullptr;     float* m_ple_ = nullptr;       // T * n_embd
     int32_t* h_out_ = nullptr;   int32_t* m_out_ = nullptr;     // T argmax ids
     // STRATA_TAP_FILE (off by default; nothing is allocated or captured without it): the DFlash2 experiment's hook.
@@ -1056,7 +1100,9 @@ private:
 
     // device
     void* arena_ = nullptr;
-    int32_t *tok_ = nullptr, *step_ = nullptr, *pos_ = nullptr, *commit_ = nullptr;
+    int32_t *tok_ = nullptr, *step_ = nullptr, *step_append_ = nullptr, *pos_ = nullptr, *commit_ = nullptr;
+    strata::kernels::VerifyTreeMap* tree_d_ = nullptr;
+    float* tree_gdn_snap_ = nullptr;
     float *ple_ = nullptr, *emb_ = nullptr, *R_ = nullptr, *mixed_ = nullptr, *bo_ = nullptr;
     float *inj_ = nullptr, *inj2_ = nullptr, *lo_ = nullptr, *rs_ = nullptr, *xn_ = nullptr;
     uint8_t* xq_ = nullptr;                                   // T columns of q8_1
