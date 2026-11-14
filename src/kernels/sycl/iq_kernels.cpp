@@ -3802,7 +3802,7 @@ inline void native_gu_kernel_fast(
     }
 }
 
-constexpr int kDtEnt = 8, kDtW = 10, kDtMaxHb = 32;
+constexpr int kDtEnt = 8, kDtW = 11, kDtMaxHb = 32;
 inline void iq_tr4x4(uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t* t) {
     const uint32_t p0 = (a0 & 0x00FF00FFu) | ((a1 & 0x00FF00FFu) << 8);
     const uint32_t p1 = ((a0 >> 8) & 0x00FF00FFu) | (a1 & 0xFF00FF00u);
@@ -3813,7 +3813,7 @@ inline void iq_tr4x4(uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_
     t[2] = (p0 >> 16) | (p2 & 0xFFFF0000u);
     t[3] = (p1 >> 16) | (p3 & 0xFFFF0000u);
 }
-template <int R, int E>
+template <int R, int E, int DTW = kDtW>
 inline void rows_dot_dt(const uint8_t* const* rows, const uint32_t* ta, int hb, int nb, int sub, float (&out)[R][E]) {
     constexpr int LANES = 8, KSTEP = 4, BS = sizeof(block_q2_0);
     const int iqs = sub % 2, kb0 = sub / 2;
@@ -3831,7 +3831,7 @@ inline void rows_dot_dt(const uint8_t* const* rows, const uint32_t* ta, int hb, 
         int c[E];
 #pragma unroll
         for (int e = 0; e < E; ++e) {
-            const uint32_t* t = ta + (e * hb + 2 * kbx + iqs) * kDtW;
+            const uint32_t* t = ta + (e * hb + 2 * kbx + iqs) * DTW;
 #pragma unroll
             for (int k = 0; k < 8; ++k) U[e][k] = t[k];
             ds[e] = iq_fast::h2f(sycl::bit_cast<sycl::half>((uint16_t) (t[8] & 0xFFFFu)));
@@ -3867,7 +3867,7 @@ inline void rows_dot_dt(const uint8_t* const* rows, const uint32_t* ta, int hb, 
         for (int e = 0; e < E; ++e) out[r][e] = lanes_sum_iq<LANES>(s[r][e]);
 }
 
-template <int RPL>
+template <int RPL, int DTW = kDtW>
 inline void native_down_kernel_dt(
     sycl::nd_item<3> item_ct1,
     const unsigned long long *__restrict__ grp_ptr,
@@ -3877,7 +3877,7 @@ inline void native_down_kernel_dt(
     constexpr int LN = 8, RB = 256 / LN;
     const int ng = *n_groups;
     if ((int) item_ct1.get_group(1) >= ng) return;
-    auto& ta = *sycl::ext::oneapi::group_local_memory_for_overwrite<uint32_t[kDtEnt * kDtMaxHb * kDtW]>(item_ct1.get_group());
+    auto& ta = *sycl::ext::oneapi::group_local_memory_for_overwrite<uint32_t[kDtEnt * kDtMaxHb * DTW]>(item_ct1.get_group());
     const int lid = (int) item_ct1.get_local_id(2);
     const int rib = lid / LN, sub = lid % LN;
     const int r0 = (int) item_ct1.get_group(2) * RB * RPL + rib;
@@ -3908,7 +3908,7 @@ inline void native_down_kernel_dt(
                 uint32_t t[8];
                 iq_tr4x4(a[0], a[1], a[2], a[3], t);
                 iq_tr4x4(a[4], a[5], a[6], a[7], t + 4);
-                uint32_t* d = &ta[(j * hb + b) * kDtW];
+                uint32_t* d = &ta[(j * hb + b) * DTW];
 #pragma unroll
                 for (int i = 0; i < 8; ++i) d[i] = t[i];
                 d[8] = *reinterpret_cast<const uint32_t*>(&y->ds);
@@ -3920,7 +3920,7 @@ inline void native_down_kernel_dt(
             auto pass = [&](auto ecn) {
                 constexpr int EC = decltype(ecn)::value;
                 float o[RPL][EC];
-                rows_dot_dt<RPL, EC>(rows, &ta[(e - ec) * hb * kDtW], hb, nb, sub, o);
+                rows_dot_dt<RPL, EC, DTW>(rows, &ta[(e - ec) * hb * DTW], hb, nb, sub, o);
                 if (sub == 0)
 #pragma unroll
                     for (int i = 0; i < RPL; ++i)
@@ -4220,11 +4220,20 @@ bool launch_down_fast(unsigned groups, sycl::queue* s, const unsigned long long 
                         });
                     return true;
                 }
-                s->parallel_for(
-                    sycl::nd_range<3>(sycl::range<3>(1, groups, (size_t) gx * 256), sycl::range<3>(1, 1, 256)),
-                    [=](sycl::nd_item<3> item) [[sycl::reqd_sub_group_size(16)]] {
-                        native_down_kernel_dt<kIqFastRows>(item, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
-                    });
+                static const int dt_w = [] {
+                    const char* e = std::getenv("STRATA_IQ_DT_W");
+                    return (e && std::atoi(e) == 10) ? 10 : kDtW;
+                }();
+                auto go_dt = [&](auto dtw) {
+                    constexpr int DTW = decltype(dtw)::value;
+                    s->parallel_for(
+                        sycl::nd_range<3>(sycl::range<3>(1, groups, (size_t) gx * 256), sycl::range<3>(1, 1, 256)),
+                        [=](sycl::nd_item<3> item) [[sycl::reqd_sub_group_size(16)]] {
+                            native_down_kernel_dt<kIqFastRows, DTW>(item, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+                        });
+                };
+                if (dt_w == 10) go_dt(std::integral_constant<int, 10>{});
+                else go_dt(std::integral_constant<int, kDtW>{});
                 return true;
             }
         }
@@ -4428,6 +4437,616 @@ bool launch_iq3s_wide(const uint8_t* W, size_t rb, const block_q8_1* X, float* y
     }
 }
 
+// ---------------------------------------------------------------- Mode 7 / Mode 8 (DecG + nib_neg4 + SLM grid & activations + fused SwiGLU/q8_1)
+template <int TY>
+struct GridOf;
+template <>
+struct GridOf<22> {
+    using T = uint64_t;
+    static constexpr int N = 1024;
+    static const T* src() { return (const T*)iq2s_grid; }
+};
+template <>
+struct GridOf<16> {
+    using T = uint64_t;
+    static constexpr int N = 256;
+    static const T* src() { return (const T*)iq2xxs_grid; }
+};
+template <>
+struct GridOf<17> {
+    using T = uint64_t;
+    static constexpr int N = 512;
+    static const T* src() { return (const T*)iq2xs_grid; }
+};
+template <>
+struct GridOf<18> {
+    using T = uint32_t;
+    static constexpr int N = 256;
+    static const T* src() { return reinterpret_cast<const T*>(iq3xxs_grid); }
+};
+template <>
+struct GridOf<21> {
+    using T = uint32_t;
+    static constexpr int N = 512;
+    static const T* src() { return reinterpret_cast<const T*>(iq3s_grid); }
+};
+template <>
+struct GridOf<23> {
+    using T = uint32_t;
+    static constexpr int N = 1;
+    static const T* src() { return reinterpret_cast<const T*>(iq3s_grid); }
+};
+template <>
+struct GridOf<29> {
+    using T = uint32_t;
+    static constexpr int N = 2048;
+    static const T* src() { return reinterpret_cast<const T*>(iq1s_grid_gpu); }
+};
+
+inline int nib_mask(uint32_t n) {
+    const uint32_t b = ((n & 0xFu) * 0x204081u) & 0x01010101u;
+    return (int)((b << 8) - b);
+}
+
+// Exact two's-complement byte negation for strictly positive IQ2/IQ3 grid bytes (all bytes in [1, 62]):
+// halves dp4a count from 16 to 8 per 32 weights, bit-for-bit identical.
+inline int nib_neg4(int g, uint32_t n) {
+    const uint32_t b = ((n & 0xFu) * 0x204081u) & 0x01010101u;
+    const uint32_t m = (b << 8) - b;
+    return (int)(((uint32_t)g ^ m) + b);
+}
+
+template <int TY>
+struct DecG;
+
+template <>
+struct DecG<22> {
+    int ws[8];
+    int ls0, ls1;
+    float dw;
+    static inline DecG load(const void* vbq, int kbx, int iqs, const uint64_t* grid) {
+        const block_iq2_s* bq2 = (const block_iq2_s*)vbq + kbx;
+        const int qs_packed = get_int_b2(bq2->qs, iqs / 2);
+        const uint8_t* qs = (const uint8_t*)&qs_packed;
+        const int qh = bq2->qh[iqs / 2];
+        const int signs_packed_32 = get_int_b2(bq2->qs, QK_K / 32 + iqs / 2);
+        const uint8_t* signs_packed_8 = (const uint8_t*)&signs_packed_32;
+        DecG r;
+        r.ls0 = bq2->scales[iqs / 2] & 0x0F;
+        r.ls1 = bq2->scales[iqs / 2] >> 4;
+        r.dw = iq_fast::h2f(bq2->d);
+#pragma unroll
+        for (int c = 0; c < 4; ++c) {
+            const int l0 = 2 * c;
+            const int* grid_pos = (const int*)(grid + (qs[c] | ((qh << (8 - l0)) & 0x300)));
+            r.ws[2 * c + 0] = nib_neg4(grid_pos[0], signs_packed_8[c]);
+            r.ws[2 * c + 1] = nib_neg4(grid_pos[1], signs_packed_8[c] >> 4);
+        }
+        return r;
+    }
+    inline float dot(const block_q8_1* bq8_1, int iqs) const {
+        const block_q8_1& b = bq8_1[iqs / 2];
+        int sumi0 = 0, sumi1 = 0;
+#pragma unroll
+        for (int l0 = 0; l0 < 4; ++l0) sumi0 = ggml_cuda_dp4a(ws[l0], get_int_b4(b.qs, l0), sumi0);
+#pragma unroll
+        for (int l0 = 4; l0 < 8; ++l0) sumi1 = ggml_cuda_dp4a(ws[l0], get_int_b4(b.qs, l0), sumi1);
+        const int sumi = (sumi0 * ls0 + sumi1 * ls1 + (sumi0 + sumi1) / 2) / 4;
+        const float d = dw * iq_fast::h2f(b.ds[0]);
+        return d * sumi;
+    }
+};
+
+template <>
+struct DecG<17> {
+    int ws[8];
+    int ls0, ls1;
+    float dw;
+    static inline DecG load(const void* vbq, int kbx, int iqs, const uint64_t* grid) {
+        const block_iq2_xs* bq2 = (const block_iq2_xs*)vbq + kbx;
+        const uint32_t q2_0 = (uint32_t)get_int_b2(bq2->qs, iqs + 0);
+        const uint32_t q2_1 = (uint32_t)get_int_b2(bq2->qs, iqs + 1);
+        const uint16_t q2[4] = {
+            (uint16_t)(q2_0 & 0xFFFFu), (uint16_t)(q2_0 >> 16),
+            (uint16_t)(q2_1 & 0xFFFFu), (uint16_t)(q2_1 >> 16),
+        };
+        DecG r;
+        r.ls0 = bq2->scales[iqs / 2] & 0x0F;
+        r.ls1 = bq2->scales[iqs / 2] >> 4;
+        r.dw = iq_fast::h2f(bq2->d);
+#pragma unroll
+        for (int c = 0; c < 4; ++c) {
+            const sycl::uint2 grid_pos = *(const sycl::uint2*)(grid + (q2[c] & 0x1FF));
+            const uint32_t v = q2[c] >> 9, sg = v | ((sycl::popcount(v) & 1) << 7);
+            r.ws[2 * c + 0] = nib_neg4((int)grid_pos.x(), sg);
+            r.ws[2 * c + 1] = nib_neg4((int)grid_pos.y(), sg >> 4);
+        }
+        return r;
+    }
+    inline float dot(const block_q8_1* bq8_1, int iqs) const {
+        const block_q8_1& b = bq8_1[iqs / 2];
+        int sumi0 = 0, sumi1 = 0;
+#pragma unroll
+        for (int l0 = 0; l0 < 4; ++l0) sumi0 = ggml_cuda_dp4a(ws[l0], get_int_b4(b.qs, l0), sumi0);
+#pragma unroll
+        for (int l0 = 4; l0 < 8; ++l0) sumi1 = ggml_cuda_dp4a(ws[l0], get_int_b4(b.qs, l0), sumi1);
+        const int sumi = (sumi0 * ls0 + sumi1 * ls1 + (sumi0 + sumi1) / 2) / 4;
+        const float d = dw * iq_fast::h2f(b.ds[0]);
+        return d * sumi;
+    }
+};
+
+template <>
+struct DecG<16> {
+    int ws[8];
+    int ls;
+    float dw;
+    static inline DecG load(const void* vbq, int kbx, int iqs, const uint64_t* grid) {
+        const block_iq2_xxs* bq2 = (const block_iq2_xxs*)vbq + kbx;
+        const int q2 = get_int_b2(bq2->qs, iqs);
+        const uint8_t* aux8 = (const uint8_t*)&q2;
+        const uint32_t aux32 = (uint32_t)get_int_b2(bq2->qs, iqs + 1);
+        DecG r;
+        r.ls = (int)(aux32 >> 27) | 1;
+        r.dw = iq_fast::h2f(bq2->d);
+#pragma unroll
+        for (int c = 0; c < 4; ++c) {
+            const sycl::uint2 grid_pos = *(const sycl::uint2*)(grid + aux8[c]);
+            const uint32_t v = (aux32 >> (7 * c)) & 0x7F, sg = v | ((sycl::popcount(v) & 1) << 7);
+            r.ws[2 * c + 0] = nib_neg4((int)grid_pos.x(), sg);
+            r.ws[2 * c + 1] = nib_neg4((int)grid_pos.y(), sg >> 4);
+        }
+        return r;
+    }
+    inline float dot(const block_q8_1* bq8_1, int iqs) const {
+        const block_q8_1& b = bq8_1[iqs / 2];
+        int sumi = 0;
+#pragma unroll
+        for (int l0 = 0; l0 < 8; ++l0) sumi = ggml_cuda_dp4a(ws[l0], get_int_b4(b.qs, l0), sumi);
+        sumi = sumi * ls / 8;
+        const float d = dw * iq_fast::h2f(b.ds[0]);
+        return d * sumi;
+    }
+};
+
+template <>
+struct DecG<18> {
+    int ws[8];
+    int ls;
+    float dw;
+    static inline DecG load(const void* vbq, int kbx, int iqs, const uint32_t* grid) {
+        const block_iq3_xxs* bq3 = (const block_iq3_xxs*)vbq + kbx;
+        const sycl::int2 q3_packed(get_int_b2(bq3->qs, iqs), get_int_b2(bq3->qs, iqs + 1));
+        const uint8_t* q3 = (const uint8_t*)&q3_packed;
+        const uint32_t aux32 = (uint32_t)get_int_b2(bq3->qs, QK_K / 16 + iqs / 2);
+        DecG r;
+        r.ls = (int)(aux32 >> 28);
+        r.dw = iq_fast::h2f(bq3->d);
+#pragma unroll
+        for (int c = 0; c < 4; ++c) {
+            const uint32_t signs = unpack_ksigns((uint8_t)(aux32 >> (7 * c)));
+            r.ws[2 * c + 0] = nib_neg4((int)grid[q3[2 * c + 0]], signs);
+            r.ws[2 * c + 1] = nib_neg4((int)grid[q3[2 * c + 1]], signs >> 4);
+        }
+        return r;
+    }
+    inline float dot(const block_q8_1* bq8_1, int iqs) const {
+        const block_q8_1& b = bq8_1[iqs / 2];
+        int sumi = 0;
+#pragma unroll
+        for (int l0 = 0; l0 < 8; ++l0) sumi = ggml_cuda_dp4a(ws[l0], get_int_b4(b.qs, l0), sumi);
+        sumi = (ls * sumi + sumi / 2) / 2;
+        const float d = dw * iq_fast::h2f(b.ds[0]);
+        return d * sumi;
+    }
+};
+
+template <>
+struct DecG<21> {
+    int ws[8];
+    int ls;
+    float dw;
+    static inline DecG load(const void* vbq, int kbx, int iqs, const uint32_t* grid) {
+        const block_iq3_s* bq3 = (const block_iq3_s*)vbq + kbx;
+        const sycl::int2 qs_packed(get_int_b2(bq3->qs, iqs + 0), get_int_b2(bq3->qs, iqs + 1));
+        const uint8_t* qs = (const uint8_t*)&qs_packed;
+        const int qh = bq3->qh[iqs / 2];
+        const int signs_packed_32 = get_int_b2(bq3->signs, iqs / 2);
+        const uint8_t* signs_packed_8 = (const uint8_t*)&signs_packed_32;
+        DecG r;
+        r.ls = 1 + 2 * ((bq3->scales[iqs / 4] >> ((iqs << 1) & 0x04)) & 0x0F);
+        r.dw = iq_fast::h2f(bq3->d);
+#pragma unroll
+        for (int c = 0; c < 4; ++c) {
+            const int l0 = 2 * c;
+            const int g0 = (int)grid[qs[l0 + 0] | ((qh << (8 - l0)) & 0x100)];
+            const int g1 = (int)grid[qs[l0 + 1] | ((qh << (7 - l0)) & 0x100)];
+            r.ws[l0 + 0] = nib_neg4(g0, signs_packed_8[c]);
+            r.ws[l0 + 1] = nib_neg4(g1, signs_packed_8[c] >> 4);
+        }
+        return r;
+    }
+    inline float dot(const block_q8_1* bq8_1, int iqs) const {
+        const block_q8_1& b = bq8_1[iqs / 2];
+        int sumi = 0;
+#pragma unroll
+        for (int l0 = 0; l0 < 8; ++l0) sumi = ggml_cuda_dp4a(ws[l0], get_int_b4(b.qs, l0), sumi);
+        sumi *= ls;
+        const float d = dw * iq_fast::h2f(b.ds[0]);
+        return d * sumi;
+    }
+};
+
+template <>
+struct DecG<29> {
+    int g0[4], g1[4];
+    int qh8[4];
+    int sc0, sc1;
+    float dw;
+    static inline DecG load(const void* vbq, int kbx, int iqs, const uint32_t* grid_lut) {
+        const block_iq1_m* bq1 = (const block_iq1_m*)vbq + kbx;
+        const int qs_packed = get_int_b4(bq1->qs, iqs);
+        const uint8_t* qs = (const uint8_t*)&qs_packed;
+        DecG r;
+#pragma unroll
+        for (int c = 0; c < 4; ++c) {
+            const int l0 = 2 * c;
+            const int qhl = bq1->qh[2 * iqs + l0 / 4] >> (4 * (c % 2));
+            const int grid = (int)grid_lut[qs[c] | ((qhl & 0x07) << 8)];
+            r.g0[c] = (grid >> 0) & 0x0F0F0F0F;
+            r.g1[c] = (grid >> 4) & 0x0F0F0F0F;
+            r.qh8[c] = qhl & 0x08;
+        }
+        const uint16_t* sc = (const uint16_t*)bq1->scales;
+        iq1m_scale_t scale;
+        scale.u16 = (sc[0] >> 12) | ((sc[1] >> 8) & 0x00F0) | ((sc[2] >> 4) & 0x0F00) | (sc[3] & 0xF000);
+        r.dw = iq_fast::h2f(scale.f16);
+        const int tmp = sc[iqs / 2] >> (6 * (iqs % 2));
+        r.sc0 = 2 * ((tmp >> 0) & 0x07) + 1;
+        r.sc1 = 2 * ((tmp >> 3) & 0x07) + 1;
+        return r;
+    }
+    inline float dot(const block_q8_1* bq8_1, int iqs) const {
+        const block_q8_1& b = bq8_1[iqs];
+        int sumi[2] = {0, 0};
+        float sumf[2] = {0.0f, 0.0f};
+#pragma unroll
+        for (int c = 0; c < 4; ++c) {
+            const int u0 = get_int_b4(b.qs, 2 * c + 0);
+            const int u1 = get_int_b4(b.qs, 2 * c + 1);
+            sumi[c / 2] = ggml_cuda_dp4a(g0[c], u0, sumi[c / 2]);
+            sumi[c / 2] = ggml_cuda_dp4a(g1[c], u1, sumi[c / 2]);
+            const float delta = -1.0f + IQ1M_DELTA - qh8[c] * (2.0f * IQ1M_DELTA / 0x08);
+            int sumy = 0;
+            sumy = ggml_cuda_dp4a(u0, 0x01010101, sumy);
+            sumy = ggml_cuda_dp4a(u1, 0x01010101, sumy);
+            sumf[c / 2] += delta * sumy;
+        }
+        const float d = dw * iq_fast::h2f(b.ds[0]);
+        return d * ((sumi[0] + sumf[0]) * sc0 + (sumi[1] + sumf[1]) * sc1);
+    }
+};
+
+template <>
+struct DecG<23> {
+    const void* vbq;
+    int kbx;
+    static inline DecG load(const void* v, int kb, int, const uint32_t*) { return DecG{v, kb}; }
+    inline float dot(const block_q8_1* bq8_1, int iqs) const { return vec_dot_iq4_xs_q8_1(vbq, bq8_1, kbx, iqs); }
+};
+
+constexpr int kLdsRb = 64;
+constexpr int kLdsNt = 4;
+
+template <int TG>
+inline void native_gu_lds_kernel(
+    sycl::nd_item<3> item_ct1,
+    const unsigned long long* __restrict__ grp_ptr,
+    const int32_t* __restrict__ grp_start,
+    const int32_t* __restrict__ n_groups,
+    const int32_t* __restrict__ ent_tok,
+    const block_q8_1* __restrict__ xq,
+    NativeExpertLayout L,
+    float* __restrict__ gate,
+    float* __restrict__ up,
+    sycl::local_accessor<int, 1> sx_acc) {
+    static_assert(sizeof(block_q8_1) == 36);
+    using GT = typename GridOf<TG>::T;
+    using F = Fmt<TG>;
+    auto& sgrid = *sycl::ext::oneapi::group_local_memory_for_overwrite<GT[GridOf<TG>::N]>(item_ct1.get_group());
+    int* sx_raw = sx_acc.get_multi_ptr<sycl::access::decorated::no>().get();
+    const int ng = *n_groups;
+    if ((int)item_ct1.get_group(1) >= ng) return;
+    const int tid = (int)item_ct1.get_local_id(2), lane = tid & 31, warp = tid >> 5;
+    const GT* gsrc = GridOf<TG>::src();
+    for (int i = tid; i < GridOf<TG>::N; i += 256) sgrid[i] = gsrc[i];
+    const int nb = (int)(L.n_embd / F::qk), xb = (int)(L.n_embd / 32);
+    const int nrow = 2 * (int)L.n_ff;
+    const block_q8_1* sx = (const block_q8_1*)sx_raw;
+    auto put = [&](int row, int e, float v) {
+        const bool is_up = row >= L.n_ff;
+        (is_up ? up : gate)[(size_t)e * L.n_ff + (is_up ? row - (int)L.n_ff : row)] = v;
+    };
+    for (int g = (int)item_ct1.get_group(1); g < ng; g += (int)item_ct1.get_group_range(1)) {
+        const uint8_t* blob = (const uint8_t*)grp_ptr[g];
+        const int e0 = grp_start[g], e1 = grp_start[g + 1];
+        auto wrow = [&](int row) -> const uint8_t* {
+            const bool is_up = row >= L.n_ff;
+            return blob + (is_up ? L.up_off : 0) + (size_t)(is_up ? row - (int)L.n_ff : row) * L.gu_row;
+        };
+        for (int c0 = e0; c0 < e1; c0 += kLdsNt) {
+            const int cn = sycl::min(kLdsNt, e1 - c0);
+            item_ct1.barrier(sycl::access::fence_space::local_space);
+            for (int j = 0; j < cn; ++j) {
+                const int* src = (const int*)(xq + (size_t)ent_tok[c0 + j] * xb);
+                for (int i = tid; i < xb * 9; i += 256) sx_raw[j * xb * 9 + i] = src[i];
+            }
+            item_ct1.barrier(sycl::access::fence_space::local_space);
+            for (int p = 0; p < kLdsRb / 16; ++p) {
+                const int row0 = (int)item_ct1.get_group(2) * kLdsRb + p * 16 + warp, row1 = row0 + 8;
+                if (row0 >= nrow) break;
+                const bool two = row1 < nrow;
+                const uint8_t* w0 = wrow(row0);
+                const uint8_t* w1 = wrow(two ? row1 : row0);
+                const float sc0 = L.tail_off ? ((const float*)(blob + L.tail_off))[row0 >= L.n_ff ? 1 : 0] : 1.0f;
+                const float sc1 = L.tail_off ? ((const float*)(blob + L.tail_off))[(two ? row1 : row0) >= L.n_ff ? 1 : 0] : 1.0f;
+                auto pass = [&](auto ntc) {
+                    constexpr int NTC = decltype(ntc)::value;
+                    float s0[NTC], s1[NTC];
+#pragma unroll
+                    for (int j = 0; j < NTC; ++j) {
+                        s0[j] = 0.0f;
+                        s1[j] = 0.0f;
+                    }
+                    for (int k = lane; k < nb * F::ipb; k += 32) {
+                        const int kbx = k / F::ipb, iqs = F::step * (k % F::ipb);
+                        const DecG<TG> dw0 = DecG<TG>::load(w0, kbx, iqs, &sgrid[0]);
+                        const DecG<TG> dw1 = DecG<TG>::load(w1, kbx, iqs, &sgrid[0]);
+#pragma unroll
+                        for (int j = 0; j < NTC; ++j) {
+                            const block_q8_1* xk = sx + (size_t)j * xb + kbx * (F::qk / 32);
+                            s0[j] += dw0.dot(xk, iqs);
+                            s1[j] += dw1.dot(xk, iqs);
+                        }
+                    }
+#pragma unroll
+                    for (int j = 0; j < NTC; ++j) {
+                        const float a = warp_sum(s0[j]) * sc0, b = warp_sum(s1[j]) * sc1;
+                        if (lane == 0) {
+                            put(row0, c0 + j, a);
+                            if (two) put(row1, c0 + j, b);
+                        }
+                    }
+                };
+                switch (cn) {
+                    case 1: pass(std::integral_constant<int, 1>{}); break;
+                    case 2: pass(std::integral_constant<int, 2>{}); break;
+                    case 3: pass(std::integral_constant<int, 3>{}); break;
+                    default: pass(std::integral_constant<int, 4>{}); break;
+                }
+            }
+        }
+    }
+}
+
+template <int TG, int LNT = kLdsNt>
+inline void native_gu_fused_kernel(
+    sycl::nd_item<3> item_ct1,
+    const unsigned long long* __restrict__ grp_ptr,
+    const int32_t* __restrict__ grp_start,
+    const int32_t* __restrict__ n_groups,
+    const int32_t* __restrict__ ent_tok,
+    const block_q8_1* __restrict__ xq,
+    NativeExpertLayout L,
+    block_q8_1* __restrict__ hq,
+    sycl::local_accessor<int, 1> sx_acc) {
+#pragma clang fp contract(off)
+    static_assert(sizeof(block_q8_1) == 36);
+    using GT = typename GridOf<TG>::T;
+    using F = Fmt<TG>;
+    auto& sgrid = *sycl::ext::oneapi::group_local_memory_for_overwrite<GT[GridOf<TG>::N]>(item_ct1.get_group());
+    auto& res = *sycl::ext::oneapi::group_local_memory_for_overwrite<float[LNT][64]>(item_ct1.get_group());
+    int* sx_raw = sx_acc.get_multi_ptr<sycl::access::decorated::no>().get();
+    const int ng = *n_groups;
+    if ((int)item_ct1.get_group(1) >= ng) return;
+    const int tid = (int)item_ct1.get_local_id(2), lane = tid & 31, warp = tid >> 5;
+    const GT* gsrc = GridOf<TG>::src();
+    for (int i = tid; i < GridOf<TG>::N; i += 256) sgrid[i] = gsrc[i];
+    const int nb = (int)(L.n_embd / F::qk), xb = (int)(L.n_embd / 32), hb = (int)(L.n_ff / 32);
+    const int r0 = (int)item_ct1.get_group(2) * 32;
+    const block_q8_1* sx = (const block_q8_1*)sx_raw;
+    for (int g = (int)item_ct1.get_group(1); g < ng; g += (int)item_ct1.get_group_range(1)) {
+        const uint8_t* blob = (const uint8_t*)grp_ptr[g];
+        const int e0 = grp_start[g], e1 = grp_start[g + 1];
+        const float sc_g = L.tail_off ? ((const float*)(blob + L.tail_off))[0] : 1.0f;
+        const float sc_u = L.tail_off ? ((const float*)(blob + L.tail_off))[1] : 1.0f;
+        auto wrow = [&](int i) -> const uint8_t* {
+            return blob + (i < 32 ? (size_t)0 : L.up_off) + (size_t)(r0 + (i & 31)) * L.gu_row;
+        };
+        for (int c0 = e0; c0 < e1; c0 += LNT) {
+            const int cn = sycl::min(LNT, e1 - c0);
+            item_ct1.barrier(sycl::access::fence_space::local_space);
+            for (int j = 0; j < cn; ++j) {
+                const int* src = (const int*)(xq + (size_t)ent_tok[c0 + j] * xb);
+                for (int i = tid; i < xb * 9; i += 256) sx_raw[j * xb * 9 + i] = src[i];
+            }
+            item_ct1.barrier(sycl::access::fence_space::local_space);
+            for (int p = 0; p < 4; ++p) {
+                const int i0 = p * 16 + warp, i1 = i0 + 8;
+                const uint8_t* w0 = wrow(i0);
+                const uint8_t* w1 = wrow(i1);
+                const float sc0 = i0 < 32 ? sc_g : sc_u;
+                const float sc1 = i1 < 32 ? sc_g : sc_u;
+                auto pass = [&](auto ntc) {
+                    constexpr int NTC = decltype(ntc)::value;
+                    float s0[NTC], s1[NTC];
+#pragma unroll
+                    for (int j = 0; j < NTC; ++j) {
+                        s0[j] = 0.0f;
+                        s1[j] = 0.0f;
+                    }
+                    for (int k = lane; k < nb * F::ipb; k += 32) {
+                        const int kbx = k / F::ipb, iqs = F::step * (k % F::ipb);
+                        const DecG<TG> dw0 = DecG<TG>::load(w0, kbx, iqs, &sgrid[0]);
+                        const DecG<TG> dw1 = DecG<TG>::load(w1, kbx, iqs, &sgrid[0]);
+#pragma unroll
+                        for (int j = 0; j < NTC; ++j) {
+                            const block_q8_1* xk = sx + (size_t)j * xb + kbx * (F::qk / 32);
+                            s0[j] += dw0.dot(xk, iqs);
+                            s1[j] += dw1.dot(xk, iqs);
+                        }
+                    }
+#pragma unroll
+                    for (int j = 0; j < NTC; ++j) {
+                        const float a = warp_sum(s0[j]) * sc0, b = warp_sum(s1[j]) * sc1;
+                        if (lane == 0) {
+                            res[j][i0] = a;
+                            res[j][i1] = b;
+                        }
+                    }
+                };
+                if constexpr (LNT == 1) {
+                    pass(std::integral_constant<int, 1>{});
+                } else if constexpr (LNT == 2) {
+                    if (cn == 1) pass(std::integral_constant<int, 1>{});
+                    else pass(std::integral_constant<int, 2>{});
+                } else {
+                    switch (cn) {
+                        case 1: pass(std::integral_constant<int, 1>{}); break;
+                        case 2: pass(std::integral_constant<int, 2>{}); break;
+                        case 3: pass(std::integral_constant<int, 3>{}); break;
+                        default: pass(std::integral_constant<int, 4>{}); break;
+                    }
+                }
+            }
+            item_ct1.barrier(sycl::access::fence_space::local_space);
+            if (warp < cn) {
+                const float gg = res[warp][lane], uu = res[warp][32 + lane];
+                const float xi = (gg / (1.0f + sycl::native::exp(-gg))) * uu;
+                float amax = sycl::fabs(xi), sum = xi;
+                auto sg = item_ct1.get_sub_group();
+#pragma unroll
+                for (int o = 16; o > 0; o >>= 1) {
+                    amax = sycl::fmax(amax, sycl::permute_group_by_xor(sg, amax, o));
+                    sum += sycl::permute_group_by_xor(sg, sum, o);
+                }
+                const float d = q8_1_finite(amax / 127.0f);
+                const int8_t q = q8_1_quant(xi, d, amax);
+                block_q8_1* y = hq + (size_t)(c0 + warp) * hb + (size_t)item_ct1.get_group(2);
+                y->qs[lane] = q;
+                if (lane == 0) y->ds = q8_1_ds(d, sum);
+            }
+        }
+    }
+}
+
+inline int gu_lnt(int gu_type, int64_t cap_groups, int64_t cap_entries) {
+    static const int cfg = [] {
+        const char* v = std::getenv("STRATA_GU_LNT");
+        return v ? std::atoi(v) : 0;
+    }();
+    if (cfg == 1 || cfg == 2 || cfg == 4) return cfg;
+    (void)gu_type;
+    if (cap_entries <= 10 || cap_entries <= cap_groups) return 1;
+    if (cap_entries <= 20 && cap_entries <= 2 * cap_groups) return 2;
+    return kLdsNt;
+}
+
+inline size_t gu_grid_bytes(int gu_type) {
+    switch (gu_type) {
+        case 16: return sizeof(GridOf<16>::T) * GridOf<16>::N;
+        case 17: return sizeof(GridOf<17>::T) * GridOf<17>::N;
+        case 18: return sizeof(GridOf<18>::T) * GridOf<18>::N;
+        case 21: return sizeof(GridOf<21>::T) * GridOf<21>::N;
+        case 22: return sizeof(GridOf<22>::T) * GridOf<22>::N;
+        case 23: return sizeof(GridOf<23>::T) * GridOf<23>::N;
+        case 29: return sizeof(GridOf<29>::T) * GridOf<29>::N;
+        default: return 0;
+    }
+}
+
+template <int TG, int LNT>
+inline void launch_gu_fused_t(sycl::range<3> gl, sycl::queue* s, size_t xb,
+                                const unsigned long long* grp_ptr, const int32_t* grp_start,
+                                const int32_t* n_groups, const int32_t* ent_tok,
+                                const block_q8_1* X, const NativeExpertLayout& L, block_q8_1* hq) {
+    s->submit([&](sycl::handler& cgh) {
+        sycl::local_accessor<int, 1> sx_acc(sycl::range<1>((size_t)LNT * xb * 9), cgh);
+        cgh.parallel_for(
+            sycl::nd_range<3>(gl * sycl::range<3>(1, 1, 256), sycl::range<3>(1, 1, 256)),
+            [=](sycl::nd_item<3> item) [[sycl::reqd_sub_group_size(32)]] {
+                native_gu_fused_kernel<TG, LNT>(item, grp_ptr, grp_start, n_groups, ent_tok, X, L, hq, sx_acc);
+            });
+    });
+}
+
+inline bool launch_gu_fused(int64_t gy, int64_t cap_groups, int64_t cap_entries, sycl::queue* s,
+                            const unsigned long long* grp_ptr, const int32_t* grp_start,
+                            const int32_t* n_groups, const int32_t* ent_tok, const block_q8_1* X,
+                            const NativeExpertLayout& L, block_q8_1* hq) {
+    const size_t max_slm = s->get_device().get_info<sycl::info::device::local_mem_size>();
+    const size_t xb = (size_t)(L.n_embd / 32);
+    const size_t gbytes = gu_grid_bytes(L.gu_type);
+    if (gbytes == 0) return false;
+    int lnt = gu_lnt(L.gu_type, cap_groups, cap_entries);
+    auto slm_need = [&](int n) -> size_t {
+        return gbytes + (size_t)n * 64 * sizeof(float) + (size_t)n * xb * sizeof(block_q8_1);
+    };
+    if (slm_need(lnt) > max_slm) lnt = 1;
+    if (slm_need(lnt) > max_slm) return false;
+    const sycl::range<3> gl(1, (size_t)gy, (size_t)(L.n_ff / 32));
+#define STRATA_LAUNCH_GU_FUSED(T)                                                                        \
+    case T:                                                                                              \
+        if (lnt == 1) launch_gu_fused_t<T, 1>(gl, s, xb, grp_ptr, grp_start, n_groups, ent_tok, X, L, hq); \
+        else if (lnt == 2) launch_gu_fused_t<T, 2>(gl, s, xb, grp_ptr, grp_start, n_groups, ent_tok, X, L, hq); \
+        else launch_gu_fused_t<T, 4>(gl, s, xb, grp_ptr, grp_start, n_groups, ent_tok, X, L, hq);       \
+        return true;
+    switch (L.gu_type) {
+        STRATA_LAUNCH_GU_FUSED(16)
+        STRATA_LAUNCH_GU_FUSED(17)
+        STRATA_LAUNCH_GU_FUSED(18)
+        STRATA_LAUNCH_GU_FUSED(21)
+        STRATA_LAUNCH_GU_FUSED(22)
+        STRATA_LAUNCH_GU_FUSED(23)
+        STRATA_LAUNCH_GU_FUSED(29)
+        default: return false;
+    }
+#undef STRATA_LAUNCH_GU_FUSED
+}
+
+inline bool launch_gu_lds(int64_t gy, sycl::queue* s,
+                          const unsigned long long* grp_ptr, const int32_t* grp_start,
+                          const int32_t* n_groups, const int32_t* ent_tok, const block_q8_1* X,
+                          const NativeExpertLayout& L, float* gate, float* up) {
+    const size_t max_slm = s->get_device().get_info<sycl::info::device::local_mem_size>();
+    const size_t xb = (size_t)(L.n_embd / 32);
+    const size_t gbytes = gu_grid_bytes(L.gu_type);
+    if (gbytes == 0 || gbytes + (size_t)kLdsNt * xb * sizeof(block_q8_1) > max_slm) return false;
+    const sycl::range<3> gl(1, (size_t)gy, (size_t)((2 * L.n_ff + kLdsRb - 1) / kLdsRb));
+#define STRATA_LAUNCH_GU_LDS(T)                                                                         \
+    case T:                                                                                             \
+        s->submit([&](sycl::handler& cgh) {                                                             \
+            sycl::local_accessor<int, 1> sx_acc(sycl::range<1>((size_t)kLdsNt * xb * 9), cgh);          \
+            cgh.parallel_for(                                                                           \
+                sycl::nd_range<3>(gl * sycl::range<3>(1, 1, 256), sycl::range<3>(1, 1, 256)),          \
+                [=](sycl::nd_item<3> item) [[sycl::reqd_sub_group_size(32)]] {                          \
+                    native_gu_lds_kernel<T>(item, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, sx_acc); \
+                });                                                                                     \
+        });                                                                                             \
+        return true;
+    switch (L.gu_type) {
+        STRATA_LAUNCH_GU_LDS(16)
+        STRATA_LAUNCH_GU_LDS(17)
+        STRATA_LAUNCH_GU_LDS(18)
+        STRATA_LAUNCH_GU_LDS(21)
+        STRATA_LAUNCH_GU_LDS(22)
+        STRATA_LAUNCH_GU_LDS(23)
+        STRATA_LAUNCH_GU_LDS(29)
+        default: return false;
+    }
+#undef STRATA_LAUNCH_GU_LDS
+}
+
 }  // namespace
 
 void iq_set_old_kernels(bool old) { g_old_kernels = old; }
@@ -4626,10 +5245,21 @@ size_t native_expert_scratch_bytes(int64_t cap, int64_t n_ff) {
            (((size_t)cap * (size_t)(n_ff / 32) * sizeof(block_q8_1) + 255) & ~(size_t)255);
 }
 
-static int g_exp_phase = 0;  // the bench: 0 all, 1 gate/up + swiglu + quantize only, 2 down only
+static int g_exp_mode = -1;  // native_expert_set_mode; -1 = STRATA_EXP_MODE (0 default, 7 = LDS, 8 = fused)
+static int g_exp_phase = 0;  // the bench: 0 all, 1 gate/up + swiglu + quantize only, 2 down only, 3 gate/up + swiglu only
 void native_expert_set_mode(int mode, int phase) {
-    (void)mode;
+    g_exp_mode = mode;
     g_exp_phase = phase;
+}
+
+static int exp_mode() {
+    static const int env = [] {
+        const char* v = std::getenv("STRATA_EXP_MODE");
+        return v ? std::atoi(v) : -1;
+    }();
+    if (g_exp_mode >= 0) return g_exp_mode;
+    if (env >= 0) return env;
+    return 0;
 }
 
 static bool g_grouped_v1 = env_on("STRATA_GROUPED_V1");
@@ -4685,46 +5315,64 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
         (g_grouped_v1 || grid_groups <= 0 || grid_groups > cap_groups) ? cap_groups : grid_groups;
     const int gu_rows = (!g_old_kernels && !g_no_sub16_gu && L.n_embd == 2560 && gu_split(L.gu_type)) ? 16 : GU_ROWS;
     const sycl::range<3> ggu(1, (size_t)gy, (size_t)((2 * L.n_ff + gu_rows - 1) / gu_rows));
+    const int em0 = exp_mode();
+    const bool gu_lds_type = L.gu_type == 16 || L.gu_type == 17 || L.gu_type == 18 ||
+                             L.gu_type == 21 || L.gu_type == 22 || L.gu_type == 23 || L.gu_type == 29;
+    const bool gu_lds_eligible = !g_old_kernels && !L.gu_nib && L.had_block <= 0 && !(g_expdec && expdec_gu_ok(L)) && gu_lds_type;
+    bool fused_done = false;
     if (g_exp_phase != 2) {
-        if (!expdec_gu(L, gy, cap_groups, s, grp_ptr, grp_start, n_groups, ent_tok, X, gate, up)) {
-            switch (L.gu_type) {
+        if (gu_lds_eligible && em0 == 8) {
+            fused_done = launch_gu_fused(gy, cap_groups, cap_entries, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, hq);
+        }
+        if (!fused_done) {
+            bool lds_done = false;
+            if (gu_lds_eligible && (em0 == 6 || em0 == 7)) {
+                lds_done = launch_gu_lds(gy, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
+            }
+            if (!lds_done && !expdec_gu(L, gy, cap_groups, s, grp_ptr, grp_start, n_groups, ent_tok, X, gate, up)) {
+                switch (L.gu_type) {
 #define STRATA_GU(T)                                                                 \
     case T:                                                                          \
         launch_gu<T>(ggu, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); \
         break;
-                STRATA_GU_FMTS(STRATA_GU)
+                    STRATA_GU_FMTS(STRATA_GU)
 #undef STRATA_GU
-                default:
-                    std::fprintf(stderr, "native_expert_grouped: gate/up type %d\n", L.gu_type);
-                    std::exit(1);
+                    default:
+                        std::fprintf(stderr, "native_expert_grouped: gate/up type %d\n", L.gu_type);
+                        std::exit(1);
+                }
             }
-        }
-        check("native_expert_grouped/gu");
-        const long long nh = (long long)cap_entries * L.n_ff;
-        if (g_grouped_v1) {
-            s->parallel_for(
-                sycl::nd_range<3>(sycl::range<3>(1, 1, (unsigned)((nh + 255) / 256)) * sycl::range<3>(1, 1, 256),
-                                  sycl::range<3>(1, 1, 256)),
-                [=](sycl::nd_item<3> /*item_ct1*/) { swiglu_entries_kernel(gate, up, h, nh); });
-            s->submit([&](sycl::handler& cgh) {
-                cgh.parallel_for(
+            check("native_expert_grouped/gu");
+            const long long nh = (long long)cap_entries * L.n_ff;
+            if (g_grouped_v1) {
+                s->parallel_for(
+                    sycl::nd_range<3>(sycl::range<3>(1, 1, (unsigned)((nh + 255) / 256)) * sycl::range<3>(1, 1, 256),
+                                      sycl::range<3>(1, 1, 256)),
+                    [=](sycl::nd_item<3> /*item_ct1*/) { swiglu_entries_kernel(gate, up, h, nh); });
+                if (g_exp_phase != 3) {
+                    s->submit([&](sycl::handler& cgh) {
+                        cgh.parallel_for(
+                            sycl::nd_range<3>(sycl::range<3>(1, 1, (unsigned)((nh + 255) / 256)) * sycl::range<3>(1, 1, 256),
+                                              sycl::range<3>(1, 1, 256)),
+                            [=](sycl::nd_item<3> /*item_ct1*/) [[sycl::reqd_sub_group_size(32)]] {
+                                quantize_q8_1_kernel(h, hq, nh);
+                            });
+                    });
+                }
+            } else {
+                s->parallel_for(
                     sycl::nd_range<3>(sycl::range<3>(1, 1, (unsigned)((nh + 255) / 256)) * sycl::range<3>(1, 1, 256),
                                       sycl::range<3>(1, 1, 256)),
                     [=](sycl::nd_item<3> /*item_ct1*/) [[sycl::reqd_sub_group_size(32)]] {
-                        quantize_q8_1_kernel(h, hq, nh);
+                        swiglu_q8_1_entries_kernel(gate, up, grp_start, n_groups, (int)L.n_ff, hq);
                     });
-            });
+            }
+            check("native_expert_grouped/swiglu");
         } else {
-            s->parallel_for(
-                sycl::nd_range<3>(sycl::range<3>(1, 1, (unsigned)((nh + 255) / 256)) * sycl::range<3>(1, 1, 256),
-                                  sycl::range<3>(1, 1, 256)),
-                [=](sycl::nd_item<3> /*item_ct1*/) [[sycl::reqd_sub_group_size(32)]] {
-                    swiglu_q8_1_entries_kernel(gate, up, grp_start, n_groups, (int)L.n_ff, hq);
-                });
+            check("native_expert_grouped/gu fused");
         }
-        check("native_expert_grouped/swiglu");
     }
-    if (g_exp_phase == 1) return;
+    if (g_exp_phase == 1 || g_exp_phase == 3) return;
     const int d_rows = (!g_old_kernels && !g_no_sub16_gu && L.n_ff == 640) ? (L.d_type == 20 || L.d_type == 40 ? 32 : (L.d_type == 42 ? 16 : 8)) : 8;
     const sycl::range<3> gd(1, (size_t)gy, (size_t)((L.n_embd + d_rows - 1) / d_rows));
     if (!expdec_down(L, gy, cap_groups, s, grp_ptr, grp_start, n_groups, ent_dst, hq, out)) {

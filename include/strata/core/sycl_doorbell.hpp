@@ -144,4 +144,25 @@ inline bool bm_default_on(const char* name, const sycl::device& d, bool bm_defau
     return bm_default && intel_gpu_gen(d) == IntelGpuGen::Battlemage;
 }
 
+/// Create an in-order SYCL queue, requesting high priority when supported and falling back cleanly on exception.
+inline sycl::queue make_in_order_queue(const sycl::context& ctx, const sycl::device& dev, bool high_priority,
+                                       bool* used_high_priority = nullptr) {
+    if (used_high_priority) *used_high_priority = false;
+#if defined(SYCL_EXT_ONEAPI_QUEUE_PRIORITY)
+    if (high_priority) {
+        try {
+            sycl::queue q(ctx, dev,
+                          sycl::property_list{sycl::property::queue::in_order{},
+                                              sycl::ext::oneapi::property::queue::priority_high{}});
+            if (used_high_priority) *used_high_priority = true;
+            return q;
+        } catch (const sycl::exception&) {
+        }
+    }
+#else
+    (void)high_priority;
+#endif
+    return sycl::queue(ctx, dev, sycl::property::queue::in_order{});
+}
+
 }  // namespace strata

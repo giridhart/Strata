@@ -889,7 +889,8 @@ void qsa_block_topk(const float* scores, const int32_t* steps, int64_t nq, int64
     if (cluster && !old && nq <= 16 && qsa_block_topk_cluster(scores, steps, nq, max_blocks, cap, s, ids, stream))
         return;
 #endif
-    const int64_t reach = active_blocks > 0 && active_blocks < max_blocks ? active_blocks : max_blocks;
+    const bool counted = active_blocks > 0;
+    const int64_t reach = counted && active_blocks < max_blocks ? active_blocks : max_blocks;
     const int64_t fit = (int64_t)TK_T * TK_PER;
     if (old) {
         qsa_block_topk_ref(scores, steps, nq, max_blocks, cap, s, ids, stream);
@@ -899,10 +900,30 @@ void qsa_block_topk(const float* scores, const int32_t* steps, int64_t nq, int64
         std::fprintf(stderr, "qsa_block_topk: unsupported geometry or cap\n");
         std::exit(1);
     }
-    static sycl::queue default_queue{sycl::property::queue::in_order()};
     sycl::queue* q_ptr = stream ? static_cast<sycl::queue*>(stream) : &get_default_queue();
 
-    if (reach > fit) {
+    // Prefill (counted == true) with large block*query work can thrash L2 / GRF in block_topk_reg_kernel<33>;
+    // route counted dispatches with reach * nq >= STRATA_QSA_TOPK_WIDE_MIN (default 7168) to block_topk_wide_kernel.
+    // STRATA_QSA_TOPK_PREFILL_WIDE=0 disables the guard; =1 forces wide for all counted calls.
+    const char* prefill_wide_env = std::getenv("STRATA_QSA_TOPK_PREFILL_WIDE");
+    const char* wide_min_env = std::getenv("STRATA_QSA_TOPK_WIDE_MIN");
+    bool prefill_wide = false;
+    if (counted) {
+        if (prefill_wide_env != nullptr && prefill_wide_env[0] == '0') {
+            prefill_wide = false;
+        } else if (prefill_wide_env != nullptr && prefill_wide_env[0] == '1') {
+            prefill_wide = true;
+        } else {
+            const int64_t wide_min = (wide_min_env != nullptr && wide_min_env[0] != '\0')
+                                         ? std::atoll(wide_min_env)
+                                         : (int64_t)7168;
+            if (wide_min >= 0) {
+                prefill_wide = (wide_min == 0) || (reach > 0 && reach >= (wide_min + nq - 1) / nq);
+            }
+        }
+    }
+
+    if (reach > fit || prefill_wide) {
         q_ptr->submit([&](sycl::handler& cgh) {
             sycl::local_accessor<int[TK_T / 32][256], 0> hist_acc(cgh);
             sycl::local_accessor<int, 1> s_gt_acc(sycl::range<1>(TK_T / 32), cgh);

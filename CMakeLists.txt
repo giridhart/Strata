@@ -999,6 +999,13 @@ endif()
     add_test(NAME expert_profile_version_test COMMAND expert_profile_version_test)
     set_tests_properties(expert_profile_version_test PROPERTIES TIMEOUT 60)
   endif()
+  if(STRATA_BUILD_TESTS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/core/mtp_kv_resident_test.cpp")
+    enable_testing()
+    add_executable(mtp_kv_resident_test tests/core/mtp_kv_resident_test.cpp)
+    target_link_libraries(mtp_kv_resident_test PRIVATE strata_engine)
+    add_test(NAME mtp_kv_resident_test COMMAND mtp_kv_resident_test)
+    set_tests_properties(mtp_kv_resident_test PROPERTIES RESOURCE_LOCK gpu TIMEOUT 60)
+  endif()
   if(STRATA_BUILD_TESTS AND STRATA_NATIVE_EXPERTS)
     # native_experts.txt v2-v4 (the real packs' copies and the per-role shard column) and the arena filled from
     # synthetic GGUF shards at the real expert dimensions
@@ -2222,6 +2229,13 @@ endif()
     add_test(NAME sycl_verify_kernels COMMAND sycl_verify_kernels)
   endif()
 
+  if(STRATA_ENABLE_SYCL AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/sycl/spec_tree_test.cpp")
+    add_executable(sycl_spec_tree tests/sycl/spec_tree_test.cpp)
+    target_include_directories(sycl_spec_tree PRIVATE ${_strata_gpu_include_directories})
+    target_link_libraries(sycl_spec_tree PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+    add_test(NAME sycl_spec_tree COMMAND sycl_spec_tree)
+  endif()
+
   if(STRATA_ENABLE_SYCL AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/sycl/draft_head_test.cpp")
     add_executable(sycl_draft_head tests/sycl/draft_head_test.cpp)
     target_include_directories(sycl_draft_head PRIVATE ${_strata_gpu_include_directories})
@@ -2404,6 +2418,21 @@ endif()
       "${CMAKE_CURRENT_SOURCE_DIR}/third_party/llama.cpp/ggml/src")
     target_link_libraries(sycl_iq_mmq_parity PRIVATE strata_kernels ggml-base ${_strata_gpu_runtime_target})
     add_test(NAME sycl_iq_mmq_parity COMMAND sycl_iq_mmq_parity)
+  endif()
+
+  if(STRATA_ENABLE_SYCL AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/sycl/sycl_iq_fused_bench.cpp")
+    add_executable(sycl_iq_fused_bench tests/sycl/sycl_iq_fused_bench.cpp)
+    target_include_directories(sycl_iq_fused_bench PRIVATE ${_strata_gpu_include_directories})
+    target_link_libraries(sycl_iq_fused_bench PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+    add_test(NAME sycl_iq_fused_bench COMMAND sycl_iq_fused_bench)
+  endif()
+
+  if(STRATA_ENABLE_SYCL AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/sycl/sycl_p2_kernels_bench.cpp")
+    add_executable(sycl_p2_kernels_bench tests/sycl/sycl_p2_kernels_bench.cpp)
+    target_include_directories(sycl_p2_kernels_bench PRIVATE ${_strata_gpu_include_directories})
+    target_link_libraries(sycl_p2_kernels_bench PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+    add_test(NAME sycl_p2_kernels_bench COMMAND sycl_p2_kernels_bench)
+    set_tests_properties(sycl_p2_kernels_bench PROPERTIES SKIP_RETURN_CODE 77)
   endif()
 
   if(STRATA_ENABLE_SYCL AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/sycl/gdn_chunk_parity.cpp")
@@ -3182,6 +3211,10 @@ if(STRATA_NATIVE_EXPERTS)
   if(STRATA_BUILD_TESTS)
     add_test(NAME iq_avx2_parity COMMAND iq_avx2_parity)
     add_test(NAME iq_avx2_parity_iq3s_mt1 COMMAND ${CMAKE_COMMAND} -E env STRATA_IQ3S_MT1=1 $<TARGET_FILE:iq_avx2_parity>)
+    add_executable(cpu_dual_row_parity src/kernels/cpu/cpu_dual_row_parity.cpp)
+    target_link_libraries(cpu_dual_row_parity PRIVATE strata_kernels_cpu)
+    add_test(NAME cpu_dual_row_parity COMMAND cpu_dual_row_parity)
+    set_tests_properties(cpu_dual_row_parity PROPERTIES ENVIRONMENT "STRATA_Q2_BITPLANE=1")
   endif()
   # the older CPUs' AVX1 expert rows (iq_avx1.cpp) against ggml-cpu's dots and against their own one-token
   # rows at every width; --bench: ms per expert, the weights streamed from DRAM.  Runs on any AVX CPU:
@@ -3959,7 +3992,7 @@ if(STRATA_ENABLE_SYCL)
     DEPENDS sycl_native_qsa_score sycl_native_router sycl_native_ple_postops
             sycl_native_bf16 sycl_native_gdn sycl_native_gdn_preprocess
             sycl_native_flash_attn sycl_native_mmvq sycl_model_shapes sycl_fused_gdn
-            sycl_dequant_bf16 sycl_verify_kernels sycl_draft_head sycl_graph strata-device
+            sycl_dequant_bf16 sycl_verify_kernels sycl_spec_tree sycl_draft_head sycl_graph strata-device
             sycl_native_gr_norm sycl_xe2_subgroup_gemv sycl_xmx_joint_matrix
             sycl_qsa_negative_cell_guard sycl_queue_sync_test sycl_subgroup_divergence_test
             s_gemv_pair_parity quantize_act_images_parity bf16_gemv_pair_parity
@@ -3967,6 +4000,7 @@ if(STRATA_ENABLE_SYCL)
             gdn_chunk_parity trellis_parity finish_test gemv_rows_test numerics_test
             hc_mix_split_test q8_quant_multi_test sycl_igc_workaround_test
             sycl_level_zero_memory_test prefill_gemm_parity sycl_iq_mmq_parity
+            sycl_iq_fused_bench sycl_p2_kernels_bench
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
     COMMENT "Running Intel SYCL tests via ctest"
     USES_TERMINAL
