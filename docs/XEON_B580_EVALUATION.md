@@ -56,7 +56,7 @@ ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build_sycl/sycl_spec_tree --bench
 
 ## 3. End-to-End Model A/B Matrix (`strata`)
 
-Compare before/after end-to-end `tok/s` on your exact GGUF pack (`IQ3_S`, `IQ2_XS`, `IQ1_M`, etc.) with identical prompt, `--max-tokens`, and `--kv` / `--kv-resident` flags:
+Compare before/after end-to-end `tok/s` on your exact GGUF pack (`IQ3_S`, `IQ2_XS`, `IQ1_M`, etc.) with identical prompt, `--max-new`, and `--kv` / `--kv-resident` flags:
 
 ```bash
 # Baseline (disable new defaults + keep opt-in features off)
