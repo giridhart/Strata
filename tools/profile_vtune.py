@@ -211,6 +211,12 @@ def main():
         default="gpu-hotspots",
         help="Intel VTune analysis type (default: gpu-hotspots)",
     )
+    parser.add_argument(
+        "--knob",
+        action="append",
+        default=[],
+        help="Pass custom -knob key=value to VTune (can be specified multiple times)",
+    )
     parser.add_argument("--url", default="http://127.0.0.1:8080", help="Strata server URL")
     parser.add_argument("--port", type=int, default=8080, help="Port to start server on if not running")
     parser.add_argument("--max-tokens", type=int, default=512, help="Maximum new tokens to generate (default: 512)")
@@ -278,9 +284,13 @@ def main():
             vtune_cmd = [
                 vtune,
                 "-collect", args.analysis,
+            ]
+            for knob in args.knob:
+                vtune_cmd.extend(["-knob", knob])
+            vtune_cmd.extend([
                 "-result-dir", str(out_dir),
                 "-target-pid", str(target_pid),
-            ]
+            ])
             vtune_proc = subprocess.Popen(vtune_cmd, env=env)
             time.sleep(2)  # Allow VTune collector to initialize hooks
 
@@ -306,7 +316,16 @@ def main():
                 f"import sys; sys.path.insert(0, '{ROOT}/tools'); "
                 f"import profile_vtune; profile_vtune.send_prompt('{args.url}', '{args.prompt}', {args.max_tokens}, {args.temperature}, '{args.api_key}', {effort_repr})"
             ]
-            vtune_cmd = [vtune, "-collect", args.analysis, "-result-dir", str(out_dir), "--", *runner]
+            vtune_cmd = [
+                vtune,
+                "-collect", args.analysis,
+            ]
+            for knob in args.knob:
+                vtune_cmd.extend(["-knob", knob])
+            vtune_cmd.extend([
+                "-result-dir", str(out_dir),
+                "--", *runner
+            ])
             subprocess.run(vtune_cmd, env=env, check=False)
 
         print("\n=======================================================")
