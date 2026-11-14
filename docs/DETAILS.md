@@ -133,7 +133,7 @@ released app, run its installer and open Strata from the Start menu. For the Ter
 setup plan and the startup log for what is actually chosen on your machine, and see [TROUBLESHOOTING.md](TROUBLESHOOTING.md)
 if a component is missing.
 
-Terminal chat from a checkout: `.venv\Scripts\python chat.py`.
+Terminal chat from a checkout: `.venv\Scripts\python tools\chat.py`.
 
 ### Tuning for your PC (`--calibrate`)
 
@@ -191,7 +191,7 @@ These notes are for **source setup**. Normal installs use [the Terminal or AppIm
 Source setup offers choices for the detected machine and can install missing Debian or Ubuntu dependencies with `sudo apt`.
 It starts the server on `http://127.0.0.1:8080` unless you configure another address or port. Later runs of `./setup.sh`
 or `./run-<model>.sh` start the model directly. The options are the same as on Windows (`./setup.sh --setup`,
-`--model Q2_0 --yes`, `--gguf-dir /data/Q2_0`). Terminal chat: `.venv/bin/python chat.py`. Building from git and trying a pull
+`--model Q2_0 --yes`, `--gguf-dir /data/Q2_0`). Terminal chat: `.venv/bin/python tools/chat.py`. Building from git and trying a pull
 request: [SOURCE_INSTALL.md](SOURCE_INSTALL.md#build-from-git-on-linux-to-try-a-pull-request-or-change-the-code).
 
 - **Updating:** `git pull`, then `./setup.sh`. It compiles the engine again when its source changed. If the compile
@@ -266,7 +266,8 @@ When the RAM cannot hold them beside the system (the experts plus about 10 GB), 
 - Several GPUs: setup recommends one GPU in the low-RAM mode and asks. `--gpus 0,1` shares the model across both cards
   ([MULTI_GPU.md](MULTI_GPU.md#using-it)). `--yes` keeps one GPU.
 - With a page-locked copy the GPU also takes its share of the misses over PCIe (`--pcie-frac`). `--pcie-frac 0` (or
-  `STRATA_RESIDENT_PIN=0`) gives the mapped mode's exact tokens.
+  `STRATA_RESIDENT_PIN=0`) gives the mapped mode's exact tokens. `STRATA_RESIDENT_PIN=0` applies to `--resident-experts`,
+  `--resident-budget-gib N` and the RAM copy the engine makes on its own when the expert arena does not fit.
 - Linux, opt-in: `STRATA_ARENA_MMAP=1` maps a native pack's expert arena read-only from `experts.bin` instead of reading
   it into locked RAM (for example 2x 16 GB GPUs with 32 GB of RAM). Run it with `--pcie-frac 0`.
 - Windows, opt-in: `STRATA_FILE_RELEASE=1` trims the file-backed pages of experts after their GPU uploads. It is a
@@ -723,7 +724,7 @@ system prompt with a billing header that changes on every request; the server pi
 | Option | Effect |
 | --- | --- |
 | `--prompt-cache N` | Number of checkpoints (`0` = off, which also disables parking). |
-| `--prompt-cache-every N`, `--prompt-cache-root N`, `--turn-token ID` | Checkpoint interval, the system-prompt checkpoint (`0` = none) and the turn token. The interval is not a piece-size setting: [what it does](PROMPT_CACHE_TAIL.md#prompt-cache-every-does-not-set-the-size-of-the-pieces-a-prompt-is-read-in). |
+| `--prompt-cache-every N`, `--prompt-cache-root N`, `--turn-token ID` | Checkpoint interval, the system-prompt checkpoint (`0` = none) and the turn token. The interval is not a piece-size setting: [what it does](PROMPT_CACHE_TAIL.md#--prompt-cache-every-does-not-set-the-size-of-the-pieces-a-prompt-is-read-in). |
 | `--prompt-cache-spread` (opt-in) | The checkpoint that leaves is the one whose removal leaves the smallest gap, so the kept points thin out geometrically back from the end. An agent that rewrites its history a few thousand tokens back then resumes near the edit instead of at the system prompt. Same RAM. |
 | `"strata_checkpoint": false` (per request) | A one-shot request that no later request continues saves no checkpoints and keeps no session. |
 | `"strata_prefix": {"messages": 1}` (per request, opt-in) | One long document, many questions. Marks where the document ends: `{"messages": 1}`, `{"message": 0, "chars": 210000}` or `{"tokens": 12345}`. The checkpoint at the boundary is pinned, so 20 questions cost one read of the document. One pinned prefix at a time per engine; needs `--prompt-cache 3` or more; a malformed field is a 400. See [RESEARCH_RUNS.md](RESEARCH_RUNS.md). |
@@ -741,7 +742,7 @@ the source. It covers parking and session files only, not the startup sizing of 
 **When the arena does not fit in the RAM that is free (#4051).** The engine checks the RAM before it reads the experts into the
 arena. A memory limit below the arena (a container) stops the start with the numbers. Less free RAM than the arena (an engine
 that was still exiting, another program) is waited for up to 20 s, and the log says so (`STRATA_ARENA_RAM_WAIT_S` changes the
-seconds, `0` loads at once); if it is still short the load goes on with a warning that says how much, never a refusal. Below half
+seconds, `0` loads at once). On Linux, if free memory, file cache or a reserved huge-page pool can hold the experts, they load anyway with a warning; otherwise the run reads them from the file. `STRATA_ARENA_FILE_CACHE=0` always reads from the file. Below half
 of the arena the warning adds that the whole PC can stall in memory reclaim, and that a systemd `MemoryHigh=` below the RAM keeps
 one program from taking all of it. The server, before it starts an engine, ends one that an earlier run left behind and now waits up
 to 120 s for it to be gone (it used to wait 10 s): an engine with tens of GB of pinned memory needs longer to give it back, and the
@@ -763,6 +764,9 @@ in a RAM copy, as much as the RAM available at the start allows after a headroom
   the safety headroom. The explicit modes (`--resident-budget-gib N`, `--resident-experts`) leave `max(W, their own 4 GiB)`.
 - The app's "Leave 20% for my work" passes W = clamp(ceil(0.2 x RAM in GB), 5, 8) as `STRATA_RAM_KEEP_GIB` in the run config's env (not as the flag, so an older engine chosen in the Engine tab, which ignores an env variable, still starts); `strata serve` and full performance pass nothing.
 - `STRATA_ARENA_FALLBACK_RESIDENT=0` keeps the plain file source for the fallback (testers).
+- The RAM copy is page-locked. `STRATA_RESIDENT_PIN=0` keeps it in ordinary pageable memory, as with `--resident-budget-gib`. Under a
+  tight memory limit the system can then swap part of it out: with a 51.75 GiB limit on an R9700 PC (explicit 45.24 GiB budget, one run)
+  prompts read at 920 against 1,754 tok/s and decoding ran at 77.7 against 83.3 tok/s.
 
 Snapshots hold running state, checkpoints, used K/V pages and draft-layer K/V. They add host RAM, not VRAM. Oldest parked entries
 are evicted first. A new conversation that starts at a checkpoint inside a parked one (sub-agents that share a system prompt)

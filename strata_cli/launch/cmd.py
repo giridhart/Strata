@@ -7,9 +7,7 @@ import json
 import os
 import re
 import sys
-import threading
 from pathlib import Path
-from typing import Any
 
 from strata_cli.launch import settings as S
 
@@ -103,7 +101,7 @@ def add_parsers(sp: argparse._SubParsersAction) -> list[argparse.ArgumentParser]
                         "slower answers; use it when the engine stops at start on a small card or a PC with little RAM. Default: on")
     g.add_argument("--drafting", type=_choice("a drafting setting", S.DRAFTING_MODES), metavar="auto|mtp|dflash2|off",
                    help="which drafter guesses words ahead to make answers faster, one at a time: auto (recommended: DFlash2 for Qwen3.8-Flash-Next where the engine has it, "
-                        "else the MTP), mtp, dflash2 (downloads a 1.2 GB drafter once) or off. Auto uses the MTP when several requests run at once; --drafting dflash2 runs with the --parallel count you set. "
+                        "else the MTP), mtp, dflash2 (downloads its drafter once, 0.3 to 1.2 GB depending on the model; the size is shown before the download) or off. Auto uses the MTP when several requests run at once; --drafting dflash2 runs with the --parallel count you set. "
                         "If DFlash2 cannot run (on a model it is not for, for example) the MTP is used alone and the start says why")
     g.add_argument("--split-engine", type=_choice("a split-engine setting", S.SPLIT_MODES), metavar="auto|on|off",
                    help="NVIDIA, two or more cards: the engine that splits every layer across the cards (faster answers). auto (the default) uses it by itself "
@@ -113,7 +111,8 @@ def add_parsers(sp: argparse._SubParsersAction) -> list[argparse.ArgumentParser]
                    help="DeepSeek: faster uses 5 of 6 experts per word (a small quality change, usually not noticeable; the default on a PC with 16 GB "
                         "of graphics memory or less, and on a single Radeon RX 9000 / AI PRO R9700 card, or several that hold half of the experts), full uses all 6")
     g.add_argument("--full-quality", action="store_true", help="DeepSeek: all 6 experts per word (the same as --speed full), for scripts")
-    g.add_argument("--gpu", metavar="LIST", help="graphics card numbers to use, e.g. 0 or 0,1 (default: the engine's choice)")
+    g.add_argument("--gpu", metavar="LIST", help="graphics card numbers to use, e.g. 0 or 0,1 (default: the engine's choice). "
+                   "With more than one card the engine decides which is the Main card; --gpu-roles (instead of --gpu) sets the roles yourself.")
     g.add_argument("--backend", metavar="nvidia|amd|intel|auto",
                    help="which make of graphics card the engine uses on a PC that has cards of more than one make (default: auto = NVIDIA first, "
                         "then AMD, then Intel). Your choice is remembered for the next launch, update and app; 'auto' forgets it")
@@ -411,6 +410,8 @@ def apply_defaults(s: S.LaunchSettings, catalog) -> tuple[S.LaunchSettings, list
                     pass
             if r.verdict == "no":
                 notices.append(S.Notice("warn", f"{r.title} does not fit this computer.", "It can still start; expect it to be slow or to run out of memory."))
+            elif r.verdict == "slower":
+                notices.append(S.Notice("warn", f"{r.title}: {r.words}.", ""))
             elif r.verdict == "tight" and s.model_path and "disk space" in r.words:
                 pass                                         # the files are already here ("used where they are"): there is no download to make room for
             elif r.verdict == "tight":
@@ -565,7 +566,7 @@ def _interrupted_move_notice() -> None:
 
 def _printer(quiet: bool = False):
     """An emit callback that prints readable lines: new text once, progress in steps of 10% when not on a terminal."""
-    state = {"last": None, "pct": -10, "stage": None}
+    state = {"last": None, "pct": -10, "stage": None, "key": None}
     isatty = sys.stdout.isatty()
 
     def emit(ev) -> None:
@@ -577,9 +578,10 @@ def _printer(quiet: bool = False):
                 sys.stdout.write(f"\r  {text}  {ev.pct:.0f}%   " + ("\n" if ev.pct >= 100 else ""))
                 sys.stdout.flush()
                 return
-            if ev.pct < 100 and ev.pct < state["pct"] + 10 and state["stage"] == ev.stage:
+            key = text.rsplit(":", 1)[0]                     # the sentence without its figure: a new sentence is always shown
+            if ev.pct < 100 and ev.pct < state["pct"] + 10 and state["stage"] == ev.stage and key == state["key"]:
                 return
-            state["pct"] = ev.pct
+            state["pct"], state["key"] = ev.pct, key
         if ev.stage == "start" and ev.text.startswith("Loading the model") and state["stage"] == "start" and not isatty:
             n = int("".join(ch for ch in ev.text.split("…")[-1] if ch.isdigit()) or 0)
             if n % 15:
@@ -592,7 +594,7 @@ def _printer(quiet: bool = False):
 
 
 def _stop_all(name: str | None) -> int:
-    from strata_cli.launch import access, store
+    from strata_cli.launch import access
     from strata_control import profiles, runtime
     targets = [name] if name else [p["id"] for p in profiles.list_profiles() if p["id"].startswith("launch-")]
     stopped = failed = 0
@@ -1062,7 +1064,7 @@ def run_launch(a: argparse.Namespace) -> int:
 # ------------------------------------------------------------------------------------------------ connect
 
 def run_connect(a: argparse.Namespace) -> int:
-    from strata_cli.launch import access, harness
+    from strata_cli.launch import harness
     machine = a.output == "json"
     if not a.harness:
         rows = [{"id": h.id, "title": h.title, "speaks": h.speaks, "status": h.status, "vendor_tested": h.tested or None} for h in harness.HARNESSES]

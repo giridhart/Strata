@@ -1459,6 +1459,9 @@ public:
     void stage_lend_regions(std::vector<std::vector<std::pair<int32_t, int32_t>>> regions) {
         stage_lend_regions_ = std::move(regions);
     }
+    /// The budget passed to `pin_cache_complement` is the automatic RAM copy's (the engine chose it because the expert
+    /// arena did not fit), not --resident-budget-gib: the line printed when it is cut names no flag.  Set BEFORE it.
+    void budget_is_automatic(bool automatic) { budget_automatic_ = automatic; }
     void close();
 
     bool mapped() const { return base_ != nullptr; }
@@ -1913,7 +1916,8 @@ private:
     uint64_t complement_locked_ = 0;          ///< bytes held in the working set (pin refused)
     int64_t complement_lent_slots_ = 0;
     std::vector<std::vector<std::pair<int32_t, int32_t>>> stage_lend_regions_;  ///< a split: each stage's lend region
-    std::vector<const uint8_t*> override_;    ///< staged exchanges: an evicted expert read from its exchange buffer
+    bool budget_automatic_ = false;           ///< budget_is_automatic
+    std::vector<const uint8_t*> override_;   ///< staged exchanges: an evicted expert read from its exchange buffer
     struct Exchange { size_t in, out; int64_t q; uint64_t bytes; };
     std::vector<Exchange> staged_;
     std::atomic<ForesightSwap*> fs_swap_{nullptr};   ///< set_foresight_swap
@@ -2015,6 +2019,10 @@ public:
     /// The headroom the arena must find under a HARD memory limit (cgroup, container, job object) beyond its own size when the fallback is
     /// allowed: the RAM copy's headroom (ple_residency.hpp, arena_hard_limit_need).  0: none.  Set before `open`.
     uint64_t hard_limit_headroom_bytes = 0;
+    /// #5327: `open` also says the "loads anyway" warning on stdout when this is set (`--serve`: a service setup keeps stdout in its log and
+    /// never sees stderr; the lines come before READY, which the server ignores).  Unset (a plain `generate` run): stderr only, so the token
+    /// stream stays clean.  Set before `open`.
+    bool notices_on_stdout = false;
     bool ram_short() const { return ram_short_; }
     /// #633: set by `open` when the RAM available is less than the arena needs (a recommendation; it still loads)
     const std::string& ram_warning() const { return ram_warning_; }

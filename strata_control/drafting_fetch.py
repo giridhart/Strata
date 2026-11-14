@@ -54,7 +54,8 @@ def plan(data_dir: str | Path, engine: str | os.PathLike[str] | None = None, *, 
         text = (f"The DFlash2 drafter is {drafting.DOWNLOAD_GB:.1f} GB to download (it is packed to {drafting.PACK_GB:.2f} GB for the engine and the "
                 f"download is removed), from {drafting.REPO}, {drafting.LICENSE}. It needs about {drafting.vram_gb(data_dir, engine):.1f} GB of graphics memory, "
                 "less than the MTP's layer, which is not loaded beside it.")
-    return {"ready": ready, "gb": gb, "vram_gb": drafting.vram_gb(data_dir, engine), "selq4": drafting.uses_selector_q4(data_dir, engine), "pack": str(drafting.pack_path(data_dir, model_name=model_name, backend=backend)), "repo": drafting.REPO, "revision": drafting.REVISION, "text": text}
+    return {"ready": ready, "gb": gb, "drafter_gb": pin.gb if tuned else drafting.DOWNLOAD_GB, "tuned": tuned, "file": pin.name if tuned else drafting.PACK_NAME,
+            "vram_gb": drafting.vram_gb(data_dir, engine), "selq4": drafting.uses_selector_q4(data_dir, engine), "pack": str(drafting.pack_path(data_dir, model_name=model_name, backend=backend)), "repo": drafting.REPO, "revision": drafting.REVISION, "text": text}
 
 
 def _packer():
@@ -156,15 +157,9 @@ def convert_selector(data_dir: str | Path, *, progress: Progress | None = None, 
 
 
 FEED_TIMEOUT = 8.0
-RETRY_AFTER_S = 12 * 3600          # Load (strata launch) asks the feed for the tuned drafter at most this often when the answer was "nothing"; setup and `strata drafting fetch` always ask
-MISS_MARK = ".tuned-feed-miss"
-
-
-def _recent_miss(data_dir: str | Path) -> bool:
-    try:
-        return time.time() - (Path(data_dir) / drafting.FOLDER / MISS_MARK).stat().st_mtime < RETRY_AFTER_S
-    except OSError:
-        return False
+RETRY_AFTER_S = drafting.RETRY_AFTER_S          # Load (strata launch) asks the feed for the tuned drafter at most this often when the answer was "nothing"; setup and `strata drafting fetch` always ask
+MISS_MARK = drafting.MISS_MARK
+_recent_miss = drafting.recent_miss              # (the start's "Run strata drafting fetch" line reads the same mark: strata_control/drafting.py fetch_hint)
 
 
 def _note_miss(data_dir: str | Path, missed: bool) -> None:
@@ -201,7 +196,7 @@ def tuned_from_feed(*, feed: str | None = None, backend: str | None = None, size
     try:
         loaded = feedmod.fetch(source, signing.load_trusted_keys(), timeout=FEED_TIMEOUT, channel="stable")
     except feedmod.FeedError as exc:
-        if exc.exit_code == 6 or "trusts no update key" in str(exc):
+        if isinstance(exc, feedmod.FeedUnreachable) or exc.exit_code == 6 or "trusts no update key" in str(exc):
             return None
         raise DraftingError(f"The update feed could not be trusted: {exc}") from None
     for entry in loaded.drafters:
@@ -264,8 +259,10 @@ def ensure_tuned(data_dir: str | Path, *, progress: Progress | None = None, canc
     out.parent.mkdir(parents=True, exist_ok=True)
     partial = out.with_name(out.name + ".part")
     try:
-        transfer.download(location, partial, size=want_size, sha256=want_sha, cancel=cancel,
+        transfer.download(location, partial, size=want_size, sha256=want_sha, cancel=cancel, what="the tuned DFlash2 drafter",
                           progress=lambda d, _s: report("Downloading the tuned DFlash2 drafter…", d, want_size))
+    except transfer.Unreachable as exc:
+        raise DraftingError(str(exc)) from None          # the network rule's sentence: the host, what to check, what still works
     except transfer.ChecksumMismatch:
         raise DraftingError("The tuned DFlash2 drafter did not pass the safety check, so it was deleted.") from None
     except transfer.Cancelled:
@@ -339,8 +336,10 @@ def ensure(data_dir: str | Path, *, progress: Progress | None = None, cancel: th
             base = done_before
             partial = src / (name + ".part")
             try:
-                transfer.download((base_url or drafting.BASE_URL) + name, partial, size=size, sha256=sha, cancel=cancel,
+                transfer.download((base_url or drafting.BASE_URL) + name, partial, size=size, sha256=sha, cancel=cancel, what="the DFlash2 drafter",
                                   progress=lambda d, _s, base=base: report("Downloading the DFlash2 drafter…", base + d, total))
+            except transfer.Unreachable as exc:
+                raise DraftingError(str(exc)) from None  # the network rule's sentence: the host, what to check, what still works
             except transfer.ChecksumMismatch:
                 raise DraftingError("The downloaded DFlash2 file did not pass the safety check, so it was deleted. Try again; if it keeps "
                                     "happening, use MTP for now.") from None

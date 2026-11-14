@@ -2,6 +2,7 @@
 #include "strata/prefill/gemm.hpp"
 #include "strata/kernels/dequant_bf16.hpp"
 #if defined(STRATA_PREFILL_MMQ) && defined(__HIPCC__)
+#include "strata/prefill/mmq_ids_margin.hpp"
 #include "strata/prefill/moe_mmq.hpp"
 #endif
 
@@ -28,6 +29,8 @@
 #endif
 
 #include <algorithm>
+#include <cctype>
+#include <initializer_list>
 #include <climits>
 #include <cstdio>
 #include <cstdlib>
@@ -272,10 +275,19 @@ std::string own_tuning_dir() {
 std::unique_ptr<HipLtState> create_hipblaslt_state(void* workspace, size_t workspace_bytes) {
     std::string path_own;
     const char* path = std::getenv("STRATA_HIPBLASLT_TUNING");
-    bool from_package = false;
+    bool from_package = false, table_forced = false;
     if (!path || !*path) {
-        const char* sw = std::getenv("STRATA_HIPBLASLT_TABLE");     // the launcher's switch: off / 0 / false = never the packaged table
-        if (sw != nullptr && (std::strcmp(sw, "off") == 0 || std::strcmp(sw, "0") == 0 || std::strcmp(sw, "false") == 0)) return nullptr;
+        const char* sw = std::getenv("STRATA_HIPBLASLT_TABLE");     // the launcher's switch (strata_control/hipblaslt_tuning.py): off / on / auto
+        std::string low = sw != nullptr ? sw : "";                   // trimmed and lower case, as the launcher reads it
+        while (!low.empty() && std::isspace((unsigned char) low.back())) low.pop_back();
+        while (!low.empty() && std::isspace((unsigned char) low.front())) low.erase(low.begin());
+        for (char& ch : low) ch = (char) std::tolower((unsigned char) ch);
+        const auto word = [&](std::initializer_list<const char*> ws) {
+            for (const char* w : ws) if (low == w) return true;
+            return false;
+        };
+        if (word({"off", "0", "no", "false", "none", "disable", "disabled"})) return nullptr;   // never the packaged table
+        table_forced = word({"on", "1", "yes", "true", "force", "enable", "enabled"});          // any card that has a table beside the engine
         from_package = true;                                          // the file is found below, once the card and the version are known
     }
 
@@ -303,6 +315,10 @@ std::unique_ptr<HipLtState> create_hipblaslt_state(void* workspace, size_t works
     if (suffix != std::string::npos) arch.resize(suffix);
 
     if (from_package) {
+        // Unset or "auto": only Strix Halo (gfx1151) takes the packaged table by itself, the owner's decision of 2026-10-19 (the same
+        // rule as AUTO_ARCHS in strata_control/hipblaslt_tuning.py): on other cards the table changes the answers' last digits for ~1%
+        // (gfx1201), so they take it with STRATA_HIPBLASLT_TABLE=on only.
+        if (!table_forced && arch != "gfx1151") return nullptr;
         const std::string dir = own_tuning_dir();
         if (dir.empty()) return nullptr;
         path_own = dir + arch + "-hipblaslt-" + std::to_string(version) + ".txt";
@@ -1279,8 +1295,12 @@ bool Gemm::native_mmq(const uint16_t* X, int type, const void* W, float* Y, int6
     if (ldy <= 0) ldy = N;
 
     const auto up = [](size_t v) { return (v + 255) & ~(size_t) 255; };
+    // The row table is read past its end by llama.cpp's MMQ (mul_mat_q: a whole J-column tile from the start of each tile, J up to 128; the stream-k fixup:
+    // up to roundup(max_rows, J) from the expert's first row): kRows + the margin of mmq_ids_margin.hpp (max_rows <= kRows), the identity written over all of it.
+    // Exact, with only the 256 bytes of the bounds after it, a tile of 112 columns on a full chunk read 384 bytes past the table, 128 past the allocation.
+    const size_t ids_rows = (size_t) mmq::mmq_ids_table_rows((uint64_t) kRows, (uint64_t) kRows);
     const size_t ident_off = up(mmq::q8_bytes(kRows, kMaxK));
-    const size_t bounds_off = ident_off + up((size_t) kRows * 4);
+    const size_t bounds_off = ident_off + up(ids_rows * 4);
     if (!mmq_buf_) {
         if (cudaMalloc(&mmq_buf_, bounds_off + 256) != cudaSuccess) {
             cudaGetLastError();
@@ -1288,7 +1308,7 @@ bool Gemm::native_mmq(const uint16_t* X, int type, const void* W, float* Y, int6
             return false;
         }
         mmq_ctx_ = new mmq::Context();
-        mmq::iota((int32_t*) ((uint8_t*) mmq_buf_ + ident_off), kRows, stream_);
+        mmq::iota((int32_t*) ((uint8_t*) mmq_buf_ + ident_off), (int64_t) ids_rows, stream_);
         std::fprintf(stderr, "prefill gemm: dense MMQ on (STRATA_DENSE_MMQ=1)\n");
     }
     void* xq = mmq_buf_;

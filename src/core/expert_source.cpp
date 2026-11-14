@@ -5,6 +5,7 @@
 #include "strata/core/foresight_swap.hpp"
 #include "strata/core/on_device.hpp"
 #include "strata/core/ple_residency.hpp"
+#include "strata/core/resident_ram_copy.hpp"
 #include "strata/platform/aux_cpus.hpp"
 #include "strata/core/remote_experts.hpp"
 #include "strata/core/peer_experts.hpp"
@@ -38,6 +39,7 @@
 #include <deque>
 #include <fstream>
 #include <filesystem>
+#include <iterator>
 #include <sstream>
 #include <limits>
 #include <map>
@@ -3585,7 +3587,8 @@ bool FileExpertSource::pin_cache_complement(
         // they fit, the rest left on the mapped files; Windows commit capacity also limits the allocation (#730).
         uint64_t physical = 0;
         if (!available_memory_bytes(physical, &budget_commit)) {
-            err = "FileExpertSource: cannot determine available memory for --resident-budget-gib";
+            err = budget_automatic_ ? "FileExpertSource: cannot determine available memory for the automatic RAM copy"
+                                    : "FileExpertSource: cannot determine available memory for --resident-budget-gib";
             return false;
         }
         budget_physical = physical;
@@ -3596,16 +3599,10 @@ bool FileExpertSource::pin_cache_complement(
             // #403: 256 MiB under the room, so the engine's own allocations after this reading still leave the
             // headroom (a budget clamped to exactly the room failed the safety check below on a reading a few MB
             // lower).  An unclamped budget is unchanged.
-            if (what_fits)
-                std::fprintf(stderr, "FileExpertSource: room for the complement: %.2f GiB (%.2f GiB available %s "
-                                     "minus %.0f GiB headroom and a 0.25 GiB margin)\n",
-                             (double) clamped / 1073741824.0, (double) available / 1073741824.0, limit,
-                             (double) headroom_bytes / 1073741824.0);
-            else
-                std::fprintf(stderr, "FileExpertSource: --resident-budget-gib %.2f exceeds available %s "
-                                     "(%.2f GiB minus %.0f GiB headroom and a 0.25 GiB margin): %.2f GiB\n",
-                             (double) budget_bytes / 1073741824.0, limit, (double) available / 1073741824.0,
-                             (double) headroom_bytes / 1073741824.0, (double) clamped / 1073741824.0);
+            // the automatic RAM copy names no flag: none was given (its line used to say --resident-budget-gib)
+            const ResidentBudgetFrom from = what_fits ? ResidentBudgetFrom::WhatFits
+                                          : budget_automatic_ ? ResidentBudgetFrom::Automatic : ResidentBudgetFrom::Flag;
+            std::fputs(resident_clamp_line(from, budget_bytes, limit, available, headroom_bytes, clamped).c_str(), stderr);
             budget_bytes = clamped;
         }
         std::vector<uint64_t> ranked(offsets.size(), kNoComplement);
@@ -4217,7 +4214,8 @@ bool FileExpertSource::pin_cache_complement(
                              "cost 26%%). %s and restart; the line above should read N of N.\n", missing, lendable,
                      100.0 * (double) missing / (double) std::max<long long>(1, lendable),
                      lend ? "Free RAM or lower STRATA_RESIDENT_HEADROOM_GIB (now the RAM left free at start)"
-                          : "Raise --resident-budget-gib (the lend region comes after the ranked experts)");
+                          : budget_automatic_ ? "Free more RAM for the automatic RAM copy (the lend region comes after the ranked experts)"
+                                              : "Raise --resident-budget-gib (the lend region comes after the ranked experts)");
     }
     if (!stage_lend_regions_.empty()) {
         int64_t offered = 0;
@@ -6040,7 +6038,55 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
                     }
                 }
             }
-            if (arena_ram_verdict(need, hm.available, ~uint64_t{0}, fall_back_when_ram_short) == ArenaRamVerdict::FallBack) {
+            const ArenaRamVerdict verdict = arena_ram_verdict(need, hm.available, ~uint64_t{0}, fall_back_when_ram_short);
+#if defined(__linux__)
+            // #5327: the refusal reads every shortfall as one the kernel can only serve by taking another program's
+            // memory (#4051's host: an engine that was still exiting, anonymous RAM - the stall the refusal is for).
+            // On a bare Linux host the usual false alarm is a reserved hugetlb pool: MemAvailable does not count free
+            // huge pages, and a launcher may reserve the pool for exactly this arena (the arena maps MAP_HUGETLB
+            // first), so the reserve itself takes MemAvailable below the need while the pool holds all of it.  That
+            // is the case 0.1.54/0.1.55 loaded anyway ("expert arena read through the file cache") at full decode
+            // speed: credit the pool when it holds the whole arena (and free pages + droppable file pages, which the
+            // kernel evicts as the arena reads - only a small margin beyond MemAvailable's own count) and load,
+            // LOUDLY (a service setup never sees stderr).  STRATA_ARENA_FILE_CACHE=0
+            // refuses as since 0.1.56.  Not under a cgroup limit (the host's cache is not the container's to drop)
+            // and not on Windows: the proceed path was never trusted there ("buffered (not Windows)", the mapped
+            // view's trim needs the headroom the refusal keeps).
+            const bool file_cache_off = [] { const char* v = std::getenv("STRATA_ARENA_FILE_CACHE"); return v != nullptr && v[0] == '0'; }();
+            bool file_cache_arena = false;
+            uint64_t memfree_b = 0, droppable_b = 0, huge_free_b = 0;
+            if (verdict == ArenaRamVerdict::FallBack && hm.cgroup_limit == ~uint64_t{0} && !file_cache_off) {
+                if (std::ifstream info("/proc/meminfo"); info) {
+                    const std::string text((std::istreambuf_iterator<char>(info)), std::istreambuf_iterator<char>());
+                    if (meminfo_free_and_droppable(text, memfree_b, droppable_b, &huge_free_b)) {
+                        // the pool serves the arena only if the MAP_HUGETLB try is made (STRATA_NO_LARGEPAGES skips it) and
+                        // the pool holds the whole mapping, which is the padded arena plus the spare blob, not `want + blob`
+                        uint64_t map_bytes = want + (uint64_t) blob;
+                        if (pin_by_need_ && !pin_pairs_.empty() && !arena_mmap && shared_arena_file.empty()) {
+                            uint64_t at = 0;
+                            for (int64_t l = 0; l < n_layers; ++l)
+                                at += ((lay.blob_bytes(l) + 4095) & ~(uint64_t) 4095) * (uint64_t) n_expert;
+                            map_bytes = at + (uint64_t) blob;
+                        }
+                        if (std::getenv("STRATA_NO_LARGEPAGES") != nullptr || huge_free_b < map_bytes) huge_free_b = 0;
+                        file_cache_arena = arena_shortfall_served_by_file_cache(need, memfree_b, droppable_b, huge_free_b);
+                    }
+                }
+            }
+            if (file_cache_arena) {
+                std::snprintf(buf, sizeof buf,
+                              "the experts need %.2f GiB of RAM and %.2f GiB is free, but free memory, file cache and reserved huge "
+                              "pages can hold them, so they load anyway (same answers). STRATA_ARENA_FILE_CACHE=0 reads them from "
+                              "the file instead.",
+                              (double) need / gib, (double) hm.available / gib);
+                ram_warning_ = buf;   // the caller says it on stderr before the load's numbers
+                if (notices_on_stdout) {   // --serve only: a service setup never sees stderr (#5327); a plain run keeps its token stream clean
+                    std::printf("strata generate: WARNING: %s\n", buf);
+                    std::fflush(stdout);
+                }
+            } else
+#endif
+            if (verdict == ArenaRamVerdict::FallBack) {
                 // #4846 (owner 11-01): still short after the wait and the give-back.  Registering anyway can stall the whole host in
                 // reclaim until it is power-cycled: nothing is allocated, the caller takes the --mmap-experts source for this run.
                 std::snprintf(buf, sizeof buf,
@@ -6051,7 +6097,7 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
                 ram_short_ = true;
                 return false;
             }
-            if (hm.available < need) {
+            if (hm.available < need && ram_warning_.empty()) {
                 std::snprintf(buf, sizeof buf,
                               "the expert arena needs %.2f GiB of RAM but %.2f GiB is available (%.2f GiB short%s): the "
                               "load may swap or be stopped by the OS%s. Close other programs, or run with less RAM: "
