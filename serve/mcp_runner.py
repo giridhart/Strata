@@ -433,15 +433,20 @@ def execute_in_runner(code: str, hub: McpHub, timeout_s: float, cancel: threadin
         if d not in all_deps:
             all_deps.append(d)
     import importlib.util
+    reverse_pkg_map = {pkg: mod for mod, pkg in COMMON_PACKAGE_MAP.items()}
     clean_deps = []
     for d in all_deps:
         d_str = str(d).strip()
         if not d_str:
             continue
         mapped = COMMON_PACKAGE_MAP.get(d_str, d_str)
+        import_name = reverse_pkg_map.get(mapped, mapped)
         # Skip if already installed in the base python environment
-        if importlib.util.find_spec(mapped) is not None:
-            continue
+        try:
+            if importlib.util.find_spec(d_str) is not None or importlib.util.find_spec(import_name) is not None:
+                continue
+        except (ValueError, ModuleNotFoundError):
+            pass
         if mapped not in clean_deps:
             clean_deps.append(mapped)
 
@@ -468,12 +473,10 @@ def execute_in_runner(code: str, hub: McpHub, timeout_s: float, cancel: threadin
                 extra["start_new_session"] = True
                 extra["preexec_fn"] = _apply_rlimits
 
-            uv_bin = shutil.which("uv")
+            uv_bin = shutil.which("uv") if clean_deps else None
             if uv_bin:
-                cmd = [uv_bin, "run", "--python", sys.executable, "-q"]
-                if clean_deps:
-                    cmd += ["--with", ",".join(clean_deps)]
-                cmd += ["python", "-m", "serve.mcp_runner"]
+                cmd = [uv_bin, "run", "--python", sys.executable, "-q", "--with", ",".join(clean_deps),
+                       "python", "-m", "serve.mcp_runner"]
             else:
                 cmd = [sys.executable, "-m", "serve.mcp_runner"]
 
@@ -491,10 +494,6 @@ def execute_in_runner(code: str, hub: McpHub, timeout_s: float, cancel: threadin
                     **extra
                 )
             except OSError as e:
-                try:
-                    shutil.rmtree(scratch_dir, ignore_errors=True)
-                except Exception:
-                    pass
                 return {"ok": False, "text": f"error: could not start Python runner: {e}", "ms": int((time.monotonic() - t0) * 1000)}
 
             q = queue.Queue()

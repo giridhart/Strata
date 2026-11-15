@@ -597,10 +597,14 @@ class McpHub:
         - mcp prefix: 'mcp.math.calculate', 'mcp.math__calculate', 'mcp__math__calculate'
         - bare tool: 'calculate' (if unambiguous across servers)
         """
-        if name in ("run_python", "python", "py", "run_code", "execute_code") and self.settings.get("codemode"):
-            return None, "run_python"
-        if name in ("run_javascript", "javascript", "js", "run_js") and self.settings.get("codemode"):
-            return None, "run_javascript"
+        if self.settings.get("codemode"):
+            if name in CODEMODE_PYTHON_NAMES:
+                return None, "run_python"
+            if name in CODEMODE_JS_NAMES:
+                return None, "run_javascript"
+            if name in CODEMODE_GENERIC_NAMES:
+                lang = str(self.settings.get("codemode_lang") or "javascript").lower()
+                return None, "run_javascript" if lang in ("javascript", "js") else "run_python"
         routes = self._routes or self.routes()
         if name in routes:
             return routes[name]
@@ -640,6 +644,26 @@ class McpHub:
     def openai_tools(self) -> list[dict]:
         return [{"type": "function", "function": t} for t in self.template_tools()]
 
+    def _codemode_signatures(self, js: bool) -> str:
+        """Formats compact `mcp.<server>.<tool>(...)` signatures for Code Mode tool descriptions."""
+        sigs = []
+        for name, (s, tool) in self.routes().items():
+            if tool == "generate_plot" or name == "generate_plot" or name.endswith("__generate_plot"):
+                continue
+            t = next((x for x in s.tools if x["name"] == tool), None)
+            if not t:
+                continue
+            schema = t.get("inputSchema") if isinstance(t.get("inputSchema"), dict) else {}
+            props = schema.get("properties") or {}
+            args_str = ", ".join(f"{k}: {v.get('type', 'any')}" for k, v in props.items())
+            call_args = f"{{{args_str}}}" if js else args_str
+            desc = str(t.get("description") or t.get("title") or "").strip().replace("\n", " ")
+            if desc:
+                first_sent = desc.split(". ")[0].rstrip(".")
+                desc = f": {first_sent[:90]}"
+            sigs.append(f"  - mcp.{_clean(s.name)}.{_clean(tool)}({call_args}){desc}")
+        return "\n".join(sigs) if sigs else "  (no MCP tools currently registered)"
+
     def codemode_tools(self, exclude=(), lang: str | None = None) -> list[dict]:
         """A single execution tool for Code Mode with compact signatures of all MCP tools."""
         effective_lang = (lang or self.settings.get("codemode_lang") or "javascript").lower()
@@ -647,23 +671,7 @@ class McpHub:
             tool_name = "run_javascript"
             if tool_name in exclude:
                 return []
-            sigs = []
-            for name, (s, tool) in self.routes().items():
-                if tool == "generate_plot" or name == "generate_plot" or name.endswith("__generate_plot"):
-                    continue
-                t = next((x for x in s.tools if x["name"] == tool), None)
-                if not t:
-                    continue
-                schema = t.get("inputSchema") if isinstance(t.get("inputSchema"), dict) else {}
-                props = schema.get("properties") or {}
-                args_str = ", ".join(f"{k}: {v.get('type', 'any')}" for k, v in props.items())
-                desc = str(t.get("description") or t.get("title") or "").strip().replace("\n", " ")
-                if desc:
-                    first_sent = desc.split(". ")[0].rstrip(".")
-                    desc = f": {first_sent[:90]}"
-                sigs.append(f"  - mcp.{_clean(s.name)}.{_clean(tool)}({{{args_str}}}){desc}")
-
-            tools_list_text = "\n".join(sigs) if sigs else "  (no MCP tools currently registered)"
+            tools_list_text = self._codemode_signatures(js=True)
             desc = (
                 "Execute JavaScript (ES6) code in an isolated QuickJS sandbox to interact with MCP tools, perform calculations, or process data.\n\n"
                 "CRITICAL INSTRUCTIONS:\n"
@@ -703,55 +711,23 @@ class McpHub:
 
         if "run_python" in exclude:
             return []
-        sigs = []
-        for name, (s, tool) in self.routes().items():
-            if tool == "generate_plot" or name == "generate_plot" or name.endswith("__generate_plot"):
-                continue
-            t = next((x for x in s.tools if x["name"] == tool), None)
-            if not t:
-                continue
-            schema = t.get("inputSchema") if isinstance(t.get("inputSchema"), dict) else {}
-            props = schema.get("properties") or {}
-            args_str = ", ".join(f"{k}: {v.get('type', 'any')}" for k, v in props.items())
-            desc = str(t.get("description") or t.get("title") or "").strip().replace("\n", " ")
-            if desc:
-                first_sent = desc.split(". ")[0].rstrip(".")
-                desc = f": {first_sent[:90]}"
-            sigs.append(f"  - mcp.{_clean(s.name)}.{_clean(tool)}({args_str}){desc}")
-
-        tools_list_text = "\n".join(sigs) if sigs else "  (no MCP tools currently registered)"
+        tools_list_text = self._codemode_signatures(js=False)
         desc = (
-            "Execute Python code to interact with MCP tools, run calculations, or process data locally.\n\n"
-            "CRITICAL INSTRUCTIONS:\n"
-            "1. `run_python` is the ONLY valid function name for tool calls. You MUST call `run_python`.\n"
-            "2. NEVER emit `<function=mcp...>` or invoke MCP functions directly as tool names.\n"
-            "3. Variables and symbols persist across turns within the same conversation session.\n"
-            "4. Expressions at the end of the script auto-return their value (Jupyter/REPL style). `print(...)` or `result = ...` is also supported.\n"
-            "5. Pre-imported in your environment (zero tokens needed, DO NOT import them):\n"
-            "   - sp / sympy (e.g. sp.Symbol, sp.solve, sp.diff, sp.simplify)\n"
-            "   - np / numpy, math, cmath, pint, z3, astropy\n"
-            "   - pd / pandas, px (plotly.express), go (plotly.graph_objects)\n"
-            "   - render_interactive_plot(fig) -> dict\n"
-            "   - verify_equivalence(expr1, expr2) -> dict\n"
-            "   - dimensional_analysis(lhs, rhs, variables) -> dict\n"
-            "   - solve_and_derive(equation, solve_for=None, derive_wrt=None) -> dict\n"
-            "   - compile_equation_to_code(expr, target_lang) -> dict (c, rust, py, js, julia)\n"
-            "   - solve_constraints(variables, constraints, types=None, maximize=None, minimize=None) -> dict\n"
-            "   - lint_python_code(code) -> dict\n"
-            "   - calculate_time_delta(start, end, timezone1, timezone2, business_days_only) -> dict\n"
-            "   - list_workspace_files() -> list[str]\n"
-            "6. Jailed Workspace File I/O: You can read and write files inside the workspace using standard `open('filename', 'w')`. All file paths are jailed to the workspace directory.\n"
-            "7. To generate charts, use pre-imported `px` or `go` directly (e.g. `fig = px.bar(...)`). NEVER write `import px` (`px` is a pre-imported variable, not a PyPI package). Pass your final figure to `render_interactive_plot(fig)` (or leave `fig` as the final expression, or call `fig.show()`).\n"
-            "8. You may also import any PyPI package (resolved dynamically via uv in milliseconds).\n\n"
+            "Execute Python code to interact with MCP tools, run calculations, or process data.\n\n"
+            "1. Call `run_python` directly (never emit MCP tool names as top-level tool calls).\n"
+            "2. Variables and symbols persist across turns within the same session.\n"
+            "3. Final expressions auto-return (REPL style); `print(...)` and `result = ...` also work.\n"
+            "4. Pre-imported in the sandbox:\n"
+            "   - `sp`/`sympy`, `np`/`numpy`, `pd`/`pandas`, `px` (`plotly.express`), `go` (`plotly.graph_objects`), `math`, `cmath`, `json`, `pint`, `z3`, `astropy`\n"
+            "   - `render_interactive_plot(fig)`, `list_workspace_files()`\n"
+            "   - `verify_equivalence(expr1, expr2)`, `dimensional_analysis(lhs, rhs, variables)`, `solve_and_derive(equation, solve_for=None, derive_wrt=None)`, `compile_equation_to_code(expr, target_lang)`\n"
+            "   - `solve_constraints(variables, constraints, types=None, maximize=None, minimize=None)`\n"
+            "   - `lint_python_code(code)`, `calculate_time_delta(start, end, timezone1, timezone2, business_days_only)`\n"
+            "5. File I/O via `open(...)` is jailed to the workspace directory. Other PyPI packages can be imported or passed via `dependencies` (installed via `uv` if available).\n"
+            "6. For charts, pass a Plotly figure to `render_interactive_plot(fig)`, call `fig.show()`, or leave `fig` as the final expression.\n\n"
             "EXAMPLES:\n"
-            "# Interactive Plotting:\n"
-            "run_python(code='df = pd.DataFrame({\"Category\": [\"A\", \"B\", \"C\"], \"Values\": [10, 20, 15]})\\nfig = px.bar(df, x=\"Category\", y=\"Values\", title=\"Sample Chart\")\\nrender_interactive_plot(fig)')\n\n"
-            "# Symbolic derivation:\n"
+            "run_python(code='df = pd.DataFrame({\"Category\": [\"A\", \"B\", \"C\"], \"Values\": [10, 20, 15]})\\nfig = px.bar(df, x=\"Category\", y=\"Values\", title=\"Sample Chart\")\\nrender_interactive_plot(fig)')\n"
             "run_python(code='x = sp.Symbol(\"x\")\\nsp.diff(sp.sin(x) * sp.exp(x), x)')\n\n"
-            "# Dimensional analysis:\n"
-            "run_python(code='dimensional_analysis(\"T\", \"2*pi*sqrt(L/g)\", {\"T\": \"s\", \"L\": \"m\", \"g\": \"m/s^2\"})')\n\n"
-            "# Constraint solving:\n"
-            "run_python(code='solve_constraints([\"Alice\", \"Bob\"], [\"Alice < Bob\", \"Alice >= 9\", \"Bob <= 17\"])')\n\n"
             f"MCP server tools callable via `mcp.<server>.<tool>(...)`:\n{tools_list_text}"
         )
         return [{

@@ -19,6 +19,7 @@ import os
 from pathlib import Path
 import re
 import sys
+import threading
 import time
 import traceback
 from typing import Any
@@ -54,6 +55,9 @@ except ImportError:
 
 DEFAULT_SESSION_TTL_S = 900.0  # 15 minutes
 MAX_SESSIONS = 100
+DEFAULT_MAX_LOOP_ITERS = 500_000
+
+_ACTIVE_PLOT_TLS = threading.local()
 
 
 def strip_markdown_fences(code: str) -> str:
@@ -219,7 +223,7 @@ class SecurityVisitor(ast.NodeVisitor):
 class LoopBoundingTransformer(ast.NodeTransformer):
     """Injects iteration counters into while and for loops to prevent runaway execution / 30s timeouts."""
 
-    def __init__(self, max_iters: int = 500_000):
+    def __init__(self, max_iters: int = DEFAULT_MAX_LOOP_ITERS):
         self.max_iters = max_iters
 
     def _guard_stmts(self) -> list[ast.stmt]:
@@ -240,6 +244,17 @@ class LoopBoundingTransformer(ast.NodeTransformer):
         return node
 
 
+def _is_plotly_figure(obj: Any) -> bool:
+    """Returns True if `obj` is a Plotly Figure or duck-types one."""
+    try:
+        import plotly.graph_objects as go
+        if isinstance(obj, go.Figure):
+            return True
+    except ImportError:
+        pass
+    return hasattr(obj, "data") and hasattr(obj, "layout") and callable(getattr(obj, "to_json", None))
+
+
 def render_interactive_plot(fig: Any) -> dict[str, Any]:
     """Accepts a Plotly Figure object and serializes it to an interactive JSON schema.
 
@@ -256,20 +271,7 @@ def render_interactive_plot(fig: Any) -> dict[str, Any]:
     if fig is None:
         raise ValueError("render_interactive_plot() requires a Plotly Figure, but received None.")
 
-    is_plotly = False
-    try:
-        import plotly.graph_objects as go
-        if isinstance(fig, go.Figure):
-            is_plotly = True
-    except ImportError:
-        pass
-
-    if not is_plotly:
-        # Duck-typing: must have to_json, layout, and data (to reject DataFrames or arbitrary objects)
-        if hasattr(fig, "data") and hasattr(fig, "layout") and callable(getattr(fig, "to_json", None)):
-            is_plotly = True
-
-    if is_plotly:
+    if _is_plotly_figure(fig):
         try:
             raw_json = fig.to_json()
             content = json.loads(raw_json)
@@ -455,7 +457,6 @@ def create_base_globals(custom_tools: dict[str, Any] | None = None) -> dict[str,
         pass
 
     # Pre-import plotly.express as px and plotly.graph_objects as go if present
-    _plot_wrapper = None
     try:
         import plotly.express as px
         import plotly.graph_objects as go
@@ -484,19 +485,18 @@ def create_base_globals(custom_tools: dict[str, Any] | None = None) -> dict[str,
 
     env["render_interactive_plot"] = _plot_wrapper
 
-    # Monkey patch Plotly Figure.show so standard Plotly fig.show() routes to render_interactive_plot
+    # Route Plotly fig.show() through the active session's plot wrapper without leaking across sessions
     try:
         import plotly.graph_objects as go
-        go.Figure.show = lambda self, *a, **kw: _plot_wrapper(self)
+        if not getattr(go.Figure.show, "_strata_patched", False):
+            def _strata_figure_show(self, *a, **kw):
+                fn = getattr(_ACTIVE_PLOT_TLS, "render_fn", None) or _plot_wrapper
+                return fn(self)
+            _strata_figure_show._strata_patched = True
+            go.Figure.show = _strata_figure_show
     except ImportError:
         pass
 
-    def _st_loop_tick():
-        env["_st_loop_count"] = env.get("_st_loop_count", 0) + 1
-        if env["_st_loop_count"] > 500_000:
-            raise TimeoutError("Loop iteration limit exceeded in Code Mode (500,000 iterations)")
-
-    env["_st_loop_tick"] = _st_loop_tick
     env["_st_loop_count"] = 0
 
     def _blocked_input(*a, **kw):
@@ -620,14 +620,18 @@ class LLMSandbox:
 
         def _st_loop_tick():
             state["_st_loop_count"] += 1
-            if state["_st_loop_count"] > 500_000:
-                raise TimeoutError("Loop iteration limit exceeded in Code Mode (500,000 iterations)")
+            if state["_st_loop_count"] > DEFAULT_MAX_LOOP_ITERS:
+                raise TimeoutError(
+                    f"Loop iteration limit exceeded in Code Mode ({DEFAULT_MAX_LOOP_ITERS:,} iterations)"
+                )
 
         state["_st_loop_tick"] = _st_loop_tick
 
         user_stdout = io.StringIO()
         user_stderr = io.StringIO()
         old_stdout, old_stderr = sys.stdout, sys.stderr
+        prev_plot_fn = getattr(_ACTIVE_PLOT_TLS, "render_fn", None)
+        _ACTIVE_PLOT_TLS.render_fn = state.get("render_interactive_plot")
 
         try:
             tree = ast.parse(clean_code, "<codemode>")
@@ -658,18 +662,8 @@ class LLMSandbox:
                 evaluated_val = eval(eval_code, state)
 
                 # Auto-render Plotly Figure if left as standalone expression
-                if evaluated_val is not None:
-                    is_fig = False
-                    try:
-                        import plotly.graph_objects as go
-                        if isinstance(evaluated_val, go.Figure):
-                            is_fig = True
-                    except ImportError:
-                        pass
-                    if not is_fig and hasattr(evaluated_val, "data") and hasattr(evaluated_val, "layout") and callable(getattr(evaluated_val, "to_json", None)):
-                        is_fig = True
-                    if is_fig:
-                        evaluated_val = render_interactive_plot(evaluated_val)
+                if evaluated_val is not None and _is_plotly_figure(evaluated_val):
+                    evaluated_val = render_interactive_plot(evaluated_val)
 
                 # Set result in state if not explicitly overwritten
                 if state.get("result") is None and evaluated_val is not None:
@@ -689,18 +683,7 @@ class LLMSandbox:
                 other = [k for k in assigned_names if k not in preferred and not k.startswith("_")]
                 for k in preferred + other:
                     val = state.get(k)
-                    if val is None:
-                        continue
-                    is_candidate_fig = False
-                    try:
-                        import plotly.graph_objects as go
-                        if isinstance(val, go.Figure):
-                            is_candidate_fig = True
-                    except ImportError:
-                        pass
-                    if not is_candidate_fig and hasattr(val, "data") and hasattr(val, "layout") and callable(getattr(val, "to_json", None)):
-                        is_candidate_fig = True
-                    if is_candidate_fig:
+                    if val is not None and _is_plotly_figure(val):
                         try:
                             ret = render_interactive_plot(val)
                             state["_last_plot"] = ret
@@ -768,5 +751,6 @@ class LLMSandbox:
                 "error": traceback.format_exc(),
             }
         finally:
+            _ACTIVE_PLOT_TLS.render_fn = prev_plot_fn
             sys.stdout = old_stdout
             sys.stderr = old_stderr
