@@ -7,6 +7,7 @@ inline sycl::queue& default_queue() {
 }
 }  // namespace
 #include "strata/prefill/prefill.hpp"
+#include "strata/prefill/sycl_dma_direct.hpp"
 #include "strata/prefill/mmq_ids_margin.hpp"
 #include "strata/kernels/qsa_two_pass_status.hpp"
 #include "strata/prefill/kva.hpp"
@@ -291,21 +292,14 @@ inline int walk_base_t(size_t T) {
 inline int stage_slots(size_t T) {
     return std::max({ring_slots(T), stage_slots_t(T)});
 }
-inline bool dma_direct(const core::ExpertSource* src, int64_t layer, int64_t expert, const void* blob, sycl::queue* q = nullptr) {
-    if (!src || !src->pinned(layer, expert)) return false;
-    static const bool pageable_ok = [] { const char* v = std::getenv("STRATA_PF_DMA_PAGEABLE"); return v && v[0] == '1'; }();
-    if (pageable_ok) return true;
-    if (blob == nullptr) return false;
-    static thread_local std::unordered_map<uintptr_t, bool> usm_bucket;
-    const uintptr_t key = (uintptr_t) blob >> 21;
-    const auto it = usm_bucket.find(key);
-    if (it != usm_bucket.end()) return it->second;
+inline bool dma_direct(const core::ExpertSource* src, int64_t layer, int64_t expert, const void* blob,
+                       sycl::queue* q = nullptr, size_t bytes = 0) {
+    static const bool pageable_ok = [] {
+        const char* v = std::getenv("STRATA_PF_DMA_PAGEABLE");
+        return v && v[0] == '1';
+    }();
     const auto ctx = q ? q->get_context() : default_queue().get_context();
-    const bool usm = sycl::get_pointer_type((const void*) (key << 21), ctx) == sycl::usm::alloc::host &&
-                     sycl::get_pointer_type((const void*) (((key + 1) << 21) - 1), ctx) == sycl::usm::alloc::host &&
-                     sycl::get_pointer_type(blob, ctx) == sycl::usm::alloc::host;
-    usm_bucket.emplace(key, usm);
-    return usm;
+    return sycl_dma_direct_check(src, layer, expert, blob, bytes, ctx, pageable_ok);
 }
 constexpr int DQ = 2;  // dequantized-expert ring (FP16 gate/up + down)
 // The BF16-weight projections (hyper-connection, SSM alpha/beta, indexer, router, shared gate, PLE key/value) take
@@ -536,23 +530,29 @@ struct Stager {
     }
     /// Layer-major prefill: job j's bytes are not needed after all (the routing skipped the expert) - a thread that has not
     /// started it yet marks it ready without reading.  Never waited for, so its buffer's content does not matter.
-    void skip(int j) { skipped[(size_t) j].store(1, std::memory_order_release); }
+    void skip(int j) {
+        if (j < 0 || !skipped || (size_t)j >= jobs.size()) return;
+        skipped[(size_t) j].store(1, std::memory_order_release);
+    }
     /// Layer-major prefill, before wait(j): the launching thread stages its jobs in increasing order, so a job below j
     /// it has not issued was skipped and never gets a DMA - the watermark moves to j.  A skipped job is never issued,
     /// so without this a routed job after about a ring's depth of skipped ones waits for `issued` forever.
     void pass(int j) {
+        if (j < 0) return;
         if (issued.load(std::memory_order_relaxed) < j) {
             issued.store(j, std::memory_order_release);
         }
     }
     /// Job j's bytes, in a pinned buffer (waits for the copy).
     const uint8_t* wait(int j) {
+        if (j < 0 || !ready || (size_t)j >= jobs.size()) return nullptr;
         while (!ready[(size_t)j].load(std::memory_order_acquire))
             std::this_thread::yield();
         return buf[j % kRing];
     }
     /// The launching thread queued job j's DMA on `copy`: its buffer is free once that is done.
     void issued_one(int j, sycl::queue* copy) {
+        if (j < 0) return;
         if (copy && dma_done[j % kRing]) {
             *dma_done[j % kRing] = copy->ext_oneapi_submit_barrier();
         }
@@ -2218,7 +2218,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             for (int32_t e = 0; e < m.g->n_expert && n < pf_bank(); ++e) {
                 if (m.host_res[(size_t) l * m.g->n_expert + e] >= 0) continue;
                 const uint8_t* b = m.src->pinned(l, e) ? m.src->blob(l, e) : nullptr;
-                if (!dma_direct(m.src, l, e, b) || b == nullptr) break;   // the stager's: the walk copies it and all after
+                if (!dma_direct(m.src, l, e, b, m.copy, bytes) || b == nullptr) break;   // the stager's: the walk copies it and all after
                 const int sl = base + n++;
                 if (m.stage_live[sl] && m.pf_fill[sl] >= m.pf_drain && sl != waited) {
                     m.copy->ext_oneapi_submit_barrier({*m.used[sl]});
@@ -2901,7 +2901,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 if (m.cnt[(size_t) e] == 0 || m.host_res[(size_t) l * m.g->n_expert + e] >= 0) continue;
                                 if (!pf_slot.empty() && pf_slot[(size_t) e] >= 0) continue;   // prefetched or predicted
                                 const uint8_t* b = m.src->pinned(l, e) ? m.src->blob(l, e) : nullptr;
-                                if (!dma_direct(m.src, l, e, b) || b == nullptr) continue;   // the stager's: the walk copies it
+                                if (!dma_direct(m.src, l, e, b, m.copy, nbytes) || b == nullptr) continue;   // the stager's: the walk copies it
                                 if (early_slot.empty()) early_slot.assign((size_t) m.g->n_expert, -1);
                                 const int sl = st_w0 + n++;
                                 if (m.stage_live[sl]) m.copy->ext_oneapi_submit_barrier({*m.used[sl]});
@@ -2921,15 +2921,19 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         std::vector<int> stage_of(order.size(), -1);
                         // the unpinned ones are copied to pinned buffers by the stager's threads, in this order
                         std::vector<int> job_of(order.size(), -1);
+                        const size_t lbytes = (size_t)lay.blob_bytes(l);
+                        std::vector<char> direct_of(order.size(), 0);
+                        std::vector<const uint8_t*> direct_blob(order.size(), nullptr);
                         if (!stream_all) {
                             std::vector<Stager::Job> js;
                             for (size_t j = 0; j < order.size(); ++j) {
                                 const int32_t e = order[j];
                                 if (m.host_res && m.cache && m.host_res[(size_t)l * m.g->n_expert + e] >= 0) continue;
-                                if (m.src->pinned(l, e)) continue;
-                                job_of[j] = (int)js.size();
+                                if (!pf_slot.empty() && pf_slot[(size_t)e] >= 0) continue;
+                                if (!early_slot.empty() && early_slot[(size_t)e] >= 0) continue;
                                 if (m.src->transient(l, e)) {  // CS-T: copied by the source
-                                    js.push_back({nullptr, (size_t)lay.blob_bytes(l), m.src, (int32_t)l, e});
+                                    job_of[j] = (int)js.size();
+                                    js.push_back({nullptr, lbytes, m.src, (int32_t)l, e});
                                     continue;
                                 }
                                 const uint8_t* b = m.src->blob(l, e);
@@ -2937,7 +2941,13 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     err = "prefill: expert source has no blob";
                                     return false;
                                 }
-                                js.push_back({b, (size_t)lay.blob_bytes(l)});
+                                if (dma_direct(m.src, l, e, b, m.copy, lbytes)) {
+                                    direct_of[j] = 1;
+                                    direct_blob[j] = b;
+                                    continue;
+                                }
+                                job_of[j] = (int)js.size();
+                                js.push_back({b, lbytes});
                             }
                             m.stager->start(std::move(js));
                         }
@@ -2962,18 +2972,20 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             const int sl = stage_next;
                             stage_next = stage_w0 + (stage_next - stage_w0 + 1) % (stage_n - stage_w0);
                             const auto th = Clock::now();
-                            const uint8_t* pb0 = m.src->pinned(l, e) ? m.src->blob(l, e) : nullptr;
-                            const bool pinned = dma_direct(m.src, l, e, pb0);
-                            if (pinned) {
+                            if (direct_of[j] && direct_blob[j] != nullptr) {
                                 // DMA straight from the page-locked arena: the copy stream only waits for the slot
                                 if (m.stage_live[sl]) (m.copy)->ext_oneapi_submit_barrier({*m.used[sl]});
-                                m.copy->memcpy(m.stage_dev[sl], pb0, (size_t)lay.blob_bytes(l));
+                                m.copy->memcpy(m.stage_dev[sl], direct_blob[j], lbytes);
                                 ++stats_.experts_dma;
                             } else {
                                 // copied to a pinned buffer by the stager (waits only if it is behind), then DMA
                                 const uint8_t* hb = m.stager->wait(job_of[j]);
+                                if (!hb) {
+                                    err = "prefill: missing stager job for unpinned expert";
+                                    return false;
+                                }
                                 if (m.stage_live[sl]) (m.copy)->ext_oneapi_submit_barrier({*m.used[sl]});
-                                m.copy->memcpy(m.stage_dev[sl], hb, (size_t)lay.blob_bytes(l));
+                                m.copy->memcpy(m.stage_dev[sl], hb, lbytes);
                                 m.stager->issued_one(job_of[j], m.copy);
                             }
                             *m.copied[sl] = m.copy->ext_oneapi_submit_barrier();
@@ -3234,7 +3246,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 for (int32_t e = 0; e < m.g->n_expert && n < pred_bank; ++e) {
                                     if (!want[(size_t) e] || (m.host_res && m.host_res[(size_t) l1 * m.g->n_expert + e] >= 0)) continue;
                                     const uint8_t* b = m.src->pinned(l1, e) ? m.src->blob(l1, e) : nullptr;
-                                    if (!dma_direct(m.src, l1, e, b) || b == nullptr) continue;
+                                    if (!dma_direct(m.src, l1, e, b, m.copy, nbytes) || b == nullptr) continue;
                                     const int sl = base + n++;
                                     m.copy->memcpy(m.stage_dev[sl], b, nbytes);
                                     *m.copied[sl] = m.copy->ext_oneapi_submit_barrier();
@@ -4022,8 +4034,16 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
                 m.copy->memcpy(m.stage_dev[sl], b, (size_t) lay.blob_bytes(l));
                 ++stats_.experts_dma;
             } else {
+                if (job_of[u] < 0) {
+                    err = "prefill (layer-major): missing stager job for unpinned expert";
+                    return false;
+                }
                 m.stager->pass(job_of[u]);
                 const uint8_t* hb = m.stager->wait(job_of[u]);
+                if (!hb) {
+                    err = "prefill (layer-major): failed waiting for stager job";
+                    return false;
+                }
                 m.copy->memcpy(m.stage_dev[sl], hb, (size_t) lay.blob_bytes(l));
                 m.stager->issued_one(job_of[u], m.copy);
             }
