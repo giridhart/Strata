@@ -84,7 +84,7 @@ echo "4a42b98220ea7880664002c8edda1563aecbae754b762a2e2f31b2b91ee93ecd  qwen3.8-
 To keep comparisons fair on a hybrid Xeon + B580 setup:
 
 1. **Pin identical model, KV, prefill, CPU pool, and PCIe settings** across both arms.
-2. **Use greedy decoding** (`--temp 0`) and identical prompts + `--max-new` so you can verify exact token parity and compare acceptance rates and `tok/s`.
+2. **Use greedy decoding** (`--temperature 0`) and identical pretokenized prompts (`--tokens-file`) + `--max-new` so you can verify exact token parity and compare acceptance rates and `tok/s`.
 3. **Alternate arm order (`A -> B -> B -> A`)** across at least 3 rounds to cancel thermal/boost drift and page-cache effects.
 4. **Test at least two prompt regimes:**
    * **Short/medium coding or structured output** (e.g., 512–2048 input tokens, 256–512 output tokens) — DFlash2 typically shines here.
@@ -115,8 +115,7 @@ export STRATA_FUSED_GDN=1
 
 ```bash
 COMMON_ARGS=(
-  --model /path/to/qwen3.8-flash-next-iq3_s.gguf
-  --native
+  --native /path/to/qwen3.8-flash-next-iq3_s-00001-of-0000N.gguf
   --resident-experts
   --max-context 131072
   --kv int8
@@ -125,10 +124,12 @@ COMMON_ARGS=(
   --pool-workers 26
   --ple-io ram
   --pcie-frac 0.2
-  --temp 0
+  --temperature 0
   --max-new 512
 )
 ```
+
+*(Note: `build_sycl/strata` takes pretokenized IDs via `--tokens-file` or `--tokens`, not raw text. For example, `sycl/tools/data/prompt_deadlock_2744.tok` is a ready-to-use token file in this repo, or you can run through `serve/server.py` / `strata-b580-*.json`.)*
 
 ### Arm A — MTP Baseline
 
@@ -137,7 +138,7 @@ COMMON_ARGS=(
   --expert-cache 1000 \
   --mtp /path/to/mtp_dir \
   --spec 4 --spec-min-p 0.5 \
-  --prompt-file /path/to/prompt.txt \
+  --tokens-file /path/to/prompt.tok \
   2>&1 | tee ab_mtp.log
 ```
 
@@ -154,7 +155,7 @@ for CONF in 0.35 0.5 0.6 0.7; do
     --draft-model /path/to/qwen3.8-flash-next-dflash2.q4_0-selq4.pack \
     --spec 6 \
     --draft-conf "$CONF" \
-    --prompt-file /path/to/prompt.txt \
+    --tokens-file /path/to/prompt.tok \
     2>&1 | tee "ab_dflash2_c${CONF}.log"
 done
 ```
@@ -171,7 +172,7 @@ Once you pick the best `--draft-conf`, re-run with the ~367 MiB saved by the Q4_
   --draft-model /path/to/qwen3.8-flash-next-dflash2.q4_0-selq4.pack \
   --spec 6 \
   --draft-conf 0.6 \
-  --prompt-file /path/to/prompt.txt \
+  --tokens-file /path/to/prompt.tok \
   2>&1 | tee ab_dflash2_1180slots.log
 ```
 
@@ -186,7 +187,7 @@ Extract these metrics from each log:
 * **Drafting overhead (`dflash2 ... ms/round drafting`)** vs. MTP drafting time
 * **Mean accepted tokens / round** (confirm acceptance is healthy—if it is near `0`, check that `dflash2_head_test` passed and `strata dflash2: ... selector codebooks: Q4_0 rows` printed at startup)
 * **VRAM usage / free headroom** at startup (ensure `--vram-reserve-mib` is respected)
-* **Exact output match** (greedy `--temp 0` should produce identical tokens between MTP and DFlash2 on the same prompt)
+* **Exact output match** (greedy `--temperature 0` should produce identical tokens between MTP and DFlash2 on the same prompt)
 
 ### Decision Rules
 
