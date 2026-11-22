@@ -15,10 +15,8 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP OR STRATA_ENABLE_SYCL)
                                  src/core/layout.cpp)
   endif()
   target_include_directories(strata_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
-  # the DFlash2 drafter (src/core/dflash2.cpp, src/kernels/cuda/dflash2.cu) exists in the CUDA and HIP builds; the Metal and SYCL builds compile without it
-  if(NOT STRATA_ENABLE_SYCL)
-    target_compile_definitions(strata_core PUBLIC STRATA_HAVE_DFLASH2=1)
-  endif()
+  # the DFlash2 drafter exists in CUDA, HIP, and native SYCL builds
+  target_compile_definitions(strata_core PUBLIC STRATA_HAVE_DFLASH2=1)
   if(STRATA_ENABLE_CUDA AND STRATA_EXPERIMENTAL_SM60)
     # the runtime device check (src/core/device.cu) admits the cards this build was made for (#236)
     target_compile_definitions(strata_core PRIVATE STRATA_EXPERIMENTAL_SM60=1)
@@ -111,6 +109,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP OR STRATA_ENABLE_SYCL)
                           src/kernels/sycl/xmx_gemm.cpp
                           src/kernels/sycl/iq_mmq.cpp
                           src/kernels/sycl/draft_head.cpp
+                          src/kernels/sycl/dflash2.cpp
                           src/kernels/ngram.cpp
                           src/ngram/ple_reader.cpp
                           src/platform/direct_file.cpp)
@@ -379,7 +378,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP OR STRATA_ENABLE_SYCL)
   # library is the honest shape of the dependency graph: core knows about devices and weights, kernels know
   # about arithmetic, and this one knows the ORDER the arithmetic happens in.
   if(STRATA_ENABLE_SYCL)
-    add_library(strata_engine STATIC src/core/sycl/layer.cpp src/core/sycl/session.cpp src/core/sycl/expert_source.cpp src/core/sycl/remote_experts.cpp src/core/sycl/expert_cache.cpp src/core/sycl/native_head.cpp src/core/sycl/native_dense.cpp src/core/sycl/verify.cpp src/core/sycl/mtp.cpp src/core/sycl/draft_head.cpp src/core/sycl/conversation_snapshot.cpp src/core/sycl/conversation_state.cpp src/core/sycl/conversation_memory.cpp src/core/arch_defaults.cpp src/core/nv_defaults.cpp src/core/vmm.cpp src/core/conversation_file.cpp src/core/conversation_kv_store.cpp)
+    add_library(strata_engine STATIC src/core/sycl/layer.cpp src/core/sycl/session.cpp src/core/sycl/expert_source.cpp src/core/sycl/remote_experts.cpp src/core/sycl/expert_cache.cpp src/core/sycl/native_head.cpp src/core/sycl/native_dense.cpp src/core/sycl/verify.cpp src/core/sycl/mtp.cpp src/core/sycl/dflash2.cpp src/core/sycl/draft_head.cpp src/core/sycl/conversation_snapshot.cpp src/core/sycl/conversation_state.cpp src/core/sycl/conversation_memory.cpp src/core/arch_defaults.cpp src/core/nv_defaults.cpp src/core/vmm.cpp src/core/conversation_file.cpp src/core/conversation_kv_store.cpp)
   else()
     add_library(strata_engine STATIC src/core/layer.cpp src/core/session.cpp src/core/expert_source.cpp src/core/remote_experts.cpp
       src/core/remote_expert_opt.cu
@@ -645,6 +644,18 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP OR STRATA_ENABLE_SYCL)
     add_executable(dflash2_bw_bench EXCLUDE_FROM_ALL src/core/sycl/dflash2_bw_bench.cpp)
     target_include_directories(dflash2_bw_bench PRIVATE ${_strata_gpu_include_directories})
     target_link_libraries(dflash2_bw_bench PRIVATE ${_strata_gpu_runtime_target})
+    if(STRATA_BUILD_TESTS)
+      add_executable(dflash2_head_test src/core/sycl/dflash2_head_test.cpp)
+      target_include_directories(dflash2_head_test PRIVATE ${_strata_gpu_include_directories})
+      target_link_libraries(dflash2_head_test PRIVATE strata_engine strata_kernels ${_strata_gpu_runtime_target})
+      add_test(NAME dflash2_head_test COMMAND dflash2_head_test)
+      set_tests_properties(dflash2_head_test PROPERTIES SKIP_RETURN_CODE 77)
+      add_test(NAME dflash2_head_test_legacy COMMAND dflash2_head_test --legacy)
+      set_tests_properties(dflash2_head_test_legacy PROPERTIES WILL_FAIL TRUE)
+      add_executable(dflash2_ring_test src/core/sycl/dflash2_ring_test.cpp)
+      target_include_directories(dflash2_ring_test PRIVATE ${_strata_gpu_include_directories})
+      target_link_libraries(dflash2_ring_test PRIVATE strata_engine strata_kernels ${_strata_gpu_runtime_target})
+    endif()
   endif()
 
   if(STRATA_ENABLE_SYCL)

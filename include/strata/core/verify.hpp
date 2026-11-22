@@ -163,6 +163,11 @@ public:
     /// Token t's residual after the last layer, (hc, n_embd) on the device, valid until the next `run`.
     const float* final_R(int t) const;
     const float* final_R_all() const { return next_ ? next_->final_R_all() : R_; }
+    /// DFlash2 (before init): keep the completed outputs of these layers (zero-based; mean of hc streams) for every row
+    /// of each window in a device buffer, tap_dev() = [max_t][n_taps][n_embd] floats, valid until the next window.
+    void set_taps(const std::vector<int>& layers) { tap_req_ = layers; }
+    const float* tap_dev() const { return tap_dev_; }
+    bool tapping() const { return tap_on_; }
 
     /// The GPU plan the pool writes each layer (VRAM hits + the PCIe share of the misses); give it to the
     /// dispatch (`ExpertDispatch::plan`) before the first `run`.
@@ -332,6 +337,11 @@ private:
     float* hist_snap_ = nullptr;                              // T * NG_HIST * NG_HC_DIM
     int64_t cap_ = 0, max_blocks_ = 0, attn_scratch_floats_ = 0;
     bool batch_rec_ = false;
+    bool tap_on_ = false;
+    std::vector<int> tap_req_;
+    std::vector<int> tap_layers_;
+    std::vector<int> tap_slot_;
+    float* tap_dev_ = nullptr;
     bool is_lean() const;
 };
 
@@ -735,6 +745,11 @@ public:
     /// Token t's residual after the last layer, (hc, n_embd) on the device, valid until the next `run`.
     const float* final_R(int t) const;
     const float* final_R_all() const { return next_ ? next_->final_R_all() : R_; }
+    /// DFlash2 (before init): keep the completed outputs of these layers (zero-based; mean of hc streams) for every row
+    /// of each window in a device buffer, tap_dev() = [max_t][n_taps][n_embd] floats, valid until the next window.
+    void set_taps(const std::vector<int>& layers) { tap_req_ = layers; }
+    const float* tap_dev() const { return tap_dev_; }
+    bool tapping() const { return tap_on_; }
     /// DFlash2 (before init): keep the completed outputs of these layers (zero-based; the mean of the hc streams) for every row of
     /// each window in a device buffer, tap_dev() = [max_t][n_taps][n_embd] floats, valid until the next window.  Single-stage
     /// verifiers only; STRATA_TAP_FILE (research dump) turns the same buffer on without this call.

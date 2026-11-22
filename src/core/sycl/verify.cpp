@@ -50,6 +50,9 @@ inline sycl::queue& get_default_queue() {
 #include "strata/core/progress.hpp"
 #include "strata/kernels/shared_expert.hpp"
 #include "strata/kernels/verify_kernels.hpp"
+#if defined(STRATA_HAVE_DFLASH2)
+#include "strata/kernels/dflash2.hpp"
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -307,6 +310,10 @@ Verifier::~Verifier() {
     if (tree_gdn_snap_) {
         sycl::free(tree_gdn_snap_, get_default_queue());
         tree_gdn_snap_ = nullptr;
+    }
+    if (tap_dev_) {
+        sycl::free(tap_dev_, get_default_queue());
+        tap_dev_ = nullptr;
     }
     for (auto& chunks : exec_chunks_) {
         for (void* e : chunks)
@@ -579,6 +586,19 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     Bump real;
     real.base = (uint8_t*)arena_;
     carve(real);
+    // DFlash2 taps (set_taps): off, and nothing is allocated or recorded, otherwise
+    if (!tap_req_.empty() && lb_ == 0 && le_ == g.n_layers) {
+        tap_layers_.clear();
+        for (int l : tap_req_) if (l >= 0 && l < g.n_layers - 1) tap_layers_.push_back(l);
+        tap_slot_.assign((size_t) g.n_layers, -1);
+        for (size_t i = 0; i < tap_layers_.size(); ++i) tap_slot_[(size_t) tap_layers_[i]] = (int) i;
+        const size_t nt = tap_layers_.size();
+        if (nt == 0 || (tap_dev_ = sycl::malloc_device<float>((size_t) T * nt * N, get_default_queue())) == nullptr) {
+            err = "verify: DFlash2 tap buffer allocation failed";
+            return false;
+        }
+        tap_on_ = true;
+    }
     sink_.staging = (unsigned long long)staging_;
     sink_.staging_cap = kStagingBlobs;
     (void)TS;
@@ -1440,6 +1460,14 @@ bool Verifier::record_layer_post(int T, int64_t l, int grp, sycl::queue* cs, std
             VDBG("layer_post (l=%lld, grp=%d): cvec apply\n", (long long)l, grp);
             cvec_apply(Rt(tb), l, n, HC * N, bo_ + tb * N, N, inj2_ + tb * HC, HC, true, cs);
         }
+#if defined(STRATA_HAVE_DFLASH2)
+        if (tap_on_ && !batch_rec_ && l < (int64_t) tap_slot_.size() && tap_slot_[(size_t) l] >= 0) {
+            const int64_t nt = (int64_t) tap_layers_.size();
+            strata::kernels::df2_tap_gr(Rt(tb), HC * N, bo_ + tb * N, N, inj2_ + tb * HC, HC,
+                                        tap_dev_ + ((size_t) tb * nt + (size_t) tap_slot_[(size_t) l]) * N,
+                                        nt * N, n, N, (int) HC, cs);
+        }
+#endif
         VDBG("layer_post (l=%lld, grp=%d): end\n", (long long)l, grp);
         return true;
 

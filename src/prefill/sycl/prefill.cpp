@@ -35,6 +35,9 @@ inline sycl::queue& default_queue() {
 #include "strata/core/layer.hpp"
 #include "strata/core/native_head.hpp"
 #include "strata/kernels/verify_kernels.hpp"
+#if defined(STRATA_HAVE_DFLASH2)
+#include "strata/kernels/dflash2.hpp"
+#endif
 #include "strata/kernels/qsa_decode_attn.hpp"
 #include "strata/kernels/qsa_prompt_attn.hpp"
 #include "strata/kernels/qsa_select.hpp"
@@ -752,6 +755,26 @@ strata::kernels::QsaAttnPools pools_of(const strata::kernels::KvHostPools& h, co
 Prefill::Prefill() : impl_(new Impl) {}
 Prefill::~Prefill() { release(); }
 
+bool Prefill::reserve_taps(const std::vector<int>& layers, int64_t cap_rows, int64_t n_embd, std::string& err) {
+    tap_layers_ = layers;
+    tap_cap_ = cap_rows;
+    if (tap_dev_ != nullptr) return true;
+    tap_dev_ = sycl::malloc_device<float>((size_t) cap_rows * layers.size() * (size_t) n_embd, default_queue());
+    if (tap_dev_ == nullptr) {
+        err = "prefill: the DFlash2 tap staging does not fit in VRAM";
+        return false;
+    }
+    return true;
+}
+
+void Prefill::clear_taps() {
+    if (tap_dev_ != nullptr) {
+        try { sycl::free(tap_dev_, default_queue()); } catch (...) {}
+        tap_dev_ = nullptr;
+    }
+    tap_layers_.clear();
+}
+
 void Prefill::reset() {
     release();
     impl_.reset(new Impl);
@@ -759,6 +782,7 @@ void Prefill::reset() {
 }
 
 void Prefill::release() {
+    clear_taps();
     if (!impl_) return;
     lm_release();
     if (impl_->lm.tab_host) {
@@ -1873,6 +1897,16 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     std::future<bool> ple_next;  // declared after everything it reads: an early return waits for it
     int ple_buf = 0;
 
+    std::vector<int> tap_slot;
+    if (!tap_layers_.empty() && stage_lb_ == 0 && (stage_le_ < 0 || stage_le_ == g.n_layers)) {
+        if (tap_dev_ == nullptr) {
+            tap_dev_ = sycl::malloc_device<float>((size_t) tap_cap_ * tap_layers_.size() * (size_t) g.n_embd, default_queue());
+            if (tap_dev_ == nullptr) { err = "prefill: the DFlash2 tap staging does not fit in VRAM"; return false; }
+        }
+        tap_slot.assign((size_t) g.n_layers, -1);
+        for (size_t i = 0; i < tap_layers_.size(); ++i) tap_slot[(size_t) tap_layers_[i]] = (int) i;
+    }
+
     for (int64_t c0 = 0; c0 < n; c0 += m.T) {
         if (should_stop && should_stop()) {
             err = "cancelled";
@@ -1883,6 +1917,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             std::fflush(stderr);
         }
         const int64_t T = std::min(m.T, n - c0), p0 = pos0 + c0;
+        const int64_t tap_t0 = tap_dev_ != nullptr ? std::min<int64_t>(T, std::max<int64_t>(0, tap_first_ - p0)) : T;
+        const int64_t tap_rows = T - tap_t0;
+        if (tap_rows > tap_cap_) { err = "prefill: the DFlash2 tap staging is smaller than the chunk's tapped rows"; return false; }
         const bool kva_approx = kva_run && (p0 + T <= kva_frontier);
         if (kva_approx) {
             kva_positions += T;
@@ -3349,6 +3386,11 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 }
                 if (half == 1 && strata::kernels::cvec().covers(l))  // --control-vector-scaled
                     strata::kernels::cvec_apply(m.R, l, T, D, nullptr, 0, nullptr, 0, false, m.cs);
+#if defined(STRATA_HAVE_DFLASH2)
+                if (half == 1 && tap_rows > 0 && !tap_slot.empty() && tap_slot[(size_t) l] >= 0)
+                    strata::kernels::df2_tap_rows(m.R + (size_t) tap_t0 * D, tap_dev_ + (size_t) tap_slot[(size_t) l] * N,
+                                                  (int64_t) tap_layers_.size() * N, N, (int) HC, (int) tap_rows, m.cs);
+#endif
             }
         }
         if (issuer.joinable()) {
@@ -3402,7 +3444,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 std::fclose(f);
             }
         }
-        if (on_chunk || on_stage_chunk) {
+        if (on_chunk || on_stage_chunk || (tap_rows > 0 && on_taps)) {
             const auto toc = Clock::now();
             try {
                 m.cs->wait();
@@ -3411,6 +3453,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 return false;
             }
             const auto toc2 = Clock::now();
+            if (tap_rows > 0 && on_taps && !on_taps(tap_dev_, tap_rows, p0 + tap_t0, err)) return false;
             if (on_stage_chunk && !on_stage_chunk(p0 + T, err)) return false;
             if (on_chunk && !on_chunk(m.R, T, p0, err)) return false;
             host_sync_ms += std::chrono::duration<double, std::milli>(toc2 - toc).count();
