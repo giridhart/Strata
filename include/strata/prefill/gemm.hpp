@@ -1,4 +1,4 @@
-#ifdef SYCL_LANGUAGE_VERSION
+#if defined(SYCL_LANGUAGE_VERSION) && defined(STRATA_ENABLE_SYCL)
 // include/strata/prefill/gemm.hpp - plan v0.3 P5: the batched projections of prompt processing.
 //
 // Every projection of a chunk of T tokens is Y[T, N] = X[T, K] . W[N, K]^T with W row-major (the GGUF / pack layout)
