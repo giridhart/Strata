@@ -39,7 +39,11 @@
 namespace strata::prefill {
 
 /// Check if chunked GDN prompt recurrence is available (Volta cc 7.0 for CUDA, or Intel Xe2 for SYCL).
+#ifdef STRATA_ENABLE_SYCL
 bool gdn_chunk_available(void* stream = nullptr);
+#else
+bool gdn_chunk_available();
+#endif
 
 /// The chunked recurrence over `T` tokens (T a multiple of 64):
 void gdn_chunk_recurrence(float* state, const float* h, const float* gate, const float* beta, float* oc,
