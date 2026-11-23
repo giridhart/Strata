@@ -119,8 +119,9 @@ inline void route_token(const float* logits, int32_t* ids, float* weights, size_
 // all 512 experts serially: lanes coalesced-read candidates f = lane, lane + 32, ... and reduce
 // across the subgroup via shift_group_left.  Bitwise identical to reference semantics.
 void route_resident_k(const float* __restrict__ logits, int32_t* __restrict__ ids, float* __restrict__ weights,
-                      const int32_t* __restrict__ res, int n_tok, float margin, int lo, int hi,
-                      unsigned long long* __restrict__ stats, const sycl::nd_item<1>& item) {
+                      const int32_t* __restrict__ res, int n_tok, float margin, int lo, int hi, float edge,
+                      float budget, float budget_tail, unsigned long long* __restrict__ stats,
+                      const sycl::nd_item<1>& item) {
     const int t = item.get_group(0);
     if (t >= n_tok) return;
     const int lane = (int)item.get_local_id(0);
@@ -133,9 +134,15 @@ void route_resident_k(const float* __restrict__ logits, int32_t* __restrict__ id
     if (lane == 0) {
         for (int r = 0; r < 10; ++r) before += (res[my[r]] < 0);
     }
-    for (int r = lo; r <= hi && r < 10; ++r) {
+    const bool bud = budget > 0.0f;
+    const int first = (edge >= 0.0f && lo > 0) ? (lo - 1) : lo;
+    const int r_start = bud ? 0 : first;
+    for (int r = r_start; r <= hi && r < 10; ++r) {
         const int e = my[r];
         if (res[e] >= 0) continue;  // already resident: uniform across subgroup
+        const bool brank = bud && r < lo;
+        const bool trank = budget_tail > 0.0f && r >= lo;
+        if (!brank && r < first) continue;
         if (lane == 0) ++tail;
         float bv = -INFINITY;
         int bi = -1;
@@ -160,9 +167,16 @@ void route_resident_k(const float* __restrict__ logits, int32_t* __restrict__ id
                 }
             }
         }
-        if (lane == 0 && bi >= 0 && l[e] - bv <= margin) {
-            my[r] = bi;
-            ++swaps;
+        if (lane == 0 && bi >= 0) {
+            const float gap = l[e] - bv;
+            const float w = weights[(size_t)t * 10 + r];
+            const bool take = brank   ? (w * sycl::fmax(gap, 0.0f) <= budget)
+                            : trank   ? (w * sycl::fmax(gap, 0.0f) <= budget_tail)
+                                      : (gap <= ((edge >= 0.0f && lo > 0 && r == lo - 1) ? edge : margin));
+            if (take) {
+                my[r] = bi;
+                ++swaps;
+            }
         }
         my[r] = sycl::select_from_group(sg, my[r], 0);  // all lanes keep same picked set
     }
@@ -333,10 +347,11 @@ void native_router_topk(const float* logits, int32_t* ids, float* weights, int n
     }
 }
 
-void native_route_resident(const float* logits, int32_t* ids, float* weights, const int32_t* res_layer, int n_tok,
-                           float margin, int rank_lo, int rank_hi, unsigned long long* stats, void* stream) {
+void native_route_resident_ext(const float* logits, int32_t* ids, float* weights, const int32_t* res_layer, int n_tok,
+                               float margin, int rank_lo, int rank_hi, float edge, float budget, float budget_tail,
+                               unsigned long long* stats, void* stream) {
     if (!stream || n_tok < 1 || !res_layer)
-        throw std::invalid_argument("native_route_resident: bad arguments");
+        throw std::invalid_argument("native_route_resident_ext: bad arguments");
 
     static sycl::queue default_queue{sycl::property::queue::in_order()};
     sycl::queue* q = stream ? static_cast<sycl::queue*>(stream) : &default_queue;
@@ -345,8 +360,14 @@ void native_route_resident(const float* logits, int32_t* ids, float* weights, co
     const size_t global = (size_t)n_tok * 32;
     q->parallel_for(sycl::nd_range<1>(sycl::range<1>(global), sycl::range<1>(wg)),
                     [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(32)]] {
-                        route_resident_k(logits, ids, weights, res_layer, n_tok, margin, rank_lo, rank_hi, stats,
-                                         item);
+                        route_resident_k(logits, ids, weights, res_layer, n_tok, margin, rank_lo, rank_hi, edge, budget,
+                                         budget_tail, stats, item);
                     });
+}
+
+void native_route_resident(const float* logits, int32_t* ids, float* weights, const int32_t* res_layer, int n_tok,
+                           float margin, int rank_lo, int rank_hi, unsigned long long* stats, void* stream) {
+    native_route_resident_ext(logits, ids, weights, res_layer, n_tok, margin, rank_lo, rank_hi, -1.0f, 0.0f, 0.0f,
+                              stats, stream);
 }
 }  // namespace strata::kernels

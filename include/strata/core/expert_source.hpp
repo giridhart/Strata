@@ -214,6 +214,91 @@ struct GpuPlanSink {
     int pcie_mode = 0;
 };
 
+/// Verifier::set_pcie_balance (STRATA_PCIE_BALANCE=1, opt-in): a verify window's costs, fitted to each layer's
+/// measured times (ms, least squares with forgetting): CPU pool time a + c*n_c + d*n_p (none: p0), GPU time g0 + g*n_p.
+struct PcieModel {
+    bool on = false;
+    double a = 0, c = 0, d = 0, p0 = 0, g0 = 0, g = 0;
+    int np0 = 0;
+    double A[3][3] = {}, B[3] = {};
+    double C[2][2] = {}, D[2] = {};
+    int ncpu = 0, ngpu = 0, ngpu_p = 0;
+    uint32_t explore = 0;
+    static void mean(double& v, int& n, double x) {
+        if (n < 16) v += (x - v) / ++n;
+        else v += 0.05 * (x - v);
+    }
+    void sample(int n_c, int n_p, double p, double gpu) {
+        constexpr double lam = 0.995;
+        if (n_c == 0) mean(p0, np0, p);
+        else {
+            const double x[3] = {1.0, (double)n_c, (double)n_p};
+            for (int i = 0; i < 3; ++i) {
+                B[i] = lam * B[i] + x[i] * p;
+                for (int j = 0; j < 3; ++j) A[i][j] = lam * A[i][j] + x[i] * x[j];
+            }
+            ++ncpu;
+        }
+        if (gpu > 0.0) {
+            const double y[2] = {1.0, (double)n_p};
+            for (int i = 0; i < 2; ++i) {
+                D[i] = lam * D[i] + y[i] * gpu;
+                for (int j = 0; j < 2; ++j) C[i][j] = lam * C[i][j] + y[i] * y[j];
+            }
+            ++ngpu;
+            ngpu_p += n_p > 0;
+        }
+    }
+    void solve() {
+        if (ncpu >= 8) {
+            double M[3][4];
+            for (int i = 0; i < 3; ++i) {
+                for (int j = 0; j < 3; ++j) M[i][j] = A[i][j] + (i == j && i > 0 ? 1e-3 * A[0][0] : 0.0);
+                M[i][3] = B[i];
+            }
+            bool ok = true;
+            for (int k = 0; k < 3 && ok; ++k) {
+                int piv = k;
+                for (int i = k + 1; i < 3; ++i)
+                    if (std::abs(M[i][k]) > std::abs(M[piv][k])) piv = i;
+                if (std::abs(M[piv][k]) < 1e-12) { ok = false; break; }
+                for (int j = 0; j < 4; ++j) std::swap(M[k][j], M[piv][j]);
+                for (int i = 0; i < 3; ++i) {
+                    if (i == k) continue;
+                    const double f = M[i][k] / M[k][k];
+                    for (int j = k; j < 4; ++j) M[i][j] -= f * M[k][j];
+                }
+            }
+            if (ok) {
+                a = std::max(M[0][3] / M[0][0], 0.0);
+                c = std::max(M[1][3] / M[1][1], 0.0);
+                d = std::clamp(M[2][3] / M[2][2], 0.0, c);
+            }
+        }
+        if (ngpu >= 8 && ngpu_p >= 4) {
+            const double det = C[0][0] * C[1][1] - C[0][1] * C[1][0];
+            if (std::abs(det) > 1e-12) {
+                g0 = std::max((D[0] * C[1][1] - C[0][1] * D[1]) / det, 0.0);
+                g = std::max((C[0][0] * D[1] - C[1][0] * D[0]) / det, 0.0);
+            }
+        }
+    }
+    bool ready() const { return on && ncpu >= 8 && ngpu_p >= 4; }
+    int pick(int nmiss, int fixed) {
+        int m = fixed;
+        if (ready()) {
+            double best = 1e300;
+            for (int k = 0; k <= nmiss; ++k) {
+                const double cpu = nmiss - k > 0 ? a + c * (nmiss - k) + d * k : p0;
+                const double t = std::max(g0 + g * k, cpu);
+                if (t < best - 1e-6) { best = t; m = k; }
+            }
+        }
+        if (on && nmiss >= 1 && (++explore & 63u) == 0) m = m == 0 ? 1 : m == nmiss ? nmiss - 1 : m;
+        return m;
+    }
+};
+
 /// The adapter's own state.  One per session, reused every layer so the token path allocates nothing (P2.T10).
 struct ExpertDispatch {
     strata::kernels::cpu::ExpertPool* pool = nullptr;
@@ -334,7 +419,11 @@ struct ExpertDispatch {
     /// each layer's distinct missed experts (the last ones in routing order) are read by the GPU over PCIe.
     GpuPlanSink* plan = nullptr;
     int pcie_num = 0;
+    PcieModel pcie_model;          ///< STRATA_PCIE_BALANCE=1 (opt-in): dynamic PCIe expert count from measured costs
+    int last_n_cpu = 0;            ///< distinct CPU misses in the most recent expert_pool_dispatch_multi call
+    int last_n_pcie = 0;           ///< distinct PCIe misses in the most recent expert_pool_dispatch_multi call
     int64_t pcie_experts = 0;      ///< distinct experts the GPU read over PCIe in verify windows
+    int64_t tail_experts = 0;      ///< distinct experts skipped by tail rules (opt-in)
     double ms_plan = 0, ms_actq = 0, ms_jobs = 0, ms_run = 0;   ///< verify-window dispatch sections
     /// Plan v0.3 P6: decayed routing counts per (layer, expert) during decode (sized by the caller; empty = off),
     /// which the driver uses to swap the most-routed missing experts into the VRAM tier between rounds.
@@ -364,6 +453,11 @@ void expert_pool_dispatch(void* user, const float* x_f, const int32_t* ids, cons
 /// resident experts' rows are zeroed (the GPU adds them).  Requires `host_res` (the token-graph residency).
 void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k,
                                 float* out);
+/// Pass the current verify slice's host-mapped router weights [n_tok, k] into expert_pool_dispatch_multi
+/// (used by opt-in STRATA_TAIL_WEIGHT / STRATA_LAYER_LIVE). Call with nullptr after dispatch.
+void expert_dispatch_set_weights(const float* weights);
+/// Called once per completed verify window when opt-in STRATA_LAYER_LIVE or STRATA_LAYER_STATS is active.
+void expert_dispatch_window_tick(int n_layers);
 
 /// **THE HITS, LAUNCHED AFTER THE MISSES ARE STAGED AND BEFORE `post[l]`.**  Same shape as `PoolFn` and for the
 /// same reason: `session_loop` owns the ORDER and this owns the work, so the loop needs to know nothing about

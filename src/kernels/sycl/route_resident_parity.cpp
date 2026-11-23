@@ -27,8 +27,8 @@ constexpr int kWeightUlp = 8;
 // Runs on device so that exp, and therefore the softmax bits, are evaluated by the same runtime math library.
 void route_resident_ref_k(const float* __restrict__ logits, int32_t* __restrict__ ids,
                           float* __restrict__ weights, const int32_t* __restrict__ res, int n_tok,
-                          float margin, int lo, int hi, unsigned long long* __restrict__ stats,
-                          const sycl::nd_item<1>& item) {
+                          float margin, int lo, int hi, float edge, float budget, float budget_tail,
+                          unsigned long long* __restrict__ stats, const sycl::nd_item<1>& item) {
     const int t = (int)item.get_global_id(0);
     if (t >= n_tok) return;
     const float* l = logits + (size_t)t * kExperts;
@@ -37,9 +37,15 @@ void route_resident_ref_k(const float* __restrict__ logits, int32_t* __restrict_
     for (int r = 0; r < kTop; ++r) my[r] = id[r];
     int swaps = 0, tail = 0, before = 0;
     for (int r = 0; r < kTop; ++r) before += (res[my[r]] < 0);
-    for (int r = lo; r <= hi && r < kTop; ++r) {
+    const bool bud = budget > 0.0f;
+    const int first = (edge >= 0.0f && lo > 0) ? (lo - 1) : lo;
+    const int r_start = bud ? 0 : first;
+    for (int r = r_start; r <= hi && r < kTop; ++r) {
         const int e = my[r];
         if (res[e] >= 0) continue;  // resident already: nothing to swap
+        const bool brank = bud && r < lo;
+        const bool trank = budget_tail > 0.0f && r >= lo;
+        if (!brank && r < first) continue;
         ++tail;
         float bv = -INFINITY;
         int bi = -1;
@@ -53,9 +59,16 @@ void route_resident_ref_k(const float* __restrict__ logits, int32_t* __restrict_
                 bi = f;
             }
         }
-        if (bi >= 0 && l[e] - bv <= margin) {
-            my[r] = bi;
-            ++swaps;
+        if (bi >= 0) {
+            const float gap = l[e] - bv;
+            const float w = weights[(size_t)t * kTop + r];
+            const bool take = brank ? (w * sycl::fmax(gap, 0.0f) <= budget)
+                            : trank ? (w * sycl::fmax(gap, 0.0f) <= budget_tail)
+                                    : (gap <= ((edge >= 0.0f && lo > 0 && r == lo - 1) ? edge : margin));
+            if (take) {
+                my[r] = bi;
+                ++swaps;
+            }
         }
     }
     int after = 0;
@@ -169,7 +182,8 @@ int main() {
         const size_t ref_grid = ((size_t)n_tok + 31) / 32 * 32;
         q.parallel_for(sycl::nd_range<1>(sycl::range<1>(ref_grid), sycl::range<1>(32)),
                        [=](sycl::nd_item<1> item) {
-                           route_resident_ref_k(d_logits, d_ids_ref, d_w_ref, d_res, n_tok, margin, lo, hi, d_stats, item);
+                           route_resident_ref_k(d_logits, d_ids_ref, d_w_ref, d_res, n_tok, margin, lo, hi, -1.0f,
+                                                0.0f, 0.0f, d_stats, item);
                        }).wait();
         unsigned long long st_ref[4] = {0, 0, 0, 0};
         q.memcpy(st_ref, d_stats, sizeof(st_ref)).wait();
@@ -239,6 +253,93 @@ int main() {
         ++bad;
     }
     std::printf(bad ? "route_resident_parity: %d FAILURES\n" : "route_resident_parity OK\n", bad);
+
+    // ---- Extended HotRod modes: edge (fractional floor), budget (ranks < lo), budget_tail (ranks >= lo) ----
+    int ext_bad = 0, ext_swapped = 0, ext_worst_ulp = 0;
+    unsigned long long ext_swaps_total = 0;
+    const int ext_cases = 240;
+    const float edges[] = {-1.0f, 0.0f, 0.5f, 1.0f, 2.0f};
+    const float budgets[] = {0.0f, 0.05f, 0.15f, 0.35f};
+    const float btails[] = {0.0f, 0.10f, 0.25f, 0.50f};
+    for (int c = 0; c < ext_cases; ++c) {
+        const int n_tok = 1 + (c % kMaxTok);
+        const float margin = (c % 3 == 0) ? 1e30f : margins[c % n_margins];
+        const int lo = 1 + (c % 6);
+        const int hi = kTop - 1;
+        const float edge = edges[c % 5];
+        const float budget = budgets[(c / 5) % 4];
+        const float budget_tail = btails[(c / 20) % 4];
+        const int resident_pct = 25 + coin(rng) % 55;
+        for (int e = 0; e < kExperts; ++e) res[e] = (coin(rng) < resident_pct) ? (int32_t)(e % 7) : -1;
+        for (size_t i = 0; i < logits.size(); ++i) logits[i] = ud(rng);
+        for (int t = 0; t < n_tok; ++t) {
+            int32_t* row = ids.data() + (size_t)t * kTop;
+            const float* lr = logits.data() + (size_t)t * kExperts;
+            top10(lr, row);
+            float m = -INFINITY;
+            for (int r = 0; r < kTop; ++r) m = std::fmax(m, lr[row[r]]);
+            float sum = 0.0f;
+            for (int r = 0; r < kTop; ++r) {
+                weights[(size_t)t * kTop + r] = std::exp(lr[row[r]] - m);
+                sum += weights[(size_t)t * kTop + r];
+            }
+            for (int r = 0; r < kTop; ++r) weights[(size_t)t * kTop + r] /= sum;
+        }
+        q.memcpy(d_logits, logits.data(), logits.size() * sizeof(float)).wait();
+        q.memcpy(d_res, res.data(), res.size() * sizeof(int32_t)).wait();
+
+        q.memcpy(d_ids_ref, ids.data(), ids.size() * sizeof(int32_t)).wait();
+        q.memcpy(d_w_ref, weights.data(), weights.size() * sizeof(float)).wait();
+        q.memset(d_stats, 0, 4 * sizeof(unsigned long long)).wait();
+        const size_t ref_grid = ((size_t)n_tok + 31) / 32 * 32;
+        q.parallel_for(sycl::nd_range<1>(sycl::range<1>(ref_grid), sycl::range<1>(32)),
+                       [=](sycl::nd_item<1> item) {
+                           route_resident_ref_k(d_logits, d_ids_ref, d_w_ref, d_res, n_tok, margin, lo, hi, edge,
+                                                budget, budget_tail, d_stats, item);
+                       }).wait();
+        unsigned long long st_ref[4] = {};
+        q.memcpy(st_ref, d_stats, sizeof(st_ref)).wait();
+
+        q.memcpy(d_ids_par, ids.data(), ids.size() * sizeof(int32_t)).wait();
+        q.memcpy(d_w_par, weights.data(), weights.size() * sizeof(float)).wait();
+        q.memset(d_stats, 0, 4 * sizeof(unsigned long long)).wait();
+        strata::kernels::native_route_resident_ext(d_logits, d_ids_par, d_w_par, d_res, n_tok, margin, lo, hi, edge,
+                                                   budget, budget_tail, d_stats, static_cast<void*>(&q));
+        q.wait();
+        unsigned long long st_par[4] = {};
+        q.memcpy(st_par, d_stats, sizeof(st_par)).wait();
+
+        std::vector<int32_t> i_ref(ids.size()), i_par(ids.size());
+        std::vector<float> w_ref(weights.size()), w_par(weights.size());
+        q.memcpy(i_ref.data(), d_ids_ref, i_ref.size() * sizeof(int32_t)).wait();
+        q.memcpy(i_par.data(), d_ids_par, i_par.size() * sizeof(int32_t)).wait();
+        q.memcpy(w_ref.data(), d_w_ref, w_ref.size() * sizeof(float)).wait();
+        q.memcpy(w_par.data(), d_w_par, w_par.size() * sizeof(float)).wait();
+
+        int w_ulp = 0;
+        for (size_t i = 0; i < w_ref.size(); ++i) {
+            uint32_t a = 0, b = 0;
+            std::memcpy(&a, &w_ref[i], 4);
+            std::memcpy(&b, &w_par[i], 4);
+            if (a != b) {
+                const uint32_t d = a > b ? a - b : b - a;
+                if ((int)d > w_ulp) w_ulp = (int)d;
+            }
+        }
+        if (w_ulp > ext_worst_ulp) ext_worst_ulp = w_ulp;
+        if (i_ref != i_par || w_ulp > kWeightUlp || std::memcmp(st_ref, st_par, sizeof(st_ref)) != 0) {
+            ++ext_bad;
+            std::printf("  ext case %3d  n_tok %d  lo %d  edge %.2f  bud %.2f  btail %.2f  DIFFER (ulp=%d)\n",
+                        c, n_tok, lo, edge, budget, budget_tail, w_ulp);
+        }
+        if (st_par[1]) {
+            ++ext_swapped;
+            ext_swaps_total += st_par[1];
+        }
+    }
+    std::printf("route_resident_ext_parity: %d cases, %d with swaps (%llu swaps), %d mismatches, weights within %d ulp\n",
+                ext_cases, ext_swapped, ext_swaps_total, ext_bad, ext_worst_ulp);
+    bad += ext_bad;
 
     sycl::free(d_logits, q);
     sycl::free(d_w_ref, q);

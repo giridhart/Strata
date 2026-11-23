@@ -22,6 +22,7 @@ inline sycl::queue& default_queue() {
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -2024,6 +2025,197 @@ constexpr int64_t kMaxWindowEntries = 128;
 static_assert(strata::kernels::cpu::MAXT * 10 <= kMaxWindowEntries, "a verify window's entries overflow the tables");
 }  // namespace
 
+namespace {
+// ---- Opt-in HotRod tail-skipping, live per-layer weight thresholds, and layer diagnostics (all OFF by default) ----
+thread_local const float* t_route_w = nullptr;
+
+struct HotrodTailCfg {
+    int tail_rank = 0;        // STRATA_ROUTE_TAIL_SKIP=R or STRATA_TAIL_CPU=0
+    int cut_rank = 0;         // STRATA_RANK_CUTOFF=R
+    float tail_weight = 0.0f; // STRATA_TAIL_WEIGHT=<tau>
+    int tail_w_from = 2;      // floor rank for weight rule (STRATA_TAIL_WEIGHT_FROM or STRATA_ROUTE_RESIDENT_RANKS lo)
+    bool layer_live = false;  // STRATA_LAYER_LIVE=1
+    float layer_share = 0.5f; // STRATA_LAYER_SHARE=<0..1>
+    bool pcie_min1 = false;   // STRATA_PCIE_MIN1=1
+    bool layer_stats = false; // STRATA_LAYER_STATS=1
+};
+
+const HotrodTailCfg& hotrod_tail_cfg() {
+    static const HotrodTailCfg cfg = [] {
+        HotrodTailCfg c;
+        int rr_lo = 6, rr_hi = 9;
+        const bool has_rr_ranks = std::getenv("STRATA_ROUTE_RESIDENT_RANKS") != nullptr;
+        if (const char* v = std::getenv("STRATA_ROUTE_RESIDENT_RANKS")) std::sscanf(v, "%d-%d", &rr_lo, &rr_hi);
+        if (const char* v = std::getenv("STRATA_ROUTE_TAIL_SKIP")) c.tail_rank = std::max(0, std::atoi(v));
+        if (const char* v = std::getenv("STRATA_TAIL_CPU")) {
+            if (std::atoi(v) == 0 && c.tail_rank == 0) c.tail_rank = has_rr_ranks ? rr_lo : 3;
+        }
+        if (const char* v = std::getenv("STRATA_RANK_CUTOFF")) c.cut_rank = std::max(0, std::atoi(v));
+        if (const char* v = std::getenv("STRATA_TAIL_WEIGHT")) {
+            const float t = (float)std::atof(v);
+            if (t > 0.0f && t < 1.0f) c.tail_weight = t;
+        }
+        c.tail_w_from = has_rr_ranks ? rr_lo : 2;
+        if (const char* v = std::getenv("STRATA_TAIL_WEIGHT_FROM")) c.tail_w_from = std::max(0, std::atoi(v));
+        if (const char* v = std::getenv("STRATA_LAYER_LIVE")) c.layer_live = std::atoi(v) != 0;
+        if (const char* v = std::getenv("STRATA_LAYER_SHARE")) {
+            const float s = (float)std::atof(v);
+            if (s > 0.0f && s < 1.0f) c.layer_share = s;
+        }
+        if (const char* v = std::getenv("STRATA_PCIE_MIN1")) c.pcie_min1 = std::atoi(v) != 0;
+        if (const char* v = std::getenv("STRATA_LAYER_STATS")) c.layer_stats = std::atoi(v) != 0;
+        if (c.pcie_min1) std::fprintf(stderr, "strata hotrod: STRATA_PCIE_MIN1=1 (exact: >=1 PCIe miss when nmiss>=2)\n");
+        if (c.tail_rank > 0)
+            std::fprintf(stderr, "strata hotrod: tail rank skip active (rank >= %d skipped when missed; changes output)\n", c.tail_rank);
+        if (c.cut_rank > 0)
+            std::fprintf(stderr, "strata hotrod: STRATA_RANK_CUTOFF=%d (all ranks >= %d skipped; changes output)\n", c.cut_rank, c.cut_rank);
+        if (c.tail_weight > 0.0f && !c.layer_live)
+            std::fprintf(stderr, "strata hotrod: STRATA_TAIL_WEIGHT=%.4f (from rank %d; changes output)\n", (double)c.tail_weight, c.tail_w_from);
+        if (c.layer_live)
+            std::fprintf(stderr, "strata hotrod: STRATA_LAYER_LIVE=1 share=%.2f (from rank %d; changes output)\n", (double)c.layer_share, c.tail_w_from);
+        if (c.layer_stats)
+            std::fprintf(stderr, "strata hotrod: STRATA_LAYER_STATS=1 (depth-band diagnostics every 1024 windows)\n");
+        return c;
+    }();
+    return cfg;
+}
+
+// Live per-layer log-binned histogram of missed tail router weights (STRATA_LAYER_LIVE=1).
+constexpr int kLiveMaxLayers = 256;
+constexpr int kLiveBins = 48;
+constexpr double kLiveBinLo = 1e-4, kLiveBinSpan = 5000.0;
+std::atomic<uint32_t> g_lhist[kLiveMaxLayers][kLiveBins];
+std::atomic<uint64_t> g_lwsum[kLiveMaxLayers][kLiveBins];
+std::atomic<float> g_live_tau[kLiveMaxLayers];
+std::atomic<uint32_t> g_live_win{0};
+std::atomic<bool> g_live_settled{false};
+std::atomic<uint32_t> g_live_calm{0};
+
+inline int live_bin(double w) {
+    if (w <= kLiveBinLo) return 0;
+    const double pos = std::log(w / kLiveBinLo) / std::log(kLiveBinSpan) * kLiveBins;
+    return pos < 0.0 ? 0 : (pos >= kLiveBins ? kLiveBins - 1 : (int)pos);
+}
+inline double hist_below(int l, double t) {
+    if (t <= kLiveBinLo) return 0.0;
+    const double pos = std::log(t / kLiveBinLo) / std::log(kLiveBinSpan) * kLiveBins;
+    double c = 0.0;
+    const int full = (int)std::min<double>(pos, (double)kLiveBins);
+    for (int b = 0; b < full; ++b) c += (double)g_lhist[l][b].load(std::memory_order_relaxed);
+    if (full < kLiveBins) c += (pos - full) * (double)g_lhist[l][full].load(std::memory_order_relaxed);
+    return c;
+}
+inline void layer_live_note(int layer, float w) {
+    if (layer < 0 || layer >= kLiveMaxLayers || !(w > 0.0f)) return;
+    const int b = live_bin((double)w);
+    g_lhist[layer][b].fetch_add(1u, std::memory_order_relaxed);
+    g_lwsum[layer][b].fetch_add((uint64_t)(w * 1e6f + 0.5f), std::memory_order_relaxed);
+}
+
+// STRATA_LAYER_STATS=1: 4 depth bands x {0:VRAM, 1:PCIe, 2:CPU, 3:Skipped}.
+std::atomic<uint64_t> g_ls_cnt[4][4];
+std::atomic<uint32_t> g_ls_win{0};
+inline void ls_note(int layer, int n_layers, int bucket, uint64_t delta) {
+    const int nl = n_layers > 0 ? n_layers : 48;
+    const int band = std::min(3, std::max(0, (layer * 4) / nl));
+    g_ls_cnt[band][bucket].fetch_add(delta, std::memory_order_relaxed);
+}
+}  // namespace
+
+void expert_dispatch_set_weights(const float* weights) { t_route_w = weights; }
+
+void expert_dispatch_window_tick(int n_layers) {
+    const auto& cfg = hotrod_tail_cfg();
+    const int nl = std::min(kLiveMaxLayers, std::max(1, n_layers));
+    if (cfg.layer_live) {
+        const uint32_t w = g_live_win.fetch_add(1u, std::memory_order_relaxed) + 1u;
+        const uint32_t period = g_live_settled.load(std::memory_order_relaxed) ? 1024u : 64u;
+        if (w % period == 0u) {
+            double total_n = 0.0;
+            double shape[kLiveMaxLayers] = {};
+            double layer_n[kLiveMaxLayers] = {};
+            for (int l = 0; l < nl; ++l) {
+                double ln = 0.0;
+                for (int b = 0; b < kLiveBins; ++b) ln += (double)g_lhist[l][b].load(std::memory_order_relaxed);
+                layer_n[l] = ln;
+                total_n += ln;
+            }
+            if (total_n >= 2000.0) {
+                double m10_sum = 0.0;
+                int m10_cnt = 0;
+                double m10[kLiveMaxLayers] = {};
+                for (int l = 0; l < nl; ++l) {
+                    if (layer_n[l] < 10.0) continue;
+                    const double want = std::max(1.0, 0.10 * layer_n[l]);
+                    double acc_n = 0.0, acc_w = 0.0;
+                    for (int b = 0; b < kLiveBins && acc_n < want; ++b) {
+                        const double bn = (double)g_lhist[l][b].load(std::memory_order_relaxed);
+                        if (bn <= 0.0) continue;
+                        const double bw = (double)g_lwsum[l][b].load(std::memory_order_relaxed) * 1e-6;
+                        const double take = std::min(bn, want - acc_n);
+                        acc_n += take;
+                        acc_w += bw * (take / bn);
+                    }
+                    if (acc_n > 0.0 && acc_w > 0.0) {
+                        m10[l] = acc_w / acc_n;
+                        m10_sum += m10[l];
+                        ++m10_cnt;
+                    }
+                }
+                const double mean_m10 = m10_cnt > 0 ? m10_sum / (double)m10_cnt : 0.05;
+                for (int l = 0; l < nl; ++l) {
+                    const double raw = m10[l] > 0.0 ? (mean_m10 / m10[l]) : 1.0;
+                    shape[l] = std::clamp(raw, 0.25, 4.0);
+                }
+                const double target = (double)cfg.layer_share * total_n;
+                double lo = 1e-4, hi = 0.5;
+                for (int it = 0; it < 28; ++it) {
+                    const double mid = 0.5 * (lo + hi);
+                    double s = 0.0;
+                    for (int l = 0; l < nl; ++l) s += hist_below(l, mid * shape[l]);
+                    if (s < target) lo = mid;
+                    else hi = mid;
+                }
+                const double c = 0.5 * (lo + hi);
+                double max_rel = 0.0;
+                for (int l = 0; l < nl; ++l) {
+                    const float nt = (float)std::clamp(c * shape[l], 0.0, 0.99);
+                    const float prev = g_live_tau[l].load(std::memory_order_relaxed);
+                    const float smoothed = prev > 0.0f ? (0.7f * prev + 0.3f * nt) : nt;
+                    if (prev > 1e-5f) max_rel = std::max(max_rel, (double)std::abs(smoothed - prev) / (double)prev);
+                    else max_rel = 1.0;
+                    g_live_tau[l].store(smoothed, std::memory_order_relaxed);
+                }
+                if (max_rel <= 0.03) {
+                    if (g_live_calm.fetch_add(1u, std::memory_order_relaxed) + 1u >= 6u)
+                        g_live_settled.store(true, std::memory_order_relaxed);
+                } else {
+                    g_live_calm.store(0u, std::memory_order_relaxed);
+                    if (max_rel > 0.10) g_live_settled.store(false, std::memory_order_relaxed);
+                }
+            }
+        }
+    }
+    if (cfg.layer_stats) {
+        const uint32_t sw = g_ls_win.fetch_add(1u, std::memory_order_relaxed) + 1u;
+        if (sw % 1024u == 0u) {
+            std::fprintf(stderr, "strata layer_stats (win=%u):", sw);
+            for (int b = 0; b < 4; ++b) {
+                const uint64_t v = g_ls_cnt[b][0].load(std::memory_order_relaxed);
+                const uint64_t p = g_ls_cnt[b][1].load(std::memory_order_relaxed);
+                const uint64_t c = g_ls_cnt[b][2].load(std::memory_order_relaxed);
+                const uint64_t s = g_ls_cnt[b][3].load(std::memory_order_relaxed);
+                const double tot = (double)(v + p + c + s);
+                if (tot > 0.0) {
+                    std::fprintf(stderr, " B%d[vram=%.0f%% pcie=%.0f%% cpu=%.0f%% skip=%.0f%%]",
+                                 b, 100.0 * v / tot, 100.0 * p / tot, 100.0 * c / tot, 100.0 * s / tot);
+                }
+            }
+            std::fprintf(stderr, "\n");
+        }
+    }
+}
+
 void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k,
                                 float* out) {
     using namespace strata::kernels::cpu;
@@ -2066,7 +2258,10 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     // ---- plan v0.3 P6: the GPU's share, decided and published FIRST so the GPU starts while the CPU works.
     // Distinct experts in routing order; resident ones and the last pcie_num/256 of the missed ones go to the GPU.
     const int64_t n = n_tok * k;
-    int32_t kind[kMaxWindowEntries];  // per entry: -1 CPU, 0 VRAM, 1 PCIe
+    int32_t kind[kMaxWindowEntries];  // per entry: -2 skipped, -1 CPU, 0 VRAM, 1 PCIe
+    const auto& hcfg = hotrod_tail_cfg();
+    d.last_n_cpu = 0;
+    d.last_n_pcie = 0;
     if (d.plan != nullptr && n <= kMaxWindowEntries && n <= d.plan->cap) {
         int64_t distinct[kMaxWindowEntries], first_of[kMaxWindowEntries];
         int nd = 0, nmiss = 0;
@@ -2084,8 +2279,53 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                     ++nmiss;
             }
         }
-        const bool pcie_ok = d.pcie_num > 0 && d.src->pcie_layer(d.layers);
-        const int m = pcie_ok ? (nmiss * d.pcie_num) >> 8 : 0;
+        // Opt-in HotRod tail-skipping (STRATA_ROUTE_TAIL_SKIP / STRATA_TAIL_CPU=0 / STRATA_RANK_CUTOFF /
+        // STRATA_TAIL_WEIGHT / STRATA_LAYER_LIVE). Default OFF: zero behavior change.
+        const int tail_rank = hcfg.tail_rank;
+        const int cut_rank = hcfg.cut_rank;
+        const float* rw = t_route_w;
+        const float live_tau = (hcfg.layer_live && d.layers >= 0 && d.layers < kLiveMaxLayers)
+                                   ? g_live_tau[(size_t)d.layers].load(std::memory_order_relaxed)
+                                   : 0.0f;
+        const float tail_w = hcfg.layer_live ? live_tau : hcfg.tail_weight;
+        const bool wt_on = tail_w > 0.0f && rw != nullptr;
+        const bool live_note = hcfg.layer_live && rw != nullptr && n_tok <= 8 &&
+                               (!g_live_settled.load(std::memory_order_relaxed) ||
+                                (g_live_win.load(std::memory_order_relaxed) & 15u) == 0u);
+        bool skip_d[kMaxWindowEntries];
+        for (int q = 0; q < nd; ++q) skip_d[q] = false;
+        if ((tail_rank > 0 || cut_rank > 0 || wt_on || live_note) && d.remote_count == 0) {
+            int minr[kMaxWindowEntries];
+            float maxw[kMaxWindowEntries];
+            for (int q = 0; q < nd; ++q) {
+                minr[q] = 99;
+                maxw[q] = 0.0f;
+            }
+            for (int64_t i = 0; i < n; ++i) {
+                int q = 0;
+                while (q < nd && distinct[q] != first_of[i]) ++q;
+                if (q < nd) {
+                    minr[q] = std::min(minr[q], (int)(i % k));
+                    if (rw != nullptr) maxw[q] = std::max(maxw[q], rw[i]);
+                }
+            }
+            for (int q = 0; q < nd; ++q) {
+                const int32_t e = ids[distinct[q]];
+                if (e < 0 || e >= d.n_expert) continue;
+                const bool resident = d.host_res[(size_t)d.layers * (size_t)d.n_expert + (size_t)e] >= 0;
+                if (live_note && !resident && minr[q] >= hcfg.tail_w_from) layer_live_note((int)d.layers, maxw[q]);
+                const bool cut = cut_rank > 0 && minr[q] >= cut_rank;
+                const bool tail = tail_rank > 0 && minr[q] >= tail_rank && !resident;
+                const bool wtail = wt_on && !resident && minr[q] >= hcfg.tail_w_from && maxw[q] < tail_w;
+                if (!cut && !tail && !wtail) continue;
+                skip_d[q] = true;
+                if (!resident) --nmiss;
+                ++d.tail_experts;
+            }
+        }
+        const bool pcie_ok = (d.pcie_num > 0 || d.pcie_model.on) && d.src->pcie_layer(d.layers);
+        int m = pcie_ok ? d.pcie_model.pick(nmiss, (nmiss * d.pcie_num) >> 8) : 0;
+        if (hcfg.pcie_min1 && pcie_ok && m < 1 && nmiss >= 2) m = 1;
         int miss_rank = 0, groups = 0, entries = 0, fetches = 0;
         GpuPlanSink& P = *d.plan;
         const uint8_t* dma_src[64];
@@ -2093,6 +2333,11 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         for (int q = 0; q < nd; ++q) {
             const int64_t i0 = distinct[q];
             const int32_t e = ids[i0];
+            if (skip_d[q]) {
+                for (int64_t i = i0; i < n; ++i)
+                    if (first_of[i] == i0) kind[i] = -2;
+                continue;
+            }
             int kd = -1;
             unsigned long long ptr = 0;
             if (e >= 0 && e < d.n_expert) {
@@ -2126,6 +2371,22 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                     ++entries;
                 }
             ++groups;
+        }
+        d.last_n_pcie = fetches;
+        d.last_n_cpu = std::max(0, nmiss - fetches);
+        if (hcfg.layer_stats) {
+            const int nl = (int)lay.fmt.size();
+            uint64_t bv = 0, bp = 0, bc = 0, bs = 0;
+            for (int64_t i = 0; i < n; ++i) {
+                if (kind[i] == 0) ++bv;
+                else if (kind[i] == 1) ++bp;
+                else if (kind[i] == -2) ++bs;
+                else ++bc;
+            }
+            if (bv) ls_note((int)d.layers, nl, 0, bv);
+            if (bp) ls_note((int)d.layers, nl, 1, bp);
+            if (bc) ls_note((int)d.layers, nl, 2, bc);
+            if (bs) ls_note((int)d.layers, nl, 3, bs);
         }
         P.start[groups] = entries;
         const uint64_t bb = lay.blob_bytes(d.layers);
@@ -2200,7 +2461,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         static thread_local std::vector<int64_t> miss;
         miss.clear();
         for (int64_t i = 0; i < n_tok * k; ++i)
-            if (kind[i] < 0 && ids[i] >= 0 && ids[i] < d.n_expert &&
+            if (kind[i] == -1 && ids[i] >= 0 && ids[i] < d.n_expert &&
                 std::find(miss.begin(), miss.end(), (int64_t)ids[i]) == miss.end())
                 miss.push_back(ids[i]);
         d.src->prefetch(d.layers, miss.data(), (int64_t)miss.size());
@@ -2218,7 +2479,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                 d.fail_expert = e;
                 return;
             }
-            if (kind[i] >= 0) {  // CUDA0, PCIe, or a remote result staged into this row below
+            if (kind[i] >= 0 || kind[i] == -2) {  // VRAM, PCIe, remote, or skipped tail expert
                 if (kind[i] == 0) ++d.cache_hits;
                 std::memset(row, 0, (size_t)H * sizeof(float));
                 continue;

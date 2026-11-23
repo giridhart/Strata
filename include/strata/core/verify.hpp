@@ -180,6 +180,8 @@ public:
     /// arena directly, 2 = a copy kernel stages it inside the graph (no API calls on the pool's thread; best when
     /// the CPU is RAM-bound, Q2_0).  Set before the first `run`.
     void set_pcie_mode(int mode) { sink_.pcie_mode = mode; }
+    /// STRATA_PCIE_BALANCE=1 (opt-in): dynamically balance PCIe vs CPU misses from measured per-layer times.
+    void set_pcie_balance(ExpertDispatch* disp);
     /// the pool never plans a PCIe share (--pcie-frac 0): the window skips that path.  Before the first run.
 
     double ms_wait = 0, ms_pool = 0, ms_host = 0, ms_commit = 0;
@@ -246,6 +248,9 @@ private:
     int32_t last_tokens_[8] = {};
     int64_t n_vocab_ = 0;
     sycl::queue* cs_ = nullptr;
+    sycl::queue* pf_cs_ = nullptr;        ///< STRATA_PCIE_EARLY=1 (opt-in): side queue overlapping PCIe fetch with VRAM experts
+    bool capturing_graph_ = false;        ///< true while recording a SYCL command graph
+    ExpertDispatch* bal_disp_ = nullptr;  ///< STRATA_PCIE_BALANCE=1 (opt-in): dispatch holding PcieModel and per-step miss counts
     void* exec_[9] = {};
     void* exec_res_[9] = {};
     void* exec_tree_[9] = {};

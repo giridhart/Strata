@@ -147,6 +147,36 @@ inline int verify_graph_chunk_layers() {
     return n;
 }
 
+// Opt-in HotRod exact switches (all OFF by default):
+// STRATA_PCIE_EARLY=1 (or =force to also attempt inside graph capture): overlap pcie_mode==2 fetch_blobs on pf_cs_ beside VRAM experts.
+inline int pcie_early_env() {
+    static const int mode = [] {
+        const char* v = std::getenv("STRATA_PCIE_EARLY");
+        if (!v || !*v || std::strcmp(v, "0") == 0) return 0;
+        if (std::strcmp(v, "force") == 0 || std::strcmp(v, "2") == 0) return 2;
+        return 1;
+    }();
+    return mode;
+}
+
+// STRATA_FUSE_WAIT=1: fuse wait_flag_ge(m_flagA_) + copy_i32_from_mapped into wait_copy_i32_from_mapped.
+inline bool fuse_wait_env() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_FUSE_WAIT");
+        return v != nullptr && std::atoi(v) != 0;
+    }();
+    return on;
+}
+
+// STRATA_PCIE_BALANCE=1: dynamically pick each layer's PCIe miss count from measured host+GPU times.
+inline bool pcie_balance_env() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_PCIE_BALANCE");
+        return v != nullptr && std::atoi(v) != 0;
+    }();
+    return on;
+}
+
 struct Bump {
     uint8_t* base = nullptr;
     uint64_t used = 0;
@@ -247,7 +277,7 @@ bool Verifier::release_gpu_waits(int timeout_ms) try {
     _mm_sfence();
     const OnDevice on_device(device_);
     const Clock::time_point t0 = Clock::now();
-    for (sycl::queue* s : {cs_, copy_}) {
+    for (sycl::queue* s : {cs_, copy_, pf_cs_}) {
         if (!s) continue;
         while (true) {
             bool empty = false;
@@ -330,6 +360,11 @@ Verifier::~Verifier() {
         copy_->wait();
         delete copy_;
         copy_ = nullptr;
+    }
+    if (pf_cs_) {
+        try { pf_cs_->wait(); } catch (...) {}
+        delete pf_cs_;
+        pf_cs_ = nullptr;
     }
     if (commit_done_) {
         delete commit_done_;
@@ -614,6 +649,29 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         err = std::string("verify: stream create failed: ") + e.what();
         return false;
     }
+    if (pcie_early_env() > 0) {
+        try {
+            pf_cs_ = new sycl::queue(cs_->get_context(), cs_->get_device(),
+                                     sycl::property_list{sycl::property::queue::in_order{}});
+            std::fprintf(stderr,
+                         "strata hotrod: STRATA_PCIE_EARLY=%d (exact: pcie_mode==2 fetch overlaps VRAM experts on side queue%s)\n",
+                         pcie_early_env(),
+                         verify_graph_mode() != VerifyGraphMode::Direct && pcie_early_env() == 1
+                             ? "; note: use STRATA_VERIFY_GRAPH=direct to activate"
+                             : "");
+        } catch (const sycl::exception& e) {
+            pf_cs_ = nullptr;
+            std::fprintf(stderr, "strata hotrod: STRATA_PCIE_EARLY side queue failed (%s); staying on main queue\n",
+                         e.what());
+        }
+    }
+    if (fuse_wait_env()) {
+        std::fprintf(stderr, "strata hotrod: STRATA_FUSE_WAIT=1 (exact: fused wait_copy_i32_from_mapped)\n");
+    }
+    if (pcie_balance_env() && bal_disp_ != nullptr && !bal_disp_->pcie_model.on) {
+        bal_disp_->pcie_model.on = true;
+        std::fprintf(stderr, "strata hotrod: STRATA_PCIE_BALANCE=1 (exact: dynamic per-layer PCIe/CPU balance)\n");
+    }
     try {
         commit_done_ = new sycl::event();
     } catch (...) {
@@ -689,6 +747,14 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     return false;
 } catch (...) {
     return false;
+}
+
+void Verifier::set_pcie_balance(ExpertDispatch* disp) {
+    bal_disp_ = disp;
+    if (pcie_balance_env() && bal_disp_ != nullptr && !bal_disp_->pcie_model.on) {
+        bal_disp_->pcie_model.on = true;
+        std::fprintf(stderr, "strata hotrod: STRATA_PCIE_BALANCE=1 (exact: dynamic per-layer PCIe/CPU balance)\n");
+    }
 }
 
 const float* Verifier::final_R(int t) const { return R_ + (size_t)t * (size_t)(g_->hc * g_->n_embd); }
@@ -1210,17 +1276,36 @@ bool Verifier::record_layer_pre(int T, int64_t l, int grp, sycl::queue* cs, std:
                               n, cs);
         }
         static const auto route_resident_cfg = [] {
-            struct { float margin = 0.0f; int lo = 6, hi = 9; } c;
+            struct {
+                float margin = 0.0f;
+                int lo = 6, hi = 9;
+                float edge = -1.0f;
+                float budget = 0.0f;
+                float budget_tail = 0.0f;
+            } c;
             if (const char* v = std::getenv("STRATA_ROUTE_RESIDENT")) c.margin = (float)std::atof(v);
             if (const char* v = std::getenv("STRATA_ROUTE_RESIDENT_RANKS")) std::sscanf(v, "%d-%d", &c.lo, &c.hi);
+            if (const char* v = std::getenv("STRATA_ROUTE_RESIDENT_EDGE")) c.edge = (float)std::atof(v);
+            if (const char* v = std::getenv("STRATA_ROUTE_BUDGET")) c.budget = std::max(0.0f, (float)std::atof(v));
+            if (const char* v = std::getenv("STRATA_ROUTE_BUDGET_TAIL"))
+                c.budget_tail = std::max(0.0f, (float)std::atof(v));
+            if (c.margin > 0.0f || c.edge >= 0.0f || c.budget > 0.0f || c.budget_tail > 0.0f) {
+                std::fprintf(stderr,
+                             "strata hotrod: route_resident active (margin=%.3g ranks=%d-%d edge=%.3g budget=%.4g "
+                             "budget_tail=%.4g; changes output)\n",
+                             (double)c.margin, c.lo, c.hi, (double)c.edge, (double)c.budget, (double)c.budget_tail);
+            }
             return c;
         }();
-        if (route_resident_cfg.margin > 0.0f && NE == 512 && K == 10 && hits_.d_res != nullptr) {
+        if ((route_resident_cfg.margin > 0.0f || route_resident_cfg.edge >= 0.0f ||
+             route_resident_cfg.budget > 0.0f || route_resident_cfg.budget_tail > 0.0f) &&
+            NE == 512 && K == 10 && hits_.d_res != nullptr) {
             try {
-                VDBG("layer_pre (l=%lld, grp=%d): native_route_resident\n", (long long)l, grp);
-                native_route_resident(logits_ + tb * NE, ids_ + tb * K, w_ + tb * K, hits_.d_res + l * g.n_expert, n,
-                                      route_resident_cfg.margin, route_resident_cfg.lo, route_resident_cfg.hi,
-                                      nullptr, cs);
+                VDBG("layer_pre (l=%lld, grp=%d): native_route_resident_ext\n", (long long)l, grp);
+                native_route_resident_ext(logits_ + tb * NE, ids_ + tb * K, w_ + tb * K,
+                                          hits_.d_res + l * g.n_expert, n, route_resident_cfg.margin,
+                                          route_resident_cfg.lo, route_resident_cfg.hi, route_resident_cfg.edge,
+                                          route_resident_cfg.budget, route_resident_cfg.budget_tail, nullptr, cs);
             } catch (const std::exception& e) {
                 err = "verify route-resident: " + std::string(e.what());
                 return false;
@@ -1339,9 +1424,15 @@ bool Verifier::record_layer_post(int T, int64_t l, int grp, sycl::queue* cs, std
                                             cs);
             }
         } else {
-            VDBG("layer_post (l=%lld, grp=%d): wait_flag_ge flagA ring=%u\n", (long long)l, grp, ring);
-            wait_flag_ge(m_flagA_, ring, cs);  // the pool published this group's GPU plan
-            copy_i32_from_mapped(pl, m_plan_ + (size_t)grp * (size_t)(plan_i32_), plan_i32_, cs);
+            if (fuse_wait_env()) {
+                VDBG("layer_post (l=%lld, grp=%d): wait_copy_i32_from_mapped ring=%u\n", (long long)l, grp, ring);
+                wait_copy_i32_from_mapped(m_flagA_, ring, pl, m_plan_ + (size_t)grp * (size_t)(plan_i32_), plan_i32_,
+                                          cs);
+            } else {
+                VDBG("layer_post (l=%lld, grp=%d): wait_flag_ge flagA ring=%u\n", (long long)l, grp, ring);
+                wait_flag_ge(m_flagA_, ring, cs);  // the pool published this group's GPU plan
+                copy_i32_from_mapped(pl, m_plan_ + (size_t)grp * (size_t)(plan_i32_), plan_i32_, cs);
+            }
         }
         stamp(l, 19, grp, cs);
         const int32_t* p_counts = pl;
@@ -1369,6 +1460,20 @@ bool Verifier::record_layer_post(int T, int64_t l, int grp, sycl::queue* cs, std
         };
         if (lean && mstage_ != nullptr)   // STRATA_MIRROR_STAGE: the plan's mirrored list into VRAM first
             mirror_stage(pl, capx, (long long)lay.blob_bytes(l), msrc_ + (size_t)grp * (size_t)capx, cs);
+        const bool pf_early = pf_cs_ != nullptr && !lean && sink_.pcie_mode == 2 && !device_plan_ && !recording_res_ &&
+                              (!capturing_graph_ || pcie_early_env() == 2);
+        sycl::event ev_pf_join;
+        if (pf_early) {
+            // STRATA_PCIE_EARLY: overlap pcie_mode==2 staging copy on pf_cs_ beside VRAM experts on cs.
+            sycl::event ev_pf_fork = cs->ext_oneapi_submit_barrier();
+            pf_cs_->ext_oneapi_submit_barrier({ev_pf_fork});
+            wait_flag_ge(m_flagB_, ring, pf_cs_);
+            const int64_t per_e = G == 2 ? kStagingBlobs / 2 : kStagingBlobs;
+            uint8_t* stage_e = staging_ + (size_t)(grp * per_e) * lay.max_blob;
+            fetch_blobs(p_ptr2, p_counts + 2, stage_e, (int64_t)lay.blob_bytes(l), (int)per_e, pf_cs_);
+            rebase_ptrs((unsigned long long*)p_ptr2, p_counts + 2, stage_e, (int64_t)lay.blob_bytes(l), pf_cs_);
+            ev_pf_join = pf_cs_->ext_oneapi_submit_barrier();
+        }
         VDBG("layer_post (l=%lld, grp=%d): grouped 0 (VRAM) start\n", (long long)l, grp);
         grouped(p_ptr, p_start, p_counts);
         VDBG("layer_post (l=%lld, grp=%d): grouped 0 (VRAM) done\n", (long long)l, grp);
@@ -1383,7 +1488,9 @@ bool Verifier::record_layer_post(int T, int64_t l, int grp, sycl::queue* cs, std
                 VDBG("layer_post (l=%lld, grp=%d): wait_flag_ge flagB ring=%u\n", (long long)l, grp, ring);
                 wait_flag_ge(m_flagB_, ring, cs);  // the PCIe share is in staging (DMA) or mapped
             }
-            if (!lean && sink_.pcie_mode == 2) {   // stage it with a copy kernel, then point at staging
+            if (pf_early) {
+                cs->ext_oneapi_submit_barrier({ev_pf_join});
+            } else if (!lean && sink_.pcie_mode == 2) {   // stage it with a copy kernel, then point at staging
                 VDBG("layer_post (l=%lld, grp=%d): pcie staging copy\n", (long long)l, grp);
                 const int64_t per = G == 2 ? kStagingBlobs / 2 : kStagingBlobs;
                 uint8_t* stage = staging_ + (size_t)(grp * per) * lay.max_blob;
@@ -1613,6 +1720,13 @@ struct ChunkRecorder {
 
 bool Verifier::record_window(int T, sycl::queue* cs, std::string& err, void* chunk_rec) try {
     ChunkRecorder* rec = static_cast<ChunkRecorder*>(chunk_rec);
+    const bool prev_cap = capturing_graph_;
+    if (rec != nullptr || verify_graph_mode() != VerifyGraphMode::Direct) capturing_graph_ = true;
+    struct CapGuard {
+        bool& f;
+        bool p;
+        ~CapGuard() { f = p; }
+    } cap_guard{capturing_graph_, prev_cap};
     if (rec && !rec->start()) {
         err = "verify: begin prologue capture failed";
         return false;
@@ -2163,6 +2277,11 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     const int64_t steps = (le_ - lb_) * G;
     const bool test_stall = g_test_stall > 0 && windows + 1 == g_test_stall;  // #267 test hook (off: false)
     const bool lean = is_lean();
+    const bool bal_active = bal_disp_ != nullptr && bal_disp_->pcie_model.on && !run_res && !lean && steps <= 512;
+    Clock::time_point bal_t_arrive[512], bal_t_pub[512];
+    double bal_cpu_ms[512] = {};
+    int bal_nc[512] = {}, bal_np[512] = {};
+    bool bal_ok[512] = {};
     VDBG("waiting loop starting: lean=%d, test_stall=%d, steps=%lld, G=%d\n", (int)lean, (int)test_stall, (long long)steps, G);
     for (int64_t k = 0; (!run_res && (!lean || test_stall)) && k < steps; ++k) {
         const int64_t l = lb_ + k / G;
@@ -2222,10 +2341,21 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         progress_at("verify window: the CPU experts of layer", l);
         VDBG("layer %lld: dispatching CPU experts (tb=%d, n=%d, k=%ld)\n", (long long)l, tb, n, (long)ss.k);
         const auto t_pool_start = Clock::now();
-        if (pool != nullptr)
+        if (pool != nullptr) {
+            strata::core::expert_dispatch_set_weights(h_w_ + (size_t)tb * ss.k);
             pool(user, h_x_ + (size_t)tb * g.n_embd, h_ids_ + (size_t)tb * ss.k, n, ss.k,
                  h_ymiss_ + (size_t)tb * ss.k * g.n_embd, l);
+            strata::core::expert_dispatch_set_weights(nullptr);
+        }
         const auto t_pool_end = Clock::now();
+        if (bal_active) {
+            bal_t_arrive[k] = b;
+            bal_t_pub[k] = t_pool_start;
+            bal_cpu_ms[k] = std::chrono::duration<double, std::milli>(t_pool_end - t_pool_start).count();
+            bal_nc[k] = bal_disp_->last_n_cpu;
+            bal_np[k] = bal_disp_->last_n_pcie;
+            bal_ok[k] = true;
+        }
         VDBG("layer %lld: CPU experts served in %.2f ms\n", (long long)l,
              std::chrono::duration<double, std::milli>(t_pool_end - t_pool_start).count());
         progress_tick();
@@ -2403,6 +2533,22 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         }
     }
     VDBG("window done\n");
+    if (bal_active) {
+        for (int64_t k = 0; k < steps; ++k) {
+            if (!bal_ok[k]) continue;
+            double gpu_ms = 0.0;
+            if (k + G < steps && bal_ok[k + G]) {
+                const double step_ms =
+                    std::chrono::duration<double, std::milli>(bal_t_arrive[k + G] - bal_t_pub[k]).count();
+                // Feed GPU timing when CPU did not stall m_flag_ (n_c == 0 or GPU step clearly exceeded CPU pool).
+                if (step_ms > 0.0 && step_ms < 500.0 && (bal_nc[k] == 0 || step_ms > bal_cpu_ms[k] * 1.10))
+                    gpu_ms = step_ms;
+            }
+            bal_disp_->pcie_model.sample(bal_nc[k], bal_np[k], bal_cpu_ms[k], gpu_ms);
+        }
+        bal_disp_->pcie_model.solve();
+    }
+    strata::core::expert_dispatch_window_tick((int)g.n_layers);
     ++windows;
     progress_at("decode");
     progress_beat();

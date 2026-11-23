@@ -24,4 +24,12 @@ void native_router_topk(const float* logits, int32_t* ids, float* weights, int n
 /// `stats` is nullptr or 4 device uint64 counters: tail entries seen, swaps, non-resident before, non-resident after.
 void native_route_resident(const float* logits, int32_t* ids, float* weights, const int32_t* res_layer, int n_tok, float margin,
                            int rank_lo, int rank_hi, unsigned long long* stats, void* stream);
+#ifdef STRATA_ENABLE_SYCL
+/// Extended STRATA_ROUTE_RESIDENT (HotRod port, opt-in): adds fractional floor `edge` (rank lo - 1 within `edge`
+/// logits, < 0 = off), confidence budget `budget` for ranks < lo (w * max(gap, 0) <= budget, <= 0 = off), and
+/// confidence budget `budget_tail` for ranks >= lo (w * max(gap, 0) <= budget_tail, <= 0 = off).
+void native_route_resident_ext(const float* logits, int32_t* ids, float* weights, const int32_t* res_layer, int n_tok,
+                               float margin, int rank_lo, int rank_hi, float edge, float budget, float budget_tail,
+                               unsigned long long* stats, void* stream);
+#endif
 }
