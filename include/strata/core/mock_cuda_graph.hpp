@@ -2,6 +2,8 @@
 #include <sycl/sycl.hpp>
 #include <sycl/ext/oneapi/experimental/graph.hpp>
 
+#include "strata/core/sycl_graph_env.hpp"
+
 #include <chrono>
 #include <cstddef>
 #include <cstdio>
@@ -16,9 +18,18 @@ namespace sycl_ext = sycl::ext::oneapi::experimental;
 using mod_graph_t = sycl_ext::command_graph<sycl_ext::graph_state::modifiable>;
 using exec_graph_t = sycl_ext::command_graph<sycl_ext::graph_state::executable>;
 
-inline std::map<void*, mod_graph_t*>& get_active_recording() {
-    static thread_local std::map<void*, mod_graph_t*> active;
+struct ActiveCapture {
+    mod_graph_t* graph = nullptr;
+    bool end_all_queues = false;
+};
+
+inline std::map<void*, ActiveCapture>& get_active_recording() {
+    static thread_local std::map<void*, ActiveCapture> active;
     return active;
+}
+
+inline bool trace_enabled() {
+    return std::getenv("STRATA_VERIFY_DEBUG") != nullptr || std::getenv("STRATA_TRACE") != nullptr;
 }
 } // namespace strata_graph_detail
 
@@ -26,10 +37,22 @@ inline int cudaStreamBeginCapture(void* stream, int = 0) {
     if (!stream) return 1;
     auto* q = static_cast<sycl::queue*>(stream);
     try {
-        auto* g = new strata_graph_detail::mod_graph_t(q->get_context(), q->get_device());
+        const auto opts = strata::sycl_graph::read_options();
+        const auto props = strata::sycl_graph::make_properties(opts);
+        auto* g = new strata_graph_detail::mod_graph_t(q->get_context(), q->get_device(), props);
         g->begin_recording(*q);
-        strata_graph_detail::get_active_recording()[stream] = g;
+        strata_graph_detail::get_active_recording()[stream] = {g, opts.end_all_queues};
+    } catch (const std::exception& e) {
+        if (strata_graph_detail::trace_enabled()) {
+            std::fprintf(stderr, "strata graph: begin_recording exception: %s\n", e.what());
+            std::fflush(stderr);
+        }
+        return 1;
     } catch (...) {
+        if (strata_graph_detail::trace_enabled()) {
+            std::fprintf(stderr, "strata graph: begin_recording unknown exception\n");
+            std::fflush(stderr);
+        }
         return 1;
     }
     return 0;
@@ -41,12 +64,29 @@ inline int cudaStreamEndCapture(void* stream, void** out_graph) {
     auto it = active.find(stream);
     if (it == active.end()) return 1;
     auto* q = static_cast<sycl::queue*>(stream);
-    auto* g = it->second;
+    auto* g = it->second.graph;
+    const bool end_all = it->second.end_all_queues;
     active.erase(it);
     try {
-        g->end_recording(*q);
+        if (end_all) {
+            g->end_recording();
+        } else {
+            g->end_recording(*q);
+        }
         *out_graph = static_cast<void*>(g);
+    } catch (const std::exception& e) {
+        if (strata_graph_detail::trace_enabled()) {
+            std::fprintf(stderr, "strata graph: end_recording exception: %s\n", e.what());
+            std::fflush(stderr);
+        }
+        delete g;
+        *out_graph = nullptr;
+        return 1;
     } catch (...) {
+        if (strata_graph_detail::trace_enabled()) {
+            std::fprintf(stderr, "strata graph: end_recording unknown exception\n");
+            std::fflush(stderr);
+        }
         delete g;
         *out_graph = nullptr;
         return 1;
@@ -111,7 +151,17 @@ inline int cudaGraphLaunch(void* exec, void* stream) {
     auto* q = static_cast<sycl::queue*>(stream);
     try {
         q->ext_oneapi_graph(*exec_g);
+    } catch (const std::exception& e) {
+        if (strata_graph_detail::trace_enabled()) {
+            std::fprintf(stderr, "strata graph: launch exception: %s\n", e.what());
+            std::fflush(stderr);
+        }
+        return 1;
     } catch (...) {
+        if (strata_graph_detail::trace_enabled()) {
+            std::fprintf(stderr, "strata graph: launch unknown exception\n");
+            std::fflush(stderr);
+        }
         return 1;
     }
     return 0;

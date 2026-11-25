@@ -6,6 +6,7 @@
 #include "strata/core/on_device.hpp"
 #include "strata/core/device.hpp"
 #include "strata/core/sycl_doorbell.hpp"
+#include "strata/core/sycl_graph_env.hpp"
 #include "strata/core/weights.hpp"
 #include "strata/kernels/dflash2.hpp"
 #include "strata/kernels/native_mmvq.hpp"
@@ -429,11 +430,17 @@ bool Dflash2Drafter::record_block(std::string& err) {
 bool Dflash2Drafter::capture(int n, const float* taps, std::string& err) {
     if (exec_[n]) return true;
     try {
-        Df2GraphMod graph(cs_->get_context(), cs_->get_device());
+        const auto opts = strata::sycl_graph::read_options();
+        const auto props = strata::sycl_graph::make_properties(opts);
+        Df2GraphMod graph(cs_->get_context(), cs_->get_device(), props);
         graph.begin_recording(*cs_);
         bool ok = record_context(taps, n, err);
         if (ok) ok = record_block(err);
-        graph.end_recording(*cs_);
+        if (opts.end_all_queues) {
+            graph.end_recording();
+        } else {
+            graph.end_recording(*cs_);
+        }
         if (!ok) return false;
         exec_[n] = new Df2GraphExec(graph.finalize());
         return true;

@@ -1,5 +1,6 @@
 // src/core/sycl/graph.cpp.dp.cpp - P2.S5: Pure SYCL 2020 command_graph implementation.
 #include "strata/core/graph.hpp"
+#include "strata/core/sycl_graph_env.hpp"
 
 #include <chrono>
 #include <cstdio>
@@ -40,7 +41,9 @@ bool CapturedGraph::begin(void* stream, std::string& err) {
     }
     sycl::queue* q = static_cast<sycl::queue*>(stream);
     try {
-        graph_ = std::make_unique<modifiable_graph_t>(q->get_context(), q->get_device());
+        const auto opts = strata::sycl_graph::read_options();
+        const auto props = strata::sycl_graph::make_properties(opts);
+        graph_ = std::make_unique<modifiable_graph_t>(q->get_context(), q->get_device(), props);
         graph_->begin_recording(*q);
     } catch (const sycl::exception& e) {
         graph_.reset();
@@ -61,12 +64,22 @@ bool CapturedGraph::end(void* stream, std::string& err) {
     }
     sycl::queue* q = static_cast<sycl::queue*>(stream);
     try {
-        graph_->end_recording(*q);
-        nodes_ = graph_->get_nodes().size();
-        if (nodes_ == 0) {
-            err = "end: the capture recorded ZERO nodes - the body launched nothing";
-            reset();
-            return false;
+        const auto opts = strata::sycl_graph::read_options();
+        if (opts.end_all_queues) {
+            graph_->end_recording();
+        } else {
+            graph_->end_recording(*q);
+        }
+        if (opts.native_recording) {
+            // get_nodes() is unsupported for graphs created with enable_native_recording.
+            nodes_ = 0;
+        } else {
+            nodes_ = graph_->get_nodes().size();
+            if (nodes_ == 0) {
+                err = "end: the capture recorded ZERO nodes - the body launched nothing";
+                reset();
+                return false;
+            }
         }
         exec_ = std::make_unique<executable_graph_t>(graph_->finalize());
     } catch (const sycl::exception& e) {
