@@ -57,6 +57,7 @@ inline sycl::queue& default_queue() {
 #include <future>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <thread>
 #include <unordered_map>
 #include <vector>
@@ -413,8 +414,10 @@ struct Stager {
     std::condition_variable cv;
     std::vector<std::thread> threads;
     int device = 0;
+    std::optional<sycl::queue> alloc_q;
 
-    bool init(size_t blob_bytes, int nthreads) {
+    bool init(size_t blob_bytes, int nthreads, sycl::queue* q = nullptr) {
+        alloc_q = q ? *q : default_queue();
         if (const char* v = std::getenv("STRATA_STAGER_RING")) kRing = std::clamp(std::atoi(v), 2, 256);
         buf.assign((size_t)kRing, nullptr);
         pinned.assign((size_t)kRing, 0);
@@ -427,7 +430,7 @@ struct Stager {
             You may need to check the migrated code.
             */
             try {
-                buf[i] = (uint8_t*)sycl::malloc_host(blob_bytes, default_queue());
+                buf[i] = (uint8_t*)sycl::malloc_host(blob_bytes, *alloc_q);
                 pinned[i] = (buf[i] != nullptr);
             } catch (...) {
                 pinned[i] = 0;
@@ -454,7 +457,7 @@ struct Stager {
             t.join();
         for (int i = 0; i < kRing; ++i) {
             if (dma_done[i]) delete dma_done[i];
-            if (buf[i] && pinned[i]) sycl::free(buf[i], default_queue());
+            if (buf[i] && pinned[i]) sycl::free(buf[i], alloc_q ? *alloc_q : default_queue());
         }
     }
     void work() {
@@ -487,8 +490,14 @@ struct Stager {
                 if (j >= kRing) {
                     while (issued.load(std::memory_order_acquire) <= j - kRing)
                         std::this_thread::yield();
-                    dma_done[b]->wait_and_throw();
+                    // Wait for job j - kRing's own host copy into buf[b] to finish: `pass()` can advance
+                    // `issued` past a skipped job whose thread had already claimed it.
+                    while (!ready[(size_t)(j - kRing)].load(std::memory_order_acquire))
+                        std::this_thread::yield();
                 }
+                // Wait for the previous DMA from buf[b] even for j < kRing (the previous layer's last DMAs
+                // are still in flight on m.copy when layer-major lm_prefetch starts the next layer).
+                if (dma_done[b]) dma_done[b]->wait_and_throw();
                 const Job& jb = jobs[(size_t)j];
                 if (jb.from == nullptr)
                     std::memcpy(buf[b], jb.src, jb.bytes);
@@ -567,6 +576,88 @@ struct Stager {
         issued.store(1 << 30, std::memory_order_release);
         while (active.load(std::memory_order_acquire) != 0)
             std::this_thread::yield();
+    }
+};
+
+// Pinned host bounce ring for async host->device uploads whose caller buffer is reused across sub-chunks
+// (e.g. m.steps_host at QSA layers, m.tok_host at layer 0).
+struct SyclPinnedRing {
+    static constexpr int kSlots = 4;
+    static constexpr size_t kMinCap = 4096;
+    struct Slot {
+        void* p = nullptr;
+        size_t cap = 0;
+        sycl::event ev;
+        bool pending = false;
+    };
+    Slot slots[kSlots];
+    int next = 0;
+    std::optional<sycl::queue> alloc_q;
+
+    SyclPinnedRing() = default;
+    SyclPinnedRing(const SyclPinnedRing&) = delete;
+    SyclPinnedRing& operator=(const SyclPinnedRing&) = delete;
+    ~SyclPinnedRing() { release(); }
+
+    bool h2d(void* dst, const void* src, size_t bytes, sycl::queue* q) {
+        if (bytes == 0 || !q) return true;
+        if (!alloc_q) alloc_q = *q;
+        Slot& sl = slots[next];
+        next = (next + 1) % kSlots;
+        if (sl.pending) {
+            sl.pending = false;
+            try {
+                sl.ev.wait_and_throw();
+            } catch (...) {
+                return false;
+            }
+        }
+        if (sl.cap < bytes) {
+            if (sl.p) {
+                sycl::free(sl.p, *alloc_q);
+                sl.p = nullptr;
+                sl.cap = 0;
+            }
+            const size_t cap = bytes < kMinCap ? kMinCap : bytes;
+            try {
+                sl.p = sycl::malloc_host(cap, *alloc_q);
+            } catch (...) {
+                sl.p = nullptr;
+            }
+            if (sl.p) sl.cap = cap;
+        }
+        try {
+            if (sl.p) {
+                std::memcpy(sl.p, src, bytes);
+                sl.ev = q->memcpy(dst, sl.p, bytes);
+                sl.pending = true;
+            } else {
+                q->memcpy(dst, src, bytes).wait_and_throw();
+            }
+        } catch (...) {
+            return false;
+        }
+        return true;
+    }
+
+    void release() {
+        for (Slot& sl : slots) {
+            if (sl.pending) {
+                try {
+                    sl.ev.wait_and_throw();
+                } catch (...) {}
+                sl.pending = false;
+            }
+            if (sl.p && alloc_q) {
+                try {
+                    sycl::free(sl.p, *alloc_q);
+                } catch (...) {}
+                sl.p = nullptr;
+                sl.cap = 0;
+            }
+        }
+        alloc_q.reset();
+        next = 0;
     }
 };
 
@@ -683,6 +774,7 @@ struct Prefill::Impl {
     // C-4: the chunk's token ids on the device, for one batched embedding gather
     int32_t* tok_dev = nullptr;
     std::vector<int32_t> tok_host;
+    SyclPinnedRing up_ring;
     struct LmBufs {
         int64_t S = 0;                       // tokens of a super-chunk (0: not allocated)
         bool r_dev = false;                  // its residual rows in VRAM (else R_host, copied per sub-chunk)
@@ -802,6 +894,7 @@ void Prefill::release() {
     }
     if (impl_->cs) impl_->cs->wait();
     if (impl_->copy) impl_->copy->wait();
+    impl_->up_ring.release();
     for (int i = 0; i < RING_MAX; ++i) {
         if (impl_->copied[i]) {
             delete impl_->copied[i];
@@ -1101,7 +1194,7 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
                 files = src->transient(l, e);
         const int threads = stv ? std::clamp(std::atoi(stv), 1, 32) : files ? 32 : std::max(2, std::min(4, hw / 4));
         if (files && std::getenv("STRATA_STAGER_RING") == nullptr) m.stager->kRing = 4 * threads;
-        if (!m.stager->init((size_t)MAXBLOB(), threads)) ok = false;
+        if (!m.stager->init((size_t)MAXBLOB(), threads, m.cs)) ok = false;
     }
     m.steps_host.resize(T * strata::kernels::kStepCount);
     m.ids_host.resize(T * K);
@@ -1957,9 +2050,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 m.tok_host[(size_t)t] = (int32_t)tok;
         }
         if (batched) {
-            try {
-                m.cs->memcpy(m.tok_dev, m.tok_host.data(), (size_t)T * sizeof(int32_t));
-            } catch (...) {
+            if (!m.up_ring.h2d(m.tok_dev, m.tok_host.data(), (size_t)T * sizeof(int32_t), m.cs)) {
                 err = "prefill: the token id upload failed";
                 return false;
             }
@@ -2024,13 +2115,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         // ---- the QSA step records of every position in the chunk
         for (int64_t t = 0; t < T; ++t)
             strata::kernels::qsa_step_fill(m.steps_host.data() + t * strata::kernels::kStepCount, p0 + t, s);
-        /*
-        DPCT1124:455: cudaMemcpyAsync is migrated to asynchronous memcpy API.
-        While the origin API might be synchronous, it depends on the type of
-        operand memory, so you may need to call wait() on event return by memcpy
-        API to ensure synchronization behavior.
-        */
-        m.cs->memcpy(m.steps_dev, m.steps_host.data(), (size_t)T * strata::kernels::kStepCount * 4);
+        if (!m.up_ring.h2d(m.steps_dev, m.steps_host.data(), (size_t)T * strata::kernels::kStepCount * 4, m.cs)) {
+            err = "prefill: the QSA step records' upload failed";
+            return false;
+        }
 
         int64_t qsa_index = 0, gdn_index = 0;
         for (int64_t l = 0; l < LB; ++l)
@@ -4256,7 +4344,10 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
                         else m.tok_host[(size_t) t] = (int32_t) tok;
                     }
                     if (batched) {
-                        m.cs->memcpy(m.tok_dev, m.tok_host.data(), (size_t) T * sizeof(int32_t));
+                        if (!m.up_ring.h2d(m.tok_dev, m.tok_host.data(), (size_t) T * sizeof(int32_t), m.cs)) {
+                            err = "prefill: the token id upload failed";
+                            return false;
+                        }
                         if (nemb) {
                             nemb->gather_dev(m.tok_dev, T, m.emb, m.cs);
                         } else {
@@ -4379,7 +4470,10 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
                 if (core::is_qsa_layer(g, l)) {
                     for (int64_t t = 0; t < T; ++t)
                         strata::kernels::qsa_step_fill(m.steps_host.data() + t * strata::kernels::kStepCount, p0 + t, s);
-                    m.cs->memcpy(m.steps_dev, m.steps_host.data(), (size_t) T * strata::kernels::kStepCount * 4);
+                    if (!m.up_ring.h2d(m.steps_dev, m.steps_host.data(), (size_t) T * strata::kernels::kStepCount * 4, m.cs)) {
+                        err = "prefill: the QSA step records' upload failed";
+                        return false;
+                    }
                 }
                 bool normed = false;
                 for (int half = 0; half < 2; ++half) {
