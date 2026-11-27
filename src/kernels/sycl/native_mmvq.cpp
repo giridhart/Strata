@@ -1290,12 +1290,7 @@ void native_mmvq_multi_kernel(const typename F::Block* __restrict__ w, const Q81
             for (int i = 0; i < ROWS; ++i)
                 partial[item_ct1.get_local_id(1) - 1][j][i][item_ct1.get_local_id(2)] = tmp[j][i];
     }
-    /*
-    DPCT1065:419: Consider replacing sycl::nd_item::barrier() with
-    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
-    performance if there is no access to global memory.
-    */
-    item_ct1.barrier();
+    item_ct1.barrier(sycl::access::fence_space::local_space);
     if (item_ct1.get_local_id(1) > 0) return;
 #pragma unroll
     for (int j = 0; j < NCOLS; ++j) {

@@ -1349,15 +1349,24 @@ bool Verifier::record_layer_pre(int T, int64_t l, int grp, sycl::queue* cs, std:
             nsw.down_type = wsd->native_type;
             nsw.down_data = wsd->native_data;
             nsw.q8_1 = xq_;
-            if (dec_batch)
-                f32_to_bf16_bulk(mixed_ + tb * N, sh_bf16_ + tb * N, (int64_t)n * N, cs);  // contiguous rows
-            else
-                for (int t = tb; t < te; ++t)
-                    f32_to_bf16_bulk(mixed_ + t * N, sh_bf16_ + t * N, N, cs);
+            static const bool qdedup_env = [] {
+                const char* e = std::getenv("STRATA_VERIFY_QDEDUP");
+                return e != nullptr && e[0] == '1';
+            }();
+            const bool qdedup = qdedup_env && strata::kernels::cpu::expert_layout().native;
+            if (qdedup) quantize_q8_1_rows(xm, n, N, nat_xq_ + (size_t)tb * (N / 32) * 36, cs);
+            if (!shared_expert_native_bf16_enabled()) {
+                if (dec_batch)
+                    f32_to_bf16_bulk(mixed_ + tb * N, sh_bf16_ + tb * N, (int64_t)n * N, cs);  // contiguous rows
+                else
+                    for (int t = tb; t < te; ++t)
+                        f32_to_bf16_bulk(mixed_ + t * N, sh_bf16_ + t * N, N, cs);
+            }
             try {
                 shared_expert_multi(n, xm, sh_bf16_ + tb * N, nsw, (const uint16_t*)wgi->data,
                                     sh_gate_ + (size_t)tb * g.n_ff, sh_up_ + (size_t)tb * g.n_ff, sh_g_ + tb,
-                                    shared_ + tb * N, N, g.n_ff, cs);
+                                    shared_ + tb * N, N, g.n_ff, cs,
+                                    qdedup ? (const void*)(nat_xq_ + (size_t)tb * (N / 32) * 36) : nullptr);
             } catch (const std::exception& e) {
                 /*
                 DPCT1109:34: Virtual functions cannot be called in SYCL device
@@ -1368,13 +1377,14 @@ bool Verifier::record_layer_pre(int T, int64_t l, int grp, sycl::queue* cs, std:
             }
             VDBG("layer_pre (l=%lld, grp=%d): shared_expert done\n", (long long)l, grp);
             progress_beat();
+            VDBG("layer_pre (l=%lld, grp=%d): quantize start\n", (long long)l, grp);
+            if (strata::kernels::cpu::expert_layout().native) {
+                if (!qdedup) quantize_q8_1_rows(xm, n, N, nat_xq_ + (size_t)tb * (N / 32) * 36, cs);
+            } else {
+                quantize_q8_0_scaled(xm, hit_xq_ + (size_t)tb * (N / 32) * 34, hit_xs_ + (size_t)tb * (N / 32),
+                                     (int64_t)n * N, cs);
+            }
         }
-        VDBG("layer_pre (l=%lld, grp=%d): quantize start\n", (long long)l, grp);
-        if (strata::kernels::cpu::expert_layout().native)
-            quantize_q8_1_rows(xm, n, N, nat_xq_ + (size_t)tb * (N / 32) * 36, cs);
-        else
-            quantize_q8_0_scaled(xm, hit_xq_ + (size_t)tb * (N / 32) * 34, hit_xs_ + (size_t)tb * (N / 32),
-                                 (int64_t)n * N, cs);
         stamp(l, 18, grp, cs);
         VDBG("layer_pre (l=%lld, grp=%d): end\n", (long long)l, grp);
         progress_beat();
@@ -1446,13 +1456,13 @@ bool Verifier::record_layer_post(int T, int64_t l, int grp, sycl::queue* cs, std
         float* hit_out = hit_out_ + (size_t)tb * K * N;
         const auto& lay = strata::kernels::cpu::expert_layout();
         // plan v0.3 P6: the VRAM groups now; the PCIe groups once the copy engine has landed them in staging
-        auto grouped = [&](const unsigned long long* gp, const int32_t* gs, const int32_t* gn) {
+        auto grouped = [&](const unsigned long long* gp, const int32_t* gs, const int32_t* gn, int64_t grid_groups = 0) {
             if (lay.native) {
                 // the layer's GGUF formats (i-quant gate/up, Q2_0 / IQ4_NL down)
                 const auto& f = lay.fmt[(size_t)l];
                 const NativeExpertLayout L = native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff);
                 native_expert_grouped(L, gp, gs, gn, p_dst, p_tok, cap, cap, nat_xq_ + (size_t)tb * (N / 32) * 36,
-                                      hit_scratch_, hit_out, cs);
+                                      hit_scratch_, hit_out, cs, grid_groups);
             } else {
                 moe_grouped_s2(gp, gs, gn, p_dst, p_tok, cap, cap, hit_xq_ + (size_t)tb * (N / 32) * 34,
                                hit_xs_ + (size_t)tb * (N / 32), hit_scratch_, hit_out, cs);
@@ -1501,7 +1511,8 @@ bool Verifier::record_layer_post(int T, int64_t l, int grp, sycl::queue* cs, std
         stamp(l, 21, grp, cs);
         if (!lean && !recording_res_) {
             VDBG("layer_post (l=%lld, grp=%d): grouped 1 (PCIe) start\n", (long long)l, grp);
-            grouped(p_ptr2, p_start2, p_counts + 2);
+            constexpr int64_t kPcieGroupRows = 4;
+            grouped(p_ptr2, p_start2, p_counts + 2, kPcieGroupRows);
             VDBG("layer_post (l=%lld, grp=%d): grouped 1 (PCIe) done\n", (long long)l, grp);
         }
         stamp(l, 22, grp, cs);
@@ -1560,8 +1571,11 @@ bool Verifier::record_layer_post(int T, int64_t l, int grp, sycl::queue* cs, std
         stamp(l, 24, grp, cs);
         if (l == g.n_layers - 1) {
             VDBG("layer_post (l=%lld, grp=%d): final layer residual write\n", (long long)l, grp);
-            for (int t = tb; t < te; ++t)
-                gr_write(Rt(t), bo_ + t * N, inj2_ + t * HC, gs, Rt(t), cs);
+            if (dec_batch && n > 1)
+                gr_write_multi(Rt(tb), bo_ + tb * N, inj2_ + tb * HC, gs, Rt(tb), n, cs);
+            else
+                for (int t = tb; t < te; ++t)
+                    gr_write(Rt(t), bo_ + t * N, inj2_ + t * HC, gs, Rt(t), cs);
             if (cvec().covers(l)) cvec_apply(Rt(tb), l, n, HC * N, nullptr, 0, nullptr, 0, false, cs);
         } else if (cvec().covers(l)) {
             VDBG("layer_post (l=%lld, grp=%d): cvec apply\n", (long long)l, grp);
@@ -2059,9 +2073,68 @@ bool Verifier::record_commit(sycl::queue* cs, std::string& err) {
         int64_t qsa_index = 0, gdn_index = 0;
         for (int64_t l = 0; l < lb_; ++l)
             (is_qsa_layer(g, l) ? qsa_index : gdn_index) += 1;
+        // Opt-in STRATA_COMMIT_BATCH=1: collapse all GDN commits into 2 launches (gdn_commit_layers) and all QSA
+        // tail-restore + indexer appends into 1 launch (native_qsa_indexer_append_steps_layers). Bitwise identical.
+        static const bool commit_batch = [] {
+            const char* e = std::getenv("STRATA_COMMIT_BATCH");
+            return e != nullptr && e[0] == '1';
+        }();
+        bool gdn_batched = false;
+        if (commit_batch) {
+            int64_t n_gdn = 0;
+            bool norms_ok = true;
+            for (int64_t l = lb_; l < le_ && norms_ok; ++l)
+                if (!is_qsa_layer(g, l)) {
+                    ++n_gdn;
+                    norms_ok = need(LayerView(*wt_, l), "ssm_norm.weight", err) != nullptr;
+                }
+            if (!norms_ok) return false;
+            if (n_gdn > 0)
+                gdn_batched = gdn_commit_layers(
+                    ss.gdn_state + (size_t)(gdn_index - ss.gdn_ord0) * gdn_floats, (int64_t)gdn_floats,
+                    (int64_t)g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size, qkv_L_ + (size_t)gdn_index * MT * C,
+                    MT * C, h_L_ + (size_t)gdn_index * MT * C, MT * C, gate_L_ + (size_t)gdn_index * MT * HV,
+                    beta_L_ + (size_t)gdn_index * MT * HV, MT * HV, (int)C, (int)g.ssm_k_heads, (int)HV, (int)MT,
+                    (int)n_gdn, commit_, cs);
+        }
+        bool qsa_batched = false;
+        if (commit_batch) {
+            QsaIndexerLayers il;
+            int nq = 0;
+            int64_t mc = -1;
+            bool fits = true;
+            for (int64_t l = lb_, qi = qsa_index; l < le_ && fits; ++l) {
+                if (!is_qsa_layer(g, l)) continue;
+                const WeightRef* wikn = need(LayerView(*wt_, l), "indexer.k_norm.weight", err);
+                if (!wikn) return false;
+                const QsaState& st = ss.qsa_states[qi];
+                if (nq >= QsaIndexerLayers::kMax || (mc >= 0 && st.max_cells != mc)) {
+                    fits = false;
+                    break;
+                }
+                mc = st.max_cells;
+                il.gamma[nq] = (const float*)wikn->data;
+                il.tail_src[nq] = tail_snap_ + (size_t)qi * TS;
+                il.tail[nq] = st.idx_tail;
+                il.dead[nq] = st.idx_dead;
+                il.pooled[nq] = st.idx_pooled;
+                il.block_pos[nq] = st.idx_block_pos;
+                ++nq;
+                ++qi;
+            }
+            if (fits && nq > 0) {
+                native_qsa_indexer_append_steps_layers(idx_raw_L_ + (size_t)qsa_index * MT * ID, MT * ID, commit_ + 2,
+                                                       1, (int)MT, 0, EPS, il, nq, s, mc, rope_scaling(), cs);
+                qsa_batched = true;
+            }
+        }
         for (int64_t l = lb_; l < le_; ++l) {
             const LayerView v(*wt_, l);
-            if (!is_qsa_layer(g, l)) {
+            if (is_qsa_layer(g, l) && qsa_batched) {
+                ++qsa_index;
+            } else if (!is_qsa_layer(g, l) && gdn_batched) {
+                ++gdn_index;
+            } else if (!is_qsa_layer(g, l)) {
                 const WeightRef* wnm = need(v, "ssm_norm.weight", err);
                 if (!wnm) return false;
                 float* state = ss.gdn_state + (size_t)(gdn_index - ss.gdn_ord0) * gdn_floats;
@@ -2071,7 +2144,7 @@ bool Verifier::record_commit(sycl::queue* cs, std::string& err) {
                 gdn_step_norm_multi(state, h_L_ + (size_t)gdn_index * MT * C, (int)C,
                                     gate_L_ + (size_t)gdn_index * MT * HV, beta_L_ + (size_t)gdn_index * MT * HV, z_,
                                     (const float*)wnm->data, EPS, y_dummy_, (int)g.ssm_k_heads, (int)HV, (int)MT,
-                                    commit_, cs);
+                                    commit_, cs, (int)MT);
                 ++gdn_index;
             } else {
                 const QsaState& st = ss.qsa_states[qsa_index];
@@ -2079,9 +2152,16 @@ bool Verifier::record_commit(sycl::queue* cs, std::string& err) {
                 if (!wikn) return false;
                 copy_from_mapped(st.idx_tail, tail_snap_ + (size_t)qsa_index * TS, TS, cs);
                 const QsaIndexerBuffers ib{st.idx_tail, st.idx_dead, st.idx_pooled, st.idx_block_pos};
-                for (int64_t t = 0; t < MT; ++t)
-                    native_qsa_indexer_append(idx_raw_L_ + (size_t)(qsa_index * MT + t) * ID, commit_ + 2 + t, 0,
-                                              (const float*)wikn->data, EPS, ib, s, st.max_cells, rope_scaling(), cs);
+                if (commit_batch) {
+                    native_qsa_indexer_append_steps(idx_raw_L_ + (size_t)qsa_index * MT * ID, commit_ + 2, 1, (int)MT,
+                                                    0, (const float*)wikn->data, EPS, ib, s, st.max_cells,
+                                                    rope_scaling(), cs);
+                } else {
+                    for (int64_t t = 0; t < MT; ++t)
+                        native_qsa_indexer_append(idx_raw_L_ + (size_t)(qsa_index * MT + t) * ID, commit_ + 2 + t, 0,
+                                                  (const float*)wikn->data, EPS, ib, s, st.max_cells, rope_scaling(),
+                                                  cs);
+                }
                 ++qsa_index;
             }
         }
