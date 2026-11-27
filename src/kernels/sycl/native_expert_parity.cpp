@@ -327,8 +327,25 @@ int check_blob(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob, int se
         strata::kernels::native_expert_grouped(L, dptr, dstart, dn, ddst, dtok, 1, NT, dxq, dscr, dout, s);
         s->wait();
         q_ct1.memcpy(got_g.data(), dout, got_g.size() * 4).wait();
-        {  // the kernels that decode a weight part once for the NT entries, bitwise vs the per-entry ones (#242;
-            // the formats without a decode-once split take the per-entry kernels either way)
+        {  // the kernels that decode a weight part once for the NT entries vs per-entry (#242):
+            // (1) active kernel width invariance (NT entries in one group vs NT single-entry groups): must be bitwise equal
+            std::vector<float> single_g(got_g.size());
+            for (int k = 0; k < NT; ++k) {
+                const int32_t st1[2] = {0, 1}, dst1 = k, tok1 = k;
+                q_ct1.memcpy(dstart, st1, 8).wait();
+                q_ct1.memcpy(ddst, &dst1, 4).wait();
+                q_ct1.memcpy(dtok, &tok1, 4).wait();
+                strata::kernels::native_expert_grouped(L, dptr, dstart, dn, ddst, dtok, 1, 1, dxq, dscr, dout, s);
+            }
+            s->wait();
+            q_ct1.memcpy(single_g.data(), dout, single_g.size() * 4).wait();
+            q_ct1.memcpy(dstart, st, 8).wait();
+            q_ct1.memcpy(ddst, idx, NT * 4).wait();
+            q_ct1.memcpy(dtok, idx, NT * 4).wait();
+            const bool width_same = std::memcmp(single_g.data(), got_g.data(), got_g.size() * 4) == 0;
+
+            // (2) active kernel vs old 32-lane per-entry kernel (iq_set_old_kernels):
+            // bitwise equal except when Xe2 8-lane fast down kernels (Q2_0=42, IQ4_NL=20) change FP32 summation order
             std::vector<float> old_g(got_g.size());
             const bool was = strata::kernels::iq_old_kernels();
             strata::kernels::iq_set_old_kernels(!was);
@@ -337,8 +354,24 @@ int check_blob(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob, int se
             s->wait();
             q_ct1.memcpy(old_g.data(), dout, old_g.size() * 4).wait();
             const bool same = std::memcmp(old_g.data(), got_g.data(), got_g.size() * 4) == 0;
-            std::printf("          gpu decode-once vs per-entry kernels: %s\n", same ? "bitwise equal" : "MISMATCH");
-            if (!same) ++failures;
+            const double old_rel = rel(got_g, old_g);
+            float max_abs = 0.f;
+            size_t diff_n = 0;
+            bool finite = true;
+            for (size_t i = 0; i < got_g.size(); ++i) {
+                finite = finite && std::isfinite(got_g[i]) && std::isfinite(old_g[i]);
+                if (std::memcmp(&old_g[i], &got_g[i], 4) != 0) {
+                    ++diff_n;
+                    const float ad = std::fabs(got_g[i] - old_g[i]);
+                    if (ad > max_abs) max_abs = ad;
+                }
+            }
+            const bool fast_down_summation = (f.d_type == 42 || f.d_type == 20) && finite && old_rel < 1e-5;
+            const bool ok_kernels = width_same && (same || fast_down_summation);
+            std::printf("          gpu decode-once vs per-entry kernels: %s (width %s, diff %zu, rel %.2e, max_abs %.2e)\n",
+                        same ? "bitwise equal" : (fast_down_summation ? "equal (within float summation order)" : "MISMATCH"),
+                        width_same ? "bitwise equal" : "MISMATCH", diff_n, old_rel, max_abs);
+            if (!ok_kernels) ++failures;
         }
         {  // (d) the GPU dequantizers (prompt path: iq_dequant_f32/_f16; embedding: iq_embed_rows) against to_float
             float* dq = nullptr;

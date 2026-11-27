@@ -2629,7 +2629,7 @@ inline bool wide_32() {
 
 template <typename F>
 bool try_wide32(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, int ncols, void* stream) {
-    if (!wide_32() || ncols < 1 || ncols > 8 || n_in % 32 != 0) return false;
+    if (!wide_32() || !g_multi_exact || ncols < 1 || ncols > 8 || n_in % 32 != 0) return false;
     sycl::queue* s = stream ? static_cast<sycl::queue*>(stream) : &default_queue();
     switch (ncols) {
         case 1: launch_wide32<F, 1>(weights, x_q8_1, y, n_in, n_out, s); return true;
@@ -3640,7 +3640,7 @@ void native_q5_0_f32(const void* weights, const float* x, void* scratch_q8_1, fl
 
 bool native_mmvq_pair(int ggml_type, const void* w1, const void* w2, const void* x_q8_1, float* y1, float* y2,
                       int n_in, int n_out, int ncols, void* stream) {
-    if (ggml_type == 8 && xe2_kq(kXe2KqPair) && ncols >= 1 && ncols <= 8 && n_out > 0 && n_in > 0 &&
+    if (ggml_type == 8 && g_multi_exact && xe2_kq(kXe2KqPair) && ncols >= 1 && ncols <= 8 && n_out > 0 && n_in > 0 &&
         n_in % 32 == 0 && w1 && w2 && x_q8_1 && y1 && y2 && y1 != y2 && stream) {
         sycl::queue* s = stream ? static_cast<sycl::queue*>(stream) : &default_queue();
         switch (ncols) {
