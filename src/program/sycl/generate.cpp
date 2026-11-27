@@ -4973,6 +4973,8 @@ int main(int argc, char** argv) try {
             return 2;
         }
         const bool use_mtp = !o.mtp.empty();
+        const bool share_pool = !o.no_pool;
+        strata::prefill::Prefill::arm_cpu_share(share_pool, false);
         strata::prefill::Prefill sp;
         void* borrow = nullptr;
         uint64_t borrow_bytes = 0;
@@ -5251,6 +5253,7 @@ int main(int argc, char** argv) try {
                     sb = st.cache.device_slot(pf_parts[i + 1].first);
                     sbb = part_bytes(pf_parts[i + 1], pf_parts[i + 1].first);
                 }
+                if (share_pool) st.sp.set_cpu_pool(&pool);
                 if (!st.sp.init(st.wt, g, st.ss, srcp, &st.cache, host_res.data(), o.prefill_chunk, (void*)st.stream,
                                 err, sb, sbb)) {
                     err = "layer split, CUDA" + std::to_string(st.dev) + " prompt path: " + err;
@@ -5258,6 +5261,7 @@ int main(int argc, char** argv) try {
                 }
             }
             if (multi_gpu) sp.set_stage(0, split_at[0], &stages[0]->sp);
+            if (share_pool) sp.set_cpu_pool(&pool);
             if (!sp.init(wt, g, ss, srcp, &xcache, host_res.data(), o.prefill_chunk, main_cs, err, borrow,
                          borrow_bytes, o.prefill_head_alias))
                 return err.find("do not fit") != std::string::npos ? 2 : 1;
@@ -7581,6 +7585,7 @@ int main(int argc, char** argv) try {
     std::vector<std::pair<int32_t, int32_t>> lent;  // (residency index, slot) lent to the prompt path
     const int64_t n_batched = (o.prefill_until > 0 && o.prefill_until < n_prompt - 1) ? o.prefill_until : n_prompt - 1;
     if (o.prefill_chunk > 0 && n_prompt > 1) {
+        strata::prefill::Prefill::arm_cpu_share(!multi_gpu && !o.no_pool, false);
         void* borrow = nullptr;
         uint64_t borrow_bytes = 0;
         if (!o.no_prefill_borrow && !host_res.empty() && d_res != nullptr) {
@@ -7618,6 +7623,7 @@ int main(int argc, char** argv) try {
         }
         if (borrow == nullptr)
             std::fprintf(stderr, "strata generate: prompt path allocates its own buffers (no cache slots to borrow)\n");
+        if (!multi_gpu && !o.no_pool) prefill.set_cpu_pool(&pool);
         if (!prefill.init(wt, g, ss, srcp, o.expert_cache > 0 ? &xcache : nullptr,
                           host_res.empty() ? nullptr : host_res.data(), o.prefill_chunk, main_cs, err, borrow,
                           borrow_bytes)) {
@@ -7681,10 +7687,16 @@ int main(int argc, char** argv) try {
         const strata::prefill::PrefillStats& ps = prefill.stats();
         std::fprintf(stderr,
                      "strata generate: prefill %lld tokens in %lld chunks, %.1f ms (%.1f tok/s); experts "
-                     "streamed %lld (%lld by DMA, host %.1f ms), resident %lld; PLE %.1f ms\n",
+                     "streamed %lld (%lld by DMA, host %.1f ms), resident %lld%s; PLE %.1f ms\n",
                      (long long)ps.tokens, (long long)ps.chunks, ps.ms_total,
                      ps.ms_total > 0 ? 1000.0 * (double)ps.tokens / ps.ms_total : 0.0, (long long)ps.experts_streamed,
-                     (long long)ps.experts_dma, ps.ms_experts_host, (long long)ps.experts_resident, ps.ms_ple);
+                     (long long)ps.experts_dma, ps.ms_experts_host, (long long)ps.experts_resident,
+                     ps.experts_cpu > 0
+                         ? (", cpu " + std::to_string(ps.experts_cpu) + " (share " +
+                            std::to_string((int)std::llround(ps.cpu_share * 100.0)) + "%)")
+                               .c_str()
+                         : "",
+                     ps.ms_ple);
     }
 
     for (int64_t pos = pos_start;; ++pos) {
