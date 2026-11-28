@@ -118,7 +118,8 @@ if [[ ! -f "${BUILD_DIR}/Makefile" || "${RECONFIGURE}" == "true" ]]; then
         CXX_FLAGS="${CXX_FLAGS} ${EXTRA_CXX_FLAGS}"
     fi
 
-    cmake -B "${BUILD_DIR}" -S "${REPO_DIR}" \
+    cmake -B "${BUILD_DIR}" -S "${REPO_DIR}/engine" \
+        -DCMAKE_C_COMPILER=icx \
         -DCMAKE_CXX_COMPILER=icpx \
         -DCMAKE_BUILD_TYPE="${BUILD_TYPE}" \
         -DSTRATA_ENABLE_SYCL=ON \
@@ -126,6 +127,7 @@ if [[ ! -f "${BUILD_DIR}/Makefile" || "${RECONFIGURE}" == "true" ]]; then
         -DSTRATA_XMX_SG16=ON \
         ${CMAKE_AOT_FLAG} \
         -DCMAKE_CXX_FLAGS="${CXX_FLAGS}" \
+        -DSTRATA_BUILD_INKLING=OFF \
         -DSTRATA_BUILD_PERF=ON \
         -DSTRATA_BUILD_TESTS=ON > "${LOG_FILE}" 2>&1 || {
             echo "[FAILED] CMake configure failed. Log excerpt:"
