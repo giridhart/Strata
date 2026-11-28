@@ -167,6 +167,170 @@ class Client(unittest.TestCase):
         seen = [json.loads(line) for line in Path(self.log.name).read_text().splitlines()]
         self.assertTrue(any("cancelled" in e for e in seen), seen)   # notifications/cancelled reached the server
 
+    def test_codemode_tool_definition(self):
+        tools = self.hub.codemode_tools()
+        self.assertEqual(len(tools), 1)
+        self.assertEqual(tools[0]["name"], "run_javascript")
+        self.assertIn("mcp.fake.echo", tools[0]["description"])
+        self.assertIn("mcp.fake.add", tools[0]["description"])
+        self.assertEqual(self.hub.codemode_tools(exclude={"run_javascript"}), [])
+        py_tools = self.hub.codemode_tools(lang="python")
+        self.assertEqual(len(py_tools), 1)
+        self.assertEqual(py_tools[0]["name"], "run_python")
+        self.assertEqual(self.hub.codemode_tools(exclude={"run_python"}, lang="python"), [])
+
+    def test_call_codemode_execution(self):
+        r = self.hub.call("run_python", {"code": "s = mcp.fake.add(a=20, b=30)\nprint(f'sum={s}')"})
+        self.assertTrue(r["ok"])
+        self.assertIn("sum=50", r["text"])
+
+    def test_call_codemode_positional_args(self):
+        r = self.hub.call("run_python", {"code": "s = mcp.fake.add(100, 200)\nresult = s"})
+        self.assertTrue(r["ok"])
+        self.assertIn("300", r["text"])
+
+    def test_call_codemode_syntax_error(self):
+        r = self.hub.call("run_python", {"code": "def foo(: print(1)"})
+        self.assertFalse(r["ok"])
+        self.assertIn("SyntaxError", r["text"])
+
+    def test_call_codemode_dynamic_dependency(self):
+        import shutil
+        if not shutil.which("uv"):
+            self.skipTest("uv is not available on PATH")
+        r = self.hub.call("run_python", {
+            "code": "import tabulate\nprint(tabulate.tabulate([['codemode', 1]]))",
+            "dependencies": ["tabulate"]
+        })
+        self.assertTrue(r["ok"], r.get("text"))
+        self.assertIn("codemode", r["text"])
+
+    def test_call_codemode_markdown_fences(self):
+        code_with_fences = "```python\nx = 100\ny = 250\nprint(f'result={x + y}')\n```"
+        r = self.hub.call("run_python", {"code": code_with_fences})
+        self.assertTrue(r["ok"], r.get("text"))
+        self.assertIn("result=350", r["text"])
+
+    def test_call_codemode_expression_auto_capture(self):
+        # Expression without print() or result= variable is captured Jupyter/REPL style
+        r = self.hub.call("run_python", {"code": "mcp.fake.add(a=12, b=34)"})
+        self.assertTrue(r["ok"], r.get("text"))
+        self.assertIn("46", r["text"])
+
+        # Multiple statements with expression at the end
+        r2 = self.hub.call("run_python", {"code": "a = 7\nb = 8\na * b"})
+        self.assertTrue(r2["ok"], r2.get("text"))
+        self.assertIn("56", r2["text"])
+
+    def test_call_codemode_auto_dependency_detection(self):
+        import shutil
+        if not shutil.which("uv"):
+            self.skipTest("uv is not available on PATH")
+        # Automatically detects 'tabulate' from import without explicit dependencies argument
+        r = self.hub.call("run_python", {
+            "code": "import tabulate\ntabulate.tabulate([['auto_detected', 99]])"
+        })
+        self.assertTrue(r["ok"], r.get("text"))
+        self.assertIn("auto_detected", r["text"])
+
+    def test_call_codemode_pep723_dependencies(self):
+        import shutil
+        if not shutil.which("uv"):
+            self.skipTest("uv is not available on PATH")
+        script = (
+            "# /// script\n"
+            "# dependencies = [\"tabulate\"]\n"
+            "# ///\n"
+            "import tabulate\n"
+            "tabulate.tabulate([['pep723', 42]])\n"
+        )
+        r = self.hub.call("run_python", {"code": script})
+        self.assertTrue(r["ok"], r.get("text"))
+        self.assertIn("pep723", r["text"])
+
+    def test_call_codemode_aliases_and_string_arg(self):
+        # Calling via alias 'python'
+        r1 = self.hub.call("python", {"code": "2 + 3"})
+        self.assertTrue(r1["ok"])
+        self.assertIn("5", r1["text"])
+
+        # Calling with raw string argument
+        r2 = self.hub.call("run_python", "40 + 2")
+        self.assertTrue(r2["ok"])
+        self.assertIn("42", r2["text"])
+
+    def test_call_codemode_state_persistence_and_injected_tools(self):
+        # Turn 1: define variables and symbols in session 'turn_test'
+        r1 = self.hub.call("run_python", {
+            "code": "x = sp.Symbol('x')\nstored_offset = 150",
+            "session_id": "turn_test"
+        })
+        self.assertTrue(r1["ok"], r1.get("text"))
+
+        # Turn 2: use stored_offset from Turn 1 without re-declaring it
+        r2 = self.hub.call("run_python", {
+            "code": "stored_offset + 50",
+            "session_id": "turn_test"
+        })
+        self.assertTrue(r2["ok"], r2.get("text"))
+        self.assertIn("200", r2["text"])
+
+        # Turn 3: use Symbol x from Turn 1 to compute derivative and verify equivalence
+        r3 = self.hub.call("run_python", {
+            "code": "verify_equivalence('sin(x)**2 + cos(x)**2', '1')",
+            "session_id": "turn_test"
+        })
+        self.assertTrue(r3["ok"], r3.get("text"))
+        self.assertIn("algebraic_simplification", r3["text"])
+
+        # Turn 4: solve constraints with Z3
+        r4 = self.hub.call("run_python", {
+            "code": "solve_constraints(['Alice', 'Bob'], ['Alice < Bob', 'Alice == 5', 'Bob <= 10'])",
+            "session_id": "turn_test"
+        })
+        self.assertTrue(r4["ok"], r4.get("text"))
+        self.assertIn('"Alice": 5', r4["text"])
+
+    def test_resolve_route_and_aliases(self):
+        s, tool = self.hub.resolve_route("fake__add")
+        self.assertEqual((s.name, tool), ("fake", "add"))
+        s, tool = self.hub.resolve_route("fake.add")
+        self.assertEqual((s.name, tool), ("fake", "add"))
+        s, tool = self.hub.resolve_route("mcp.fake.add")
+        self.assertEqual((s.name, tool), ("fake", "add"))
+        s, tool = self.hub.resolve_route("mcp.fake__add")
+        self.assertEqual((s.name, tool), ("fake", "add"))
+        s, tool = self.hub.resolve_route("mcp__fake__add")
+        self.assertEqual((s.name, tool), ("fake", "add"))
+        # 'add' exists on both 'fake' and 'paged', so bare 'add' is ambiguous and resolves to None
+        s, tool = self.hub.resolve_route("add")
+        self.assertIsNone(s)
+        s, tool = self.hub.resolve_route("nonexistent")
+        self.assertIsNone(s)
+
+    def test_output_parser_direct_mcp_aliases_and_loose_closer(self):
+        from serve.frontend import OutputParser
+        schemas = [
+            {"name": "run_python", "parameters": {"type": "object", "properties": {"code": {"type": "string"}}}},
+            {"name": "clock__get_current_time", "parameters": {"type": "object", "properties": {"timezone": {"type": "string"}}}},
+            {"name": "math__calculate", "parameters": {"type": "object", "properties": {"expression": {"type": "string"}}}}
+        ]
+        parser = OutputParser(thinking=False, tools=schemas, recover=True, declared_only=True)
+        raw_clock = "<tool_call><function=mcp.clock.get_current_time><parameter=timezone>UTC</parameter></functino></tool_call>"
+        evs = parser.feed(raw_clock) + parser.finish()
+        calls = [e.call for e in evs if e.kind == "tool_call"]
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].name, "clock__get_current_time")
+        self.assertEqual(calls[0].arguments, {"timezone": "UTC"})
+
+        parser = OutputParser(thinking=False, tools=schemas, recover=True, declared_only=True)
+        raw_math = "<tool_call><function=mcp.math.calculate><parameter=expression>sqrt(10230)+pow(32,32)+exp(2)</parameter></function></tool_call>"
+        evs = parser.feed(raw_math) + parser.finish()
+        calls = [e.call for e in evs if e.kind == "tool_call"]
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].name, "math__calculate")
+        self.assertEqual(calls[0].arguments, {"expression": "sqrt(10230)+pow(32,32)+exp(2)"})
+
 
 class HttpClient(unittest.TestCase):
     """Streamable HTTP: JSON answers, an event-stream answer, the session id."""
@@ -297,12 +461,12 @@ class Config(unittest.TestCase):
                                   encoding="utf-8")
             hub = hub_from_config({"mcp_servers": {"a": {"command": "old"}},
                                    "mcpServers": {"c": stdio(), "off": {"command": "x", "disabled": True}},
-                                   "mcp": {"timeout_s": 5, "max_result_chars": 100, "max_rounds": 3}}, path)
+                                   "mcp": {"timeout_s": 5, "max_result_chars": 100, "max_rounds": 3, "codemode": True}}, path)
             self.assertEqual(sorted(hub.servers), ["a", "b", "c"])
             self.assertEqual(hub.servers["a"].cfg["command"], sys.executable)   # the file wins a name clash
             self.assertEqual(hub.servers["b"].kind, "http")
-            self.assertEqual((hub.settings["timeout_s"], hub.settings["max_result_chars"], hub.settings["max_rounds"]),
-                             (5.0, 100, 3))
+            self.assertEqual((hub.settings["timeout_s"], hub.settings["max_result_chars"], hub.settings["max_rounds"], hub.settings["codemode"]),
+                             (5.0, 100, 3, True))
         self.assertIsNone(hub_from_config({}))
         self.assertEqual(McpHub({}).settings["max_result_chars"], 20000)
 
@@ -406,6 +570,68 @@ class ToolLoop(unittest.TestCase):
         msg = json.loads(text)["choices"][0]["message"]
         self.assertEqual(msg["content"], "Let me check.5.")
         self.assertEqual(msg["strata_mcp"][-1]["text"], "5")
+
+    def test_codemode_e2e_request(self):
+        script = call_script("run_javascript", code="const s = mcp.fake.add({a: 15, b: 25}); `sum=${s.text}`")
+        self.start(script, "</think>\n\nThe sum is 40.")
+        code, text = self.post({"strata_mcp": True, "codemode": True})
+        self.assertEqual(code, 200, text)
+        cs = self.chunks(text)
+        mcp = [c["strata_mcp"] for c in cs if "strata_mcp" in c]
+        self.assertEqual([m["event"] for m in mcp], ["start", "call", "result"])
+        self.assertEqual(mcp[1]["name"], "run_javascript")
+        self.assertTrue(mcp[2]["ok"])
+        self.assertIn("sum=40", mcp[2]["text"])
+        self.assertEqual(len(self.engine.prompts), 2)
+        first, second = self.engine.prompt_text(0), self.engine.prompt_text(1)
+        self.assertIn('"name": "run_javascript"', first)
+        self.assertNotIn('"name": "fake__echo"', first)
+        self.assertIn("<tool_response>\nsum=40\n</tool_response>", second)
+
+    def test_codemode_python_explicit_opt_in(self):
+        script = call_script("run_python", code="s = mcp.fake.add(a=15, b=25)\nprint(f'sum={s}')")
+        self.start(script, "</think>\n\nThe sum is 40.")
+        code, text = self.post({"strata_mcp": True, "codemode": True, "codemode_lang": "python"})
+        self.assertEqual(code, 200, text)
+        cs = self.chunks(text)
+        mcp = [c["strata_mcp"] for c in cs if "strata_mcp" in c]
+        self.assertEqual([m["event"] for m in mcp], ["start", "call", "result"])
+        self.assertEqual(mcp[1]["name"], "run_python")
+        self.assertTrue(mcp[2]["ok"])
+        self.assertIn("sum=40", mcp[2]["text"])
+        first = self.engine.prompt_text(0)
+        self.assertIn('"name": "run_python"', first)
+
+    def test_codemode_config_opt_in(self):
+        self.hub.settings["codemode"] = True
+        script = call_script("run_javascript", code="mcp.fake.echo({text: 'codemode from config'}).text")
+        self.start(script, "</think>\n\nDone.")
+        code, text = self.post({"strata_mcp": True})
+        self.assertEqual(code, 200, text)
+        cs = self.chunks(text)
+        mcp = [c["strata_mcp"] for c in cs if "strata_mcp" in c]
+        self.assertEqual([m["event"] for m in mcp], ["start", "call", "result"])
+        self.assertIn("codemode from config", mcp[2]["text"])
+        first = self.engine.prompt_text(0)
+        self.assertIn('"name": "run_javascript"', first)
+        self.assertNotIn('"name": "fake__echo"', first)
+
+    def test_codemode_direct_tool_fallback_execution(self):
+        # When model emits <function=mcp.fake.add> directly in Code Mode (with or without loose closer),
+        # the fallback mechanism intercepts, executes fake__add, and returns the result.
+        script = "</think>\n<tool_call><function=mcp.fake.add><parameter=a>15</parameter><parameter=b>25</parameter></functino></tool_call>"
+        self.start(script, "</think>\n\nThe sum is 40.")
+        code, text = self.post({"strata_mcp": True, "codemode": True})
+        self.assertEqual(code, 200, text)
+        cs = self.chunks(text)
+        mcp = [c["strata_mcp"] for c in cs if "strata_mcp" in c]
+        self.assertEqual([m["event"] for m in mcp], ["start", "call", "result"])
+        self.assertEqual(mcp[1]["tool"], "add")
+        self.assertEqual(mcp[2]["text"], "40")
+        first, second = self.engine.prompt_text(0), self.engine.prompt_text(1)
+        self.assertIn('"name": "run_javascript"', first)
+        self.assertNotIn('"name": "fake__add"', first)
+        self.assertIn("<tool_response>\n40\n</tool_response>", second)
 
     def test_plain_requests_get_no_mcp_tools(self):
         self.start(call_script("fake__echo", text="x"), "</think>\n\nnever")
@@ -597,6 +823,80 @@ class ToolLoop(unittest.TestCase):
         with self.assertRaises(urllib.error.HTTPError):
             urllib.request.urlopen(self.base + "/mcp", timeout=10)
         self.svc.api_key = ""
+
+    def test_truncate_error_preserves_head_and_tail(self):
+        from serve.mcp import truncate_error
+        long_err = "Traceback (most recent call last):\n" + ("  File 'lib.py', line 1\n" * 50) + "ZeroDivisionError: division by zero"
+        truncated, was_trunc = truncate_error(long_err, max_chars=400)
+        self.assertTrue(was_trunc)
+        self.assertLessEqual(len(truncated), 450)
+        self.assertTrue(truncated.startswith("Traceback (most recent call last):"))
+        self.assertTrue(truncated.endswith("ZeroDivisionError: division by zero"))
+        self.assertIn("truncated", truncated)
+
+        short_err = "error: small issue"
+        untouched, was_trunc = truncate_error(short_err, max_chars=400)
+        self.assertFalse(was_trunc)
+        self.assertEqual(untouched, short_err)
+
+    def test_settings_max_error_chars(self):
+        from serve.mcp import settings_from
+        cfg = {"mcp": {"max_error_chars": 800}}
+        settings = settings_from(cfg)
+        self.assertEqual(settings["max_error_chars"], 800)
+
+    def test_compact_superseded_tool_rounds(self):
+        from serve.server import compact_superseded_tool_rounds
+        msgs = [
+            {"role": "user", "content": "solve task"},
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"function": {"name": "run_javascript", "arguments": {"code": "const a = 1;\n" * 20}}}
+            ]},
+            {"role": "tool", "content": "error: SyntaxError\n" + ("line\n" * 30)},
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"function": {"name": "run_javascript", "arguments": {"code": "const b = 2;\n" * 20}}}
+            ]},
+            {"role": "tool", "content": "error: TypeError\n" + ("line\n" * 30)}
+        ]
+        compacted = compact_superseded_tool_rounds(msgs)
+        # Round 1 code should be replaced by stub
+        self.assertEqual(compacted[1]["tool_calls"][0]["function"]["arguments"]["code"],
+                         "// [Superseded failed attempt omitted to conserve context]")
+        # Round 1 tool error should be truncated
+        self.assertIn("omitted for superseded round", compacted[2]["content"])
+        # Round 2 code should stay intact for the model to fix
+        self.assertIn("const b = 2;", compacted[3]["tool_calls"][0]["function"]["arguments"]["code"])
+        self.assertNotIn("omitted for superseded round", compacted[4]["content"])
+
+    def test_compact_superseded_tool_rounds_python(self):
+        from serve.server import compact_superseded_tool_rounds
+        msgs = [
+            {"role": "user", "content": "solve task"},
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"function": {"name": "run_python", "arguments": {"code": "a = 1\n" * 30}}}
+            ]},
+            {"role": "tool", "content": "error: SyntaxError\n" + ("line\n" * 30)},
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"function": {"name": "run_python", "arguments": {"code": "b = 2\n" * 30}}}
+            ]},
+            {"role": "tool", "content": "error: ValueError\n" + ("line\n" * 30)}
+        ]
+        compacted = compact_superseded_tool_rounds(msgs, default_lang="python")
+        # Python Code Mode must use '#' comment prefix, NEVER '//'
+        self.assertEqual(compacted[1]["tool_calls"][0]["function"]["arguments"]["code"],
+                         "# [Superseded failed attempt omitted to conserve context]")
+        self.assertIn("omitted for superseded round", compacted[2]["content"])
+        self.assertIn("b = 2", compacted[3]["tool_calls"][0]["function"]["arguments"]["code"])
+
+    def test_call_codemode_blocks_superseded_placeholder(self):
+        hub = McpHub({}, settings={"codemode": True})
+        res_py = hub.call_codemode({"code": "// [Superseded failed attempt omitted to conserve context]"}, lang="python")
+        self.assertFalse(res_py["ok"])
+        self.assertIn("placeholder stub", res_py["text"])
+
+        res_js = hub.call_codemode({"code": "// [Superseded failed attempt omitted to conserve context]"}, lang="javascript")
+        self.assertFalse(res_js["ok"])
+        self.assertIn("placeholder stub", res_js["text"])
 
 
 class NoServers(unittest.TestCase):

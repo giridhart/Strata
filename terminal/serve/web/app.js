@@ -3,8 +3,29 @@
 "use strict";
 
 const $ = (id) => document.getElementById(id);
-const SPRITE = "web/sprite.svg";
+let SPRITE = "web/sprite.svg";
 const icon = (name, cls = "st-icon") => `<svg class="${cls}" aria-hidden="true"><use href="${SPRITE}#i-${name}"/></svg>`;
+
+// Load and inline sprite.svg into document.body so <use href="#id"> resolves synchronously in-memory,
+// eliminating asynchronous SVG external-fragment layout/paint glitches during continuous streaming updates.
+(async function inlineSprite() {
+  try {
+    const res = await fetch("web/sprite.svg");
+    if (!res.ok) return;
+    const text = await res.text();
+    const div = document.createElement("div");
+    div.id = "st-sprite-cache";
+    div.style.display = "none";
+    div.innerHTML = text;
+    document.body.prepend(div);
+    SPRITE = "";
+    for (const u of document.querySelectorAll('use[href*="sprite.svg#"]')) {
+      u.setAttribute("href", u.getAttribute("href").replace(/^.*sprite\.svg/, ""));
+    }
+  } catch (e) {
+    /* keep external sprite fallback */
+  }
+})();
 const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c]));
 const fmt = (n, d = 0) => (n == null || Number.isNaN(n) ? "–" : Number(n).toLocaleString(undefined, {maximumFractionDigits: d, minimumFractionDigits: d}));
 const kfmt = (n) => (n == null ? "–" : n >= 1000 ? `${fmt(n / 1000, n >= 10000 ? 0 : 1)}k` : fmt(n));
@@ -61,6 +82,7 @@ function setTheme(t, save) {
   $("theme-icon").setAttribute("href", `${SPRITE}#i-${t === "dark" ? "sun" : "moon"}`);
   $("dark-toggle").setAttribute("aria-checked", String(t === "dark"));
   refreshPreviews();                                  // the preview frames carry the page's colours
+  refreshPlots();
 }
 const flipTheme = () => setTheme(document.documentElement.dataset.theme === "dark" ? "light" : "dark", true);
 $("theme-btn").onclick = flipTheme;
@@ -852,6 +874,8 @@ function renderMcp() {
   const servers = mcpInfo.servers || [];
   $("mcp-card").hidden = !servers.length;
   $("mcp-row").hidden = !servers.length;
+  if ($("mcp-rounds-row")) $("mcp-rounds-row").hidden = !servers.length;
+  if ($("mcp-lang-row")) $("mcp-lang-row").hidden = !servers.length || !(mcpInfo.settings && mcpInfo.settings.codemode);
   const ready = servers.filter((s) => s.status === "ready" || s.status === "stopped");
   $("mcp-sum").textContent = servers.length ? `${fmt(mcpInfo.tools)} tools · ${ready.length} of ${servers.length} servers connected` : "";
   $("mcp-row-sub").textContent = mcpInfo.tools ? `${fmt(mcpInfo.tools)} tools from ${ready.map((s) => s.name).join(", ")}; the model calls them when it decides to`
@@ -953,16 +977,24 @@ function fillPreview(fr, scripts, blank) {
   }
 }
 function refreshPreviews() { for (const fr of document.querySelectorAll("iframe[data-opened]")) fillPreview(fr, fr.dataset.scripts === "1"); }
+function hydratePreviews(root) {
+  for (const box of (root || document).querySelectorAll('.st-code[data-preview="true"]')) {
+    const fr = box.querySelector("iframe");
+    if (fr && !fr.dataset.opened) fillPreview(fr, false);
+  }
+}
 function codeBlock(lang, code, complete) {
   const ok = complete && StrataPreview.canPreview(lang || "", code);
-  const kind = ok ? StrataPreview.kindOf(lang) : null;
-  const label = kind === "svg" ? tr("preview.showSvg", "Preview the picture") : tr("preview.showPage", "Preview the page");
+  const kind = ok ? StrataPreview.kindOf(lang, code) : null;
+  const isSvg = kind === "svg";
+  const label = isSvg ? tr("preview.showSvg", "Preview the picture") : tr("preview.showPage", "Preview the page");
   const head = `<div class="st-code__head"><span>${esc(lang || tr("code.label", "code"))}</span><span class="st-code__btns">` +
     (kind === "page" ? `<button class="st-btn st-btn--icon" data-preview-scripts aria-label="${esc(tr("preview.runScripts", "Run scripts"))}" aria-pressed="false" title="${esc(tr("preview.runScripts", "Run scripts"))}">${icon("warning")}</button>` : "") +
-    (ok ? `<button class="st-btn st-btn--icon" data-preview-toggle data-preview-label="${esc(label)}" aria-label="${esc(label)}" title="${esc(label)}" aria-pressed="false">${icon("image")}</button>` : "") +
+    (ok ? `<button class="st-btn st-btn--icon" data-preview-toggle data-preview-label="${esc(label)}" aria-label="${esc(isSvg ? tr("preview.showCode", "Show the code") : label)}" title="${esc(isSvg ? tr("preview.showCode", "Show the code") : label)}" aria-pressed="${isSvg ? "true" : "false"}">${icon("image")}</button>` : "") +
     `<button class="st-btn st-btn--icon" data-code-copy aria-label="${esc(tr("code.copy", "Copy code"))}">${icon("copy")}</button></span></div>`;
-  const prev = ok ? `<div class="st-code__preview"><iframe sandbox="" title="${esc(kind === "svg" ? tr("preview.titleSvg", "Picture preview") : tr("preview.titlePage", "Page preview"))}" data-lang="${esc(lang)}"></iframe></div>` : "";
-  return `<div class="st-code">${head}<pre><code>${esc(code)}</code></pre>${prev}</div>`;
+  const prev = ok ? `<div class="st-code__preview"><iframe sandbox="" title="${esc(isSvg ? tr("preview.titleSvg", "Picture preview") : tr("preview.titlePage", "Page preview"))}" data-lang="${esc(lang)}"></iframe></div>` : "";
+  const attrs = isSvg ? ' class="st-code" data-preview="true"' : ' class="st-code"';
+  return `<div${attrs}>${head}<pre><code>${esc(code)}</code></pre>${prev}</div>`;
 }
 function blocks(text) {
   const out = [], lines = text.split("\n");
@@ -1020,8 +1052,8 @@ function markdown(text) {
 // fields: the server picks the card's set for the request's thinking state (thinking 1.0 / 0.95 / 20, not thinking
 // 0.7 / 0.8 / 20 with a presence penalty). Before 0.1.45 the page sent 0.6 itself; a stored 0.6 with the other two
 // values untouched counts as "not set" too.
-const DEFAULTS = {thinking: "high", temperature: 1.0, top_p: 0.95, top_k: 20, max: "", seed: "", show: true, esp: true, mcp: true, math: false,
-                  chatList: false, chatEdit: false, whileBusy: "wait"};
+const DEFAULTS = {thinking: "high", temperature: 1.0, top_p: 0.95, top_k: 20, max: "", seed: "", show: true, esp: true, mcp: true, max_rounds: 8, math: false,
+                  codemode_lang: "javascript", chatList: false, chatEdit: false, whileBusy: "wait"};
 const OLD_DEFAULT_TEMPERATURE = 0.6;
 function samplingUntouched(s) {
   const t = +s.temperature;
@@ -1030,6 +1062,14 @@ function samplingUntouched(s) {
 let settings = {...DEFAULTS, ...store.get("sampling", {})};
 if (samplingUntouched(settings)) settings.temperature = DEFAULTS.temperature;
 let messages = store.get("chat", []);   // the open chat's messages (chats-ui.js: with the saved-chats list on, also that chat's own)
+let currentChatSessionId = "c_" + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+function activeChatId() {
+  if (typeof window.getChatId === "function") {
+    const id = window.getChatId();
+    if (id) return id;
+  }
+  return currentChatSessionId;
+}
 let attachments = [];                 // {name, url}
 let busy = null;                      // {controller, msg, cut, cutAfterTool}
 let pending = null;                   // a message parked while an answer is written: {text, images, files, mode}
@@ -1116,6 +1156,7 @@ function clearToolMedia() {
   mediaEpoch++;
   for (const pending of mediaBlobs.values()) pending.then((url) => URL.revokeObjectURL(url), () => {});
   mediaBlobs.clear();
+  plotCache.clear();
 }
 window.addEventListener("pagehide", clearToolMedia);
 window.addEventListener("pageshow", (event) => { if (event.persisted) hydrateToolImages(document); });
@@ -1141,6 +1182,112 @@ function hydrateToolImages(root) {
     }).catch(() => { img.alt = "Image unavailable; try refreshing"; });
   });
 }
+const plotCache = new Map();
+function toolPlots(t) {
+  if (!t.plot || !t.plot.content) return "";
+  plotCache.set(t.id, t.plot.content);
+  return `<figure class="tool-plot" data-plot-tool-id="${esc(t.id)}">` +
+    `<div class="tool-plot__chart" id="plot-${esc(t.id)}"></div>` +
+    `<figcaption class="tool-plot__caption"><span class="muted small">Interactive Plot</span>` +
+    `<button type="button" class="st-btn st-btn--sm" data-plot-reset="${esc(t.id)}">Reset view</button></figcaption></figure>`;
+}
+let plotlyLoadingPromise = null;
+function loadPlotly() {
+  const existing = window.Plotly || window.moduleName;
+  if (existing && typeof existing.newPlot === "function") {
+    window.Plotly = existing;
+    return Promise.resolve(existing);
+  }
+  if (!plotlyLoadingPromise) {
+    plotlyLoadingPromise = new Promise((resolve, reject) => {
+      const script = document.createElement("script");
+      script.src = "web/vendor/plotly/plotly.min.js";
+      script.async = true;
+      const timer = setTimeout(() => {
+        plotlyLoadingPromise = null;
+        script.remove();
+        reject(new Error("Plotly library load timed out"));
+      }, 15000);
+      script.onload = () => {
+        clearTimeout(timer);
+        const p = window.Plotly || window.moduleName;
+        if (p && typeof p.newPlot === "function") {
+          window.Plotly = p;
+          resolve(p);
+        } else {
+          plotlyLoadingPromise = null;
+          reject(new Error("Plotly object not found on window"));
+        }
+      };
+      script.onerror = () => {
+        clearTimeout(timer);
+        plotlyLoadingPromise = null;
+        script.remove();
+        reject(new Error("Plotly library failed to load"));
+      };
+      document.head.appendChild(script);
+    });
+  }
+  return plotlyLoadingPromise;
+}
+function getPlotLayout(baseLayout, isDark) {
+  return Object.assign({}, baseLayout || {}, {
+    autosize: true,
+    paper_bgcolor: isDark ? "#1e293b" : (baseLayout && baseLayout.paper_bgcolor ? baseLayout.paper_bgcolor : "#ffffff"),
+    plot_bgcolor: isDark ? "#0f172a" : (baseLayout && baseLayout.plot_bgcolor ? baseLayout.plot_bgcolor : "#f8fafc"),
+    font: Object.assign({ color: isDark ? "#e2e8f0" : "#1e293b" }, (baseLayout && baseLayout.font) || {})
+  });
+}
+function refreshPlots() {
+  const isDark = document.documentElement.dataset.theme === "dark";
+  document.querySelectorAll("[data-plot-tool-id][data-rendered]").forEach((fig) => {
+    const id = fig.dataset.plotToolId;
+    const chartEl = fig.querySelector(".tool-plot__chart");
+    const toolData = plotCache.get(id);
+    if (chartEl && window.Plotly && toolData) {
+      window.Plotly.relayout(chartEl, getPlotLayout(toolData.layout, isDark));
+    }
+  });
+}
+function hydrateToolPlots(root) {
+  const plots = root.querySelectorAll("[data-plot-tool-id]:not([data-rendered])");
+  if (!plots.length) return;
+
+  loadPlotly().then((Plotly) => {
+    if (!Plotly) return;
+    const currentPlots = root.querySelectorAll("[data-plot-tool-id]:not([data-rendered])");
+    currentPlots.forEach((fig) => {
+      if (!fig.isConnected) return;
+      fig.dataset.rendered = "1";
+      const id = fig.dataset.plotToolId;
+      const chartEl = fig.querySelector(".tool-plot__chart");
+      const toolData = plotCache.get(id);
+      if (!chartEl || !toolData) return;
+
+      const isDark = document.documentElement.dataset.theme === "dark";
+      const layout = getPlotLayout(toolData.layout, isDark);
+      const config = { responsive: true, displayModeBar: true, displaylogo: false };
+      Plotly.newPlot(chartEl, toolData.data || [], layout, config);
+
+      const resetBtn = fig.querySelector("[data-plot-reset]");
+      if (resetBtn) {
+        resetBtn.addEventListener("click", () => {
+          Plotly.relayout(chartEl, { "xaxis.autorange": true, "yaxis.autorange": true });
+        });
+      }
+    });
+  }).catch((err) => {
+    const currentPlots = root.querySelectorAll("[data-plot-tool-id]:not([data-rendered])");
+    currentPlots.forEach((fig) => {
+      if (!fig.isConnected) return;
+      fig.dataset.rendered = "1";
+      const chartEl = fig.querySelector(".tool-plot__chart");
+      if (chartEl) {
+        chartEl.innerHTML = `<p class="muted small">Interactive chart unavailable</p>`;
+      }
+    });
+  });
+}
 // the answer's text with the tool blocks where the model called them
 // math (opt-in, serve/web/math.js): formulas become placeholders before the Markdown runs and are drawn after it
 function answerMarkdown(text) {
@@ -1153,7 +1300,7 @@ function answerHtml(m) {
     const at = Math.min(Math.max(t.at || 0, pos), m.text.length);
     if (at > pos) html += answerMarkdown(m.text.slice(pos, at));
     pos = at;
-    html += toolHtml(t, k) + toolImages(t);
+    html += toolHtml(t, k) + toolImages(t) + toolPlots(t);
   });
   return html + answerMarkdown(m.text.slice(pos));
 }
@@ -1167,6 +1314,7 @@ function onTool(m, x) {
     Object.assign(t, {name: x.name, server: x.server, tool: x.tool, arguments: x.arguments, round: x.round, state: "running"});
   } else if (x.event === "result") {
     Object.assign(t, {result: x.text, ok: x.ok, chars: x.chars, truncated: x.truncated, ms: x.ms, images: x.images || [], vision: x.vision === true,
+                      plot: x.plot || null,
                       state: x.skipped ? "skipped" : x.ok ? "done" : "error"});
   }
 }
@@ -1191,9 +1339,29 @@ function updateAssistant(el, m, streaming) {
   } else if (!m.text && streaming && !(m.tools && m.tools.length)) {
     bubble.innerHTML = m.reasoning ? `<span class="muted cursor">Writing</span>` : `<span class="cursor"></span>`;
   } else {
+    // Preserve existing rendered interactive plots across streaming frames / re-renders
+    const savedPlots = new Map();
+    bubble.querySelectorAll(".tool-plot[data-rendered]").forEach((p) => {
+      const id = p.dataset.plotToolId;
+      if (id) savedPlots.set(id, p);
+    });
+
     bubble.innerHTML = answerHtml(m);
+
+    // Reattach preserved rendered plots so DOM and WebGL contexts are kept intact
+    if (savedPlots.size > 0) {
+      bubble.querySelectorAll(".tool-plot").forEach((newP) => {
+        const id = newP.dataset.plotToolId;
+        if (id && savedPlots.has(id)) {
+          newP.replaceWith(savedPlots.get(id));
+        }
+      });
+    }
+
     hydrateToolImages(bubble);
+    hydrateToolPlots(bubble);
     if (settings.math) StrataMath.hydrate(bubble);
+    hydratePreviews(bubble);
     if (streaming) bubble.classList.add("cursor"); else bubble.classList.remove("cursor");
   }
   el.querySelector(".meta-text").textContent = m.meta || (streaming ? "" : m.stopped ? tr("chat.stopped", "Stopped") : "");
@@ -1317,15 +1485,29 @@ function assistantMessages(m) {
   }
   const out = [];
   let pos = 0;
-  for (const r of [...new Set(ran.map((t) => t.round))]) {
+  const allRounds = [...new Set(ran.map((t) => t.round))].sort((a, b) => a - b);
+  // Superseded failed round pruning: if all tool calls in round R failed (state === 'error' or !t.ok)
+  // and there is a subsequent round in this turn, omit round R from past conversation history so dead
+  // trial-and-error attempts and error traces do not bloat context in subsequent turns.
+  const activeRounds = allRounds.filter((r, idx) => {
+    const calls = ran.filter((t) => t.round === r);
+    const allFailed = calls.every((t) => !t.ok || t.state === "error");
+    const hasLater = idx < allRounds.length - 1;
+    return !(allFailed && hasLater);
+  });
+  for (const r of activeRounds) {
     const calls = ran.filter((t) => t.round === r);
     const at = Math.min(Math.max(pos, calls[0].at || 0), m.text.length);
     out.push({role: "assistant", content: m.text.slice(pos, at).trim(),
               tool_calls: calls.map((t) => ({id: t.id, type: "function", function: {name: t.name, arguments: JSON.stringify(t.arguments || {})}}))});
     for (const t of calls) {
       const pictures = t.vision ? (t.images || []).filter((im) => safeToolMedia(im.url)) : [];
-      const content = pictures.length ? [{type: "text", text: t.result}, ...pictures.map((im) =>
-        ({type: "image_url", image_url: {url: "strata-tool-media:" + im.url.split("/").pop()}}))] : t.result;
+      let resText = t.result;
+      if ((!t.ok || t.state === "error") && typeof resText === "string" && resText.length > 1200) {
+        resText = resText.slice(0, 300) + "\n\n[... truncated historical error ...]\n\n" + resText.slice(-800);
+      }
+      const content = pictures.length ? [{type: "text", text: resText}, ...pictures.map((im) =>
+        ({type: "image_url", image_url: {url: "strata-tool-media:" + im.url.split("/").pop()}}))] : resText;
       out.push({role: "tool", tool_call_id: t.id, content});
     }
     pos = at;
@@ -1466,7 +1648,8 @@ async function generateReply(opts = {}) {
   paintLive();
 
   const body = {model: health.model, messages: finishing ? finishMessages(m) : apiMessages(), stream: true,
-                reasoning_effort: finishing ? "none" : settings.thinking};
+                reasoning_effort: finishing ? "none" : settings.thinking,
+                chat_id: activeChatId()};
   if (!finishing) body.reasoning_effort = thinkingForFamily(settings.thinking);
   if (!(settings.temperature > 0)) {
     body.temperature = 0;
@@ -1480,7 +1663,11 @@ async function generateReply(opts = {}) {
     delete body.top_p; delete body.top_k;
   }
   if (projectionLoaded()) body.experimental_speed_projection = !!settings.esp;
-  if (settings.mcp !== false && mcpInfo.tools > 0) body.strata_mcp = true;   // this server may run MCP tools for it
+  if (settings.mcp !== false && (mcpInfo.tools > 0 || (mcpInfo.settings && mcpInfo.settings.codemode))) {
+    body.strata_mcp = true;   // this server may run MCP tools for it
+    if (settings.max_rounds) body.max_rounds = Number(settings.max_rounds);
+    if (settings.codemode_lang) body.strata_codemode_lang = settings.codemode_lang;
+  }
 
   let firstAt = null, thinkStart = null, usage = null, frame = 0;
   const paint = () => { frame = 0; updateAssistant(el, m, true); scrollDown(); };
@@ -1582,6 +1769,7 @@ $("new-btn").onclick = () => {
   if (!messages.length) return;
   const backup = messages;
   clearToolMedia();
+  currentChatSessionId = "c_" + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
   messages = [];
   saveChat();
   renderChat();
@@ -1717,6 +1905,11 @@ function loadDrawer(s = settings) {
   $("s-esp").setAttribute("aria-checked", String(s.esp !== false));
   $("esp-row").hidden = !projectionLoaded();
   $("s-mcp").setAttribute("aria-checked", String(s.mcp !== false));
+  if ($("s-rounds")) $("s-rounds").value = s.max_rounds || (mcpInfo.settings && mcpInfo.settings.max_rounds) || 8;
+  const lang = s.codemode_lang || (mcpInfo.settings && mcpInfo.settings.codemode_lang) || "javascript";
+  if ($("s-codemode-lang")) {
+    for (const b of $("s-codemode-lang").children) b.setAttribute("aria-checked", String(b.dataset.v === lang));
+  }
   $("s-share").setAttribute("aria-checked", String(sharedOn));
   $("s-list").setAttribute("aria-checked", String(!!s.chatList));
   $("s-edit").setAttribute("aria-checked", String(!!s.chatEdit));
@@ -1775,10 +1968,16 @@ function outputs() {
     queue: tr("drawer.busyQueueNote", "Your message waits and goes as soon as the answer is done."),
     interject: tr("drawer.busyInterjectNote", "The answer stops where it is (what is written stays) and your message goes at once. A tool that is running finishes first.")}[busyMode] || "";
   for (const id of ["s-topp", "s-topk"]) $(id).disabled = t === 0;
+  if ($("o-rounds") && $("s-rounds")) $("o-rounds").textContent = $("s-rounds").value;
 }
 for (const b of $("s-thinking").children) b.onclick = () => { for (const x of $("s-thinking").children) x.setAttribute("aria-checked", String(x === b)); outputs(); };
 for (const b of $("s-busy").children) b.onclick = () => { for (const x of $("s-busy").children) x.setAttribute("aria-checked", String(x === b)); outputs(); };
-for (const id of ["s-temp", "s-topp", "s-topk"]) $(id).oninput = outputs;
+if ($("s-codemode-lang")) {
+  for (const b of $("s-codemode-lang").children) {
+    b.onclick = () => { for (const x of $("s-codemode-lang").children) x.setAttribute("aria-checked", String(x === b)); };
+  }
+}
+for (const id of ["s-temp", "s-topp", "s-topk", "s-rounds"]) if ($(id)) $(id).oninput = outputs;
 for (const id of ["s-math", "s-show", "s-esp", "s-mcp", "s-share", "s-list", "s-edit"]) {
   $(id).onclick = () => $(id).setAttribute("aria-checked", String($(id).getAttribute("aria-checked") !== "true"));
 }
@@ -1790,6 +1989,8 @@ $("s-apply").onclick = async () => {
   settings = {thinking: segValue("s-thinking") || "high", temperature: +$("s-temp").value, top_p: +$("s-topp").value,
               top_k: +$("s-topk").value, max: $("s-max").value.trim(), seed: $("s-seed").value.trim(),
               math: checked("s-math"), show: checked("s-show"), esp: checked("s-esp"), mcp: checked("s-mcp"),
+              max_rounds: ($("s-rounds") ? +$("s-rounds").value : 8) || 8,
+              codemode_lang: segValue("s-codemode-lang") || "javascript",
               chatList: locked ? !!prev.chatList : checked("s-list"), chatEdit: locked ? !!prev.chatEdit : checked("s-edit"),
               whileBusy: segValue("s-busy") || "wait"};
   store.set("sampling", settings);

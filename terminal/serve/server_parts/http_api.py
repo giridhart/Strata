@@ -836,10 +836,14 @@ def with_history_tools(tools, req) -> list:
     if not tools or not isinstance(req, dict):
         return tools
     try:
+        from serve.mcp import CODEMODE_CALL_NAMES
         have = {t.get("name") for t in tools if isinstance(t, dict)}
+        has_codemode = bool(have & CODEMODE_CALL_NAMES)
         extra = []
         for name in _history_call_names(req):
             if isinstance(name, str) and name and name not in have:
+                if has_codemode and name in CODEMODE_CALL_NAMES:
+                    continue
                 have.add(name)
                 extra.append({"name": name, "parameters": {"type": "object", "properties": {}}})
         return [*tools, *extra] if extra else tools

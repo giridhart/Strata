@@ -983,6 +983,7 @@ FUNCTION_CALLS_END = "</function_calls>"
 PARAM_END = "</parameter>"
 FUNC_START = "<function="
 FUNC_END = "</function>"
+_LOOSE_FUNC_END = re.compile(r"<\s*/\s*(?:functions?|functino|func|fn)\s*>", re.I)
 # #3441: the opener a model writes when it drifts by a token inside the envelope the template documents:
 # `<=NAME>` (the word `function` dropped), `<function:NAME>`, `<function =NAME>`, or the bare `<NAME>`
 _LOOSE_OPEN = re.compile(r"<\s*(?:function\s*[=:]\s*|=\s*)?([A-Za-z0-9_.\-]+)\s*>")
@@ -1035,7 +1036,7 @@ def _close_verdict(after: str, final: bool) -> str:
     call, or prose with no closing tag after it.  "end": the value ends here; "continue": it goes on to the next `</parameter>`; "hold": not
     decidable yet (streaming): wait for more text.  Bounded: the end of the turn (`final`), a new `<tool_call>`, or CLOSE_LOOKAHEAD_CHARS of
     text decide, so a call is never held longer than that."""
-    m = re.match(r"(?:</function>)?\s*</tool_call>", after)
+    m = re.match(r"(?:</function>|<\s*/\s*(?:functions?|functino|func|fn)\s*>)?\s*</tool_call>", after, re.I)
     if not m:
         tail = after[len(FUNC_END):].lstrip() if after.startswith(FUNC_END) else after
         if not final and CALL_END.startswith(tail):
@@ -1060,7 +1061,7 @@ def _close_verdict(after: str, final: bool) -> str:
         return "hold"                                      # `<tool_c` of a second call is arriving
     if CALL_START in rest:
         return "end"                                       # prose, then another call: this one is complete
-    if PARAM_END in rest or CALL_END in rest or FUNC_END in rest:
+    if PARAM_END in rest or CALL_END in rest or FUNC_END in rest or _LOOSE_FUNC_END.search(rest):
         return "continue"                                  # prose, then closing tags again: the text was part of the value
     if final or len(rest) > CLOSE_LOOKAHEAD_CHARS:
         return "end"
@@ -1114,7 +1115,7 @@ def param_end(text: str, final: bool = False, name: str | None = None, hold: boo
                     return at if final else -2
                 if not allow_reopen or name is None or after[len(PARAM_START):gt].strip() != name:
                     return at
-            elif after.startswith((FUNC_END, CALL_END)):          # #4427: the model left out its `</function>`
+            elif after.startswith((FUNC_END, CALL_END)) or _LOOSE_FUNC_END.match(after):          # #4427: the model left out or misspelled its `</function>`
                 verdict = _close_verdict(after, final) if hold else "end"      # hold=False: a call inside the reasoning keeps its old rule
                 if verdict == "end":
                     return at
@@ -1127,6 +1128,7 @@ def param_end(text: str, final: bool = False, name: str | None = None, hold: boo
             elif names is not None and _stub_follows(after):
                 return at                       # #6032 R5 (recover): the model's empty stub, or a repeated closer
             elif not after or PARAM_START.startswith(after) or FUNC_END.startswith(after) or CALL_END.startswith(after) \
+                    or _LOOSE_FUNC_END.match(after) \
                     or any(t.startswith(after) for t in FOLLOWERS) or _follower_form(after) is None \
                     or (names and opener_at(after, names, final) == "pending") \
                     or (names is not None and _stub_follows(after) is None):
@@ -1343,11 +1345,13 @@ def call_end(text: str, final: bool = False, hold: bool = True, names=None) -> i
                 return -1
             seen.add(pname)
             pos = pos + length + end + close_len(text[pos + length:], end, closer)
-        elif s.startswith(FUNC_END):
-            rest = text[pos + len(FUNC_END):]
+        elif s.startswith(FUNC_END) or _LOOSE_FUNC_END.match(s):
+            m = _LOOSE_FUNC_END.match(s)
+            flen = m.end() if m else len(FUNC_END)
+            rest = text[pos + flen:]
             s = rest.lstrip()
             if s.startswith(CALL_END):
-                return pos + len(FUNC_END) + len(rest) - len(s)
+                return pos + flen + len(rest) - len(s)
             return -1 if CALL_END.startswith(s) else text.find(CALL_END, pos)
         elif not s or "<parameter=".startswith(s) or FUNC_END.startswith(s):
             return -1
@@ -1829,12 +1833,16 @@ class OutputParser:
                 last = name.rsplit("__", 1)[1]
                 if last:
                     aliases.setdefault(last, set()).add(name)
+                server, member = name.split("__", 1)
+                for alias in (f"{server}.{member}", f"mcp.{server}.{member}",
+                              f"mcp.{server}__{member}", f"mcp__{server}__{member}", member):
+                    aliases.setdefault(alias, set()).add(name)
         # #4751: a programmatic-tool-calling harness (the DeepSeek Harness's PTC mode) shows the model its tools as `tools.write(...)`
         # inside code, and the model then writes the native call with that spelling (`tools.write`, also `functions.write`).  The
         # prefix is not part of the declared name; the same unambiguous-alias rule applies, an exactly declared name always wins.
         for name in self.schemas:
             if isinstance(name, str) and name:
-                for prefix in ("tools.", "functions.", "default_api."):
+                for prefix in ("tools.", "functions.", "default_api.", "mcp."):
                     aliases.setdefault(prefix + name, set()).add(name)
         # A client that declares MCP tools as `mcp__server__tool` next to plain tools (`web_fetch`, `memory`): Qwen carries
         # the prefix over to a plain tool (`mcp__web_fetch`), drops it from an MCP tool (`server__tool`), or keeps it and
@@ -1850,6 +1858,12 @@ class OutputParser:
                     aliases.setdefault("mcp__" + rest.rsplit("__", 1)[1], set()).add(name)
             elif "__" not in name:
                 aliases.setdefault("mcp__" + name, set()).add(name)
+        if "run_python" in self.schemas:
+            for alias in ("python", "py", "run_code", "execute_code"):
+                aliases.setdefault(alias, set()).add("run_python")
+        if "run_javascript" in self.schemas:
+            for alias in ("javascript", "js", "run_js", "run_code", "execute_code"):
+                aliases.setdefault(alias, set()).add("run_javascript")
         self.aliases = {alias: next(iter(names)) for alias, names in aliases.items()
                         if len(names) == 1 and alias not in self.schemas}
         self.unread = 0              # #3441: `<tool_call>` blocks that opened like a call and were returned as text

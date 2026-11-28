@@ -324,7 +324,8 @@ from serve.frontend import (CALL_END, CALL_START, FUNC_END, FUNC_START, THINK_EN
                             parser_for_template, anthropic_to_messages, anthropic_tools,
                             forced_call, images_of, literal_tags, mark_think_literals, openai_to_messages, require_messages,
                             tool_choice_of, unmark_think_literals)
-from serve.mcp import McpCancelled, hub_from_config, resolve_image_results  # noqa: E402
+from serve.mcp import (McpCancelled, hub_from_config, resolve_image_results,  # noqa: E402
+                       CODEMODE_PYTHON_NAMES, CODEMODE_JS_NAMES, CODEMODE_CALL_NAMES)
 from serve import appendlog  # noqa: E402
 from serve import runconfig  # noqa: E402
 from serve import expert_heat  # noqa: E402
@@ -359,6 +360,7 @@ from serve.structured import StructuredOutputError, prepare_format, validated_js
 from serve import responses as responses_api  # noqa: E402
 from serve.responses import ResponsesError, error_body as responses_error_body  # noqa: E402
 from serve import images as images_api  # noqa: E402
+from serve import runtime_info  # noqa: E402
 
 
 def popen(what: str, args: list, role: str = "engine", **kw):
@@ -5603,7 +5605,12 @@ class Service:
                         "total_mib": scaled(hw.get("gpu_mem_total"), 2 ** 20), "util_pct": hw.get("gpu_util"),
                         "temp_c": hw.get("gpu_temp"), "power_w": hw.get("gpu_power")} if static.get("gpu_name") else None,
                 "ram": {"used_gib": scaled(hw.get("ram_used"), 2 ** 30, 1),
-                        "total_gib": scaled(hw.get("ram_total"), 2 ** 30, 1)} if hw.get("ram_total") else None}}
+                        "total_gib": scaled(hw.get("ram_total"), 2 ** 30, 1)} if hw.get("ram_total") else None},
+            "runtime": self.runtime()}
+
+    def runtime(self) -> dict:
+        """Runtime CLI options, defaults and environment snapshot for GET /v1/runtime."""
+        return runtime_info.snapshot(self)
 
     def render_prompt(self, messages, tools, kwargs) -> str:
         """The template rendered.  #458: with `effort_end`, a request with a non-default effort (low, medium or no
@@ -6878,9 +6885,65 @@ def _debug_req(api, req, messages, tools, max_new, thinking, prompt_tokens):
           f"prompt_tokens={prompt_tokens} last={last.get('role')!r}:{preview!r}", flush=True)
 
 
+def compact_superseded_tool_rounds(messages: list[dict], default_lang: str = "javascript") -> list[dict]:
+    """Compacts older failed tool attempts in the live multi-round loop so failed scripts
+    and stack traces don't accumulate in context. Only the most recent round is kept in full."""
+    asst_indices = [i for i, m in enumerate(messages) if m.get("role") == "assistant" and m.get("tool_calls")]
+    if len(asst_indices) <= 1:
+        return messages
+
+    for idx in asst_indices[:-1]:
+        asst = messages[idx]
+        calls = asst.get("tool_calls") or []
+        j = idx + 1
+        tool_results = []
+        while j < len(messages) and messages[j].get("role") == "tool":
+            tool_results.append(messages[j])
+            j += 1
+
+        all_failed = all(
+            (isinstance(tr.get("content"), str) and tr.get("content", "").startswith("error:")) or
+            (isinstance(tr.get("content"), list) and any(
+                isinstance(p, dict) and str(p.get("text", "")).startswith("error:") for p in tr["content"]
+            ))
+            for tr in tool_results
+        ) if tool_results else False
+
+        if all_failed:
+            for c in calls:
+                fn = c.get("function") or {}
+                fn_name = fn.get("name") or c.get("name") or ""
+                args = fn.get("arguments")
+                is_python = (fn_name in CODEMODE_PYTHON_NAMES or
+                             (not fn_name and str(default_lang).lower() in ("python", "py")) or
+                             (isinstance(args, dict) and str(args.get("language", "")).lower() in ("python", "py")))
+                stub = ("# [Superseded failed attempt omitted to conserve context]" if is_python else
+                        "// [Superseded failed attempt omitted to conserve context]")
+                if isinstance(args, dict) and "code" in args:
+                    if len(str(args.get("code", ""))) > 100:
+                        args["code"] = stub
+                elif isinstance(args, str) and '"code"' in args:
+                    try:
+                        parsed = json.loads(args)
+                        if "code" in parsed and len(str(parsed.get("code", ""))) > 100:
+                            if parsed.get("language") and str(parsed.get("language")).lower() in ("python", "py"):
+                                stub = "# [Superseded failed attempt omitted to conserve context]"
+                            parsed["code"] = stub
+                            fn["arguments"] = json.dumps(parsed)
+                    except Exception:
+                        pass
+            for tr in tool_results:
+                txt = tr.get("content", "")
+                if isinstance(txt, str) and len(txt) > 160:
+                    first_line = txt.splitlines()[0]
+                    tr["content"] = f"{first_line} [... full traceback omitted for superseded round]"
+
+    return messages
+
+
 # ------------------------------------------------------------------------------------------------ MCP tool loop
 def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new, max_req, sampling, cancel,
-                 mcp_names):
+                 mcp_names, parser_tools=None):
     """Service.run with the MCP tools executed here: the model writes a call to an MCP tool, the server runs it, adds
     the call and its result to the conversation and lets the model continue - up to `max_rounds` times.  Yields what
     Service.run yields (text, thinking, the request's own tool calls) plus ("mcp", {...}) for the tool activity, and
@@ -6890,22 +6953,40 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
     `mcp_names`: the MCP tools this request offered; any other call is one of the request's own tools and ends the
     turn as always (the client answers it).  MCP calls written in the same answer are then not run (their results
     could not reach the model before the client's)."""
-    max_rounds = int(hub.settings["max_rounds"])
+    req_rounds = sampling.get("max_rounds") or sampling.get("mcp_max_rounds") if isinstance(sampling, dict) else None
+    try:
+        max_rounds = int(req_rounds) if req_rounds and int(req_rounds) > 0 else int(hub.settings["max_rounds"])
+    except (ValueError, TypeError):
+        max_rounds = int(hub.settings["max_rounds"])
     total, rounds, done = 0, 0, None
     finalizing = False
     messages = list(messages)
+    run_tools = parser_tools if parser_tools is not None else tools
+    req_lang = (sampling.get("codemode_lang") or sampling.get("codemode_language") or
+                sampling.get("strata_codemode_lang") or hub.settings.get("codemode_lang", "javascript")
+                if isinstance(sampling, dict) else "javascript")
+    req_lang = "javascript" if str(req_lang).lower() in ("javascript", "js") else "python"
     while True:
         text, reasoning, calls, own_calls = [], [], [], 0
-        for kind, x in svc.run(ids, thinking, tools, max_new, sampling, cancel, declared_only=True):
+        started_mcp_ids = set()
+        finished_mcp_ids = set()
+        for kind, x in svc.run(ids, thinking, run_tools, max_new, sampling, cancel, declared_only=True):
             if kind == "done":
                 done = x
                 continue
             if kind == "event":
                 ev: Event = x
-                if ev.call is not None and ev.call.name in mcp_names:
+                is_mcp = (ev.call is not None and
+                          (ev.call.name in mcp_names or
+                           ev.call.name in CODEMODE_CALL_NAMES or
+                           (hub and hasattr(hub, "resolve_route") and
+                            hub.resolve_route(ev.call.name)[0] is not None)))
+                if is_mcp:
                     if ev.kind == "tool_start":          # the model has started writing a call: say so at once
+                        started_mcp_ids.add(ev.call.id)
                         yield "mcp", {"event": "start", "id": ev.call.id, "name": ev.call.name}
                     elif ev.kind == "tool_call":
+                        started_mcp_ids.add(ev.call.id)
                         calls.append(ev.call)
                     continue                             # its argument pieces are not streamed to the client
                 if ev.kind == "tool_call":
@@ -6925,16 +7006,29 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
         rounds += 1
         results = []
         for c in calls:
-            s, tool = hub.routes().get(c.name, (None, c.name))
+            s, tool = hub.resolve_route(c.name) if hasattr(hub, "resolve_route") else hub.routes().get(c.name, (None, c.name))
             yield "mcp", {"event": "call", "id": c.id, "name": c.name, "server": s.name if s else None,
                           "tool": tool, "arguments": c.arguments, "round": rounds}
             # The call runs on a thread while this generator keeps yielding heartbeats: they reach the client as
             # keep-alives, which is how a client that went away (the web app's Stop) is noticed during a slow tool.
             box = {}
+            req_timeout = None
+            if isinstance(sampling, dict):
+                _t = sampling.get("tool_timeout_s") or sampling.get("timeout_s")
+                if _t is not None:
+                    try:
+                        req_timeout = float(_t)
+                    except (ValueError, TypeError):
+                        pass
 
             def work(c=c, box=box):
                 try:
-                    box["r"] = hub.call(c.name, c.arguments, cancel)
+                    args = dict(c.arguments) if isinstance(c.arguments, dict) else c.arguments
+                    if isinstance(args, dict) and "session_id" not in args:
+                        s_id = sampling.get("chat_id") or sampling.get("session_id") if isinstance(sampling, dict) else None
+                        if s_id:
+                            args["session_id"] = str(s_id)
+                    box["r"] = hub.call(c.name, args, cancel, timeout_s=req_timeout, default_lang=req_lang)
                 except McpCancelled:
                     box["cancelled"] = True
             worker = threading.Thread(target=work, daemon=True)
@@ -6952,17 +7046,48 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
             r = box["r"]
             print(f"[strata] tool {c.name}: {'ok' if r['ok'] else 'error'}, {r['chars']:,} characters in "
                   f"{r['ms'] / 1000:.1f} s{' (truncated for the model)' if r['truncated'] else ''}", flush=True)
-            results.append(r.get("model_content", r["text"]) if svc.has_vision() else r["text"])
+            res_content = r.get("model_content", r["text"]) if svc.has_vision() else r["text"]
+            is_fallback = False
+            if req_lang == "javascript" and c.name in CODEMODE_PYTHON_NAMES:
+                is_fallback = True
+                expected_fn = "run_javascript"
+                fallback_lang = "Python"
+            elif req_lang == "python" and c.name in CODEMODE_JS_NAMES:
+                is_fallback = True
+                expected_fn = "run_python"
+                fallback_lang = "JavaScript"
+            if is_fallback:
+                fallback_note = (
+                    f"\n\n[Note: This tool call executed {fallback_lang} as an ad-hoc fallback. "
+                    f"The active Code Mode environment for this conversation remains {req_lang} ({expected_fn}). "
+                    f"All subsequent tool calls must use {expected_fn}.]"
+                )
+                if isinstance(res_content, list):
+                    res_content = [*res_content, {"type": "text", "text": fallback_note}]
+                else:
+                    res_content = str(res_content) + fallback_note
+            results.append(res_content)
+            finished_mcp_ids.add(c.id)
             yield "mcp", {"event": "result", "id": c.id,
+                          **({"plot": r["plot"]} if r.get("plot") else {}),
                           **({"images": r["images"], "vision": svc.has_vision()} if r.get("images") else {}),
                           **{k: r[k] for k in ("ok", "text", "chars", "truncated", "ms")}}
         if cancel.is_set() or len(results) < len(calls):
             done = {**done, "finish": "cancel"}
             break
+        any_failed = any(
+            (isinstance(r, str) and r.startswith("error:")) or
+            (isinstance(r, list) and any(isinstance(p, dict) and str(p.get("text", "")).startswith("error:") for p in r))
+            for r in results
+        )
+        # Drop reasoning_content from intermediate tool rounds when a failure occurred to avoid accumulating thousands
+        # of dead thinking tokens in the retry prompt.
         messages.append({"role": "assistant", "content": "".join(text).strip(),
-                         **({"reasoning_content": "".join(reasoning).strip()} if reasoning else {}),
+                         **({"reasoning_content": "".join(reasoning).strip()} if (reasoning and not any_failed) else {}),
                          "tool_calls": [{"function": {"name": c.name, "arguments": c.arguments}} for c in calls]})
         messages += [{"role": "tool", "content": r} for r in results]
+        if rounds >= 2:
+            messages = compact_superseded_tool_rounds(messages, default_lang=req_lang)
         if rounds >= max_rounds:
             finalizing = True
             tools = None
@@ -7958,6 +8083,9 @@ def make_handler(svc: Service):
             elif path == "/v1/status":
                 if self._authorized():
                     self._json(200, svc.v1_status())
+            elif path == "/v1/runtime":
+                if self._authorized():
+                    self._json(200, svc.runtime())
             else:
                 self._json(404, {"error": {"message": "not found"}})
 
@@ -8464,7 +8592,14 @@ def make_handler(svc: Service):
                 if not self._own_page("MCP tools can be used"):   # tools run with the user's rights on this PC
                     return
                 svc.mcp.wait(10)                                  # servers still starting (only right after start)
-                extra = svc.mcp.template_tools(exclude=own)       # the request's own tools win a name clash
+                use_codemode = bool(req.get("codemode") or req.get("code_mode") or req.get("strata_codemode") or
+                                    svc.mcp.settings.get("codemode"))
+                if use_codemode:
+                    req_lang = (req.get("codemode_lang") or req.get("codemode_language") or
+                                req.get("strata_codemode_lang") or svc.mcp.settings.get("codemode_lang", "javascript"))
+                    extra = svc.mcp.codemode_tools(exclude=own, lang=req_lang)
+                else:
+                    extra = svc.mcp.template_tools(exclude=own)       # the request's own tools win a name clash
                 use_mcp = bool(extra)
                 tools = (tools or []) + extra or None
             if force and use_mcp:
@@ -8474,10 +8609,22 @@ def make_handler(svc: Service):
             check_request_sampling(req)                       # ... and a sampling field of the wrong type
             cancel = threading.Event()
             self._watch_client(cancel)                       # #430 #431 (#1999: before prepare, which can take long)
+            if use_mcp and use_codemode:
+                messages = steer_codemode_history(messages, req_lang)
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, force=force, req=req, cancel=cancel)
             _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
-            run = run_with_mcp(svc, svc.mcp, messages, tools, kw, ids, thinking, max_new, max_req, req, cancel,
-                               {t["name"] for t in extra}) if use_mcp else None
+            if use_mcp:
+                all_mcp = set(svc.mcp.routes().keys())
+                mcp_names = {t["name"] for t in extra} | (all_mcp if use_codemode else set())
+                if use_codemode:
+                    fallback_lang = "python" if str(req_lang).lower() in ("javascript", "js") else "javascript"
+                    parser_tools = (tools or []) + svc.mcp.template_tools(exclude=own) + svc.mcp.codemode_tools(exclude=own, lang=fallback_lang)
+                else:
+                    parser_tools = tools or []
+                run = run_with_mcp(svc, svc.mcp, messages, tools, kw, ids, thinking, max_new, max_req, req, cancel,
+                                   mcp_names, parser_tools=parser_tools)
+            else:
+                run = None
             chunks = openai_chunks(svc, req, ids, thinking, tools, max_new, cancel, run=run, force=force)
             if validator is not None:
                 chunks = structured_chunks(chunks, validator)
@@ -9232,6 +9379,62 @@ def apply_vision_defaults(cfg: dict) -> dict:
     return cfg
 
 
+def steer_codemode_history(messages: list[dict], req_lang: str) -> list[dict]:
+    """Ensures that any ad-hoc fallback tool call in conversation history (e.g. run_python when
+    the active session language is JavaScript) does not poison the model into switching languages
+    globally. Injects a steering note into the tool response if one is not already present."""
+    if not messages or not isinstance(messages, list):
+        return messages
+    req_lang_norm = "javascript" if str(req_lang).lower() in ("javascript", "js") else "python"
+    target_fn = "run_javascript" if req_lang_norm == "javascript" else "run_python"
+    fallback_names = CODEMODE_PYTHON_NAMES if req_lang_norm == "javascript" else CODEMODE_JS_NAMES
+    fallback_lang = "Python" if req_lang_norm == "javascript" else "JavaScript"
+    fallback_note = (
+        f"[Note: This tool call executed {fallback_lang} as an ad-hoc fallback. "
+        f"The active Code Mode environment for this conversation remains {req_lang_norm} ({target_fn}). "
+        f"All subsequent tool calls must use {target_fn}.]"
+    )
+
+    fallback_call_ids = set()
+    needs_steering = False
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        role = msg.get("role")
+        if role == "assistant":
+            for call in msg.get("tool_calls") or []:
+                if isinstance(call, dict):
+                    fn_name = (call.get("function") or {}).get("name")
+                    if fn_name in fallback_names:
+                        cid = call.get("id")
+                        if cid:
+                            fallback_call_ids.add(cid)
+                        needs_steering = True
+
+    if not needs_steering:
+        return messages
+
+    out = []
+    for msg in messages:
+        if not isinstance(msg, dict):
+            out.append(msg)
+            continue
+        role = msg.get("role")
+        if role == "tool":
+            cid = msg.get("tool_call_id")
+            content = msg.get("content")
+            if (cid and cid in fallback_call_ids) or (not cid and fallback_call_ids):
+                note_present = isinstance(content, str) and "[Note: This tool call executed" in content
+                if not note_present:
+                    new_msg = dict(msg)
+                    if isinstance(content, str):
+                        new_msg["content"] = f"{content}\n\n{fallback_note}"
+                    elif isinstance(content, list):
+                        new_msg["content"] = [*content, {"type": "text", "text": f"\n\n{fallback_note}"}]
+                    out.append(new_msg)
+                    continue
+        out.append(msg)
+    return out
 def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> int:
     """Serve until stopped. For as long as it runs this server holds the shared activity lease of the runtime folder (the same one `strata serve` and
     a runtime host take), so `strata update` and a calibration run see an engine that was started by running this file directly - the desktop app's
@@ -9468,6 +9671,10 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
     ap.add_argument("--mcp-config", help="a JSON file with MCP servers in Claude Desktop's format ({\"mcpServers\": "
                                          "{...}}); the web app's chat can use their tools (also \"mcp_servers\" in "
                                          "the config)")
+    ap.add_argument("--codemode", action="store_true",
+                    help="enable Code Mode for MCP tools (synthesizes a single execution tool to reduce tokens)")
+    ap.add_argument("--codemode-lang", "--codemode-language", choices=["python", "javascript", "js"], default=None,
+                    help="execution language for Code Mode ('python' or 'javascript'; default: javascript)")
     ap.add_argument("--lazy", action="store_true", help="start the API unloaded (the engine and the vision encoder start with the first request)")
     ap.add_argument("--api-monitor", action="store_true",
                     help="the API request monitor at /api-monitor: keeps the last 100 requests' prompts and answers in "
@@ -9630,6 +9837,10 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
         except ST.UnknownPreTokenizer as e:             # a model with its own splitting rule: stop here, never split with another's
             ap.error(f"the model's tokenizer ({tpath}): {e}")
     hub = hub_from_config(cfg, a.mcp_config)            # before the minutes of loading: a bad entry stops here
+    if a.codemode and hub is not None:
+        hub.settings["codemode"] = True
+    if getattr(a, "codemode_lang", None) and hub is not None:
+        hub.settings["codemode_lang"] = "javascript" if a.codemode_lang in ("javascript", "js") else "python"
     if a.offline and (hub is not None or cfg.get("before_load") or a.before_load):
         ap.error("--offline requires MCP servers and before_load commands to be disabled in this profile")
     if a.offline:
@@ -9754,6 +9965,11 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
                   sampling_defaults=sampling_defaults,
                   fit_max_tokens=a.fit_max_tokens or (not a.no_fit_max_tokens and cfg.get("fit_max_tokens") is not False))
     svc.launch_attestation = launch_attestation
+    svc.launch_argv = list(launch_args)
+    svc.launch_script = getattr(sys.modules[__name__], "LAUNCH_SCRIPT", None) or (sys.argv[0] if sys.argv else "serve/server.py")
+    svc.parsed_args = {k: v for k, v in vars(a).items() if k != "api_key"}
+    svc.runtime_cfg = cfg
+    svc.engine_env = env if a.engine == "strata" else dict(os.environ)
     svc.offline = a.offline
     svc.max_queue = max_queue
     svc.queue_timeout_s = float(queue_timeout) if queue_timeout is not None else None

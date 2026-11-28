@@ -1,0 +1,626 @@
+"""serve/mcp_runner.py - Python execution environment for MCP Code Mode.
+
+Runs in a child process (sys.executable) with non-elevated user rights. Communicates with Strata's McpHub
+over stdin/stdout JSON-RPC pipes. Captures user prints and return values; intermediate data stays in memory.
+"""
+from __future__ import annotations
+
+import ast
+import collections
+import io
+import json
+import os
+from pathlib import Path
+import queue
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import traceback
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from serve.mcp import McpHub
+
+ROOT = Path(__file__).resolve().parent.parent
+
+COMMON_PACKAGE_MAP = {
+    "yaml": "pyyaml",
+    "cv2": "opencv-python",
+    "PIL": "pillow",
+    "sklearn": "scikit-learn",
+    "bs4": "beautifulsoup4",
+    "fitz": "pymupdf",
+    "Bio": "biopython",
+    "serial": "pyserial",
+    "usb": "pyusb",
+    "dateutil": "python-dateutil",
+    "px": "plotly",
+    "go": "plotly",
+    "sp": "sympy",
+    "np": "numpy",
+    "pd": "pandas",
+}
+
+
+def strip_markdown_fences(code: str) -> str:
+    """Strips markdown code block wrappers (e.g. ```python ... ```) or XML prompt tags if present."""
+    s = code.strip()
+    s = re.sub(r"^\s*<tool_call>\s*", "", s, flags=re.IGNORECASE)
+    s = re.sub(r"\s*</tool_call>\s*$", "", s, flags=re.IGNORECASE)
+    s = re.sub(r"^\s*<function=[^>]+>\s*", "", s, flags=re.IGNORECASE)
+    s = re.sub(r"\s*</function>\s*$", "", s, flags=re.IGNORECASE)
+    s = re.sub(r"^\s*<parameter=[^>]+>\s*", "", s, flags=re.IGNORECASE)
+    s = re.sub(r"\s*</parameter>\s*$", "", s, flags=re.IGNORECASE)
+    s = s.strip()
+    if s.startswith("```"):
+        lines = s.splitlines()
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        return "\n".join(lines).strip()
+    return s
+
+
+def get_sandboxed_env() -> dict[str, str]:
+    """Builds a minimal, secure environment for the runner with zero host secrets or credentials."""
+    allowed_keys = {
+        "PATH", "PYTHONPATH", "PYTHONHOME", "LANG", "LC_ALL", "LC_CTYPE",
+        "SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT", "TEMP", "TMP", "STRATA_WORKSPACE"
+    }
+    clean = {k: v for k, v in os.environ.items() if k in allowed_keys}
+    clean["PYTHONDONTWRITEBYTECODE"] = "1"
+    clean["PYTHONUNBUFFERED"] = "1"
+    clean["STRATA_SANDBOX"] = "1"
+    clean["OPENBLAS_NUM_THREADS"] = "1"
+    clean["OMP_NUM_THREADS"] = "1"
+    clean["MKL_NUM_THREADS"] = "1"
+    clean["NUMEXPR_NUM_THREADS"] = "1"
+    clean["VECLIB_MAXIMUM_THREADS"] = "1"
+    workspace_dir = Path(os.environ.get("STRATA_WORKSPACE") or (ROOT / "workspace")).resolve()
+    clean["STRATA_WORKSPACE"] = str(workspace_dir)
+    current_pp = clean.get("PYTHONPATH", "")
+    root_str = str(ROOT)
+    clean["PYTHONPATH"] = f"{root_str}{os.pathsep}{current_pp}" if current_pp else root_str
+    return clean
+
+
+def _apply_rlimits():
+    """Applies POSIX resource limits (CPU time, memory) to prevent runaway execution and memory bombs."""
+    try:
+        import resource
+        resource.setrlimit(resource.RLIMIT_CPU, (35, 40))
+        mem_limit = 2 * 1024 * 1024 * 1024  # 2 GiB virtual address space
+        resource.setrlimit(resource.RLIMIT_AS, (mem_limit, mem_limit))
+        max_fsize = 50 * 1024 * 1024  # 50 MiB max file write
+        resource.setrlimit(resource.RLIMIT_FSIZE, (max_fsize, max_fsize))
+    except Exception:
+        pass
+
+
+_BWRAP_SUPPORTED: bool | None = None
+
+
+def _is_bwrap_supported() -> bool:
+    """Checks whether Bubblewrap is installed and permitted to unshare user namespaces.
+
+    On modern Linux distributions (e.g. Ubuntu 24.04+ with kernel.apparmor_restrict_unprivileged_userns=1),
+    unprivileged user namespaces are restricted by default by AppArmor. Attempting to run bwrap triggers
+    an AppArmor AUDIT denial and immediately terminates the runner with exit code 1.
+    This probe verifies whether bwrap is actually functional before wrapping commands.
+    """
+    global _BWRAP_SUPPORTED
+    if _BWRAP_SUPPORTED is not None:
+        return _BWRAP_SUPPORTED
+    if os.name != "posix" or sys.platform == "darwin" or os.environ.get("STRATA_NO_BWRAP") == "1":
+        _BWRAP_SUPPORTED = False
+        return False
+    bwrap_bin = shutil.which("bwrap")
+    if not bwrap_bin:
+        _BWRAP_SUPPORTED = False
+        return False
+    try:
+        probe_cmd = [bwrap_bin, "--ro-bind", "/usr", "/usr", "--proc", "/proc", "--dev", "/dev",
+                     "--unshare-user", "--", "true"]
+        if os.path.exists("/lib"):
+            probe_cmd = [bwrap_bin, "--ro-bind", "/usr", "/usr", "--ro-bind", "/lib", "/lib",
+                         "--proc", "/proc", "--dev", "/dev", "--unshare-user", "--", "true"]
+        res = subprocess.run(
+            probe_cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=1.5,
+        )
+        _BWRAP_SUPPORTED = (res.returncode == 0)
+    except Exception:
+        _BWRAP_SUPPORTED = False
+    return _BWRAP_SUPPORTED
+
+
+def _wrap_with_bwrap_if_available(cmd: list[str], scratch_dir: str) -> list[str]:
+    """Wraps runner execution with Bubblewrap container isolation if available and permitted on Linux."""
+    if not _is_bwrap_supported():
+        return cmd
+    bwrap_bin = shutil.which("bwrap")
+    if not bwrap_bin:
+        return cmd
+
+    bwrap_cmd = [
+        bwrap_bin,
+        "--ro-bind", "/usr", "/usr",
+        "--ro-bind", "/lib", "/lib",
+        "--tmpfs", "/tmp",
+        "--bind", scratch_dir, scratch_dir,
+        "--chdir", scratch_dir,
+        "--unshare-all",
+        "--unshare-net",
+        "--proc", "/proc",
+        "--dev", "/dev",
+    ]
+    if os.path.exists("/lib64"):
+        bwrap_cmd += ["--ro-bind", "/lib64", "/lib64"]
+    if os.path.exists("/bin"):
+        bwrap_cmd += ["--ro-bind", "/bin", "/bin"]
+    if os.path.exists("/etc/alternatives"):
+        bwrap_cmd += ["--ro-bind-try", "/etc/alternatives", "/etc/alternatives"]
+    if sys.prefix:
+        bwrap_cmd += ["--ro-bind-try", sys.prefix, sys.prefix]
+    bwrap_cmd += ["--ro-bind", str(ROOT), str(ROOT)]
+    return bwrap_cmd + cmd
+
+
+def extract_dependencies(code: str) -> list[str]:
+    """Extract PEP 723 script dependencies or top-level imported third-party packages."""
+    deps = set()
+    clean = strip_markdown_fences(code)
+    # 1. PEP 723 script metadata:
+    m = re.search(r"#\s*///\s*script\s*\n(.*?)\n#\s*///", clean, re.DOTALL)
+    if m:
+        block = m.group(1)
+        for line in block.splitlines():
+            line = line.strip()
+            if line.startswith("#"):
+                line = line.lstrip("#").strip()
+            dm = re.search(r"dependencies\s*=\s*\[(.*?)\]", line)
+            if dm:
+                for item in dm.group(1).split(","):
+                    item = item.strip().strip("\"'").strip()
+                    if item:
+                        deps.add(item)
+    # 2. AST parsing for imported modules:
+    try:
+        tree = ast.parse(clean)
+        stdlib = getattr(sys, "stdlib_module_names", set())
+        local_builtins = {
+            "mcp", "serve", "strata", "__main__", "builtins", "json", "math", "cmath", "os", "sys",
+            "px", "go", "sp", "np", "pd"
+        }
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    root = alias.name.split(".")[0]
+                    if root and root not in stdlib and root not in local_builtins:
+                        pkg = COMMON_PACKAGE_MAP.get(root, root)
+                        deps.add(pkg)
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                root = node.module.split(".")[0]
+                if root and root not in stdlib and root not in local_builtins:
+                    pkg = COMMON_PACKAGE_MAP.get(root, root)
+                    deps.add(pkg)
+    except Exception:
+        pass
+    return sorted(deps)
+
+
+def _kill_tree(p):
+    """Terminate a process and its child processes."""
+    try:
+        if os.name == "nt":
+            subprocess.run(["taskkill", "/PID", str(p.pid), "/T", "/F"], stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL, timeout=10)
+        else:
+            os.killpg(p.pid, signal.SIGTERM)
+            try:
+                p.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                os.killpg(p.pid, signal.SIGKILL)
+    except (OSError, subprocess.SubprocessError):
+        pass
+    try:
+        p.kill()
+    except OSError:
+        pass
+
+
+# ------------------------------------------------------------------------------------------------ the runner process (child)
+def _run_child():
+    """Child process entry point (`python -m serve.mcp_runner`)."""
+    # Enforce single-threaded BLAS/OMP to prevent OpenBLAS RLIMIT_NPROC exhaustion crashes
+    os.environ["OPENBLAS_NUM_THREADS"] = "1"
+    os.environ["OMP_NUM_THREADS"] = "1"
+    os.environ["MKL_NUM_THREADS"] = "1"
+    os.environ["NUMEXPR_NUM_THREADS"] = "1"
+    os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
+
+    from serve.sandbox import LLMSandbox
+
+    ipc_in = sys.stdin.buffer
+    ipc_out = sys.stdout.buffer
+
+    schemas = {}
+    caller = None
+    mcp_root = None
+    sandbox = LLMSandbox()
+
+    class McpCaller:
+        def __init__(self):
+            self._id = 0
+
+        def call(self, tool_name: str, **kwargs):
+            self._id += 1
+            req = {"type": "call", "id": self._id, "tool": tool_name, "arguments": kwargs}
+            ipc_out.write(json.dumps(req, ensure_ascii=False).encode("utf-8") + b"\n")
+            ipc_out.flush()
+            resp_line = ipc_in.readline()
+            if not resp_line:
+                raise RuntimeError("MCP bridge disconnected")
+            resp = json.loads(resp_line.decode("utf-8"))
+            if not resp.get("ok"):
+                raise RuntimeError(resp.get("error") or resp.get("text") or "tool call failed")
+            val = resp.get("text", "")
+            if isinstance(val, str):
+                s = val.strip()
+                if (s.startswith(("{", "[")) and s.endswith(("}", "]"))) or s in ("true", "false", "null") or s.lstrip("-").isdigit():
+                    try:
+                        return json.loads(s)
+                    except Exception:
+                        pass
+            return val
+
+    class ServerProxy:
+        def __init__(self, caller: McpCaller, server_name: str):
+            self._caller = caller
+            self._server = server_name
+
+        def __getattr__(self, name: str):
+            def _invoke(*args, **kwargs):
+                target = f"{self._server}__{name}"
+                schema = schemas.get(target) or {}
+                props = list((schema.get("parameters", {}).get("properties") or {}).keys())
+                for i, arg in enumerate(args):
+                    if i < len(props) and props[i] not in kwargs:
+                        kwargs[props[i]] = arg
+                return self._caller.call(target, **kwargs)
+            return _invoke
+
+    class McpRoot:
+        def __init__(self, caller: McpCaller, tools_list: list[dict]):
+            self._caller = caller
+            self._tools = tools_list
+            self.call = caller.call
+
+        def __getattr__(self, server_name: str):
+            return ServerProxy(self._caller, server_name)
+
+        def search(self, query: str) -> list[dict]:
+            q = query.lower()
+            return [t for t in self._tools if q in t.get("name", "").lower() or q in (t.get("description") or "").lower()]
+
+        def list_tools(self) -> list[dict]:
+            return self._tools
+
+    while True:
+        line = ipc_in.readline()
+        if not line:
+            break
+        try:
+            req_data = json.loads(line.decode("utf-8"))
+        except Exception as e:
+            ipc_out.write(json.dumps({"type": "done", "ok": False, "error": f"invalid init payload: {e}"}).encode("utf-8") + b"\n")
+            ipc_out.flush()
+            continue
+
+        if req_data.get("type") == "exit":
+            break
+
+        code = req_data.get("code") or ""
+        tools = req_data.get("tools") or []
+        session_id = req_data.get("session_id") or "default"
+
+        if caller is None or tools:
+            for t in tools:
+                if isinstance(t, dict) and t.get("name"):
+                    schemas[t["name"]] = t
+            caller = caller or McpCaller()
+            mcp_root = McpRoot(caller, tools)
+
+        res_dict = sandbox.execute(code, session_id=session_id, custom_tools={"mcp": mcp_root})
+        raw_res = res_dict.get("result")
+        serializable_res = raw_res if isinstance(raw_res, (int, float, str, bool, list, dict)) else None
+        ipc_out.write(json.dumps({
+            "type": "done",
+            "ok": res_dict["ok"],
+            "output": res_dict["output"],
+            "result": serializable_res,
+            "error": res_dict.get("error")
+        }, ensure_ascii=False).encode("utf-8") + b"\n")
+        ipc_out.flush()
+
+
+# ------------------------------------------------------------------------------------------------ the host caller (parent)
+class RunnerHandle:
+    def __init__(self, proc, q, reader_thread, stop_reader, clean_deps, scratch_dir: str | None = None,
+                 stderr_lines: collections.deque | None = None, is_ephemeral: bool = False):
+        self.proc = proc
+        self.q = q
+        self.reader_thread = reader_thread
+        self.stop_reader = stop_reader
+        self.deps = set(clean_deps)
+        self.last_used = time.monotonic()
+        self.lock = threading.Lock()
+        self.scratch_dir = scratch_dir
+        self.stderr_lines = stderr_lines if stderr_lines is not None else collections.deque(maxlen=50)
+        self.is_ephemeral = is_ephemeral
+
+    def alive(self) -> bool:
+        return self.proc.poll() is None
+
+    def close(self):
+        self.stop_reader.set()
+        try:
+            self.proc.stdin.write(json.dumps({"type": "exit"}).encode("utf-8") + b"\n")
+            self.proc.stdin.flush()
+        except Exception:
+            pass
+        for f in (self.proc.stdin, self.proc.stdout, self.proc.stderr):
+            try:
+                if f:
+                    f.close()
+            except Exception:
+                pass
+        _kill_tree(self.proc)
+        if self.scratch_dir and self.is_ephemeral and os.path.isdir(self.scratch_dir):
+            try:
+                shutil.rmtree(self.scratch_dir, ignore_errors=True)
+            except Exception:
+                pass
+
+
+_RUNNER_POOL: dict[str, RunnerHandle] = {}
+_RUNNER_LOCK = threading.Lock()
+
+
+def cleanup_idle_runners(ttl_s: float = 900.0):
+    now = time.monotonic()
+    with _RUNNER_LOCK:
+        expired = [sid for sid, r in _RUNNER_POOL.items() if (now - r.last_used) > ttl_s or not r.alive()]
+        for sid in expired:
+            r = _RUNNER_POOL.pop(sid, None)
+            if r:
+                r.close()
+
+
+def close_all_runners():
+    with _RUNNER_LOCK:
+        for r in _RUNNER_POOL.values():
+            r.close()
+        _RUNNER_POOL.clear()
+
+
+def execute_in_runner(code: str, hub: McpHub, timeout_s: float, cancel: threading.Event | None = None,
+                      dependencies: list[str] | None = None, session_id: str = "default") -> dict:
+    """Run `code` in a child Python runner process, routing MCP calls back through `hub`.
+
+    Supports stateful persistence across turns for the same `session_id`.
+    If `uv` is available, uses `uv run -q` for fast, isolated execution and supports on-the-fly PyPI dependencies.
+    Falls back to `sys.executable` if `uv` is not present.
+    -> {"ok": bool, "text": str, "ms": int}
+    """
+    from serve import lifeline
+    from serve.mcp import McpCancelled
+
+    t0 = time.monotonic()
+    tools_info = hub.template_tools()
+
+    clean_code = strip_markdown_fences(code)
+    all_deps = list(dependencies or [])
+    for d in extract_dependencies(clean_code):
+        if d not in all_deps:
+            all_deps.append(d)
+    import importlib.util
+    reverse_pkg_map = {pkg: mod for mod, pkg in COMMON_PACKAGE_MAP.items()}
+    clean_deps = []
+    for d in all_deps:
+        d_str = str(d).strip()
+        if not d_str:
+            continue
+        mapped = COMMON_PACKAGE_MAP.get(d_str, d_str)
+        import_name = reverse_pkg_map.get(mapped, mapped)
+        # Skip if already installed in the base python environment
+        try:
+            if importlib.util.find_spec(d_str) is not None or importlib.util.find_spec(import_name) is not None:
+                continue
+        except (ValueError, ModuleNotFoundError):
+            pass
+        if mapped not in clean_deps:
+            clean_deps.append(mapped)
+
+    cleanup_idle_runners()
+
+    with _RUNNER_LOCK:
+        existing = _RUNNER_POOL.get(session_id)
+        if existing and existing.alive() and set(clean_deps).issubset(existing.deps):
+            runner = existing
+        else:
+            if existing:
+                existing.close()
+                _RUNNER_POOL.pop(session_id, None)
+
+            workspace_dir = Path(os.environ.get("STRATA_WORKSPACE") or (ROOT / "workspace")).resolve()
+            workspace_dir.mkdir(parents=True, exist_ok=True)
+            scratch_dir = str(workspace_dir)
+            sandboxed_env = get_sandboxed_env()
+
+            extra = {}
+            if os.name == "nt":
+                extra["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            else:
+                extra["start_new_session"] = True
+                extra["preexec_fn"] = _apply_rlimits
+
+            uv_bin = shutil.which("uv") if clean_deps else None
+            if uv_bin:
+                cmd = [uv_bin, "run", "--python", sys.executable, "-q", "--with", ",".join(clean_deps),
+                       "python", "-m", "serve.mcp_runner"]
+            else:
+                cmd = [sys.executable, "-m", "serve.mcp_runner"]
+
+            cmd = _wrap_with_bwrap_if_available(cmd, scratch_dir)
+
+            try:
+                proc = lifeline.popen(
+                    cmd,
+                    "mcp",
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    cwd=scratch_dir,
+                    env=sandboxed_env,
+                    **extra
+                )
+            except OSError as e:
+                return {"ok": False, "text": f"error: could not start Python runner: {e}", "ms": int((time.monotonic() - t0) * 1000)}
+
+            q = queue.Queue()
+            stop_reader = threading.Event()
+
+            def reader():
+                for line in proc.stdout:
+                    q.put(line)
+                    if stop_reader.is_set():
+                        break
+                q.put(None)
+
+            reader_thread = threading.Thread(target=reader, daemon=True)
+            reader_thread.start()
+
+            stderr_lines = collections.deque(maxlen=50)
+
+            def err_reader():
+                try:
+                    for line in proc.stderr:
+                        stderr_lines.append(line.decode("utf-8", "replace").rstrip())
+                except (OSError, ValueError):
+                    pass
+
+            err_thread = threading.Thread(target=err_reader, daemon=True)
+            err_thread.start()
+
+            runner = RunnerHandle(proc, q, reader_thread, stop_reader, clean_deps, scratch_dir=scratch_dir,
+                                  stderr_lines=stderr_lines, is_ephemeral=False)
+            _RUNNER_POOL[session_id] = runner
+
+    with runner.lock:
+        runner.last_used = time.monotonic()
+        proc = runner.proc
+        q = runner.q
+
+        req_payload = json.dumps({
+            "type": "exec",
+            "code": clean_code,
+            "tools": tools_info,
+            "session_id": session_id,
+        }, ensure_ascii=False).encode("utf-8") + b"\n"
+
+        try:
+            proc.stdin.write(req_payload)
+            proc.stdin.flush()
+        except (OSError, ValueError):
+            with _RUNNER_LOCK:
+                _RUNNER_POOL.pop(session_id, None)
+            runner.close()
+            return {"ok": False, "text": "error: runner process closed unexpectedly", "ms": int((time.monotonic() - t0) * 1000)}
+
+        deadline = time.monotonic() + timeout_s
+        done = False
+        output = None
+
+        try:
+            while time.monotonic() < deadline and not done:
+                if cancel is not None and cancel.is_set():
+                    with _RUNNER_LOCK:
+                        _RUNNER_POOL.pop(session_id, None)
+                    runner.close()
+                    raise McpCancelled("stopped")
+
+                try:
+                    line = q.get(timeout=0.05)
+                except queue.Empty:
+                    continue
+
+                if line is None:
+                    break
+
+                try:
+                    msg = json.loads(line.decode("utf-8"))
+                except Exception:
+                    continue
+
+                if msg.get("type") == "call":
+                    tool_name = msg.get("tool")
+                    tool_args = msg.get("arguments") or {}
+                    try:
+                        r = hub.call(tool_name, tool_args, cancel)
+                        ans = {"ok": r.get("ok", False), "text": r.get("text", "")}
+                    except McpCancelled:
+                        with _RUNNER_LOCK:
+                            _RUNNER_POOL.pop(session_id, None)
+                        runner.close()
+                        raise
+                    except Exception as e:
+                        ans = {"ok": False, "error": str(e)}
+
+                    try:
+                        proc.stdin.write(json.dumps(ans, ensure_ascii=False).encode("utf-8") + b"\n")
+                        proc.stdin.flush()
+                    except (OSError, ValueError):
+                        break
+                elif msg.get("type") == "done":
+                    done = True
+                    output = msg
+                    break
+        except Exception:
+            with _RUNNER_LOCK:
+                _RUNNER_POOL.pop(session_id, None)
+            runner.close()
+            raise
+
+    ms = int((time.monotonic() - t0) * 1000)
+    if not done:
+        with _RUNNER_LOCK:
+            _RUNNER_POOL.pop(session_id, None)
+        runner.close()
+        if cancel is not None and cancel.is_set():
+            raise McpCancelled("stopped")
+        if time.monotonic() >= deadline:
+            return {"ok": False, "text": f"error: Code Mode Python execution timed out after {timeout_s:g} s", "ms": ms}
+        err_detail = "\n".join(runner.stderr_lines).strip()
+        code = runner.proc.poll()
+        if err_detail:
+            return {"ok": False, "text": f"error: Code Mode Python runner exited (code {code}): {err_detail}", "ms": ms}
+        return {"ok": False, "text": f"error: Code Mode Python runner exited unexpectedly (code {code})", "ms": ms}
+
+    if output.get("ok"):
+        return {"ok": True, "text": output.get("output", ""), "ms": ms, "result": output.get("result")}
+    else:
+        err = output.get("error", "unknown error")
+        return {"ok": False, "text": f"error: {err}", "ms": ms}
+
+
+if __name__ == "__main__":
+    _run_child()
