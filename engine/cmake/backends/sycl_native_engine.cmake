@@ -1779,6 +1779,43 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP OR STRATA_ENABLE_SYCL)
     set_tests_properties(sycl_graph_limit_test PROPERTIES RESOURCE_LOCK gpu TIMEOUT 60)
   endif()
 
+  if(STRATA_ENABLE_SYCL AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/sycl/inkling2_kernels_parity.cpp")
+    if(NOT TARGET strata_zstd_dec)
+      enable_language(C)
+      set(_ink_zstd_dir "${CMAKE_CURRENT_SOURCE_DIR}/third_party/zstd-dec")
+      add_library(strata_zstd_dec STATIC
+        ${_ink_zstd_dir}/common/debug.c ${_ink_zstd_dir}/common/entropy_common.c
+        ${_ink_zstd_dir}/common/error_private.c ${_ink_zstd_dir}/common/fse_decompress.c
+        ${_ink_zstd_dir}/common/xxhash.c ${_ink_zstd_dir}/common/zstd_common.c
+        ${_ink_zstd_dir}/decompress/huf_decompress.c ${_ink_zstd_dir}/decompress/zstd_ddict.c
+        ${_ink_zstd_dir}/decompress/zstd_decompress.c ${_ink_zstd_dir}/decompress/zstd_decompress_block.c
+      )
+      target_include_directories(strata_zstd_dec PUBLIC ${_ink_zstd_dir} ${_ink_zstd_dir}/common ${_ink_zstd_dir}/decompress)
+      target_compile_definitions(strata_zstd_dec PRIVATE ZSTD_DISABLE_ASM=1)
+    endif()
+    add_executable(sycl_inkling2_kernels_parity tests/sycl/inkling2_kernels_parity.cpp)
+    target_include_directories(sycl_inkling2_kernels_parity PRIVATE
+      ${_strata_gpu_include_directories}
+      ${CMAKE_CURRENT_SOURCE_DIR}/src/inkling2/sycl
+      ${CMAKE_CURRENT_SOURCE_DIR}/third_party/zstd-dec
+    )
+    target_link_libraries(sycl_inkling2_kernels_parity PRIVATE strata_core strata_zstd_dec ${_strata_gpu_runtime_target})
+    add_test(NAME sycl_inkling2_kernels_parity COMMAND sycl_inkling2_kernels_parity)
+    set_tests_properties(sycl_inkling2_kernels_parity PROPERTIES RESOURCE_LOCK gpu TIMEOUT 180)
+  endif()
+
+  if(STRATA_ENABLE_SYCL AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/sycl/inkling2_graph_limit_test.cpp")
+    add_executable(sycl_inkling2_graph_limit_test tests/sycl/inkling2_graph_limit_test.cpp)
+    target_include_directories(sycl_inkling2_graph_limit_test PRIVATE
+      ${_strata_gpu_include_directories}
+      ${CMAKE_CURRENT_SOURCE_DIR}/src/inkling2/sycl
+      ${CMAKE_CURRENT_SOURCE_DIR}/third_party/zstd-dec
+    )
+    target_link_libraries(sycl_inkling2_graph_limit_test PRIVATE strata_core strata_zstd_dec ${_strata_gpu_runtime_target})
+    add_test(NAME sycl_inkling2_graph_limit_test COMMAND sycl_inkling2_graph_limit_test)
+    set_tests_properties(sycl_inkling2_graph_limit_test PROPERTIES RESOURCE_LOCK gpu TIMEOUT 120)
+  endif()
+
   if(STRATA_ENABLE_SYCL AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/sycl/doorbell_handshake_test.cpp")
     add_executable(sycl_doorbell_handshake tests/sycl/doorbell_handshake_test.cpp)
     target_include_directories(sycl_doorbell_handshake PRIVATE ${_strata_gpu_include_directories})

@@ -54,36 +54,104 @@ fi
   -c "${ENG_ROOT}/src/quant/dequant.cpp" -o "${OUT_DIR}/dequant.o"
 "${ICPX}" -std=c++20 -O3 "${CPU_ISA_FLAGS[@]}" -I"${ENG_ROOT}/include" \
   -c "${ENG_ROOT}/src/quant/types.cpp" -o "${OUT_DIR}/types.o"
+"${ICPX}" -std=c++20 -O3 "${CPU_ISA_FLAGS[@]}" -I"${ENG_ROOT}/include" -I"${ENG_ROOT}/src/quant" \
+  -c "${ENG_ROOT}/src/quant/isa.cpp" -o "${OUT_DIR}/isa.o"
+"${ICPX}" -std=c++20 -O3 "${CPU_ISA_FLAGS[@]}" -I"${ENG_ROOT}/include" -I"${ENG_ROOT}/src/quant" \
+  -c "${ENG_ROOT}/src/quant/dispatch.cpp" -o "${OUT_DIR}/dispatch.o"
+"${ICPX}" -std=c++20 -O3 "${CPU_ISA_FLAGS[@]}" -I"${ENG_ROOT}/include" -I"${ENG_ROOT}/src/quant" \
+  -c "${ENG_ROOT}/src/quant/selfcheck.cpp" -o "${OUT_DIR}/selfcheck.o"
+"${ICPX}" -std=c++20 -O3 "${CPU_ISA_FLAGS[@]}" -ffp-contract=off -I"${ENG_ROOT}/include" -I"${ENG_ROOT}/src/quant" \
+  -c "${ENG_ROOT}/src/quant/act_ref.cpp" -o "${OUT_DIR}/act_ref.o"
+"${ICPX}" -std=c++20 -O3 "${CPU_ISA_FLAGS[@]}" -ffp-contract=off -I"${ENG_ROOT}/include" -I"${ENG_ROOT}/src/quant" \
+  -c "${ENG_ROOT}/src/quant/dot_generic.cpp" -o "${OUT_DIR}/dot_generic.o"
 "${ICPX}" -std=c++20 -O3 "${CPU_ISA_FLAGS[@]}" -I"${ENG_ROOT}/include" \
   -c "${ENG_ROOT}/src/inkling2/inkling2_loop.cpp" -o "${OUT_DIR}/inkling2_loop.o"
-OBJS+=("${OUT_DIR}/sk_codecs.o" "${OUT_DIR}/dequant.o" "${OUT_DIR}/types.o" "${OUT_DIR}/inkling2_loop.o")
+OBJS+=("${OUT_DIR}/sk_codecs.o" "${OUT_DIR}/dequant.o" "${OUT_DIR}/types.o" "${OUT_DIR}/isa.o" "${OUT_DIR}/dispatch.o" "${OUT_DIR}/selfcheck.o" "${OUT_DIR}/act_ref.o" "${OUT_DIR}/dot_generic.o" "${OUT_DIR}/inkling2_loop.o")
 
-# 2. Target flags (Alchemist dg2 + Battlemage bmg_g21 + Arc Pro B70 bmg_g31 + portable spir64 JIT!)
+# 2. Target flags (Alchemist dg2 + Battlemage bmg_g21 B580 + Arc Pro B70 bmg_g31 + portable spir64 JIT!)
 SYCL_FLAGS=(-fsycl -std=c++20 -O3 -fno-fast-math)
-case "${TARGET_MODE}" in
-  fat)
-    if [ -n "${SYCL_TARGETS_OVERRIDE:-}" ]; then
-      SYCL_FLAGS+=("-fsycl-targets=${SYCL_TARGETS_OVERRIDE}")
-    elif command -v ocloc >/dev/null 2>&1 && ocloc ids bmg_g31 >/dev/null 2>&1; then
-      SYCL_FLAGS+=(-fsycl-targets=spir64,intel_gpu_acm_g10,intel_gpu_bmg_g21,intel_gpu_bmg_g31)
-    else
-      SYCL_FLAGS+=(-fsycl-targets=spir64,intel_gpu_acm_g10,intel_gpu_bmg_g21)
-    fi
-    ;;
-  bmg)
-    SYCL_FLAGS+=(-fsycl-targets=intel_gpu_bmg_g31,spir64)
-    ;;
-  acm)
-    SYCL_FLAGS+=(-fsycl-targets=intel_gpu_acm_g10,spir64)
-    ;;
-  jit)
-    SYCL_FLAGS+=(-fsycl-targets=spir64)
-    ;;
-  *)
-    echo "Unknown TARGET_MODE=${TARGET_MODE}" >&2
-    exit 1
-    ;;
-esac
+HAS_OCLOC=0
+if command -v ocloc >/dev/null 2>&1; then
+  HAS_OCLOC=1
+fi
+
+TARGETS_CSV=""
+if [ -n "${SYCL_TARGETS_OVERRIDE:-}" ]; then
+  TARGETS_CSV="${SYCL_TARGETS_OVERRIDE}"
+elif [ -n "${AOT_DEVICE:-}" ]; then
+  if [ "${HAS_OCLOC}" = "1" ]; then
+    case "${AOT_DEVICE}" in
+      intel_gpu_*|spir64*) TARGETS_CSV="${AOT_DEVICE},spir64" ;;
+      *) TARGETS_CSV="intel_gpu_${AOT_DEVICE},spir64" ;;
+    esac
+  else
+    echo "[build_inkling_sycl] WARNING: ocloc not found; falling back to spir64 JIT for AOT_DEVICE=${AOT_DEVICE}" >&2
+    TARGETS_CSV="spir64"
+  fi
+else
+  case "${TARGET_MODE}" in
+    fat)
+      if [ "${HAS_OCLOC}" = "1" ] && ocloc ids bmg_g31 >/dev/null 2>&1; then
+        TARGETS_CSV="spir64,intel_gpu_acm_g10,intel_gpu_bmg_g21,intel_gpu_bmg_g31"
+      elif [ "${HAS_OCLOC}" = "1" ]; then
+        TARGETS_CSV="spir64,intel_gpu_acm_g10,intel_gpu_bmg_g21"
+      else
+        echo "[build_inkling_sycl] WARNING: ocloc not found; falling back to spir64 JIT" >&2
+        TARGETS_CSV="spir64"
+      fi
+      ;;
+    bmg)
+      if [ "${HAS_OCLOC}" = "1" ] && ocloc ids bmg_g31 >/dev/null 2>&1; then
+        TARGETS_CSV="intel_gpu_bmg_g21,intel_gpu_bmg_g31,spir64"
+      elif [ "${HAS_OCLOC}" = "1" ]; then
+        TARGETS_CSV="intel_gpu_bmg_g21,spir64"
+      else
+        echo "[build_inkling_sycl] WARNING: ocloc not found; falling back to spir64 JIT for TARGET_MODE=bmg" >&2
+        TARGETS_CSV="spir64"
+      fi
+      ;;
+    acm)
+      if [ "${HAS_OCLOC}" = "1" ]; then
+        TARGETS_CSV="intel_gpu_acm_g10,spir64"
+      else
+        echo "[build_inkling_sycl] WARNING: ocloc not found; falling back to spir64 JIT for TARGET_MODE=acm" >&2
+        TARGETS_CSV="spir64"
+      fi
+      ;;
+    jit)
+      TARGETS_CSV="spir64"
+      ;;
+    *)
+      echo "Unknown TARGET_MODE=${TARGET_MODE}" >&2
+      exit 1
+      ;;
+  esac
+fi
+
+SYCL_FLAGS+=("-fsycl-targets=${TARGETS_CSV}")
+
+# Enable SPV_KHR_integer_dot_product (dp4a) for every target triple, plus optional GRF_MODE=128|256 AOT override
+IFS=',' read -r -a _TARGET_ARR <<< "${TARGETS_CSV}"
+for _tgt in "${_TARGET_ARR[@]}"; do
+  SYCL_FLAGS+=("-Xspirv-translator=${_tgt}" "--spirv-ext=+SPV_KHR_integer_dot_product")
+  if [ "${_tgt}" != "spir64" ] && [ -n "${GRF_MODE:-}" ]; then
+    case "${GRF_MODE}" in
+      256)
+        SYCL_FLAGS+=("-Xsycl-target-backend=${_tgt}" "-options -ze-opt-large-register-file")
+        ;;
+      128)
+        SYCL_FLAGS+=("-Xsycl-target-backend=${_tgt}" "-options -ze-opt-regular-grf-kernel")
+        ;;
+      *)
+        echo "Unknown GRF_MODE=${GRF_MODE} (expected 128 or 256)" >&2
+        exit 1
+        ;;
+    esac
+  fi
+done
+if [ -n "${GRF_MODE:-}" ]; then
+  echo "[build_inkling_sycl] GRF_MODE=${GRF_MODE} enabled"
+fi
 
 MKL_FLAGS=()
 MKL_LIBS=()

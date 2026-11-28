@@ -10,6 +10,14 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
+
+#if __has_include(<sycl/ext/intel/experimental/grf_size_properties.hpp>)
+#include <sycl/ext/intel/experimental/grf_size_properties.hpp>
+#define INK_SY_HAS_GRF_PROP 1
+#else
+#define INK_SY_HAS_GRF_PROP 0
+#endif
 
 #ifdef INK_SYCL_USE_ONEMKL
 #include <oneapi/mkl/blas.hpp>
@@ -18,6 +26,65 @@
 #include "ink_sy_common.h"
 
 namespace ink_sycl {
+
+// Opt-in Xe2 / Arc B580 kernel optimization flags (all OFF by default so default path stays byte-identical)
+inline bool ink_sycl_moe_vec_enabled() noexcept {
+    const char* e = std::getenv("STRATA_INK_SYCL_MOE_VEC");
+    return e && (e[0] == '1' || e[0] == 'y' || e[0] == 'Y' || e[0] == 't' || e[0] == 'T');
+}
+
+inline int ink_sycl_kreg_mode() noexcept {
+    const char* e = std::getenv("STRATA_INK_SYCL_KREG");
+    if (!e || !e[0]) return 1;
+    const int v = std::atoi(e);
+    if (v == 2 || v == 4) return v;
+    return 1;
+}
+
+// -1 = unset (compiler default), 0 = force 128 GRF, 1 = force 256 GRF
+inline int ink_sycl_256grf_mode() noexcept {
+    const char* e = std::getenv("STRATA_INK_SYCL_256GRF");
+    if (!e || !e[0]) return -1;
+    return (e[0] == '1' || e[0] == 'y' || e[0] == 'Y' || e[0] == 't' || e[0] == 'T') ? 1 : 0;
+}
+
+#if INK_SY_HAS_GRF_PROP
+template <unsigned int Grf, int Dims, typename KernelFn>
+struct InkGrfFunctor {
+    KernelFn fn;
+    void operator()(sycl::nd_item<Dims> it) const { fn(it); }
+    auto get(sycl::ext::oneapi::experimental::properties_tag) const {
+        return sycl::ext::oneapi::experimental::properties{
+            sycl::ext::intel::experimental::grf_size<Grf>,
+            sycl::ext::oneapi::experimental::sub_group_size<16>};
+    }
+};
+#endif
+
+template <int Dims, typename KernelFn>
+inline void ink_parallel_for_grf(sycl::queue& q, const sycl::nd_range<Dims>& r, int grf_mode, KernelFn fn) {
+#if INK_SY_HAS_GRF_PROP
+    if (grf_mode == 1) {
+        q.parallel_for(r, InkGrfFunctor<256, Dims, KernelFn>{fn});
+        return;
+    }
+    if (grf_mode == 0) {
+        q.parallel_for(r, InkGrfFunctor<128, Dims, KernelFn>{fn});
+        return;
+    }
+#else
+    (void)grf_mode;
+#endif
+    q.parallel_for(r, [=](sycl::nd_item<Dims> it) INK_REQD_SG16 { fn(it); });
+}
+
+// Branchless bit-exact E2M1 (NVFP4) decoder: zero LUT array, zero register shuffle
+inline float e2m1_fast(uint32_t nib) {
+    const uint32_t m = nib & 7u;
+    const uint32_t bits = (m < 2u) ? (m ? 0x3F000000u : 0u)
+                                   : ((((m >> 1) + 126u) << 23) | ((m & 1u) << 22));
+    return sycl::bit_cast<float>(bits | ((nib & 8u) << 28));
+}
 
 template <int F>
 inline void sk_q8_sy(const uint8_t* pl, int j, int* q) {
@@ -497,8 +564,91 @@ inline void k_quantize_x_q8_sg16(const float* X, int M, int K, int8_t* xq, float
     });
 }
 
+// Opt-in multi-row (KREG=1|2|4) + 16B int4 LSC Q8_ROW SG16 dp4a GEMV (bit-exact to default)
+template <int R>
+inline void k_linear_q8row_dp4a_kreg_sg16(const uint8_t* W, int N, int K, const int8_t* xq, const float* xsc,
+                                          float* Y, int M, int N_total, int grf_mode) {
+    const int n_scales = (N_total > 0) ? N_total : N;
+    const float* scales = reinterpret_cast<const float*>(W);
+    const int32_t* qw4 = reinterpret_cast<const int32_t*>(W + (size_t)n_scales * 4);
+    const int32_t* xq4 = reinterpret_cast<const int32_t*>(xq);
+    const int K4 = K >> 2;
+    const int n_groups = (N + 16 * R - 1) / (16 * R);
+    const bool vec16 = ((K4 & 3) == 0);
+    ink_parallel_for_grf(Q(), NR((size_t)n_groups, 256), grf_mode, [=](sycl::nd_item<1> it) INK_REQD_SG16 {
+        const int sg = (int)it.get_local_id(0) >> 4, lane = (int)it.get_local_id(0) & 15;
+        const int row0 = ((int)it.get_group(0) * 16 + sg) * R;
+        if (row0 >= N) return;
+        const int nr = sycl::min(R, N - row0);
+        float wsc[R];
+        const int32_t* wp[R];
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            const int rr = (r < nr) ? (row0 + r) : (N - 1);
+            wsc[r] = scales[rr];
+            wp[r] = qw4 + (size_t)rr * K4;
+        }
+        auto subg = it.get_sub_group();
+        for (int m0 = 0; m0 < M; m0 += 4) {
+            const int mm = sycl::min(4, M - m0);
+            int32_t acc[R][4];
+#pragma unroll
+            for (int r = 0; r < R; ++r)
+#pragma unroll
+                for (int i = 0; i < 4; ++i) acc[r][i] = 0;
+
+            if (vec16) {
+                const int K16 = K4 >> 2;
+                for (int k16 = lane; k16 < K16; k16 += 16) {
+                    sycl::int4 wv[R];
+#pragma unroll
+                    for (int r = 0; r < R; ++r) {
+                        wv[r] = *reinterpret_cast<const sycl::int4*>(wp[r] + (k16 << 2));
+                    }
+                    for (int i = 0; i < mm; ++i) {
+                        const sycl::int4 xv = *reinterpret_cast<const sycl::int4*>(xq4 + (size_t)(m0 + i) * K4 + (k16 << 2));
+#pragma unroll
+                        for (int r = 0; r < R; ++r) {
+                            int32_t a = acc[r][i];
+                            a = dp4a_s8(wv[r].x(), xv.x(), a);
+                            a = dp4a_s8(wv[r].y(), xv.y(), a);
+                            a = dp4a_s8(wv[r].z(), xv.z(), a);
+                            a = dp4a_s8(wv[r].w(), xv.w(), a);
+                            acc[r][i] = a;
+                        }
+                    }
+                }
+            } else {
+                for (int k = lane; k < K4; k += 16) {
+                    int32_t wv[R];
+#pragma unroll
+                    for (int r = 0; r < R; ++r) wv[r] = wp[r][k];
+                    for (int i = 0; i < mm; ++i) {
+                        const int32_t xv = xq4[(size_t)(m0 + i) * K4 + k];
+#pragma unroll
+                        for (int r = 0; r < R; ++r) acc[r][i] = dp4a_s8(wv[r], xv, acc[r][i]);
+                    }
+                }
+            }
+            for (int i = 0; i < mm; ++i) {
+                const float xs = xsc[m0 + i];
+#pragma unroll
+                for (int r = 0; r < R; ++r) {
+                    const int32_t s = sycl::reduce_over_group(subg, acc[r][i], sycl::plus<int32_t>());
+                    if (lane == 0 && r < nr) Y[(size_t)(m0 + i) * N + row0 + r] = (float)s * (wsc[r] * xs);
+                }
+            }
+        }
+    });
+}
+
 // Q8_ROW SG16 dp4a GEMV (deterministic dot_acc on int8x4!)
 inline void k_linear_q8row_dp4a_sg16(const uint8_t* W, int N, int K, const int8_t* xq, const float* xsc, float* Y, int M, int N_total = -1) {
+    const int kreg = ink_sycl_kreg_mode();
+    const int grf = ink_sycl_256grf_mode();
+    if (kreg == 4) { k_linear_q8row_dp4a_kreg_sg16<4>(W, N, K, xq, xsc, Y, M, N_total, grf); return; }
+    if (kreg == 2) { k_linear_q8row_dp4a_kreg_sg16<2>(W, N, K, xq, xsc, Y, M, N_total, grf); return; }
+    if (grf >= 0)  { k_linear_q8row_dp4a_kreg_sg16<1>(W, N, K, xq, xsc, Y, M, N_total, grf); return; }
     const int n_scales = (N_total > 0) ? N_total : N;
     const float* scales = reinterpret_cast<const float*>(W);
     const int32_t* qw4 = reinterpret_cast<const int32_t*>(W + (size_t)n_scales * 4);
@@ -654,10 +804,90 @@ inline void k_linear_f32_sg16(const float* W, int N, int K, const float* X, floa
     });
 }
 
+// Opt-in multi-row (KREG=1|2|4) MX8 SG16 Linear with float4 X reuse across rows
+template <int R>
+inline void k_linear_mx8_kreg_sg16(const uint8_t* W, int N, int K, const float* X, float* Y, int M,
+                                   int N_total, int grf_mode) {
+    const int n_tot = (N_total > 0) ? N_total : N;
+    const int n_blk = K >> 5;
+    const uint8_t* S = W + (size_t)n_tot * (size_t)K;
+    const int n_groups = (N + 16 * R - 1) / (16 * R);
+    ink_parallel_for_grf(Q(), NR((size_t)n_groups, 256), grf_mode, [=](sycl::nd_item<1> it) INK_REQD_SG16 {
+        const int sg = (int)it.get_local_id(0) >> 4, lane = (int)it.get_local_id(0) & 15;
+        const int row0 = ((int)it.get_group(0) * 16 + sg) * R;
+        if (row0 >= N) return;
+        const int nr = sycl::min(R, N - row0);
+        const uint8_t* wr[R];
+        const uint8_t* sr[R];
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            const int rr = (r < nr) ? (row0 + r) : (N - 1);
+            wr[r] = W + (size_t)rr * (size_t)K;
+            sr[r] = S + (size_t)rr * (size_t)n_blk;
+        }
+        for (int m0 = 0; m0 < M; m0 += 4) {
+            const int mm = sycl::min(4, M - m0);
+            float acc[R][4];
+#pragma unroll
+            for (int r = 0; r < R; ++r)
+#pragma unroll
+                for (int i = 0; i < 4; ++i) acc[r][i] = 0.0f;
+
+            for (int blk0 = 0; blk0 < n_blk; blk0 += 8) {
+                const int blk = blk0 + (lane >> 1);
+                if (blk < n_blk) {
+                    const int col0 = (blk << 5) + ((lane & 1) << 4);
+                    sycl::float4 x0[4], x1[4], x2[4], x3[4];
+                    for (int i = 0; i < mm; ++i) {
+                        const float* xp = X + (size_t)(m0 + i) * K + col0;
+                        x0[i] = *reinterpret_cast<const sycl::float4*>(xp + 0);
+                        x1[i] = *reinterpret_cast<const sycl::float4*>(xp + 4);
+                        x2[i] = *reinterpret_cast<const sycl::float4*>(xp + 8);
+                        x3[i] = *reinterpret_cast<const sycl::float4*>(xp + 12);
+                    }
+#pragma unroll
+                    for (int r = 0; r < R; ++r) {
+                        const float sc = ue8m0_to_f32(sr[r][blk]);
+                        const sycl::uchar16 w16 = *reinterpret_cast<const sycl::uchar16*>(wr[r] + col0);
+                        const sycl::float4 w0(e4m3_to_f32(w16[0]),  e4m3_to_f32(w16[1]),  e4m3_to_f32(w16[2]),  e4m3_to_f32(w16[3]));
+                        const sycl::float4 w1(e4m3_to_f32(w16[4]),  e4m3_to_f32(w16[5]),  e4m3_to_f32(w16[6]),  e4m3_to_f32(w16[7]));
+                        const sycl::float4 w2(e4m3_to_f32(w16[8]),  e4m3_to_f32(w16[9]),  e4m3_to_f32(w16[10]), e4m3_to_f32(w16[11]));
+                        const sycl::float4 w3(e4m3_to_f32(w16[12]), e4m3_to_f32(w16[13]), e4m3_to_f32(w16[14]), e4m3_to_f32(w16[15]));
+                        for (int i = 0; i < mm; ++i) {
+                            float p = 0.0f;
+                            p = sycl::fma(w0.x(), x0[i].x(), p); p = sycl::fma(w0.y(), x0[i].y(), p);
+                            p = sycl::fma(w0.z(), x0[i].z(), p); p = sycl::fma(w0.w(), x0[i].w(), p);
+                            p = sycl::fma(w1.x(), x1[i].x(), p); p = sycl::fma(w1.y(), x1[i].y(), p);
+                            p = sycl::fma(w1.z(), x1[i].z(), p); p = sycl::fma(w1.w(), x1[i].w(), p);
+                            p = sycl::fma(w2.x(), x2[i].x(), p); p = sycl::fma(w2.y(), x2[i].y(), p);
+                            p = sycl::fma(w2.z(), x2[i].z(), p); p = sycl::fma(w2.w(), x2[i].w(), p);
+                            p = sycl::fma(w3.x(), x3[i].x(), p); p = sycl::fma(w3.y(), x3[i].y(), p);
+                            p = sycl::fma(w3.z(), x3[i].z(), p); p = sycl::fma(w3.w(), x3[i].w(), p);
+                            acc[r][i] = sycl::fma(p, sc, acc[r][i]);
+                        }
+                    }
+                }
+            }
+            for (int i = 0; i < mm; ++i) {
+#pragma unroll
+                for (int r = 0; r < R; ++r) {
+                    const float v = sg_sum(it, acc[r][i]);
+                    if (lane == 0 && r < nr) Y[(size_t)(m0 + i) * N + row0 + r] = v;
+                }
+            }
+        }
+    });
+}
+
 // MX8 SG16 Linear (P0 fix for SQv2-20 model.llm.unembed.weight [201024, 2304], fmt == FMT_MX8!)
 // Layout: [N_total, K] FP8_E4M3 bytes followed by [N_total, K/32] UE8M0 shared exponents at W + N_total * K.
 // Uses 16-byte uchar16 coalesced LSC loads (2 lanes per 32-weight block -> 8 blocks = 256 cols per step!).
 inline void k_linear_mx8_sg16(const uint8_t* W, int N, int K, const float* X, float* Y, int M, int N_total = -1) {
+    const int kreg = ink_sycl_kreg_mode();
+    const int grf = ink_sycl_256grf_mode();
+    if (kreg == 4) { k_linear_mx8_kreg_sg16<4>(W, N, K, X, Y, M, N_total, grf); return; }
+    if (kreg == 2) { k_linear_mx8_kreg_sg16<2>(W, N, K, X, Y, M, N_total, grf); return; }
+    if (grf >= 0)  { k_linear_mx8_kreg_sg16<1>(W, N, K, X, Y, M, N_total, grf); return; }
     const int n_tot = (N_total > 0) ? N_total : N;
     const int n_blk = K >> 5;
     const uint8_t* S = W + (size_t)n_tot * (size_t)K;
@@ -696,9 +926,79 @@ inline void k_linear_mx8_sg16(const uint8_t* W, int N, int K, const float* X, fl
     });
 }
 
+// Opt-in multi-row (KREG=1|2|4) S_K SG16 Linear with float4 X reuse across rows
+template <int F, int R>
+inline void k_linear_sk_kreg_sg16(const uint8_t* W, int N, int K, const float* X, float* Y, int M, int grf_mode) {
+    constexpr int SB = sk_sb_bytes(F);
+    constexpr float H = sk_half(F);
+    const int nsb = K >> 8;
+    const size_t rowb = (size_t)nsb * SB;
+    const int n_groups = (N + 16 * R - 1) / (16 * R);
+    ink_parallel_for_grf(Q(), NR((size_t)n_groups, 256), grf_mode, [=](sycl::nd_item<1> it) INK_REQD_SG16 {
+        const int sg = (int)it.get_local_id(0) >> 4, lane = (int)it.get_local_id(0) & 15;
+        const int row0 = ((int)it.get_group(0) * 16 + sg) * R;
+        if (row0 >= N) return;
+        const int nr = sycl::min(R, N - row0);
+        const uint8_t* rp[R];
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            const int rr = (r < nr) ? (row0 + r) : (N - 1);
+            rp[r] = W + (size_t)rr * rowb;
+        }
+        for (int m0 = 0; m0 < M; m0 += 4) {
+            const int mm = sycl::min(4, M - m0);
+            float acc[R][4];
+#pragma unroll
+            for (int r = 0; r < R; ++r)
+#pragma unroll
+                for (int i = 0; i < 4; ++i) acc[r][i] = 0.0f;
+
+            for (int unit = lane; unit < nsb * 32; unit += 16) {
+                const int sbi = unit >> 5, u = unit & 31, g = u >> 3, j = (g << 6) + ((u & 7) << 3);
+                const int col = sbi * 256 + j;
+                sycl::float4 x0[4], x1[4];
+                for (int i = 0; i < mm; ++i) {
+                    const float* xp = X + (size_t)(m0 + i) * K + col;
+                    x0[i] = *reinterpret_cast<const sycl::float4*>(xp + 0);
+                    x1[i] = *reinterpret_cast<const sycl::float4*>(xp + 4);
+                }
+#pragma unroll
+                for (int r = 0; r < R; ++r) {
+                    const uint8_t* blk = rp[r] + (size_t)sbi * SB;
+                    const float eff = h2f_bits(ld16(blk)) * ((float)blk[2 + g] * (1.0f / 255.0f));
+                    int q[8];
+                    sk_q8_sy<F>(blk + 6, j, q);
+                    const float w0 = (float)q[0] - H, w1 = (float)q[1] - H, w2 = (float)q[2] - H, w3 = (float)q[3] - H;
+                    const float w4 = (float)q[4] - H, w5 = (float)q[5] - H, w6 = (float)q[6] - H, w7 = (float)q[7] - H;
+                    for (int i = 0; i < mm; ++i) {
+                        float s = 0.0f;
+                        s = sycl::fma(w0, x0[i].x(), s); s = sycl::fma(w1, x0[i].y(), s);
+                        s = sycl::fma(w2, x0[i].z(), s); s = sycl::fma(w3, x0[i].w(), s);
+                        s = sycl::fma(w4, x1[i].x(), s); s = sycl::fma(w5, x1[i].y(), s);
+                        s = sycl::fma(w6, x1[i].z(), s); s = sycl::fma(w7, x1[i].w(), s);
+                        acc[r][i] = sycl::fma(s, eff, acc[r][i]);
+                    }
+                }
+            }
+            for (int i = 0; i < mm; ++i) {
+#pragma unroll
+                for (int r = 0; r < R; ++r) {
+                    const float v = sg_sum(it, acc[r][i]);
+                    if (lane == 0 && r < nr) Y[(size_t)(m0 + i) * N + row0 + r] = v;
+                }
+            }
+        }
+    });
+}
+
 // S_K SG16 Linear (S5_K DSpark, S6_K unembed)
 template <int F>
 inline void k_linear_sk_sg16(const uint8_t* W, int N, int K, const float* X, float* Y, int M) {
+    const int kreg = ink_sycl_kreg_mode();
+    const int grf = ink_sycl_256grf_mode();
+    if (kreg == 4) { k_linear_sk_kreg_sg16<F, 4>(W, N, K, X, Y, M, grf); return; }
+    if (kreg == 2) { k_linear_sk_kreg_sg16<F, 2>(W, N, K, X, Y, M, grf); return; }
+    if (grf >= 0)  { k_linear_sk_kreg_sg16<F, 1>(W, N, K, X, Y, M, grf); return; }
     constexpr int SB = sk_sb_bytes(F);
     constexpr float H = sk_half(F);
     const int nsb = K >> 8;
@@ -776,12 +1076,389 @@ inline void k_moe_plan_sg16(const int* topk_idx, int P, int* uexp, int* uoff, in
     k_moe_plan_sg16_q(Q(), topk_idx, P, uexp, uoff, ucnt, pair_list, n_uniq_dev, nullptr);
 }
 
+// Templated S_K inner loops for vectorized MoE path (eliminates inner-loop format dispatch)
+template <int F>
+inline void moe_gu_sk_loop_vec(const uint8_t* body, int r, int lane, const float* x_in,
+                               const int* tk, int mm, float* ag, float* au) {
+    constexpr int SB = sk_sb_bytes(F);
+    constexpr float H = sk_half(F);
+    constexpr size_t rowb = 9ul * SB;
+    const uint8_t* gu = body + 2304;
+    const uint8_t* rg = gu + (size_t)(2 * r) * rowb;
+    const uint8_t* ru = gu + (size_t)(2 * r + 1) * rowb;
+    for (int unit = lane; unit < 288; unit += 16) {
+        const int sbi = unit >> 5, u = unit & 31, g = u >> 3, j = (g << 6) + ((u & 7) << 3);
+        const uint8_t* bg = rg + (size_t)sbi * SB;
+        const uint8_t* bu = ru + (size_t)sbi * SB;
+        const float effg = h2f_bits(ld16(bg)) * ((float)bg[2 + g] * (1.0f / 255.0f));
+        const float effu = h2f_bits(ld16(bu)) * ((float)bu[2 + g] * (1.0f / 255.0f));
+        int qg[8], qu[8];
+        sk_q8_sy<F>(bg + 6, j, qg);
+        sk_q8_sy<F>(bu + 6, j, qu);
+        const sycl::float4 wg0((float)qg[0] - H, (float)qg[1] - H, (float)qg[2] - H, (float)qg[3] - H);
+        const sycl::float4 wg1((float)qg[4] - H, (float)qg[5] - H, (float)qg[6] - H, (float)qg[7] - H);
+        const sycl::float4 wu0((float)qu[0] - H, (float)qu[1] - H, (float)qu[2] - H, (float)qu[3] - H);
+        const sycl::float4 wu1((float)qu[4] - H, (float)qu[5] - H, (float)qu[6] - H, (float)qu[7] - H);
+        const int col = sbi * 256 + j;
+        for (int i = 0; i < mm; ++i) {
+            const float* xp = x_in + (size_t)tk[i] * 2304 + col;
+            const sycl::float4 x0 = *reinterpret_cast<const sycl::float4*>(xp + 0);
+            const sycl::float4 x1 = *reinterpret_cast<const sycl::float4*>(xp + 4);
+            float dg = 0.0f, du = 0.0f;
+            dg = sycl::fma(wg0.x(), x0.x(), dg); dg = sycl::fma(wg0.y(), x0.y(), dg);
+            dg = sycl::fma(wg0.z(), x0.z(), dg); dg = sycl::fma(wg0.w(), x0.w(), dg);
+            dg = sycl::fma(wg1.x(), x1.x(), dg); dg = sycl::fma(wg1.y(), x1.y(), dg);
+            dg = sycl::fma(wg1.z(), x1.z(), dg); dg = sycl::fma(wg1.w(), x1.w(), dg);
+            du = sycl::fma(wu0.x(), x0.x(), du); du = sycl::fma(wu0.y(), x0.y(), du);
+            du = sycl::fma(wu0.z(), x0.z(), du); du = sycl::fma(wu0.w(), x0.w(), du);
+            du = sycl::fma(wu1.x(), x1.x(), du); du = sycl::fma(wu1.y(), x1.y(), du);
+            du = sycl::fma(wu1.z(), x1.z(), du); du = sycl::fma(wu1.w(), x1.w(), du);
+            ag[i] = sycl::fma(dg, effg, ag[i]);
+            au[i] = sycl::fma(du, effu, au[i]);
+        }
+    }
+}
+
+template <int F>
+inline void moe_dn_sk_loop_vec(const uint8_t* body, uint32_t dn_off, int rp, int lane, const float* h_act,
+                               const int* pid, int mm, float* a0, float* a1) {
+    constexpr int SB = sk_sb_bytes(F);
+    constexpr float H = sk_half(F);
+    const uint8_t* pr = body + dn_off + (size_t)rp * 9ul * SB;
+    for (int unit = lane; unit < 288; unit += 16) {
+        const int sbi = unit >> 5, u = unit & 31, g = u >> 3, j = (g << 6) + ((u & 7) << 3);
+        const uint8_t* blk = pr + (size_t)sbi * SB;
+        const float eff = h2f_bits(ld16(blk)) * ((float)blk[2 + g] * (1.0f / 255.0f));
+        int q[8];
+        sk_q8_sy<F>(blk + 6, j, q);
+        const sycl::float4 w0((float)q[0] - H, (float)q[1] - H, (float)q[2] - H, (float)q[3] - H);
+        const sycl::float4 w1((float)q[4] - H, (float)q[5] - H, (float)q[6] - H, (float)q[7] - H);
+        const bool is_r1 = (unit >= 144);
+        const int col = (is_r1 ? (unit - 144) : unit) << 3;
+        for (int i = 0; i < mm; ++i) {
+            const float* xp = h_act + (size_t)pid[i] * 1152 + col;
+            const sycl::float4 x0 = *reinterpret_cast<const sycl::float4*>(xp + 0);
+            const sycl::float4 x1 = *reinterpret_cast<const sycl::float4*>(xp + 4);
+            float s = 0.0f;
+            s = sycl::fma(w0.x(), x0.x(), s); s = sycl::fma(w0.y(), x0.y(), s);
+            s = sycl::fma(w0.z(), x0.z(), s); s = sycl::fma(w0.w(), x0.w(), s);
+            s = sycl::fma(w1.x(), x1.x(), s); s = sycl::fma(w1.y(), x1.y(), s);
+            s = sycl::fma(w1.z(), x1.z(), s); s = sycl::fma(w1.w(), x1.w(), s);
+            if (is_r1) a1[i] = sycl::fma(s, eff, a1[i]);
+            else a0[i] = sycl::fma(s, eff, a0[i]);
+        }
+    }
+}
+
+// Opt-in vectorized MoE w13 + SITU (STRATA_INK_SYCL_MOE_VEC=1)
+inline void k_moe_gu_situ_sg16_vec_q(
+    sycl::queue& q,
+    const InkSyExpertDev* ex_layer, const float* x_in,
+    const int* uexp, const int* uoff, const int* ucnt, const int* pair_list, const int* n_uniq_dev,
+    int max_uniq, float* h_act, int grf_mode) {
+    const InkSyIqGridTable* iq_grids = iq_grid_table_dev_q(q);
+    ink_parallel_for_grf(q, NR2(72, (size_t)max_uniq, 256), grf_mode, [=](sycl::nd_item<2> it) INK_REQD_SG16 {
+        const int y = (int)it.get_group(0);
+        if (y >= n_uniq_dev[0]) return;
+        const int sg = (int)it.get_local_id(1) >> 4, lane = (int)it.get_local_id(1) & 15;
+        const int r = (int)it.get_group(1) * 16 + sg;
+        if (r >= 1152) return;
+
+        const int e = uexp[y], off = uoff[y], n = ucnt[y];
+        const InkSyExpertDev ed = ex_layer[e];
+        const uint8_t* body = ed.body_ptr;
+        const bool is_sk_dn = (ed.dn_code != FMT_SF4 && ed.dn_code != FMT_MX8 && ed.dn_code != FMT_GGUF_RAW);
+        const float inv_sq = is_sk_dn ? (1.0f / h2f_bits(ld16(body + 2 * r))) : 1.0f;
+
+        for (int t0 = 0; t0 < n; t0 += 4) {
+            const int mm = sycl::min(4, n - t0);
+            int pid[4], tk[4];
+            for (int i = 0; i < mm; ++i) { pid[i] = pair_list[off + t0 + i]; tk[i] = pid[i] >> 3; }
+            float ag[4] = {0, 0, 0, 0}, au[4] = {0, 0, 0, 0};
+
+            if (ed.gu_code == FMT_SF4) {
+                const float* hdr = reinterpret_cast<const float*>(body);
+                const float outer = hdr[0] / hdr[1];
+                const uint8_t* pb = body + 16;
+                const uint8_t* sb = pb + 2654208;
+                const uint8_t* pg = pb + (size_t)(2 * r) * 1152;
+                const uint8_t* sg_p = sb + (size_t)(2 * r) * 144;
+                const uint8_t* pu = pb + (size_t)(2 * r + 1) * 1152;
+                const uint8_t* su_p = sb + (size_t)(2 * r + 1) * 144;
+                for (int b = lane; b < 144; b += 16) {
+                    const float scg = e4m3_to_f32(sg_p[b]) * outer;
+                    const float scu = e4m3_to_f32(su_p[b]) * outer;
+                    const sycl::uint2 bg2 = *reinterpret_cast<const sycl::uint2*>(pg + b * 8);
+                    const sycl::uint2 bu2 = *reinterpret_cast<const sycl::uint2*>(pu + b * 8);
+                    const uint32_t g0 = bg2.x(), g1 = bg2.y(), u0 = bu2.x(), u1 = bu2.y();
+                    const sycl::float4 wg0(e2m1_lut((g0 >> 0) & 15u),  e2m1_lut((g0 >> 4) & 15u),  e2m1_lut((g0 >> 8) & 15u),  e2m1_lut((g0 >> 12) & 15u));
+                    const sycl::float4 wg1(e2m1_lut((g0 >> 16) & 15u), e2m1_lut((g0 >> 20) & 15u), e2m1_lut((g0 >> 24) & 15u), e2m1_lut((g0 >> 28) & 15u));
+                    const sycl::float4 wg2(e2m1_lut((g1 >> 0) & 15u),  e2m1_lut((g1 >> 4) & 15u),  e2m1_lut((g1 >> 8) & 15u),  e2m1_lut((g1 >> 12) & 15u));
+                    const sycl::float4 wg3(e2m1_lut((g1 >> 16) & 15u), e2m1_lut((g1 >> 20) & 15u), e2m1_lut((g1 >> 24) & 15u), e2m1_lut((g1 >> 28) & 15u));
+                    const sycl::float4 wu0(e2m1_lut((u0 >> 0) & 15u),  e2m1_lut((u0 >> 4) & 15u),  e2m1_lut((u0 >> 8) & 15u),  e2m1_lut((u0 >> 12) & 15u));
+                    const sycl::float4 wu1(e2m1_lut((u0 >> 16) & 15u), e2m1_lut((u0 >> 20) & 15u), e2m1_lut((u0 >> 24) & 15u), e2m1_lut((u0 >> 28) & 15u));
+                    const sycl::float4 wu2(e2m1_lut((u1 >> 0) & 15u),  e2m1_lut((u1 >> 4) & 15u),  e2m1_lut((u1 >> 8) & 15u),  e2m1_lut((u1 >> 12) & 15u));
+                    const sycl::float4 wu3(e2m1_lut((u1 >> 16) & 15u), e2m1_lut((u1 >> 20) & 15u), e2m1_lut((u1 >> 24) & 15u), e2m1_lut((u1 >> 28) & 15u));
+                    for (int i = 0; i < mm; ++i) {
+                        const float* xp = x_in + (size_t)tk[i] * 2304 + b * 16;
+                        const sycl::float4 x0 = *reinterpret_cast<const sycl::float4*>(xp + 0);
+                        const sycl::float4 x1 = *reinterpret_cast<const sycl::float4*>(xp + 4);
+                        const sycl::float4 x2 = *reinterpret_cast<const sycl::float4*>(xp + 8);
+                        const sycl::float4 x3 = *reinterpret_cast<const sycl::float4*>(xp + 12);
+                        float dg = 0.0f, du = 0.0f;
+                        dg = sycl::fma(wg0.x(), x0.x(), dg); dg = sycl::fma(wg0.y(), x0.y(), dg); dg = sycl::fma(wg0.z(), x0.z(), dg); dg = sycl::fma(wg0.w(), x0.w(), dg);
+                        dg = sycl::fma(wg1.x(), x1.x(), dg); dg = sycl::fma(wg1.y(), x1.y(), dg); dg = sycl::fma(wg1.z(), x1.z(), dg); dg = sycl::fma(wg1.w(), x1.w(), dg);
+                        dg = sycl::fma(wg2.x(), x2.x(), dg); dg = sycl::fma(wg2.y(), x2.y(), dg); dg = sycl::fma(wg2.z(), x2.z(), dg); dg = sycl::fma(wg2.w(), x2.w(), dg);
+                        dg = sycl::fma(wg3.x(), x3.x(), dg); dg = sycl::fma(wg3.y(), x3.y(), dg); dg = sycl::fma(wg3.z(), x3.z(), dg); dg = sycl::fma(wg3.w(), x3.w(), dg);
+                        du = sycl::fma(wu0.x(), x0.x(), du); du = sycl::fma(wu0.y(), x0.y(), du); du = sycl::fma(wu0.z(), x0.z(), du); du = sycl::fma(wu0.w(), x0.w(), du);
+                        du = sycl::fma(wu1.x(), x1.x(), du); du = sycl::fma(wu1.y(), x1.y(), du); du = sycl::fma(wu1.z(), x1.z(), du); du = sycl::fma(wu1.w(), x1.w(), du);
+                        du = sycl::fma(wu2.x(), x2.x(), du); du = sycl::fma(wu2.y(), x2.y(), du); du = sycl::fma(wu2.z(), x2.z(), du); du = sycl::fma(wu2.w(), x2.w(), du);
+                        du = sycl::fma(wu3.x(), x3.x(), du); du = sycl::fma(wu3.y(), x3.y(), du); du = sycl::fma(wu3.z(), x3.z(), du); du = sycl::fma(wu3.w(), x3.w(), du);
+                        ag[i] = sycl::fma(dg, scg, ag[i]);
+                        au[i] = sycl::fma(du, scu, au[i]);
+                    }
+                }
+            } else if (ed.gu_code == FMT_MX8) {
+                const uint8_t* wb = body;
+                const uint8_t* sb = body + 5308416;
+                const uint8_t* wg = wb + (size_t)(2 * r) * 2304;
+                const uint8_t* sg_p = sb + (size_t)(2 * r) * 72;
+                const uint8_t* wu = wb + (size_t)(2 * r + 1) * 2304;
+                const uint8_t* su_p = sb + (size_t)(2 * r + 1) * 72;
+                // 2 lanes per 32-weight block -> 8 blocks = 256 cols per step (coalesced 16B uchar16 LSC loads!)
+                for (int blk0 = 0; blk0 < 72; blk0 += 8) {
+                    const int blk = blk0 + (lane >> 1);
+                    const int col0 = (blk << 5) + ((lane & 1) << 4);
+                    const float scg = ue8m0_to_f32(sg_p[blk]);
+                    const float scu = ue8m0_to_f32(su_p[blk]);
+                    const sycl::uchar16 wg16 = *reinterpret_cast<const sycl::uchar16*>(wg + col0);
+                    const sycl::uchar16 wu16 = *reinterpret_cast<const sycl::uchar16*>(wu + col0);
+                    for (int i = 0; i < mm; ++i) {
+                        const float* xp = x_in + (size_t)tk[i] * 2304 + col0;
+                        const sycl::float4 x0 = *reinterpret_cast<const sycl::float4*>(xp + 0);
+                        const sycl::float4 x1 = *reinterpret_cast<const sycl::float4*>(xp + 4);
+                        const sycl::float4 x2 = *reinterpret_cast<const sycl::float4*>(xp + 8);
+                        const sycl::float4 x3 = *reinterpret_cast<const sycl::float4*>(xp + 12);
+                        float dg = 0.0f, du = 0.0f;
+                        dg = sycl::fma(e4m3_to_f32(wg16[0]),  x0.x(), dg); du = sycl::fma(e4m3_to_f32(wu16[0]),  x0.x(), du);
+                        dg = sycl::fma(e4m3_to_f32(wg16[1]),  x0.y(), dg); du = sycl::fma(e4m3_to_f32(wu16[1]),  x0.y(), du);
+                        dg = sycl::fma(e4m3_to_f32(wg16[2]),  x0.z(), dg); du = sycl::fma(e4m3_to_f32(wu16[2]),  x0.z(), du);
+                        dg = sycl::fma(e4m3_to_f32(wg16[3]),  x0.w(), dg); du = sycl::fma(e4m3_to_f32(wu16[3]),  x0.w(), du);
+                        dg = sycl::fma(e4m3_to_f32(wg16[4]),  x1.x(), dg); du = sycl::fma(e4m3_to_f32(wu16[4]),  x1.x(), du);
+                        dg = sycl::fma(e4m3_to_f32(wg16[5]),  x1.y(), dg); du = sycl::fma(e4m3_to_f32(wu16[5]),  x1.y(), du);
+                        dg = sycl::fma(e4m3_to_f32(wg16[6]),  x1.z(), dg); du = sycl::fma(e4m3_to_f32(wu16[6]),  x1.z(), du);
+                        dg = sycl::fma(e4m3_to_f32(wg16[7]),  x1.w(), dg); du = sycl::fma(e4m3_to_f32(wu16[7]),  x1.w(), du);
+                        dg = sycl::fma(e4m3_to_f32(wg16[8]),  x2.x(), dg); du = sycl::fma(e4m3_to_f32(wu16[8]),  x2.x(), du);
+                        dg = sycl::fma(e4m3_to_f32(wg16[9]),  x2.y(), dg); du = sycl::fma(e4m3_to_f32(wu16[9]),  x2.y(), du);
+                        dg = sycl::fma(e4m3_to_f32(wg16[10]), x2.z(), dg); du = sycl::fma(e4m3_to_f32(wu16[10]), x2.z(), du);
+                        dg = sycl::fma(e4m3_to_f32(wg16[11]), x2.w(), dg); du = sycl::fma(e4m3_to_f32(wu16[11]), x2.w(), du);
+                        dg = sycl::fma(e4m3_to_f32(wg16[12]), x3.x(), dg); du = sycl::fma(e4m3_to_f32(wu16[12]), x3.x(), du);
+                        dg = sycl::fma(e4m3_to_f32(wg16[13]), x3.y(), dg); du = sycl::fma(e4m3_to_f32(wu16[13]), x3.y(), du);
+                        dg = sycl::fma(e4m3_to_f32(wg16[14]), x3.z(), dg); du = sycl::fma(e4m3_to_f32(wu16[14]), x3.z(), du);
+                        dg = sycl::fma(e4m3_to_f32(wg16[15]), x3.w(), dg); du = sycl::fma(e4m3_to_f32(wu16[15]), x3.w(), du);
+                        ag[i] = sycl::fma(dg, scg, ag[i]);
+                        au[i] = sycl::fma(du, scu, au[i]);
+                    }
+                }
+            } else if (ed.gu_code == FMT_GGUF_RAW) {
+                const InkSyGgufExpertHeader* hdr = reinterpret_cast<const InkSyGgufExpertHeader*>(body);
+                const uint32_t gt = hdr->gu_type;
+                const size_t rb = sy_gguf_row_bytes(gt, 2304);
+                const bool ilv = (hdr->flags & 1u) != 0;
+                const uint8_t* rg = body + 32 + (size_t)(ilv ? (2 * r) : r) * rb;
+                const uint8_t* ru = body + 32 + (size_t)(ilv ? (2 * r + 1) : (1152 + r)) * rb;
+                for (int unit = lane; unit < 288; unit += 16) {
+                    const int col = unit << 3;
+                    float wg[8], wu[8];
+                    sy_gguf_decode_8(gt, rg, col, hdr->gate_scale, wg, iq_grids);
+                    sy_gguf_decode_8(gt, ru, col, hdr->up_scale, wu, iq_grids);
+                    for (int i = 0; i < mm; ++i) {
+                        const float* xp = x_in + (size_t)tk[i] * 2304 + col;
+                        float dg = 0.0f, du = 0.0f;
+                        for (int t = 0; t < 8; ++t) { dg += wg[t] * xp[t]; du += wu[t] * xp[t]; }
+                        ag[i] += dg; au[i] += du;
+                    }
+                }
+            } else {
+                switch (ed.gu_code) {
+                    case FMT_S2: moe_gu_sk_loop_vec<FMT_S2>(body, r, lane, x_in, tk, mm, ag, au); break;
+                    case FMT_S3: moe_gu_sk_loop_vec<FMT_S3>(body, r, lane, x_in, tk, mm, ag, au); break;
+                    case FMT_S4: moe_gu_sk_loop_vec<FMT_S4>(body, r, lane, x_in, tk, mm, ag, au); break;
+                    case FMT_S5: moe_gu_sk_loop_vec<FMT_S5>(body, r, lane, x_in, tk, mm, ag, au); break;
+                    case FMT_S6: moe_gu_sk_loop_vec<FMT_S6>(body, r, lane, x_in, tk, mm, ag, au); break;
+                    default:     moe_gu_sk_loop_vec<FMT_S8>(body, r, lane, x_in, tk, mm, ag, au); break;
+                }
+            }
+
+            for (int i = 0; i < mm; ++i) {
+                const float g = sg_sum(it, ag[i]), u = sg_sum(it, au[i]);
+                if (lane == 0) h_act[(size_t)pid[i] * 1152 + r] = situ_act(g, u) * inv_sq;
+            }
+        }
+    });
+}
+
+// Opt-in vectorized MoE w2 (STRATA_INK_SYCL_MOE_VEC=1)
+inline void k_moe_dn_sg16_vec_q(
+    sycl::queue& q,
+    const InkSyExpertDev* ex_layer, const float* topk_w,
+    const int* uexp, const int* uoff, const int* ucnt, const int* pair_list, const int* n_uniq_dev,
+    int max_uniq, const float* h_act, float* y_pairs, int grf_mode) {
+    const InkSyIqGridTable* iq_grids = iq_grid_table_dev_q(q);
+    ink_parallel_for_grf(q, NR2(72, (size_t)max_uniq, 256), grf_mode, [=](sycl::nd_item<2> it) INK_REQD_SG16 {
+        const int yy = (int)it.get_group(0);
+        if (yy >= n_uniq_dev[0]) return;
+        const int sg = (int)it.get_local_id(1) >> 4, lane = (int)it.get_local_id(1) & 15;
+        const int rp = (int)it.get_group(1) * 16 + sg;
+        if (rp >= 1152) return;
+
+        const int e = uexp[yy], off = uoff[yy], n = ucnt[yy];
+        const InkSyExpertDev ed = ex_layer[e];
+        const uint8_t* body = ed.body_ptr;
+
+        for (int t0 = 0; t0 < n; t0 += 4) {
+            const int mm = sycl::min(4, n - t0);
+            int pid[4];
+            for (int i = 0; i < mm; ++i) pid[i] = pair_list[off + t0 + i];
+            float a0[4] = {0, 0, 0, 0}, a1[4] = {0, 0, 0, 0};
+
+            if (ed.dn_code == FMT_SF4) {
+                const float* hdr = reinterpret_cast<const float*>(body);
+                const float outer = hdr[2] / hdr[3];
+                const uint8_t* pb = body + ed.dn_off;
+                const uint8_t* sb = pb + 1327104;
+                const uint8_t* p0 = pb + (size_t)(2 * rp) * 576;
+                const uint8_t* s0 = sb + (size_t)(2 * rp) * 72;
+                const uint8_t* p1 = pb + (size_t)(2 * rp + 1) * 576;
+                const uint8_t* s1 = sb + (size_t)(2 * rp + 1) * 72;
+                for (int b = lane; b < 72; b += 16) {
+                    const float sc0 = e4m3_to_f32(s0[b]) * outer;
+                    const float sc1 = e4m3_to_f32(s1[b]) * outer;
+                    const sycl::uint2 b0_2 = *reinterpret_cast<const sycl::uint2*>(p0 + b * 8);
+                    const sycl::uint2 b1_2 = *reinterpret_cast<const sycl::uint2*>(p1 + b * 8);
+                    const uint32_t g0 = b0_2.x(), g1 = b0_2.y(), u0 = b1_2.x(), u1 = b1_2.y();
+                    const sycl::float4 w0_0(e2m1_lut((g0 >> 0) & 15u),  e2m1_lut((g0 >> 4) & 15u),  e2m1_lut((g0 >> 8) & 15u),  e2m1_lut((g0 >> 12) & 15u));
+                    const sycl::float4 w0_1(e2m1_lut((g0 >> 16) & 15u), e2m1_lut((g0 >> 20) & 15u), e2m1_lut((g0 >> 24) & 15u), e2m1_lut((g0 >> 28) & 15u));
+                    const sycl::float4 w0_2(e2m1_lut((g1 >> 0) & 15u),  e2m1_lut((g1 >> 4) & 15u),  e2m1_lut((g1 >> 8) & 15u),  e2m1_lut((g1 >> 12) & 15u));
+                    const sycl::float4 w0_3(e2m1_lut((g1 >> 16) & 15u), e2m1_lut((g1 >> 20) & 15u), e2m1_lut((g1 >> 24) & 15u), e2m1_lut((g1 >> 28) & 15u));
+                    const sycl::float4 w1_0(e2m1_lut((u0 >> 0) & 15u),  e2m1_lut((u0 >> 4) & 15u),  e2m1_lut((u0 >> 8) & 15u),  e2m1_lut((u0 >> 12) & 15u));
+                    const sycl::float4 w1_1(e2m1_lut((u0 >> 16) & 15u), e2m1_lut((u0 >> 20) & 15u), e2m1_lut((u0 >> 24) & 15u), e2m1_lut((u0 >> 28) & 15u));
+                    const sycl::float4 w1_2(e2m1_lut((u1 >> 0) & 15u),  e2m1_lut((u1 >> 4) & 15u),  e2m1_lut((u1 >> 8) & 15u),  e2m1_lut((u1 >> 12) & 15u));
+                    const sycl::float4 w1_3(e2m1_lut((u1 >> 16) & 15u), e2m1_lut((u1 >> 20) & 15u), e2m1_lut((u1 >> 24) & 15u), e2m1_lut((u1 >> 28) & 15u));
+                    for (int i = 0; i < mm; ++i) {
+                        const float* xp = h_act + (size_t)pid[i] * 1152 + b * 16;
+                        const sycl::float4 x0 = *reinterpret_cast<const sycl::float4*>(xp + 0);
+                        const sycl::float4 x1 = *reinterpret_cast<const sycl::float4*>(xp + 4);
+                        const sycl::float4 x2 = *reinterpret_cast<const sycl::float4*>(xp + 8);
+                        const sycl::float4 x3 = *reinterpret_cast<const sycl::float4*>(xp + 12);
+                        float d0 = 0.0f, d1 = 0.0f;
+                        d0 = sycl::fma(w0_0.x(), x0.x(), d0); d0 = sycl::fma(w0_0.y(), x0.y(), d0); d0 = sycl::fma(w0_0.z(), x0.z(), d0); d0 = sycl::fma(w0_0.w(), x0.w(), d0);
+                        d0 = sycl::fma(w0_1.x(), x1.x(), d0); d0 = sycl::fma(w0_1.y(), x1.y(), d0); d0 = sycl::fma(w0_1.z(), x1.z(), d0); d0 = sycl::fma(w0_1.w(), x1.w(), d0);
+                        d0 = sycl::fma(w0_2.x(), x2.x(), d0); d0 = sycl::fma(w0_2.y(), x2.y(), d0); d0 = sycl::fma(w0_2.z(), x2.z(), d0); d0 = sycl::fma(w0_2.w(), x2.w(), d0);
+                        d0 = sycl::fma(w0_3.x(), x3.x(), d0); d0 = sycl::fma(w0_3.y(), x3.y(), d0); d0 = sycl::fma(w0_3.z(), x3.z(), d0); d0 = sycl::fma(w0_3.w(), x3.w(), d0);
+                        d1 = sycl::fma(w1_0.x(), x0.x(), d1); d1 = sycl::fma(w1_0.y(), x0.y(), d1); d1 = sycl::fma(w1_0.z(), x0.z(), d1); d1 = sycl::fma(w1_0.w(), x0.w(), d1);
+                        d1 = sycl::fma(w1_1.x(), x1.x(), d1); d1 = sycl::fma(w1_1.y(), x1.y(), d1); d1 = sycl::fma(w1_1.z(), x1.z(), d1); d1 = sycl::fma(w1_1.w(), x1.w(), d1);
+                        d1 = sycl::fma(w1_2.x(), x2.x(), d1); d1 = sycl::fma(w1_2.y(), x2.y(), d1); d1 = sycl::fma(w1_2.z(), x2.z(), d1); d1 = sycl::fma(w1_2.w(), x2.w(), d1);
+                        d1 = sycl::fma(w1_3.x(), x3.x(), d1); d1 = sycl::fma(w1_3.y(), x3.y(), d1); d1 = sycl::fma(w1_3.z(), x3.z(), d1); d1 = sycl::fma(w1_3.w(), x3.w(), d1);
+                        a0[i] = sycl::fma(d0, sc0, a0[i]);
+                        a1[i] = sycl::fma(d1, sc1, a1[i]);
+                    }
+                }
+            } else if (ed.dn_code == FMT_MX8) {
+                const uint8_t* wb = body + ed.dn_off;
+                const uint8_t* sb = wb + 2654208;
+                const uint8_t* w0 = wb + (size_t)(2 * rp) * 1152;
+                const uint8_t* s0 = sb + (size_t)(2 * rp) * 36;
+                const uint8_t* w1 = wb + (size_t)(2 * rp + 1) * 1152;
+                const uint8_t* s1 = sb + (size_t)(2 * rp + 1) * 36;
+                for (int blk0 = 0; blk0 < 36; blk0 += 8) {
+                    const int blk = blk0 + (lane >> 1);
+                    if (blk < 36) {
+                        const int col0 = (blk << 5) + ((lane & 1) << 4);
+                        const float sc0 = ue8m0_to_f32(s0[blk]);
+                        const float sc1 = ue8m0_to_f32(s1[blk]);
+                        const sycl::uchar16 w0_16 = *reinterpret_cast<const sycl::uchar16*>(w0 + col0);
+                        const sycl::uchar16 w1_16 = *reinterpret_cast<const sycl::uchar16*>(w1 + col0);
+                        for (int i = 0; i < mm; ++i) {
+                            const float* xp = h_act + (size_t)pid[i] * 1152 + col0;
+                            const sycl::float4 x0 = *reinterpret_cast<const sycl::float4*>(xp + 0);
+                            const sycl::float4 x1 = *reinterpret_cast<const sycl::float4*>(xp + 4);
+                            const sycl::float4 x2 = *reinterpret_cast<const sycl::float4*>(xp + 8);
+                            const sycl::float4 x3 = *reinterpret_cast<const sycl::float4*>(xp + 12);
+                            float d0 = 0.0f, d1 = 0.0f;
+                            d0 = sycl::fma(e4m3_to_f32(w0_16[0]),  x0.x(), d0); d1 = sycl::fma(e4m3_to_f32(w1_16[0]),  x0.x(), d1);
+                            d0 = sycl::fma(e4m3_to_f32(w0_16[1]),  x0.y(), d0); d1 = sycl::fma(e4m3_to_f32(w1_16[1]),  x0.y(), d1);
+                            d0 = sycl::fma(e4m3_to_f32(w0_16[2]),  x0.z(), d0); d1 = sycl::fma(e4m3_to_f32(w1_16[2]),  x0.z(), d1);
+                            d0 = sycl::fma(e4m3_to_f32(w0_16[3]),  x0.w(), d0); d1 = sycl::fma(e4m3_to_f32(w1_16[3]),  x0.w(), d1);
+                            d0 = sycl::fma(e4m3_to_f32(w0_16[4]),  x1.x(), d0); d1 = sycl::fma(e4m3_to_f32(w1_16[4]),  x1.x(), d1);
+                            d0 = sycl::fma(e4m3_to_f32(w0_16[5]),  x1.y(), d0); d1 = sycl::fma(e4m3_to_f32(w1_16[5]),  x1.y(), d1);
+                            d0 = sycl::fma(e4m3_to_f32(w0_16[6]),  x1.z(), d0); d1 = sycl::fma(e4m3_to_f32(w1_16[6]),  x1.z(), d1);
+                            d0 = sycl::fma(e4m3_to_f32(w0_16[7]),  x1.w(), d0); d1 = sycl::fma(e4m3_to_f32(w1_16[7]),  x1.w(), d1);
+                            d0 = sycl::fma(e4m3_to_f32(w0_16[8]),  x2.x(), d0); d1 = sycl::fma(e4m3_to_f32(w1_16[8]),  x2.x(), d1);
+                            d0 = sycl::fma(e4m3_to_f32(w0_16[9]),  x2.y(), d0); d1 = sycl::fma(e4m3_to_f32(w1_16[9]),  x2.y(), d1);
+                            d0 = sycl::fma(e4m3_to_f32(w0_16[10]), x2.z(), d0); d1 = sycl::fma(e4m3_to_f32(w1_16[10]), x2.z(), d1);
+                            d0 = sycl::fma(e4m3_to_f32(w0_16[11]), x2.w(), d0); d1 = sycl::fma(e4m3_to_f32(w1_16[11]), x2.w(), d1);
+                            d0 = sycl::fma(e4m3_to_f32(w0_16[12]), x3.x(), d0); d1 = sycl::fma(e4m3_to_f32(w1_16[12]), x3.x(), d1);
+                            d0 = sycl::fma(e4m3_to_f32(w0_16[13]), x3.y(), d0); d1 = sycl::fma(e4m3_to_f32(w1_16[13]), x3.y(), d1);
+                            d0 = sycl::fma(e4m3_to_f32(w0_16[14]), x3.z(), d0); d1 = sycl::fma(e4m3_to_f32(w1_16[14]), x3.z(), d1);
+                            d0 = sycl::fma(e4m3_to_f32(w0_16[15]), x3.w(), d0); d1 = sycl::fma(e4m3_to_f32(w1_16[15]), x3.w(), d1);
+                            a0[i] = sycl::fma(d0, sc0, a0[i]);
+                            a1[i] = sycl::fma(d1, sc1, a1[i]);
+                        }
+                    }
+                }
+            } else if (ed.dn_code == FMT_GGUF_RAW) {
+                const InkSyGgufExpertHeader* hdr = reinterpret_cast<const InkSyGgufExpertHeader*>(body);
+                const uint32_t dt = hdr->dn_type;
+                const size_t rb = sy_gguf_row_bytes(dt, 1152);
+                const uint8_t* r0 = body + ed.dn_off + (size_t)(2 * rp) * rb;
+                const uint8_t* r1 = body + ed.dn_off + (size_t)(2 * rp + 1) * rb;
+                for (int unit = lane; unit < 144; unit += 16) {
+                    const int col = unit << 3;
+                    float w0[8], w1[8];
+                    sy_gguf_decode_8(dt, r0, col, hdr->dn_scale, w0, iq_grids);
+                    sy_gguf_decode_8(dt, r1, col, hdr->dn_scale, w1, iq_grids);
+                    for (int i = 0; i < mm; ++i) {
+                        const float* xp = h_act + (size_t)pid[i] * 1152 + col;
+                        float d0 = 0.0f, d1 = 0.0f;
+                        for (int t = 0; t < 8; ++t) { d0 += w0[t] * xp[t]; d1 += w1[t] * xp[t]; }
+                        a0[i] += d0; a1[i] += d1;
+                    }
+                }
+            } else {
+                switch (ed.dn_code) {
+                    case FMT_S2: moe_dn_sk_loop_vec<FMT_S2>(body, ed.dn_off, rp, lane, h_act, pid, mm, a0, a1); break;
+                    case FMT_S3: moe_dn_sk_loop_vec<FMT_S3>(body, ed.dn_off, rp, lane, h_act, pid, mm, a0, a1); break;
+                    case FMT_S4: moe_dn_sk_loop_vec<FMT_S4>(body, ed.dn_off, rp, lane, h_act, pid, mm, a0, a1); break;
+                    case FMT_S5: moe_dn_sk_loop_vec<FMT_S5>(body, ed.dn_off, rp, lane, h_act, pid, mm, a0, a1); break;
+                    case FMT_S6: moe_dn_sk_loop_vec<FMT_S6>(body, ed.dn_off, rp, lane, h_act, pid, mm, a0, a1); break;
+                    default:     moe_dn_sk_loop_vec<FMT_S8>(body, ed.dn_off, rp, lane, h_act, pid, mm, a0, a1); break;
+                }
+            }
+
+            for (int i = 0; i < mm; ++i) {
+                const float v0 = sg_sum(it, a0[i]), v1 = sg_sum(it, a1[i]);
+                if (lane == 0) {
+                    const float rw = topk_w[pid[i]];
+                    y_pairs[(size_t)pid[i] * 2304 + 2 * rp] = v0 * rw;
+                    y_pairs[(size_t)pid[i] * 2304 + 2 * rp + 1] = v1 * rw;
+                }
+            }
+        }
+    });
+}
+
 // Fused w13 + SITU(4.0, 25.0) + 1/sq_xd_dn (grid: 72 x max_uniq, 256 threads = 16 SG16 -> 16 inter channels/WG)
 inline void k_moe_gu_situ_sg16_q(
     sycl::queue& q,
     const InkSyExpertDev* ex_layer, const float* x_in,
     const int* uexp, const int* uoff, const int* ucnt, const int* pair_list, const int* n_uniq_dev,
     int max_uniq, float* h_act) {
+    if (ink_sycl_moe_vec_enabled()) {
+        k_moe_gu_situ_sg16_vec_q(q, ex_layer, x_in, uexp, uoff, ucnt, pair_list, n_uniq_dev, max_uniq, h_act,
+                                 ink_sycl_256grf_mode());
+        return;
+    }
     const InkSyIqGridTable* iq_grids = iq_grid_table_dev_q(q);
     // 1152 / 16 = 72 WGs along X, max_uniq along Y
     q.parallel_for(NR2(72, (size_t)max_uniq, 256), [=](sycl::nd_item<2> it) INK_REQD_SG16 {
@@ -912,6 +1589,11 @@ inline void k_moe_dn_sg16_q(
     const InkSyExpertDev* ex_layer, const float* topk_w,
     const int* uexp, const int* uoff, const int* ucnt, const int* pair_list, const int* n_uniq_dev,
     int max_uniq, const float* h_act, float* y_pairs) {
+    if (ink_sycl_moe_vec_enabled()) {
+        k_moe_dn_sg16_vec_q(q, ex_layer, topk_w, uexp, uoff, ucnt, pair_list, n_uniq_dev, max_uniq, h_act, y_pairs,
+                            ink_sycl_256grf_mode());
+        return;
+    }
     const InkSyIqGridTable* iq_grids = iq_grid_table_dev_q(q);
     q.parallel_for(NR2(72, (size_t)max_uniq, 256), [=](sycl::nd_item<2> it) INK_REQD_SG16 {
         const int yy = (int)it.get_group(0);

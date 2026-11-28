@@ -58,15 +58,31 @@ struct IntelArcCfg {
     bool use_q8_trunk = false;        // FAST only: fused 1-byte Q8_ROW trunk compaction (~0.69 GiB saved)
     bool use_fp8_kv_auto = false;     // FAST only: auto FP8_E4M3 64-token paged KV when kv_dtype_auto
     bool use_bf16_sconv = false;      // FAST only: BF16 ShortConv history
-    bool use_joint_matrix_xmx = false;// FAST only: native SG16 joint_matrix XMX FP16/INT8 DPAS (zero oneMKL)
-    bool use_vec_lsc_decode = false;  // vectorized 16B uint4 LSC + 1-cycle select_from_group LUT
+    bool use_joint_matrix_xmx = false;// FAST or STRATA_INK_SYCL_XMX=1: native SG16 joint_matrix XMX FP16/INT8 DPAS
+    bool use_vec_lsc_decode = false;  // vectorized 16B uint4 LSC + 1-cycle select_from_group LUT (STRATA_INK_SYCL_VEC_LSC)
     bool use_dflash2 = false;         // native SYCL SG16 DFlash 2 drafter
+    int graph_cap = 16;               // LRU cap on SYCL command_graph cache (STRATA_INK_SYCL_GRAPH_CAP)
 };
 
 inline bool env_truthy_arc(const char* name) noexcept {
     const char* e = std::getenv(name);
     if (!e || !e[0]) return false;
     return e[0] == '1' || e[0] == 'y' || e[0] == 'Y' || e[0] == 't' || e[0] == 'T';
+}
+
+// -1 = unset, 0 = explicitly false, 1 = explicitly true
+inline int env_tristate_arc(const char* name) noexcept {
+    const char* e = std::getenv(name);
+    if (!e || !e[0]) return -1;
+    if (e[0] == '0' || e[0] == 'n' || e[0] == 'N' || e[0] == 'f' || e[0] == 'F') return 0;
+    if (e[0] == '1' || e[0] == 'y' || e[0] == 'Y' || e[0] == 't' || e[0] == 'T') return 1;
+    return -1;
+}
+
+inline int intelarc_graph_cap_env(int default_cap = 16) noexcept {
+    const char* e = std::getenv("STRATA_INK_SYCL_GRAPH_CAP");
+    if (!e || !e[0]) return default_cap;
+    return std::atoi(e);
 }
 
 inline bool intelarc_env_requested() noexcept {
@@ -107,6 +123,35 @@ inline std::string to_lower_ascii(const std::string& s) {
     return out;
 }
 
+// Log a one-time startup warning on Battlemage/Xe2 if IGC_EnableGEPSimplification is not set to 0
+// (IGC 2.28 GEP simplification workaround; prevents kernel miscompilation / DEVICE_LOST on bmg_g21).
+inline void warn_battlemage_igc_once(const sycl::device& dev) {
+    const int arch_bmg = intelarc_arch_is_battlemage(dev);
+    if (arch_bmg != 1) return;
+    const char* gep = std::getenv("IGC_EnableGEPSimplification");
+    if (gep && gep[0] == '0' && gep[1] == '\0') return;
+    static bool warned = false;
+    if (!warned) {
+        warned = true;
+        std::fprintf(stderr,
+                     "[ink_sycl] WARNING: Battlemage/Xe2 GPU detected (%s) without IGC_EnableGEPSimplification=0; "
+                     "set IGC_EnableGEPSimplification=0 to avoid IGC GEP miscompilation / DEVICE_LOST\n",
+                     dev.get_info<sycl::info::device::name>().c_str());
+    }
+}
+
+// Apply independent per-feature env overrides so Battlemage (bmg_g21) can isolate and test each feature
+// without all-or-nothing STRATA_INK_INTELARC refusal.
+inline void apply_granular_sycl_overrides(IntelArcCfg& cfg) noexcept {
+    cfg.graph_cap = intelarc_graph_cap_env(cfg.graph_cap);
+    const int ov_vec = env_tristate_arc("STRATA_INK_SYCL_VEC_LSC");
+    if (ov_vec >= 0) cfg.use_vec_lsc_decode = (ov_vec == 1);
+    const int ov_xmx = env_tristate_arc("STRATA_INK_SYCL_XMX");
+    if (ov_xmx >= 0) cfg.use_joint_matrix_xmx = (ov_xmx == 1) && cfg.has_xmx;
+    const int ov_l0v2 = env_tristate_arc("STRATA_INK_SYCL_L0_V2");
+    if (ov_l0v2 >= 0) cfg.use_l0_v2 = (ov_l0v2 == 1);
+}
+
 inline IntelArcCfg probe_intelarc_card(const sycl::device& dev, int ordinal) {
     IntelArcCfg cfg;
     cfg.requested = intelarc_env_requested();
@@ -126,7 +171,11 @@ inline IntelArcCfg probe_intelarc_card(const sycl::device& dev, int ordinal) {
 #else
     cfg.has_xmx = false;
 #endif
-    if (!cfg.requested) return cfg;
+    warn_battlemage_igc_once(dev);
+    if (!cfg.requested) {
+        apply_granular_sycl_overrides(cfg);
+        return cfg;
+    }
 
     const std::string nl = to_lower_ascii(cfg.dev_name);
     const std::string vl = to_lower_ascii(dev.get_info<sycl::info::device::vendor>());
@@ -226,18 +275,21 @@ inline IntelArcCfg probe_intelarc_card(const sycl::device& dev, int ordinal) {
         cfg.use_bf16_sconv = !env_truthy_arc("STRATA_INK_INTELARC_NO_BF16_SCONV");
     }
 
+    // Apply independent per-feature overrides after profile defaults
+    apply_granular_sycl_overrides(cfg);
+
     static std::array<bool, 16> logged{};
     const int idx = std::clamp(ordinal, 0, 15);
     if (!logged[idx]) {
         logged[idx] = true;
         std::fprintf(stderr,
-                     "[ink_sycl_intelarc] ACTIVE ordinal=%d sku=%s (%s, %.1f GiB, %u EU, bmg=%d, uma=%d, xmx=%d) mode=%s chunk=%d df2_M*=%d q8_trunk=%d fp8_kv=%d bf16_sc=%d jm_xmx=%d\n",
+                     "[ink_sycl_intelarc] ACTIVE ordinal=%d sku=%s (%s, %.1f GiB, %u EU, bmg=%d, uma=%d, xmx=%d) mode=%s chunk=%d df2_M*=%d q8_trunk=%d fp8_kv=%d bf16_sc=%d jm_xmx=%d vec_lsc=%d graph_cap=%d\n",
                      ordinal, cfg.sku_name.c_str(), cfg.dev_name.c_str(), gib, cfg.eu_count,
                      (int)cfg.is_bmg, (int)cfg.is_uma, (int)cfg.has_xmx,
                      cfg.exact ? "EXACT" : "FAST",
                      cfg.effective_chunk, cfg.dflash2_max_m,
                      (int)cfg.use_q8_trunk, (int)cfg.use_fp8_kv_auto, (int)cfg.use_bf16_sconv,
-                     (int)cfg.use_joint_matrix_xmx);
+                     (int)cfg.use_joint_matrix_xmx, (int)cfg.use_vec_lsc_decode, cfg.graph_cap);
     }
     return cfg;
 }

@@ -14,7 +14,7 @@ if(STRATA_ENABLE_SYCL AND STRATA_BUILD_TESTS)
             gdn_chunk_parity trellis_parity finish_test gemv_rows_test numerics_test
             hc_mix_split_test q8_quant_multi_test sycl_igc_workaround_test
             sycl_level_zero_memory_test prefill_gemm_parity sycl_iq_mmq_parity
-            sycl_iq_fused_bench sycl_p2_kernels_bench
+            sycl_iq_fused_bench sycl_p2_kernels_bench sycl_inkling2_kernels_parity
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
     COMMENT "Running Intel SYCL tests via ctest"
     USES_TERMINAL
@@ -125,6 +125,30 @@ if(STRATA_BUILD_PERF)
         list(APPEND _strata_perf_targets ${_bm})
       endif()
     endforeach()
+
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/perf/sycl/perf_inkling2_kernels.cpp")
+      if(NOT TARGET strata_zstd_dec)
+        enable_language(C)
+        set(_ink_zstd_dir "${CMAKE_CURRENT_SOURCE_DIR}/third_party/zstd-dec")
+        add_library(strata_zstd_dec STATIC
+          ${_ink_zstd_dir}/common/debug.c ${_ink_zstd_dir}/common/entropy_common.c
+          ${_ink_zstd_dir}/common/error_private.c ${_ink_zstd_dir}/common/fse_decompress.c
+          ${_ink_zstd_dir}/common/xxhash.c ${_ink_zstd_dir}/common/zstd_common.c
+          ${_ink_zstd_dir}/decompress/huf_decompress.c ${_ink_zstd_dir}/decompress/zstd_ddict.c
+          ${_ink_zstd_dir}/decompress/zstd_decompress.c ${_ink_zstd_dir}/decompress/zstd_decompress_block.c
+        )
+        target_include_directories(strata_zstd_dec PUBLIC ${_ink_zstd_dir} ${_ink_zstd_dir}/common ${_ink_zstd_dir}/decompress)
+        target_compile_definitions(strata_zstd_dec PRIVATE ZSTD_DISABLE_ASM=1)
+      endif()
+      add_executable(perf_inkling2_kernels perf/sycl/perf_inkling2_kernels.cpp)
+      target_include_directories(perf_inkling2_kernels PRIVATE
+        ${_strata_gpu_include_directories}
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/inkling2/sycl
+        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/zstd-dec
+      )
+      target_link_libraries(perf_inkling2_kernels PRIVATE strata_core strata_zstd_dec ${_strata_gpu_runtime_target} benchmark::benchmark)
+      list(APPEND _strata_perf_targets perf_inkling2_kernels)
+    endif()
 
     add_custom_target(perf-sycl
       COMMAND perf_xe2_gemv

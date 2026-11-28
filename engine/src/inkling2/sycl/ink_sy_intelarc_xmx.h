@@ -85,7 +85,8 @@ inline float e2m1_sg16_lane_val(int lane) {
     (defined(__SYCL_TARGET_INTEL_GPU_LNL_M__)   && __SYCL_TARGET_INTEL_GPU_LNL_M__   == 1) || \
     (defined(__SYCL_TARGET_INTEL_GPU_PTL_H__)   && __SYCL_TARGET_INTEL_GPU_PTL_H__   == 1) || \
     (defined(__SYCL_TARGET_INTEL_GPU_PTL_U__)   && __SYCL_TARGET_INTEL_GPU_PTL_U__   == 1) || \
-    (defined(__SYCL_TARGET_INTEL_GPU_PVC__)     && __SYCL_TARGET_INTEL_GPU_PVC__     == 1))
+    (defined(__SYCL_TARGET_INTEL_GPU_PVC__)     && __SYCL_TARGET_INTEL_GPU_PVC__     == 1) || \
+    (defined(STRATA_XMX_SG16) && STRATA_XMX_SG16 == 1 && !defined(__SYCL_TARGET_INTEL_GPU_ACM_G10__)))
 #define INK_SY_DEV_JM_SG16 1
 #else
 #define INK_SY_DEV_JM_SG16 0
@@ -234,26 +235,59 @@ inline void k_jm_gemm_q8row_s8_sg16(
             const int c0 = lane * 4;
 #endif
             for (int k0 = 0; k0 < K; k0 += 32) {
-                for (int idx = tid; idx < 32 * 32; idx += 128) {
-                    const int r = idx >> 5, k = idx & 31, gm = m_base + r;
-                    sA[idx] = (gm < M && k0 + k < K) ? X_s8[(size_t)gm * K + k0 + k] : (int8_t)0;
+                // Vectorized 8B (uint2) global loads for sA [32, 32] (128 threads * 8B = 1024B = 1 load/thread!)
+                {
+                    const int r = tid >> 2;          // 0..31
+                    const int k8 = (tid & 3) << 3;   // 0, 8, 16, 24
+                    const int gm = m_base + r;
+                    sycl::uint2 v(0u, 0u);
+                    if (gm < M && k0 + k8 + 8 <= K) {
+                        v = *reinterpret_cast<const sycl::uint2*>(X_s8 + (size_t)gm * K + k0 + k8);
+                    }
+                    *reinterpret_cast<sycl::uint2*>(&sA[r * 32 + k8]) = v;
                 }
-                for (int idx = tid; idx < 64 * 32; idx += 128) {
-                    const int n = idx >> 5, k = idx & 31, gn = n_base + n;
-                    sB[k * 64 + n] = (gn < N && k0 + k < K) ? W_s8[(size_t)gn * K + k0 + k] : (int8_t)0;
+#if INK_SY_DEV_JM_SG16
+                // Vectorized 16B (uint4) global loads for W [64, 32] -> VNNI packed sB [8, 64] of uint32_t (4x fewer SLM stores, 0 repacking!)
+                {
+                    const int n = tid >> 1;          // 0..63
+                    const int k4 = (tid & 1) << 2;   // 0 or 4 (in groups of 4 K-elements)
+                    const int k16 = k4 << 2;         // 0 or 16
+                    const int gn = n_base + n;
+                    sycl::uint4 v(0u, 0u, 0u, 0u);
+                    if (gn < N && k0 + k16 + 16 <= K) {
+                        v = *reinterpret_cast<const sycl::uint4*>(W_s8 + (size_t)gn * K + k0 + k16);
+                    }
+                    uint32_t* sB32 = reinterpret_cast<uint32_t*>(&sB[0]);
+                    sB32[(k4 + 0) * 64 + n] = v.x();
+                    sB32[(k4 + 1) * 64 + n] = v.y();
+                    sB32[(k4 + 2) * 64 + n] = v.z();
+                    sB32[(k4 + 3) * 64 + n] = v.w();
                 }
                 sycl::group_barrier(it.get_group());
-#if INK_SY_DEV_JM_SG16
                 jm::joint_matrix<sycl::sub_group, int8_t, jm::use::a, 8, 32, jm::layout::row_major> a_m;
-                jm::joint_matrix<sycl::sub_group, int8_t, jm::use::b, 32, 16, jm::layout::row_major> b0, b1;
+                jm::joint_matrix<sycl::sub_group, int8_t, jm::use::b, 32, 16, jm::layout::ext_intel_packed> b0, b1;
                 auto pA = sA.template get_multi_ptr<sycl::access::decorated::no>() + sg_m * 8 * 32;
-                auto pB0 = sB.template get_multi_ptr<sycl::access::decorated::no>() + sg_n * 32;
+                auto pB0 = sB.template get_multi_ptr<sycl::access::decorated::no>() + sg_n * 32 * 4;
                 jm::joint_matrix_load(sg, a_m, pA, 32);
-                jm::joint_matrix_load(sg, b0, pB0, 64);
-                jm::joint_matrix_load(sg, b1, pB0 + 16, 64);
+                jm::joint_matrix_load(sg, b0, pB0, 64 * 4);
+                jm::joint_matrix_load(sg, b1, pB0 + 16 * 4, 64 * 4);
                 jm::joint_matrix_mad(sg, c0, a_m, b0, c0);
                 jm::joint_matrix_mad(sg, c1, a_m, b1, c1);
 #else
+                {
+                    const int n = tid >> 1;          // 0..63
+                    const int k16 = (tid & 1) << 4;  // 0 or 16
+                    const int gn = n_base + n;
+                    sycl::uchar16 v(0);
+                    if (gn < N && k0 + k16 + 16 <= K) {
+                        v = *reinterpret_cast<const sycl::uchar16*>(W_s8 + (size_t)gn * K + k0 + k16);
+                    }
+#pragma unroll
+                    for (int j = 0; j < 16; ++j) {
+                        sB[(k16 + j) * 64 + n] = (int8_t)v[j];
+                    }
+                }
+                sycl::group_barrier(it.get_group());
                 for (int k = 0; k < 32; ++k) {
                     int32_t bv[4] = {(int32_t)sB[k * 64 + c0], (int32_t)sB[k * 64 + c0 + 1],
                                      (int32_t)sB[k * 64 + c0 + 2], (int32_t)sB[k * 64 + c0 + 3]};

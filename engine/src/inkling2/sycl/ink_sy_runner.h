@@ -15,9 +15,11 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <list>
 #include <random>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "ink_sy_codecs.h"
@@ -198,15 +200,29 @@ struct InkSyRunner {
 
 #if defined(SYCL_EXT_ONEAPI_GRAPH)
     using GraphExec = sycl::ext::oneapi::experimental::command_graph<sycl::ext::oneapi::experimental::graph_state::executable>;
-    std::unordered_map<uint64_t, GraphExec> graphs;
+    struct GraphCacheEntry {
+        GraphExec exec;
+        std::list<uint64_t>::iterator lru_it;
+    };
+    std::list<uint64_t> graph_lru;
+    std::unordered_map<uint64_t, GraphCacheEntry> graphs;
+    size_t graph_evictions = 0;
 #endif
     bool graph_failed = false;
+
+    // Pre-allocated host scratch buffers for forward_batch() (zero per-token heap allocations)
+    std::vector<int> scratch_as;
+    std::vector<int> scratch_off;
+    std::vector<int> scratch_cnt;
+    std::vector<int> scratch_idx;
+    std::vector<int> scratch_slot_cnt;
+    std::vector<int> scratch_slot_pos;
 
     ~InkSyRunner() { release(); }
 
     void release() {
 #if defined(SYCL_EXT_ONEAPI_GRAPH)
-        if (!graphs.empty()) { try { wait(); } catch (...) {} graphs.clear(); }
+        if (!graphs.empty()) { try { wait(); } catch (...) {} graphs.clear(); graph_lru.clear(); }
 #endif
         hybrid.release();
         df2.release();
@@ -557,7 +573,7 @@ struct InkSyRunner {
         switch (ti.fmt) {
             case FMT_BF16:
 #if INK_SY_HAS_JOINT_MATRIX
-                if (acfg.fast && acfg.use_joint_matrix_xmx && M >= 16) {
+                if (acfg.use_joint_matrix_xmx && M >= 16) {
                     k_jm_gemm_bf16_sg16(Q(), reinterpret_cast<const uint16_t*>(ti.dev_ptr), N, K, X, Y, M);
                     break;
                 }
@@ -568,7 +584,7 @@ struct InkSyRunner {
                 break;
             case FMT_Q8ROW:
 #if INK_SY_HAS_JOINT_MATRIX
-                if (acfg.fast && acfg.use_joint_matrix_xmx && M >= 16 && (K & 31) == 0) {
+                if (acfg.use_joint_matrix_xmx && M >= 16 && (K & 31) == 0) {
                     k_quantize_x_q8_sg16(X, M, K, xq_s8_dev, xsc_dev);
                     k_jm_gemm_q8row_s8_sg16(Q(), ti.dev_ptr, N, K, (int)ti.rows(), xq_s8_dev, xsc_dev, Y, M);
                     break;
@@ -579,7 +595,7 @@ struct InkSyRunner {
                     k_gemm_q8row_sg16(ti.dev_ptr, N, K, X, Y, M, (int)ti.rows());
                 } else {
                     k_quantize_x_q8_sg16(X, M, K, xq_s8_dev, xsc_dev);
-                    if (acfg.active && acfg.use_vec_lsc_decode && (K & 15) == 0 && (((int)ti.rows()) & 3) == 0) {
+                    if (acfg.use_vec_lsc_decode && (K & 15) == 0 && (((int)ti.rows()) & 3) == 0) {
                         k_linear_q8row_vec_dp4a_sg16(ti.dev_ptr, N, K, xq_s8_dev, xsc_dev, Y, M, (int)ti.rows());
                     } else {
                         k_linear_q8row_dp4a_sg16(ti.dev_ptr, N, K, xq_s8_dev, xsc_dev, Y, M, (int)ti.rows());
@@ -588,7 +604,7 @@ struct InkSyRunner {
                 break;
             case FMT_MX8:
 #if INK_SY_HAS_JOINT_MATRIX
-                if (acfg.fast && acfg.use_joint_matrix_xmx && M >= 16) {
+                if (acfg.use_joint_matrix_xmx && M >= 16) {
                     k_jm_gemm_mx8_sg16(Q(), ti.dev_ptr, N, K, (int)ti.rows(), X, Y, M);
                     break;
                 }
@@ -618,24 +634,37 @@ struct InkSyRunner {
         return v;
     }
 
-    // Records enqueue() into a command graph (once per key) and submits it. False when the graph extension or the backend
-    // refuses: the caller then enqueues the step the normal way and graphs stay off for the run.
+    // Records enqueue() into a bounded LRU command graph cache (once per key) and submits it.
+    // Evicts least-recently-used executable graphs when cache reaches graph_cap to prevent Level Zero
+    // command-list exhaustion (UR_RESULT_ERROR_DEVICE_LOST) on 32-slot dynamic batches.
     template <class F>
     bool run_graph(uint64_t key, F&& enqueue) {
 #if defined(SYCL_EXT_ONEAPI_GRAPH)
         namespace sx = sycl::ext::oneapi::experimental;
+        const int cap = arc_cfg().graph_cap;
+        if (cap < 0) return false;
         try {
             auto it = graphs.find(key);
-            if (it == graphs.end()) {
+            if (it != graphs.end()) {
+                graph_lru.splice(graph_lru.begin(), graph_lru, it->second.lru_it);
+            } else {
                 wait();
+                if (cap > 0 && graphs.size() >= (size_t)cap) {
+                    const uint64_t victim = graph_lru.back();
+                    graph_lru.pop_back();
+                    graphs.erase(victim);
+                    ++graph_evictions;
+                }
                 sx::command_graph<sx::graph_state::modifiable> g(Q().get_context(), Q().get_device());
                 g.begin_recording(Q());
                 try { enqueue(); } catch (...) { try { g.end_recording(Q()); } catch (...) {} throw; }
                 g.end_recording(Q());
-                it = graphs.emplace(key, g.finalize()).first;
-                fprintf(stderr, "[ink_sycl] SYCL graph recorded (key %llu)\n", (unsigned long long)key);
+                graph_lru.push_front(key);
+                it = graphs.emplace(key, GraphCacheEntry{g.finalize(), graph_lru.begin()}).first;
+                fprintf(stderr, "[ink_sycl] SYCL graph recorded (key %llu, cached=%zu/%d)\n",
+                        (unsigned long long)key, graphs.size(), cap);
             }
-            Q().ext_oneapi_graph(it->second);
+            Q().ext_oneapi_graph(it->second.exec);
             return true;
         } catch (const std::exception& e) {
             graph_failed = true;
@@ -668,18 +697,56 @@ struct InkSyRunner {
         const int block_stride = max_batch * D;
         const int M_stride = M * D;
 
-        // Upload metadata & build per-slot token index lists for race-free multi-slot ShortConv
-        std::unordered_map<int, std::vector<int>> by_slot;
-        for (int m = 0; m < M; ++m) by_slot[slot_ids[m]].push_back(m);
-        std::vector<int> h_as, h_off, h_cnt, h_idx;
-        int cur_t = 0;
-        for (const auto& kv : by_slot) {
-            h_as.push_back(kv.first);
-            h_off.push_back(cur_t);
-            h_cnt.push_back((int)kv.second.size());
-            for (int m : kv.second) { h_idx.push_back(m); ++cur_t; }
+        // Upload metadata & build per-slot token index lists using pre-allocated scratch buffers (zero per-token heap allocs)
+        scratch_as.clear();
+        scratch_off.clear();
+        scratch_cnt.clear();
+        scratch_idx.resize((size_t)M);
+        if (M == 1) {
+            scratch_as.push_back(slot_ids[0]);
+            scratch_off.push_back(0);
+            scratch_cnt.push_back(1);
+            scratch_idx[0] = 0;
+        } else {
+            bool all_same_slot = true;
+            const int s0 = slot_ids[0];
+            int max_s = s0;
+            for (int m = 1; m < M; ++m) {
+                if (slot_ids[m] != s0) all_same_slot = false;
+                if (slot_ids[m] > max_s) max_s = slot_ids[m];
+            }
+            if (all_same_slot) {
+                scratch_as.push_back(s0);
+                scratch_off.push_back(0);
+                scratch_cnt.push_back(M);
+                for (int m = 0; m < M; ++m) scratch_idx[(size_t)m] = m;
+            } else {
+                const size_t need = (size_t)std::max(max_s + 1, 1);
+                if (scratch_slot_cnt.size() < need) {
+                    scratch_slot_cnt.assign(need, 0);
+                    scratch_slot_pos.assign(need, 0);
+                }
+                for (int m = 0; m < M; ++m) {
+                    const int s = slot_ids[m];
+                    if (scratch_slot_cnt[(size_t)s] == 0) scratch_as.push_back(s);
+                    ++scratch_slot_cnt[(size_t)s];
+                }
+                int cur_t = 0;
+                for (int s : scratch_as) {
+                    const int cnt = scratch_slot_cnt[(size_t)s];
+                    scratch_off.push_back(cur_t);
+                    scratch_cnt.push_back(cnt);
+                    scratch_slot_pos[(size_t)s] = cur_t;
+                    cur_t += cnt;
+                    scratch_slot_cnt[(size_t)s] = 0;  // reset for next call
+                }
+                for (int m = 0; m < M; ++m) {
+                    const int s = slot_ids[m];
+                    scratch_idx[(size_t)(scratch_slot_pos[(size_t)s]++)] = m;
+                }
+            }
         }
-        const int n_active_slots = (int)h_as.size();
+        const int n_active_slots = (int)scratch_as.size();
         const int save_ring = (n_active_slots == 1 && M > 1 && M <= 8) ? 1 : 0;
         if (save_ring) {
             last_ver_slot = slot_ids[0];
@@ -698,10 +765,10 @@ struct InkSyRunner {
         h2d(b_tok_ids, tok_ids, (size_t)M * 4);
         h2d(b_slot_ids, slot_ids, (size_t)M * 4);
         h2d(b_pos, positions, (size_t)M * 4);
-        h2d_sync(b_active_slots, h_as.data(), (size_t)n_active_slots * 4);
-        h2d_sync(b_slot_tok_off, h_off.data(), (size_t)n_active_slots * 4);
-        h2d_sync(b_slot_tok_cnt, h_cnt.data(), (size_t)n_active_slots * 4);
-        h2d_sync(b_slot_tok_idx, h_idx.data(), (size_t)M * 4);
+        h2d_sync(b_active_slots, scratch_as.data(), (size_t)n_active_slots * 4);
+        h2d_sync(b_slot_tok_off, scratch_off.data(), (size_t)n_active_slots * 4);
+        h2d_sync(b_slot_tok_cnt, scratch_cnt.data(), (size_t)n_active_slots * 4);
+        h2d_sync(b_slot_tok_idx, scratch_idx.data(), (size_t)M * 4);
         if (is_img_host && img_emb_host) {
             h2d(b_is_img, is_img_host, (size_t)M);
             h2d(b_img_emb, img_emb_host, (size_t)M * D * 4);
