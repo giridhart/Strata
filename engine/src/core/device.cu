@@ -253,6 +253,10 @@ std::string device_code_error() {
 #endif
 }
 
+std::string compiler_workaround() {
+    return "";
+}
+
 DeviceInfo device_info(int ordinal) {
     int count = 0;
     check(cudaGetDeviceCount(&count), "cudaGetDeviceCount");

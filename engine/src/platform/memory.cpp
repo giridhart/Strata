@@ -1,6 +1,9 @@
 // src/platform/memory.cpp - see include/strata/platform/memory.hpp.
 #include "strata/platform/memory.hpp"
 
+#include <chrono>
+#include <thread>
+
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -160,6 +163,8 @@ uint64_t total_physical_memory() {
 bool read_ahead_enabled() { return false; }
 void advise_willneed(const void*, uint64_t) {}
 void advise_willneed(int, uint64_t, uint64_t) {}
+double settle_page_migration(double, double, double, double& peak) { peak = 0.0; return 0.0; }
+void settle_before_ready() {}
 #else
 LockResult lock_resident(void* p, uint64_t bytes) {
     LockResult r;
@@ -229,6 +234,59 @@ void advise_willneed(int fd, uint64_t offset, uint64_t bytes) {
 #else
         (void) posix_fadvise(fd, (off_t) (offset + at), (off_t) std::min(kAdviseStep, bytes - at), POSIX_FADV_WILLNEED);
 #endif
+}
+
+namespace {
+bool pgmigrate_success(uint64_t& n) {
+    std::FILE* f = std::fopen("/proc/vmstat", "r");
+    if (f == nullptr) return false;
+    char line[256];
+    bool found = false;
+    while (!found && std::fgets(line, sizeof line, f) != nullptr)
+        if (std::strncmp(line, "pgmigrate_success ", 18) == 0) {
+            n = (uint64_t) std::strtoull(line + 18, nullptr, 10);
+            found = true;
+        }
+    std::fclose(f);
+    return found;
+}
+}  // namespace
+
+double settle_page_migration(double cap_s, double quiet_s, double quiet_rate, double& peak) {
+    peak = 0.0;
+    uint64_t last = 0;
+    if (cap_s <= 0.0 || !pgmigrate_success(last)) return 0.0;
+    using Clock = std::chrono::steady_clock;
+    const Clock::time_point t0 = Clock::now();
+    Clock::time_point tl = t0;
+    double calm = 0.0;
+    for (;;) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+        uint64_t cur = 0;
+        if (!pgmigrate_success(cur)) break;
+        const Clock::time_point now = Clock::now();
+        const double dt = std::max(std::chrono::duration<double>(now - tl).count(), 1e-3);
+        const double rate = (double) (cur - last) / dt;
+        peak = std::max(peak, rate);
+        calm = rate < quiet_rate ? calm + dt : 0.0;
+        last = cur;
+        tl = now;
+        const double waited = std::chrono::duration<double>(now - t0).count();
+        if (calm >= quiet_s || waited >= cap_s) return waited;
+    }
+    return std::chrono::duration<double>(Clock::now() - t0).count();
+}
+
+void settle_before_ready() {
+    static const double cap = [] {
+        const char* v = std::getenv("STRATA_SETTLE_S");
+        return v != nullptr ? std::strtod(v, nullptr) : 30.0;
+    }();
+    double peak = 0.0;
+    const double waited = settle_page_migration(cap, 2.0, 10000.0, peak);
+    if (waited > 0.0)
+        std::fprintf(stderr, "strata: host page migration settled in %.1f s (peak %.0f pages/s; STRATA_SETTLE_S=0: no wait)\n",
+                     waited, peak);
 }
 #endif
 

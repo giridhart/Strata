@@ -120,6 +120,21 @@ if(STRATA_BUILD_TESTS OR STRATA_BUILD_CONVERSATION_TESTS)
   add_executable(conv_cache_test src/program/conv_cache_test.cpp)
   target_include_directories(conv_cache_test PRIVATE include)
   add_test(NAME conv_cache_test COMMAND conv_cache_test)
+  add_executable(conversation_spill_test
+                 src/core/conversation_spill_test.cpp
+                 src/core/conversation_file.cpp
+                 src/core/conversation_kv_store.cpp
+                 src/platform/direct_file.cpp)
+  target_include_directories(conversation_spill_test PRIVATE include)
+  target_link_libraries(conversation_spill_test PRIVATE Threads::Threads)
+  add_test(NAME conversation_spill_test COMMAND conversation_spill_test)
+  add_executable(bench_delta_spill
+                 tools/bench_delta_spill.cpp
+                 src/core/conversation_file.cpp
+                 src/core/conversation_kv_store.cpp
+                 src/platform/direct_file.cpp)
+  target_include_directories(bench_delta_spill PRIVATE include)
+  target_link_libraries(bench_delta_spill PRIVATE Threads::Threads)
   # --adapt-decay outside 0..1 falls back to 0.7 with a line (#1284; header-only, CPU)
   add_executable(adapt_decay_test src/program/adapt_decay_test.cpp)
   target_include_directories(adapt_decay_test PRIVATE include)
@@ -128,6 +143,10 @@ if(STRATA_BUILD_TESTS OR STRATA_BUILD_CONVERSATION_TESTS)
   add_executable(window_limits_test src/core/window_limits_test.cpp)
   target_include_directories(window_limits_test PRIVATE include)
   add_test(NAME window_limits_test COMMAND window_limits_test)
+  # automatic --pipeline-windows defaulting (header-only, CPU)
+  add_executable(pipeline_auto_test src/core/pipeline_auto_test.cpp)
+  target_include_directories(pipeline_auto_test PRIVATE include)
+  add_test(NAME pipeline_auto_test COMMAND pipeline_auto_test)
   # #4677: the accepted rows a request commits are bounded to what it can emit (header-only, CPU; 2,736 cases against the old output loop)
   add_executable(serve_stop_bound_test tests/core/serve_stop_bound_test.cpp)
   target_include_directories(serve_stop_bound_test PRIVATE include)
@@ -190,7 +209,11 @@ if(STRATA_BUILD_TESTS OR STRATA_BUILD_CONVERSATION_TESTS)
   target_include_directories(draft_kv_plan_test PRIVATE include)
   add_test(NAME draft_kv_plan_test COMMAND draft_kv_plan_test)
   # coupled draft sampling's counter and penalty-ring arithmetic (header-only, CPU)
-  add_executable(coupled_draft_test src/core/coupled_draft_test.cpp)
+  if(STRATA_ENABLE_SYCL)
+    add_executable(coupled_draft_test src/core/sycl/coupled_draft_test.cpp)
+  else()
+    add_executable(coupled_draft_test src/core/coupled_draft_test.cpp)
+  endif()
   target_include_directories(coupled_draft_test PRIVATE include)
   add_test(NAME coupled_draft_test COMMAND coupled_draft_test)
   # #4590: the penalty window is the current reply by default, STRATA_PENALTY_PROMPT=1 the old prompt + reply window (header-only, CPU)
@@ -355,6 +378,13 @@ macro(strata_cpu_native_experts)
     set_source_files_properties(src/kernels/cpu/iq_avx1.cpp PROPERTIES COMPILE_OPTIONS
                                 "-msse4.2;-mavx;-mno-avx2;-mno-fma;-mno-f16c")
   endif()
+  # icpx (IntelLLVM): prevent SVML polynomial approximation drift between scalar expf (nt=1) and vectorized
+  # __svml_expf4/__svml_expf8 in unrolled multi-token SwiGLU loops (nt=2..8). -fp-model=precise preserves exact
+  # IEEE-754 semantics and ensures bit-identical evaluation across batch sizes (issue #152 parity contract).
+  if(CMAKE_CXX_COMPILER_ID MATCHES "IntelLLVM")
+    set_property(SOURCE src/kernels/cpu/expert.cpp src/kernels/cpu/iq_avx512.cpp src/kernels/cpu/iq_avx2.cpp src/kernels/cpu/iq_avx1.cpp
+                 APPEND PROPERTY COMPILE_OPTIONS "-fp-model=precise")
+  endif()
   set_property(SOURCE src/kernels/cpu/iq_avx2.cpp APPEND PROPERTY COMPILE_DEFINITIONS ${_strata_avxvnni})
   if(STRATA_ISA_FLOOR STREQUAL "avx")
     target_compile_definitions(strata_kernels_cpu PRIVATE STRATA_ISA_FLOOR_AVX=1)
@@ -464,6 +494,10 @@ macro(strata_cpu_native_experts)
   if(STRATA_BUILD_TESTS)
     add_test(NAME iq_avx2_parity COMMAND iq_avx2_parity)
     add_test(NAME iq_avx2_parity_iq3s_mt1 COMMAND ${CMAKE_COMMAND} -E env STRATA_IQ3S_MT1=1 $<TARGET_FILE:iq_avx2_parity>)
+    add_executable(cpu_dual_row_parity src/kernels/cpu/cpu_dual_row_parity.cpp)
+    target_link_libraries(cpu_dual_row_parity PRIVATE strata_kernels_cpu)
+    add_test(NAME cpu_dual_row_parity COMMAND cpu_dual_row_parity)
+    set_tests_properties(cpu_dual_row_parity PROPERTIES ENVIRONMENT "STRATA_Q2_BITPLANE=1")
   endif()
   # the older CPUs' AVX1 expert rows (iq_avx1.cpp) against ggml-cpu's dots and against their own one-token
   # rows at every width; --bench: ms per expert, the weights streamed from DRAM.  Runs on any AVX CPU:
@@ -499,8 +533,12 @@ if(STRATA_BUILD_TESTS)
   # Plan v0.3 P6: one expert applied to several tokens, bitwise vs the single-token kernel (synthetic, CPU only).
   # plan v0.3 P5: the device dequantizers vs the artifact's CPU dequantizers on the real shards (not a ctest: needs
   # the 38 GB model; run it by hand or from tools/gpu_session.py)
-  if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)   # #93: it needs the device dequantizers and a GPU runtime
-    add_executable(dequant_bf16_test src/kernels/dequant_bf16_test.cpp)
+  if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP OR STRATA_ENABLE_SYCL)   # #93: it needs the device dequantizers and a GPU runtime
+    if(STRATA_ENABLE_SYCL)
+      add_executable(dequant_bf16_test src/kernels/sycl/dequant_bf16_test.cpp)
+    else()
+      add_executable(dequant_bf16_test src/kernels/dequant_bf16_test.cpp)
+    endif()
     target_link_libraries(dequant_bf16_test PRIVATE strata_kernels strata_artifact ${_strata_gpu_runtime_target})
   endif()
 

@@ -1,0 +1,373 @@
+// Adapted from topk-moe.cu/common.cuh in llama.cpp
+// 3cf03257f219afbe7334045ff7c6a06ac68c627d; finite F32, 512-expert/10-output path.
+// MIT License
+// Copyright (c) 2023-2026 The ggml authors
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+#include <sycl/sycl.hpp>
+#include "strata/core/sycl_tuning.hpp"
+#include "strata/kernels/native_router.hpp"
+#include <atomic>
+#include <cfloat>
+#include <cmath>
+#include <cstddef>
+#include <cstdint>
+#include <stdexcept>
+
+namespace strata::kernels {
+namespace {
+std::atomic<bool> enabled{false};
+
+inline float warp_sum(float value, const sycl::sub_group& sg) {
+    return sycl::reduce_over_group(sg, value, sycl::plus<float>());
+}
+
+inline float warp_max(float value, const sycl::sub_group& sg) {
+    return sycl::reduce_over_group(sg, value, sycl::maximum<float>());
+}
+
+template <int NE = 512, int K = 10>
+inline void route_token_k(const float* logits, int32_t* ids, float* weights, size_t tok, int lane,
+                          const sycl::sub_group& sg) {
+    static_assert(NE % 32 == 0 && K <= 32, "experts in whole warps, at most 32 picks");
+    constexpr int V = NE / 32;
+    logits += tok * NE;
+    ids += tok * K;
+    weights += tok * K;
+
+    float values[V];
+#pragma unroll
+    for (int i = 0; i < V; ++i)
+        values[i] = logits[lane + i * 32];
+
+    float maximum = -INFINITY;
+#pragma unroll
+    for (int i = 0; i < V; ++i)
+        maximum = sycl::fmax(maximum, values[i]);
+    maximum = warp_max(maximum, sg);
+
+    float sum = 0.0f;
+#pragma unroll
+    for (int i = 0; i < V; ++i) {
+        values[i] = sycl::native::exp(values[i] - maximum);
+        sum += values[i];
+    }
+    const float reciprocal = 1.0f / warp_sum(sum, sg);
+#pragma unroll
+    for (int i = 0; i < V; ++i) {
+        values[i] *= reciprocal;
+        if (sycl::isnan(values[i])) values[i] = -FLT_MAX;
+    }
+    float selected = 0.0f, selected_sum = 0.0f;
+    for (int rank = 0; rank < K; ++rank) {
+        float best = values[0];
+        int expert = lane;
+#pragma unroll
+        for (int i = 1; i < V; ++i) {
+            if (values[i] > best) {
+                best = values[i];
+                expert = lane + i * 32;
+            }
+        }
+#pragma unroll
+        for (int mask = 16; mask; mask >>= 1) {
+            if ((size_t)mask < sg.get_local_range()[0]) {
+                const float other = sycl::permute_group_by_xor(sg, best, mask);
+                const int other_id = sycl::permute_group_by_xor(sg, expert, mask);
+                if (other > best || (other == best && other_id < expert)) {
+                    best = other;
+                    expert = other_id;
+                }
+            }
+        }
+        if ((expert & 31) == lane) {
+            values[expert / 32] = -INFINITY;
+            ids[rank] = expert;
+            // Deliberately accumulate by WINNING EXPERT lane, not output rank.
+            // Multiple selected experts in one lane add in selection order.
+            selected_sum += best;
+        }
+        if (rank == lane) selected = best;
+    }
+    selected_sum = sycl::fmax(warp_sum(selected_sum, sg), 6.103515625e-5f);
+    const float inverse_selected_sum = 1.0f / selected_sum;
+    if (lane < K) weights[lane] = selected * inverse_selected_sum;
+}
+
+inline void route_token(const float* logits, int32_t* ids, float* weights, size_t tok, int lane,
+                        const sycl::sub_group& sg) {
+    route_token_k<512, 10>(logits, ids, weights, tok, lane, sg);
+}
+
+// One subgroup (32 lanes) per token.  This replaces the legacy one thread per token scanning
+// all 512 experts serially: lanes coalesced-read candidates f = lane, lane + 32, ... and reduce
+// across the subgroup via shift_group_left.  Bitwise identical to reference semantics.
+void route_resident_k(const float* __restrict__ logits, int32_t* __restrict__ ids, float* __restrict__ weights,
+                      const int32_t* __restrict__ res, int n_tok, float margin, int lo, int hi, float edge,
+                      float budget, float budget_tail, unsigned long long* __restrict__ stats,
+                      const sycl::nd_item<1>& item) {
+    const int t = item.get_group(0);
+    if (t >= n_tok) return;
+    const int lane = (int)item.get_local_id(0);
+    const sycl::sub_group sg = item.get_sub_group();
+    const float* l = logits + (size_t)t * 512;
+    int32_t* id = ids + (size_t)t * 10;
+    int32_t my[10];
+    for (int r = 0; r < 10; ++r) my[r] = id[r];
+    int swaps = 0, tail = 0, before = 0;
+    if (lane == 0) {
+        for (int r = 0; r < 10; ++r) before += (res[my[r]] < 0);
+    }
+    const bool bud = budget > 0.0f;
+    const int first = (edge >= 0.0f && lo > 0) ? (lo - 1) : lo;
+    const int r_start = bud ? 0 : first;
+    for (int r = r_start; r <= hi && r < 10; ++r) {
+        const int e = my[r];
+        if (res[e] >= 0) continue;  // already resident: uniform across subgroup
+        const bool brank = bud && r < lo;
+        const bool trank = budget_tail > 0.0f && r >= lo;
+        if (!brank && r < first) continue;
+        if (lane == 0) ++tail;
+        float bv = -INFINITY;
+        int bi = -1;
+        for (int f = lane; f < 512; f += 32) {
+            if (res[f] < 0) continue;
+            bool used = false;
+            for (int q = 0; q < 10; ++q) used |= (my[q] == f);
+            if (used) continue;
+            if (l[f] > bv) {
+                bv = l[f];
+                bi = f;
+            }
+        }
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            if ((size_t)off < sg.get_local_range()[0]) {
+                const float ov = sycl::shift_group_left(sg, bv, off);
+                const int oi = sycl::shift_group_left(sg, bi, off);
+                if (ov > bv || (ov == bv && oi >= 0 && (bi < 0 || oi < bi))) {
+                    bv = ov;
+                    bi = oi;
+                }
+            }
+        }
+        if (lane == 0 && bi >= 0) {
+            const float gap = l[e] - bv;
+            const float w = weights[(size_t)t * 10 + r];
+            const bool take = brank   ? (w * sycl::fmax(gap, 0.0f) <= budget)
+                            : trank   ? (w * sycl::fmax(gap, 0.0f) <= budget_tail)
+                                      : (gap <= ((edge >= 0.0f && lo > 0 && r == lo - 1) ? edge : margin));
+            if (take) {
+                my[r] = bi;
+                ++swaps;
+            }
+        }
+        my[r] = sycl::select_from_group(sg, my[r], 0);  // all lanes keep same picked set
+    }
+    int after = 0;
+    if (lane == 0) {
+        for (int r = 0; r < 10; ++r) after += (res[my[r]] < 0);
+    }
+    const int sw = sycl::select_from_group(sg, swaps, 0);
+    if (sw) {
+        float m = -INFINITY;
+        for (int r = 0; r < 10; ++r) m = sycl::fmax(m, l[my[r]]);
+        float ex[10], sum = 0.0f;
+        for (int r = 0; r < 10; ++r) {
+            ex[r] = sycl::exp(l[my[r]] - m);
+            sum += ex[r];
+        }
+        for (int r = 0; r < 10; ++r) weights[(size_t)t * 10 + r] = ex[r] / sum;
+    }
+    if (lane == 0) {
+        for (int r = 0; r < 10; ++r) id[r] = my[r];
+        if (stats) {
+            auto a_tail = sycl::atomic_ref<unsigned long long, sycl::memory_order::relaxed, sycl::memory_scope::device,
+                                           sycl::access::address_space::global_space>(stats[0]);
+            auto a_swaps = sycl::atomic_ref<unsigned long long, sycl::memory_order::relaxed, sycl::memory_scope::device,
+                                            sycl::access::address_space::global_space>(stats[1]);
+            auto a_before = sycl::atomic_ref<unsigned long long, sycl::memory_order::relaxed, sycl::memory_scope::device,
+                                             sycl::access::address_space::global_space>(stats[2]);
+            auto a_after = sycl::atomic_ref<unsigned long long, sycl::memory_order::relaxed, sycl::memory_scope::device,
+                                            sycl::access::address_space::global_space>(stats[3]);
+            a_tail.fetch_add((unsigned long long)tail);
+            a_swaps.fetch_add((unsigned long long)sw);
+            a_before.fetch_add((unsigned long long)before);
+            a_after.fetch_add((unsigned long long)after);
+        }
+    }
+}
+
+bool valid(const void* p, size_t bytes) {
+    const auto address = reinterpret_cast<uintptr_t>(p);
+    return p && address % 4 == 0 && bytes <= UINTPTR_MAX - address;
+}
+
+bool overlap(const void* a, size_t an, const void* b, size_t bn) {
+    const auto ap = reinterpret_cast<uintptr_t>(a), bp = reinterpret_cast<uintptr_t>(b);
+    return ap < bp + bn && bp < ap + an;
+}
+}  // namespace
+
+void native_router_set_enabled(bool value) { enabled.store(value, std::memory_order_relaxed); }
+bool native_router_enabled() { return enabled.load(std::memory_order_relaxed); }
+
+void native_router_top10(const float* logits, int32_t* ids, float* weights, void* stream) {
+    if (!stream || !valid(logits, 512 * 4) || !valid(ids, 10 * 4) || !valid(weights, 10 * 4) ||
+        overlap(logits, 512 * 4, ids, 10 * 4) || overlap(logits, 512 * 4, weights, 10 * 4) ||
+        overlap(ids, 10 * 4, weights, 10 * 4))
+        throw std::invalid_argument("native router requires a stream, aligned spans, and disjoint outputs");
+
+    static sycl::queue default_queue{sycl::property::queue::in_order()};
+    sycl::queue* q = stream ? static_cast<sycl::queue*>(stream) : &default_queue;
+
+    const int n_experts = 512;
+    STRATA_SYCL_RECORD_SHAPE(strata::sycl_tuning::KernelType::ROUTER, n_experts, 1, 0, 0, 0);
+    auto& reg = strata::sycl_tuning::SyclTuningRegistry::instance();
+    reg.try_auto_load(q->get_device());
+    const uint64_t key = strata::sycl_tuning::make_kernel_key(
+        strata::sycl_tuning::KernelType::ROUTER, n_experts, 1, 0, 0, 0);
+    const uint64_t key_fallback = strata::sycl_tuning::make_kernel_key(
+        strata::sycl_tuning::KernelType::UNKNOWN, n_experts, 1, 0, 0, 0);
+    const auto tuned = reg.get_or_fallback(
+        key, reg.get_or_fallback(key_fallback, {32, 0, 0, strata::sycl_tuning::CachePolicy::Default}));
+
+    const size_t wg_size = (tuned.lws > 0 && tuned.lws % 32 == 0) ? (size_t)tuned.lws : 32;
+
+    if (wg_size == 32) {
+        q->parallel_for(sycl::nd_range<1>(sycl::range<1>(32), sycl::range<1>(32)),
+                        [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(32)]] {
+                            route_token(logits, ids, weights, 0, (int)item.get_local_id(0), item.get_sub_group());
+                        });
+    } else {
+        q->parallel_for(sycl::nd_range<1>(sycl::range<1>(wg_size), sycl::range<1>(wg_size)),
+                        [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(32)]] {
+                            const size_t global_tid = item.get_global_id(0);
+                            const size_t tok = global_tid / 32;
+                            if (tok >= 1) return;
+                            const int lane = (int)(global_tid % 32);
+                            route_token(logits, ids, weights, tok, lane, item.get_sub_group());
+                        });
+    }
+}
+
+void native_router_top10_multi(const float* logits, int32_t* ids, float* weights, int n_tok, void* stream) {
+    if (!stream || n_tok < 1 || !valid(logits, (size_t)n_tok * 512 * 4) || !valid(ids, (size_t)n_tok * 10 * 4) ||
+        !valid(weights, (size_t)n_tok * 10 * 4))
+        throw std::invalid_argument("native router (multi) requires a stream and aligned [n,512]/[n,10] buffers");
+
+    static sycl::queue default_queue{sycl::property::queue::in_order()};
+    sycl::queue* q = stream ? static_cast<sycl::queue*>(stream) : &default_queue;
+
+    const int n_experts = 512;
+    STRATA_SYCL_RECORD_SHAPE(strata::sycl_tuning::KernelType::ROUTER, n_experts, 1, 0, 0, 0);
+    auto& reg = strata::sycl_tuning::SyclTuningRegistry::instance();
+    reg.try_auto_load(q->get_device());
+    const uint64_t key = strata::sycl_tuning::make_kernel_key(
+        strata::sycl_tuning::KernelType::ROUTER, n_experts, 1, 0, 0, 0);
+    const uint64_t key_fallback = strata::sycl_tuning::make_kernel_key(
+        strata::sycl_tuning::KernelType::UNKNOWN, n_experts, 1, 0, 0, 0);
+    const auto tuned = reg.get_or_fallback(
+        key, reg.get_or_fallback(key_fallback, {256, 0, 0, strata::sycl_tuning::CachePolicy::Default}));
+
+    const size_t wg_size = (tuned.lws > 0 && tuned.lws % 32 == 0) ? (size_t)tuned.lws : 256;
+    const size_t warps_per_wg = wg_size / 32;
+    const size_t total_warps = ((size_t)n_tok + warps_per_wg - 1) / warps_per_wg * warps_per_wg;
+    const size_t total_threads = total_warps * 32;
+
+    q->parallel_for(sycl::nd_range<1>(sycl::range<1>(total_threads), sycl::range<1>(wg_size)),
+                    [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(32)]] {
+                        const size_t global_tid = item.get_global_id(0);
+                        const size_t tok = global_tid / 32;
+                        if (tok >= (size_t)n_tok) return;
+                        const int lane = (int)(global_tid % 32);
+                        route_token(logits, ids, weights, tok, lane, item.get_sub_group());
+                    });
+}
+
+bool native_router_topk_supported(int n_expert, int k) {
+    return (n_expert == 512 && k == 10) || (n_expert == 256 && k == 8);
+}
+
+void native_router_topk(const float* logits, int32_t* ids, float* weights, int n_expert, int k, int n_tok, void* stream) {
+    if (n_expert == 512 && k == 10) {   // Flash-Next
+        if (n_tok == 1) native_router_top10(logits, ids, weights, stream);
+        else native_router_top10_multi(logits, ids, weights, n_tok, stream);
+        return;
+    }
+    if (!stream || n_tok < 1 || !native_router_topk_supported(n_expert, k) ||
+        !valid(logits, (size_t)n_tok * n_expert * 4) || !valid(ids, (size_t)n_tok * k * 4) ||
+        !valid(weights, (size_t)n_tok * k * 4))
+        throw std::invalid_argument("native_router_topk: a stream, a supported (experts, k) and aligned buffers");
+
+    static sycl::queue default_queue{sycl::property::queue::in_order()};
+    sycl::queue* q = stream ? static_cast<sycl::queue*>(stream) : &default_queue;
+
+    const int n_experts = n_expert;
+    STRATA_SYCL_RECORD_SHAPE(strata::sycl_tuning::KernelType::ROUTER, n_experts, 1, 0, 0, 0);
+    auto& reg = strata::sycl_tuning::SyclTuningRegistry::instance();
+    reg.try_auto_load(q->get_device());
+    const uint64_t key = strata::sycl_tuning::make_kernel_key(
+        strata::sycl_tuning::KernelType::ROUTER, n_experts, 1, 0, 0, 0);
+    const uint64_t key_fallback = strata::sycl_tuning::make_kernel_key(
+        strata::sycl_tuning::KernelType::UNKNOWN, n_experts, 1, 0, 0, 0);
+    const auto tuned = reg.get_or_fallback(
+        key, reg.get_or_fallback(key_fallback, {256, 0, 0, strata::sycl_tuning::CachePolicy::Default}));
+
+    const size_t wg_size = (tuned.lws > 0 && tuned.lws % 32 == 0) ? (size_t)tuned.lws : 256;
+    const size_t warps_per_wg = wg_size / 32;
+    const size_t total_warps = ((size_t)n_tok + warps_per_wg - 1) / warps_per_wg * warps_per_wg;
+    const size_t total_threads = total_warps * 32;
+
+    if (n_expert == 256 && k == 8) {
+        q->parallel_for(sycl::nd_range<1>(sycl::range<1>(total_threads), sycl::range<1>(wg_size)),
+                        [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(32)]] {
+                            const size_t global_tid = item.get_global_id(0);
+                            const size_t tok = global_tid / 32;
+                            if (tok >= (size_t)n_tok) return;
+                            const int lane = (int)(global_tid % 32);
+                            route_token_k<256, 8>(logits, ids, weights, tok, lane, item.get_sub_group());
+                        });
+    }
+}
+
+void native_route_resident_ext(const float* logits, int32_t* ids, float* weights, const int32_t* res_layer, int n_tok,
+                               float margin, int rank_lo, int rank_hi, float edge, float budget, float budget_tail,
+                               unsigned long long* stats, void* stream) {
+    if (!stream || n_tok < 1 || !res_layer)
+        throw std::invalid_argument("native_route_resident_ext: bad arguments");
+
+    static sycl::queue default_queue{sycl::property::queue::in_order()};
+    sycl::queue* q = stream ? static_cast<sycl::queue*>(stream) : &default_queue;
+
+    const size_t wg = 32;
+    const size_t global = (size_t)n_tok * 32;
+    q->parallel_for(sycl::nd_range<1>(sycl::range<1>(global), sycl::range<1>(wg)),
+                    [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(32)]] {
+                        route_resident_k(logits, ids, weights, res_layer, n_tok, margin, rank_lo, rank_hi, edge, budget,
+                                         budget_tail, stats, item);
+                    });
+}
+
+void native_route_resident(const float* logits, int32_t* ids, float* weights, const int32_t* res_layer, int n_tok,
+                           float margin, int rank_lo, int rank_hi, unsigned long long* stats, void* stream) {
+    native_route_resident_ext(logits, ids, weights, res_layer, n_tok, margin, rank_lo, rank_hi, -1.0f, 0.0f, 0.0f,
+                              stats, stream);
+}
+}  // namespace strata::kernels

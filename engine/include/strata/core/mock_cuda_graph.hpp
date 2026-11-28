@@ -1,0 +1,198 @@
+#pragma once
+#include <sycl/sycl.hpp>
+#include <sycl/ext/oneapi/experimental/graph.hpp>
+
+#include "strata/core/sycl_graph_env.hpp"
+
+#include <chrono>
+#include <cstddef>
+#include <cstdio>
+#include <cstdlib>
+#include <map>
+#include <memory>
+
+#define cudaStreamCaptureModeThreadLocal 0
+
+namespace strata_graph_detail {
+namespace sycl_ext = sycl::ext::oneapi::experimental;
+using mod_graph_t = sycl_ext::command_graph<sycl_ext::graph_state::modifiable>;
+using exec_graph_t = sycl_ext::command_graph<sycl_ext::graph_state::executable>;
+
+struct ActiveCapture {
+    mod_graph_t* graph = nullptr;
+    bool end_all_queues = false;
+};
+
+inline std::map<void*, ActiveCapture>& get_active_recording() {
+    static thread_local std::map<void*, ActiveCapture> active;
+    return active;
+}
+
+inline bool trace_enabled() {
+    return std::getenv("STRATA_VERIFY_DEBUG") != nullptr || std::getenv("STRATA_TRACE") != nullptr;
+}
+} // namespace strata_graph_detail
+
+inline int cudaStreamBeginCapture(void* stream, int = 0) {
+    if (!stream) return 1;
+    auto* q = static_cast<sycl::queue*>(stream);
+    try {
+        const auto opts = strata::sycl_graph::read_options();
+        const auto props = strata::sycl_graph::make_properties(opts);
+        auto* g = new strata_graph_detail::mod_graph_t(q->get_context(), q->get_device(), props);
+        g->begin_recording(*q);
+        strata_graph_detail::get_active_recording()[stream] = {g, opts.end_all_queues};
+    } catch (const std::exception& e) {
+        if (strata_graph_detail::trace_enabled()) {
+            std::fprintf(stderr, "strata graph: begin_recording exception: %s\n", e.what());
+            std::fflush(stderr);
+        }
+        return 1;
+    } catch (...) {
+        if (strata_graph_detail::trace_enabled()) {
+            std::fprintf(stderr, "strata graph: begin_recording unknown exception\n");
+            std::fflush(stderr);
+        }
+        return 1;
+    }
+    return 0;
+}
+
+inline int cudaStreamEndCapture(void* stream, void** out_graph) {
+    if (!stream || !out_graph) return 1;
+    auto& active = strata_graph_detail::get_active_recording();
+    auto it = active.find(stream);
+    if (it == active.end()) return 1;
+    auto* q = static_cast<sycl::queue*>(stream);
+    auto* g = it->second.graph;
+    const bool end_all = it->second.end_all_queues;
+    active.erase(it);
+    try {
+        if (end_all) {
+            g->end_recording();
+        } else {
+            g->end_recording(*q);
+        }
+        *out_graph = static_cast<void*>(g);
+    } catch (const std::exception& e) {
+        if (strata_graph_detail::trace_enabled()) {
+            std::fprintf(stderr, "strata graph: end_recording exception: %s\n", e.what());
+            std::fflush(stderr);
+        }
+        delete g;
+        *out_graph = nullptr;
+        return 1;
+    } catch (...) {
+        if (strata_graph_detail::trace_enabled()) {
+            std::fprintf(stderr, "strata graph: end_recording unknown exception\n");
+            std::fflush(stderr);
+        }
+        delete g;
+        *out_graph = nullptr;
+        return 1;
+    }
+    return 0;
+}
+
+inline int cudaGraphGetNodes(void* graph, void*, size_t* count) {
+    if (!graph || !count) return 1;
+    auto* g = static_cast<strata_graph_detail::mod_graph_t*>(graph);
+    try {
+        *count = g->get_nodes().size();
+    } catch (...) {
+        *count = 0;
+        return 1;
+    }
+    return 0;
+}
+
+inline int cudaGraphInstantiate(void** out_exec, void* graph, ...) {
+    if (!graph || !out_exec) return 1;
+    auto* g = static_cast<strata_graph_detail::mod_graph_t*>(graph);
+    const bool trace = std::getenv("STRATA_VERIFY_DEBUG") != nullptr || std::getenv("STRATA_TRACE") != nullptr;
+    size_t nn = 0;
+    try {
+        nn = g->get_nodes().size();
+    } catch (...) {}
+    if (trace) {
+        std::fprintf(stderr, "strata graph: instantiating graph with %zu nodes...\n", nn);
+        std::fflush(stderr);
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    try {
+        auto* exec = new strata_graph_detail::exec_graph_t(g->finalize());
+        *out_exec = static_cast<void*>(exec);
+        if (trace) {
+            const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            std::fprintf(stderr, "strata graph: finalized %zu nodes in %.2f ms\n", nn, ms);
+            std::fflush(stderr);
+        }
+    } catch (const std::exception& e) {
+        if (trace) {
+            std::fprintf(stderr, "strata graph: finalize exception: %s\n", e.what());
+            std::fflush(stderr);
+        }
+        *out_exec = nullptr;
+        return 1;
+    } catch (...) {
+        if (trace) {
+            std::fprintf(stderr, "strata graph: finalize unknown exception\n");
+            std::fflush(stderr);
+        }
+        *out_exec = nullptr;
+        return 1;
+    }
+    return 0;
+}
+
+inline int cudaGraphLaunch(void* exec, void* stream) {
+    if (!exec || !stream) return 1;
+    auto* exec_g = static_cast<strata_graph_detail::exec_graph_t*>(exec);
+    auto* q = static_cast<sycl::queue*>(stream);
+    try {
+        q->ext_oneapi_graph(*exec_g);
+    } catch (const std::exception& e) {
+        if (strata_graph_detail::trace_enabled()) {
+            std::fprintf(stderr, "strata graph: launch exception: %s\n", e.what());
+            std::fflush(stderr);
+        }
+        return 1;
+    } catch (...) {
+        if (strata_graph_detail::trace_enabled()) {
+            std::fprintf(stderr, "strata graph: launch unknown exception\n");
+            std::fflush(stderr);
+        }
+        return 1;
+    }
+    return 0;
+}
+
+inline int cudaGraphDestroy(void* graph) {
+    if (graph) delete static_cast<strata_graph_detail::mod_graph_t*>(graph);
+    return 0;
+}
+
+inline int cudaGraphExecDestroy(void* exec) {
+    if (exec) delete static_cast<strata_graph_detail::exec_graph_t*>(exec);
+    return 0;
+}
+
+inline int cudaGraphUpload(void*, void*) {
+    return 0;
+}
+
+typedef void* cudaGraph_t;
+typedef void* cudaGraphExec_t;
+typedef void* cudaGraphNode_t;
+typedef int cudaGraphNodeType;
+#define cudaGraphNodeTypeKernel 0
+#define cudaGraphNodeTypeMemcpy 1
+#define cudaGraphNodeTypeMemset 2
+struct cudaKernelNodeParams { int x; };
+inline int cudaGraphNodeGetType(void*, int* b) { if(b) *b = 0; return 0; }
+inline int cudaGraphKernelNodeGetParams(void*, void*) { return 0; }
+inline int cudaGraphLaunch_mock(void* a, void* b) { return cudaGraphLaunch(a, b); }
+inline int cudaGraphExecDestroy_mock(void* a) { return cudaGraphExecDestroy(a); }
+#define cudaDeviceScheduleSpin 1
+#define cudaDeviceMapHost 2
+inline int cudaInitDevice(int, int, int) { return 0; }

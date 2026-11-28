@@ -27,8 +27,8 @@ namespace strata::kernels {
 void bf16_gemv(const uint16_t* x, const uint16_t* w, float* y, int64_t n_in, int64_t n_out, void* stream);
 
 /// TWO weight matrices from ONE kernel (llama.cpp's `*_mul_mat_multi` shape): `y1 = w1 @ x`, `y2 = w2 @ x`.
-/// One warp computes row o of both matrices with two accumulators over one lane-strided pass, so each output
-/// is bitwise what `bf16_gemv` produced for that matrix wherever `bf16_gemv` used its warp kernel
+/// One warp / subgroup computes row o of both matrices with two accumulators over one lane-strided pass, so each output
+/// is bitwise what `bf16_gemv` produced for that matrix wherever `bf16_gemv` used its warp/subgroup kernel
 /// (`n_out >= 64`); a matrix below that threshold falls back to the plain call to keep the naive kernel's
 /// summation order.  `n_out1` or `n_out2` may be 0 for a one-sided call.
 void bf16_gemv_pair(const uint16_t* x, const uint16_t* w1, float* y1, int64_t n_out1, const uint16_t* w2,
@@ -41,7 +41,11 @@ void bf16_gemv_pair(const uint16_t* x, const uint16_t* w1, float* y1, int64_t n_
 /// NOT bit-identical to `bf16_gemv`: the partial sums are added in a different order.  Both are kept and both
 /// are tested, because the naive one is the reference the split one is checked against.
 void bf16_gemv_split(const uint16_t* x, const uint16_t* w, float* y, int64_t n_in, int64_t n_out,
+#ifdef STRATA_ENABLE_SYCL
+                     int threads_per_row, void* stream, void* out_event = nullptr);
+#else
                      int threads_per_row, void* stream);
+#endif
 
 /// Single-token, contiguous 2D BF16-weight/F32-activation MMVF from the pinned llama.cpp CUDA path.
 /// Preserves pair accumulation, adaptive block size and warp-XOR reduction order. This is a separate

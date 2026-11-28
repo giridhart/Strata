@@ -282,11 +282,26 @@ bool iq512_supported(int type) noexcept {
 }
 
 bool iq256_supported(int type) noexcept {
-    return type == 16 || type == 17 || type == 18 || type == 21 || type == 22 || type == 23;
+    return type == 16 || type == 17 || type == 18 || type == 21 || type == 22 || type == 23 || type == 29;
 }
 
 bool kq256_supported(int type) noexcept { return type == 12 || type == 7 || type == 8; }
 bool kq512_supported(int type) noexcept { return type == 12 || type == 7 || type == 8; }
+
+size_t native_row_bytes(int type, int64_t n) {
+    const int bs = blck_size_of(type);
+    if (bs <= 0 || n <= 0 || n % bs != 0) return 0;
+    return row_size_of(type, n);
+}
+
+bool native_row_to_float(int type, const void* src, float* dst, int64_t n) {
+    if (native_row_bytes(type, n) == 0) return false;
+    if (type == 0) { // F32
+        std::memcpy(dst, src, (size_t) n * sizeof(float));
+        return true;
+    }
+    return to_float(type, src, dst, n);
+}
 
 namespace {
 // BW-4 (0.2.17): the AVX-512 VNNI rows of UD-Q4_K_XL's Q4_K gate/up and Q5_1 / Q8_0 down (kq_avx512.cpp) are the AVX2 contract's one-token dot bit for bit.  They are

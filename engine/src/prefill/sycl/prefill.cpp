@@ -1,0 +1,5054 @@
+// src/prefill/prefill.cpp - see include/strata/prefill/prefill.hpp.
+#include <sycl/sycl.hpp>
+namespace {
+inline sycl::queue& default_queue() {
+    static sycl::queue q{sycl::default_selector_v, sycl::property::queue::in_order()};
+    return q;
+}
+}  // namespace
+#include "strata/prefill/prefill.hpp"
+#include "strata/prefill/sycl_dma_direct.hpp"
+#include "strata/prefill/mmq_ids_margin.hpp"
+#include "strata/kernels/qsa_two_pass_status.hpp"
+#include "strata/prefill/kva.hpp"
+#include "strata/prefill/kva_floor.hpp"
+#include "strata/core/sm120_series.hpp"
+#include "strata/core/defaults_026.hpp"
+#include "strata/platform/aux_cpus.hpp"
+#include "strata/core/mtp.hpp"
+#include "strata/core/progress.hpp"
+#include "strata/core/stream_watch.hpp"
+#include "strata/core/on_device.hpp"
+
+#include "strata/core/layout.hpp"
+#include "strata/kernels/cpu/expert.hpp"
+#include "strata/kernels/cpu/pool.hpp"
+#include "strata/kernels/cpu/native_expert.hpp"
+#include "strata/kernels/native_qsa_indexer.hpp"
+#include "strata/kernels/ngram.hpp"
+#include "strata/kernels/ple.hpp"
+#include "strata/kernels/native_ple_postops.hpp"
+#include "strata/kernels/iq_kernels.hpp"
+#include "strata/kernels/cpu/expert_layout.hpp"
+#include "strata/kernels/qsa.hpp"
+#include "strata/kernels/kv_stream.hpp"
+#include "strata/kernels/cvec.hpp"
+#include "strata/kernels/kv_q4.hpp"
+#include "strata/core/layer.hpp"
+#include "strata/core/native_head.hpp"
+#include "strata/kernels/verify_kernels.hpp"
+#if defined(STRATA_HAVE_DFLASH2)
+#include "strata/kernels/dflash2.hpp"
+#endif
+#include "strata/kernels/qsa_decode_attn.hpp"
+#include "strata/kernels/qsa_prompt_attn.hpp"
+#include "strata/kernels/qsa_select.hpp"
+#include "strata/prefill/gemm.hpp"
+#include "strata/prefill/moe_fused.hpp"
+#include "strata/prefill/moe_fused_iq.hpp"
+#include "strata/prefill/moe_mmq.hpp"
+#include "strata/prefill/kernels.hpp"
+
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstdio>
+#include <atomic>
+#include <condition_variable>
+#include <cstring>
+#include <future>
+#include <memory>
+#include <mutex>
+#include <optional>
+#include <thread>
+#include <unordered_map>
+#include <vector>
+
+#ifndef STRATA_PREFILL_MMQ
+// A build without the llama.cpp sources (no STRATA_NATIVE_EXPERTS): no MMQ, the FP16 expert path everywhere.
+namespace strata::prefill::mmq {
+bool built() { return false; }
+bool supported(int) { return false; }
+bool fits(int, int64_t) { return false; }
+size_t matrix_bytes(int, int64_t, int64_t) { return 0; }
+size_t q8_bytes(int64_t, int64_t) { return 0; }
+void quantize(const float*, const int32_t*, void*, int, int64_t, int64_t, int64_t, void*) {}
+Context::Context() {}
+Context::~Context() {}
+void Context::run(const Product&, void*) {}
+void gather_native(const void*, const void*, size_t, const void*, size_t, void*, void*, void*) {}
+void gather_strata_q2(const uint8_t*, void*, void*, void*) {}
+void swiglu(const float*, float*, int64_t, int64_t, bool, void*) {}
+void iota(int32_t*, int64_t, void*) {}
+}  // namespace strata::prefill::mmq
+#endif
+#ifndef STRATA_PREFILL_FUSED
+// #136: the fused int8 experts are CUDA-only (HIP and builds without MMQ keep the MMQ / FP16 paths)
+namespace strata::prefill::fused {
+bool built() { return false; }
+bool available() { return false; }
+bool enabled() { return false; }
+bool requested() { return false; }
+size_t act_bytes(int64_t, int64_t) { return 0; }
+size_t group_bytes(int64_t, int) { return 0; }
+void quantize_act(const float*, int64_t, int64_t, void*, void*) {}
+void group(const int32_t*, int64_t, int, int, void*, int32_t*, int32_t*, void*) {}
+void experts(const Batch&, int, int64_t, const void*, const void*, const int32_t*, void*, float*, void*) {}
+bool native_supported(int, int) { return false; }
+void quantize_act_native(const float*, int64_t, int64_t, void*, void*) {}
+void experts_native(const Batch&, const NativeGeom&, int, int64_t, const void*, const void*, const int32_t*, void*,
+                    float*, void*) {}
+}  // namespace strata::prefill::fused
+#endif
+
+namespace strata::prefill {
+namespace {
+
+using Clock = std::chrono::steady_clock;
+constexpr float EPS = 1e-6f;
+constexpr int64_t N = 2560, HC = 4, D = N * HC, LR = 320, K = 10;
+[[maybe_unused]] constexpr int64_t NE = 512;
+constexpr int64_t C = 10240, ZV = 6144, HV = 48;
+// plan v0.3 P6: staging holds the largest blob of the pack (a native pack's blobs differ per layer)
+inline int64_t MAXBLOB() { return (int64_t)strata::kernels::cpu::expert_layout().max_blob; }
+constexpr int STAGE = 8;  // host->device expert staging ring (chunks below stream_all_min())
+// Step 3: from this chunk size on, every non-resident expert of every layer streams in a fixed order through a
+// ring_slots()-slot ring (nearly all 512 are routed at such a chunk), so the copy engine keeps working through the
+// attention halves instead of waiting for each layer's routing.
+constexpr int RING_MAX = 1024;  // the arrays; the ring itself is ring_slots(), at most ring_cap()
+// The chunk size from which every expert streams: 1024 since 0.1.30 (was 2048).  Measured on the 5070, Q2_0 / IQ2_XS,
+// fixed cache: 1,500-token prompts 621 -> 785 / 612 -> 735 tok/s, 2,000 727 -> 934 / 712 -> 892, 4,000 (its last
+// chunk) 779 -> 912 / 766 -> 844, the same output.  Below ~1,000 tokens the output changed on Q2_0 (a smaller chunk
+// takes other kernels), so 1024 is the floor.  STRATA_PREFILL_STREAM_MIN overrides (A/B).
+constexpr int64_t kStreamAllMinDefault = 1024;
+int64_t g_stream_min_share = 0;
+inline int64_t stream_all_min() {
+    static const int64_t env = [] {
+        const char* e = std::getenv("STRATA_PREFILL_STREAM_MIN");
+        return e ? (int64_t)std::atoll(e) : (int64_t)-1;
+    }();
+    if (env >= 0) return env;
+    return g_stream_min_share > 0 ? g_stream_min_share : kStreamAllMinDefault;
+}
+double g_pinned_share = 1.0;
+// The streamed ring: 384 slots when (nearly) every streamed expert is DMA'd from pinned RAM - measured on Q2_0,
+// 8192-token chunks: 96 slots 1153 tok/s, 384 1294 (the next layer's experts arrive during its attention half) -
+// and 96 when a large share goes through host copies (IQ3_S on 64 GB, a third unpinned: 96 slots 1216, 256 1070 -
+// the host copies are the limit and the bigger ring only takes cache slots).  STRATA_PREFILL_RING overrides.
+int g_ring_override = 0;  // #340: set by a layer split (Prefill::set_ring_override); 0 = the rule below
+int g_ring_budget = 0;
+int64_t g_ring_small_max = 0;
+bool g_share_default = false;
+
+inline double cpu_share_explicit() {
+    static const double v = [] {
+        const char* e = std::getenv("STRATA_PREFILL_CPU_SHARE");
+        if (e == nullptr) return -2.0;
+        if (std::strcmp(e, "auto") == 0) return -1.0;
+        return std::clamp(std::atof(e), 0.0, 1.0);
+    }();
+    return v;
+}
+inline double cpu_share_env() {
+    const double v = cpu_share_explicit();
+    return v == -2.0 ? (g_share_default ? -1.0 : 0.0) : v;
+}
+inline bool cpu_share_on() { return cpu_share_env() != 0.0; }
+inline int64_t cpu_share_max() {
+    static const int64_t v = [] {
+        const char* e = std::getenv("STRATA_PREFILL_CPU_SHARE_MAX");
+        return e ? std::max<int64_t>(1024, (int64_t)std::atoll(e)) : (int64_t)3072;
+    }();
+    static const bool explicit_max = std::getenv("STRATA_PREFILL_CPU_SHARE_MAX") != nullptr;
+    if (g_share_default && cpu_share_explicit() == -2.0 && !explicit_max) return 1024;
+    return v;
+}
+std::atomic<bool> g_cpu_pool_busy{false};
+std::atomic<bool> g_share_blocked{false};
+inline bool sycl_elapsed_ms(const sycl::event* a, const sycl::event* b, float& out_ms) {
+    if (!a || !b) return false;
+    try {
+        const auto t0 = a->get_profiling_info<sycl::info::event_profiling::command_start>();
+        const auto t1 = b->get_profiling_info<sycl::info::event_profiling::command_end>();
+        if (t1 < t0) return false;
+        out_ms = (float)((double)(t1 - t0) / 1e6);
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+// #136: the fused experts (STRATA_PF_FUSED=1) launch on a batch of a layer's streamed experts at once, so the ring
+// should hold a whole layer's (~460 of 512 on Q2_0): with 384 slots a layer's last batch waits for slots its own
+// first batch frees.  Measured on the 5070, Q2_0, the 4K / 32K code-agent prompts (one run each): fused at 384 slots
+// +5% / +3% over MMQ, at 512 +19-22% / +11-12% (MMQ itself at 512: -2% / -1%).  P3: with the fused path's smaller
+// buffers (moe_bufs) 1024 slots - two layers' experts - fit too; 2 pairs each, prompt tok/s at 512 / 1024 slots: 4K
+// 1,512 / 1,605, 32K 2,485 / 2,660 (both chunk 8192), 128K with KV streaming 2,346 / 2,392 (the chunk falls from
+// 8192 to 6144, but more experts stay resident).  A native pack likewise when the native kernels (moe_fused_iq.hpp)
+// take any of its layers: IQ2_XS, 4K / 32K, their first version at 384 slots -3% / -6% against MMQ, at 512 +8% / 0%.
+inline bool fused_ring() {
+    if (!fused::enabled()) return false;
+    const strata::kernels::cpu::ExpertLayout& lay = strata::kernels::cpu::expert_layout();
+    if (!lay.native) return true;
+    static const bool any = [&lay] {
+        for (const auto& f : lay.fmt)
+            if (fused::native_supported(f.gu_type, f.d_type)) return true;
+        return false;
+    }();
+    return any;
+}
+// the largest ring: 512 slots; 1024 with the Q2_0 pack's fused experts (P3's smaller buffers, measured there) - the
+// native packs' fused layers were measured at 512
+inline int ring_cap() { return fused_ring() && !strata::kernels::cpu::expert_layout().native ? RING_MAX : 512; }
+inline constexpr uint64_t Q2_0_BLOB = 1382400ull;
+inline uint64_t ring_bytes() {
+    const uint64_t slots = fused_ring() ? 1024ull : 384ull;
+    return (g_pinned_share >= 0.9 ? slots : slots / 4) * Q2_0_BLOB;
+}
+inline bool ring_bytes_on() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_RING_BYTES"); return v == nullptr || v[0] != '0'; }();
+    return on;
+}
+inline int ring_budget_slots() {
+    const int64_t per = MAXBLOB();
+    const int64_t n = per > 0 ? (int64_t)(ring_bytes() / (uint64_t)per) : 0;
+    const int cap = ring_cap();
+    return (int)(n <= 0 ? 0 : (n > cap ? cap : n));
+}
+inline int ring_slots(size_t T) {
+    const char* v = std::getenv("STRATA_PREFILL_RING");
+#if defined(STRATA_USE_HIP)
+    // S6: with the opt-in RDNA4 matrix-core attention (STRATA_HIP_WMMA=1) a 96-slot ring: measured with it, 9070 XT
+    // 4K prompts 718 -> 1,211 tok/s (16K 1,949 -> 2,032), R9700 4K 2,426 -> 2,483 (16K the same)
+    static const bool wmma = [] {
+        const char* e = std::getenv("STRATA_HIP_WMMA");
+        return e != nullptr && e[0] == '1';
+    }();
+    if (!v && g_ring_override <= 0 && wmma) return (int64_t)T >= stream_all_min() ? 96 : STAGE;
+#endif
+    const int pinned_ring = g_pinned_share >= 0.9 ? (fused_ring() ? 1024 : 384) : 96;
+    const bool budget = ring_bytes_on() && g_ring_budget > 0 && (int64_t)T > g_ring_small_max;
+    const int r = v ? std::atoi(v) : g_ring_override > 0 ? g_ring_override : budget ? g_ring_budget : pinned_ring;
+    if (v && r == STAGE) return STAGE;  // Explicit opt-in to routed-only staging, including large chunks.
+    const int big = r < 16 ? 16 : r > ring_cap() ? ring_cap() : r;
+    return (int64_t)T >= stream_all_min() ? big : STAGE;
+}
+// STRATA_PF_PREDICT (default on; =0 off): a short chunk's copies of the NEXT layer's mirrored experts start before that layer's
+// routing is known.  At each MoE layer the next layer's router also runs on this layer's MoE input (one small BF16 GEMM
+// and a top-10, downloaded with the routing at the same sync); after this layer's walk the experts it predicts that are
+// not in VRAM are copied, in id order, into one of two banks of ring slots (by the next layer's parity, as the blind
+// prefetch's banks: their readers, two layers back, finished before this layer's routing sync, so the copy queue waits
+// for no compute event).  The copy engine then works through the next layer's attention half instead of waiting for
+// its routing; that layer's walk takes a predicted expert from its bank and copies only the ones the prediction missed.
+// The same experts are read (from other slots), so the same bits.  STRATA_PF_PREDICT_BANK (default 96 slots a bank),
+// STRATA_PF_PREDICT_MAX_T (default 2048: layouts of larger chunks have no banks, so their loan is unchanged).
+inline bool predict_on() {
+    static const bool v = [] { const char* e = std::getenv("STRATA_PF_PREDICT"); return !(e != nullptr && e[0] == '0'); }();
+    return v;
+}
+inline int64_t predict_max_t() {
+    static const int64_t v = [] { const char* e = std::getenv("STRATA_PF_PREDICT_MAX_T"); return e ? (int64_t) std::atoll(e) : (int64_t) 2048; }();
+    return v;
+}
+inline bool prefetch_on() {
+    static const bool v = [] { const char* e = std::getenv("STRATA_PREFILL_PREFETCH"); return e != nullptr && e[0] == '1'; }();
+    return v;
+}
+inline int64_t prefetch_min_t() {
+    static const int64_t v = [] { const char* e = std::getenv("STRATA_PREFILL_PREFETCH_MIN_T"); return e ? (int64_t) std::atoll(e) : (int64_t) 4096; }();
+    return v;
+}
+inline int stage_ahead() {
+    static const int v = [] {
+        const char* e = std::getenv("STRATA_PREFILL_STAGE_AHEAD");
+        const int n = e ? std::atoi(e) : 64;
+        return std::max(0, std::min(n, RING_MAX / 4));
+    }();
+    return v;
+}
+inline int pf_bank() {
+    static const int v = [] {
+        if (!prefetch_on()) return 0;
+        const char* e = std::getenv("STRATA_PREFILL_PREFETCH_BANK");
+        const int n = e ? std::atoi(e) : 352;
+        return std::max(0, std::min(n, RING_MAX / 3));
+    }();
+    return v;
+}
+inline int predict_bank() {
+    static const int v = [] {
+        if (!predict_on() || prefetch_on()) return 0;
+        const char* e = std::getenv("STRATA_PF_PREDICT_BANK");
+        const int n = e ? std::atoi(e) : 96;
+        return std::max(0, std::min(n, RING_MAX / 3));
+    }();
+    return v;
+}
+inline int pf_bank_t(size_t T) {
+    return pf_bank() > 0 ? pf_bank() : (int64_t) T <= predict_max_t() ? predict_bank() : 0;
+}
+inline bool early_copy_on() {
+    static const bool v = [] { const char* e = std::getenv("STRATA_PF_EARLY_COPY"); return !(e != nullptr && e[0] == '0'); }();
+    return v;
+}
+inline bool shared_first() {
+    static const bool v = [] { const char* e = std::getenv("STRATA_PF_SHARED_FIRST"); return !(e != nullptr && e[0] == '0'); }();
+    return v;
+}
+inline bool fold_quiet() {
+    static const bool v = [] { const char* e = std::getenv("STRATA_PF_FOLD_QUIET"); return !(e != nullptr && e[0] == '0'); }();
+    return v;
+}
+inline bool stage_fit_on() {
+    static const bool v = [] { const char* e = std::getenv("STRATA_PF_STAGE_FIT"); return !(e != nullptr && e[0] == '0'); }();
+    return v;
+}
+int64_t g_stage_cells = 0;   // set_stage_cells: the cells the next loan's stage must hold (0: the whole context)
+inline int stage_slots_t(size_t T) {
+    return 2 * pf_bank_t(T) + STAGE + stage_ahead();
+}
+inline int stage_slots() { return stage_slots_t((size_t) INT64_MAX); }
+inline int walk_base_t(size_t T) {
+    return stage_slots_t(T) > STAGE ? 2 * pf_bank_t(T) : 0;
+}
+[[maybe_unused]] inline int walk_base() { return walk_base_t((size_t) INT64_MAX); }
+inline int stage_slots(size_t T) {
+    return std::max({ring_slots(T), stage_slots_t(T)});
+}
+inline bool dma_direct(const core::ExpertSource* src, int64_t layer, int64_t expert, const void* blob,
+                       sycl::queue* q = nullptr, size_t bytes = 0) {
+    static const bool pageable_ok = [] {
+        const char* v = std::getenv("STRATA_PF_DMA_PAGEABLE");
+        return v && v[0] == '1';
+    }();
+    const auto ctx = q ? q->get_context() : default_queue().get_context();
+    return sycl_dma_direct_check(src, layer, expert, blob, bytes, ctx, pageable_ok);
+}
+constexpr int DQ = 2;  // dequantized-expert ring (FP16 gate/up + down)
+// The BF16-weight projections (hyper-connection, SSM alpha/beta, indexer, router, shared gate, PLE key/value) take
+// BF16 activations here and FP32 ones in decode. STRATA_PREFILL_BF16X2=1 adds each activation's BF16 remainder as a
+// second GEMM (Y = W.hi + W.lo, ~16 mantissa bits): a router that picks its top 10 from the same x decode would.
+// 2 = all but the hyper-connection's; 1 = the hyper-connection's too (its activations are 10240 wide and its up
+// projection writes as much: slower); 0 (the default: opt-in, it changes the prompt path's numbers) = off.
+inline int bf16x2_mode() {
+    static const int v = [] {
+        const char* e = std::getenv("STRATA_PREFILL_BF16X2");
+        return e != nullptr ? std::atoi(e) : 0;
+    }();
+    return v;
+}
+inline bool bf16x2() { return bf16x2_mode() != 0; }
+inline bool bf16x2_hc() { return bf16x2_mode() == 1; }
+
+// F-1: STRATA_GR_UNFUSED=1 keeps the FP32 copy of the normalized rows (gr_norm + gr_mix), the A/B arm
+inline bool gr_unfused() {
+    static const bool v = [] {
+        const char* e = std::getenv("STRATA_GR_UNFUSED");
+        return e && e[0] == '1';
+    }();
+    return v;
+}
+
+double ms_since(Clock::time_point t) { return std::chrono::duration<double, std::milli>(Clock::now() - t).count(); }
+
+// Either cudaMalloc (owned, freed with the object) or a bump allocation from a borrowed region; with no base and
+// no region it only counts, which is how `bytes_needed` sizes the region.
+struct Alloc {
+    uint8_t* base = nullptr;
+    uint64_t cap = 0, used = 0;
+    bool count_only = false;
+    bool spill = false, spilled = false;
+    std::vector<void*>* owned = nullptr;
+    template <typename T>
+    T* take(size_t n, bool& ok) try {
+        const uint64_t bytes = ((uint64_t)n * sizeof(T) + 256 + 255) & ~255ull;
+        if (count_only) {
+            used += bytes;
+            return nullptr;
+        }
+        if (base != nullptr && !spilled && used + bytes <= cap) {
+            T* p = (T*)(base + used);
+            used += bytes;
+            return p;
+        }
+        if (base != nullptr && !spill) {
+            ok = false;
+            return nullptr;
+        }
+        void* p = nullptr;
+        try {
+            p = (void*)sycl::malloc_device(bytes, default_queue());
+            if (!p) {
+                ok = false;
+                return nullptr;
+            }
+        } catch (...) {
+            ok = false;
+            return nullptr;
+        }
+        spilled = true;
+        if (owned) owned->push_back(p);
+        used += bytes;
+        return (T*)p;
+    } catch (sycl::exception const& exc) {
+        std::cerr << exc.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
+        std::exit(1);
+    }
+};
+
+}  // namespace
+
+// Step 4 of the prompt-speed plan: the experts the arena could not pin (a third of the streamed ones on IQ3_S) are
+// copied into pinned buffers by these threads, ahead of the launches.  Copied in line by the launching thread they
+// left the GPU without queued work while each ~2 MB memcpy ran (~15 s of a 32K prompt on IQ3_S).  Job j - a layer's
+// j-th unpinned expert, in launch order - lands in host buffer j % kRing, which is free again once the DMA of job
+// j - kRing (recorded by the launching thread, `issued`) is done.
+struct Stager {
+    // D-5: the pinned ring's depth (STRATA_STAGER_RING, default 16) - how far the host copies can run ahead of the
+    // DMAs of the unpinned experts' blobs
+    int kRing = 16;
+    // `from` set: the blob is copied by the source itself (CS-T: a GGUF read in place assembles it from its three
+    // role slices; a pointer to it would not live as long as the queue)
+    struct Job {
+        const uint8_t* src;
+        size_t bytes;
+        core::ExpertSource* from = nullptr;
+        int32_t l = 0, e = 0;
+    };
+    std::vector<uint8_t*> buf;
+    std::vector<char> pinned;
+    std::vector<std::vector<uint8_t>> pageable;  // the fallback when no more RAM can be pinned
+    std::vector<sycl::event*> dma_done;
+    std::vector<Job> jobs;
+    std::unique_ptr<std::atomic<int>[]> ready;
+    std::unique_ptr<std::atomic<char>[]> skipped;
+    size_t ready_cap = 0;
+    // gen << 32 | n << 16 | next index: a claim is a CAS on the generation it woke for (a thread late from the
+    // previous layer can never take a job of this one - the expert pool's issue #29 lesson)
+    std::atomic<uint64_t> head{0};
+    std::atomic<int> issued{0}, active{0};
+    uint32_t gen = 0;
+    bool quit = false;
+    std::mutex mu;
+    std::condition_variable cv;
+    std::vector<std::thread> threads;
+    int device = 0;
+    std::optional<sycl::queue> alloc_q;
+
+    bool init(size_t blob_bytes, int nthreads, sycl::queue* q = nullptr) {
+        alloc_q = q ? *q : default_queue();
+        if (const char* v = std::getenv("STRATA_STAGER_RING")) kRing = std::clamp(std::atoi(v), 2, 256);
+        buf.assign((size_t)kRing, nullptr);
+        pinned.assign((size_t)kRing, 0);
+        dma_done.assign((size_t)kRing, nullptr);
+        pageable.resize(kRing);
+        for (int i = 0; i < kRing; ++i) {
+            /*
+            DPCT1048:24: The original value cudaHostAllocDefault is not
+            meaningful in the migrated code and was removed or replaced with 0.
+            You may need to check the migrated code.
+            */
+            try {
+                buf[i] = (uint8_t*)sycl::malloc_host(blob_bytes, *alloc_q);
+                pinned[i] = (buf[i] != nullptr);
+            } catch (...) {
+                pinned[i] = 0;
+            }
+            if (!pinned[i]) {
+                pageable[(size_t)i].resize(blob_bytes);
+                buf[i] = pageable[(size_t)i].data();
+            }
+            dma_done[i] = new sycl::event();
+        }
+        device = 0;
+        for (int t = 0; t < nthreads; ++t)
+            threads.emplace_back([this] { work(); });
+        return true;
+    }
+    ~Stager() {
+        finish();
+        {
+            std::lock_guard<std::mutex> lk(mu);
+            quit = true;
+        }
+        cv.notify_all();
+        for (auto& t : threads)
+            t.join();
+        for (int i = 0; i < kRing; ++i) {
+            if (dma_done[i]) delete dma_done[i];
+            if (buf[i] && pinned[i]) sycl::free(buf[i], alloc_q ? *alloc_q : default_queue());
+        }
+    }
+    void work() {
+        /*
+        DPCT1093:441: The "device" device may be not the one intended for use.
+        Adjust the selected device if needed.
+        */
+        // device selection not needed in SYCL
+        uint32_t seen = 0;
+        for (;;) {
+            {
+                std::unique_lock<std::mutex> lk(mu);
+                cv.wait(lk, [&] { return quit || gen != seen; });
+                if (quit) return;
+                seen = gen;
+            }
+            for (;;) {
+                active.fetch_add(1, std::memory_order_acq_rel);
+                const int j = claim(seen);
+                if (j < 0) {
+                    active.fetch_sub(1, std::memory_order_acq_rel);
+                    break;
+                }
+                const int b = j % kRing;
+                if (skipped[(size_t)j].load(std::memory_order_acquire)) {
+                    ready[(size_t)j].store(1, std::memory_order_release);
+                    active.fetch_sub(1, std::memory_order_acq_rel);
+                    continue;
+                }
+                if (j >= kRing) {
+                    while (issued.load(std::memory_order_acquire) <= j - kRing)
+                        std::this_thread::yield();
+                    // Wait for job j - kRing's own host copy into buf[b] to finish: `pass()` can advance
+                    // `issued` past a skipped job whose thread had already claimed it.
+                    while (!ready[(size_t)(j - kRing)].load(std::memory_order_acquire))
+                        std::this_thread::yield();
+                }
+                // Wait for the previous DMA from buf[b] even for j < kRing (the previous layer's last DMAs
+                // are still in flight on m.copy when layer-major lm_prefetch starts the next layer).
+                if (dma_done[b]) dma_done[b]->wait_and_throw();
+                const Job& jb = jobs[(size_t)j];
+                if (jb.from == nullptr)
+                    std::memcpy(buf[b], jb.src, jb.bytes);
+                else if (!jb.from->copy_blob(jb.l, jb.e, buf[b])) {
+                    std::fprintf(stderr, "prefill: the expert source could not copy expert %d of layer %d\n", jb.e,
+                                 jb.l);
+                    std::abort();
+                }
+                ready[(size_t)j].store(1, std::memory_order_release);
+                active.fetch_sub(1, std::memory_order_acq_rel);
+            }
+        }
+    }
+    int claim(uint32_t g) {
+        uint64_t cur = head.load(std::memory_order_acquire);
+        for (;;) {
+            if ((uint32_t)(cur >> 32) != g) return -1;
+            const int n = (int)((cur >> 16) & 0xffff), j = (int)(cur & 0xffff);
+            if (j >= n) return -1;
+            if (head.compare_exchange_weak(cur, cur + 1, std::memory_order_acq_rel, std::memory_order_acquire))
+                return j;
+        }
+    }
+    /// A layer's jobs; the previous layer's are finished (finish()).
+    void start(std::vector<Job>&& js) {
+        if (js.empty()) return;
+        std::lock_guard<std::mutex> lk(mu);
+        jobs = std::move(js);
+        if (ready_cap < jobs.size()) {
+            ready_cap = jobs.size() * 2;
+            ready.reset(new std::atomic<int>[ready_cap]);
+            skipped.reset(new std::atomic<char>[ready_cap]);
+        }
+        for (size_t i = 0; i < jobs.size(); ++i) {
+            ready[i].store(0, std::memory_order_relaxed);
+            skipped[i].store(0, std::memory_order_relaxed);
+        }
+        issued.store(0);
+        ++gen;
+        head.store((uint64_t)gen << 32 | (uint64_t)jobs.size() << 16, std::memory_order_release);
+        cv.notify_all();
+    }
+    /// Layer-major prefill: job j's bytes are not needed after all (the routing skipped the expert) - a thread that has not
+    /// started it yet marks it ready without reading.  Never waited for, so its buffer's content does not matter.
+    void skip(int j) {
+        if (j < 0 || !skipped || (size_t)j >= jobs.size()) return;
+        skipped[(size_t) j].store(1, std::memory_order_release);
+    }
+    /// Layer-major prefill, before wait(j): the launching thread stages its jobs in increasing order, so a job below j
+    /// it has not issued was skipped and never gets a DMA - the watermark moves to j.  A skipped job is never issued,
+    /// so without this a routed job after about a ring's depth of skipped ones waits for `issued` forever.
+    void pass(int j) {
+        if (j < 0) return;
+        if (issued.load(std::memory_order_relaxed) < j) {
+            issued.store(j, std::memory_order_release);
+        }
+    }
+    /// Job j's bytes, in a pinned buffer (waits for the copy).
+    const uint8_t* wait(int j) {
+        if (j < 0 || !ready || (size_t)j >= jobs.size()) return nullptr;
+        while (!ready[(size_t)j].load(std::memory_order_acquire))
+            std::this_thread::yield();
+        return buf[j % kRing];
+    }
+    /// The launching thread queued job j's DMA on `copy`: its buffer is free once that is done.
+    void issued_one(int j, sycl::queue* copy) {
+        if (j < 0) return;
+        if (copy && dma_done[j % kRing]) {
+            *dma_done[j % kRing] = copy->ext_oneapi_submit_barrier();
+        }
+        issued.store(j + 1, std::memory_order_release);
+    }
+    /// No job is running after this (the end of a layer, or an early return in the middle of one).
+    void finish() {
+        head.store((uint64_t)gen << 32, std::memory_order_release);  // n = 0: nothing more to claim
+        issued.store(1 << 30, std::memory_order_release);
+        while (active.load(std::memory_order_acquire) != 0)
+            std::this_thread::yield();
+    }
+};
+
+// Pinned host bounce ring for async host->device uploads whose caller buffer is reused across sub-chunks
+// (e.g. m.steps_host at QSA layers, m.tok_host at layer 0).
+struct SyclPinnedRing {
+    static constexpr int kSlots = 4;
+    static constexpr size_t kMinCap = 4096;
+    struct Slot {
+        void* p = nullptr;
+        size_t cap = 0;
+        sycl::event ev;
+        bool pending = false;
+    };
+    Slot slots[kSlots];
+    int next = 0;
+    std::optional<sycl::queue> alloc_q;
+
+    SyclPinnedRing() = default;
+    SyclPinnedRing(const SyclPinnedRing&) = delete;
+    SyclPinnedRing& operator=(const SyclPinnedRing&) = delete;
+    ~SyclPinnedRing() { release(); }
+
+    bool h2d(void* dst, const void* src, size_t bytes, sycl::queue* q) {
+        if (bytes == 0 || !q) return true;
+        if (!alloc_q) alloc_q = *q;
+        Slot& sl = slots[next];
+        next = (next + 1) % kSlots;
+        if (sl.pending) {
+            sl.pending = false;
+            try {
+                sl.ev.wait_and_throw();
+            } catch (...) {
+                return false;
+            }
+        }
+        if (sl.cap < bytes) {
+            if (sl.p) {
+                sycl::free(sl.p, *alloc_q);
+                sl.p = nullptr;
+                sl.cap = 0;
+            }
+            const size_t cap = bytes < kMinCap ? kMinCap : bytes;
+            try {
+                sl.p = sycl::malloc_host(cap, *alloc_q);
+            } catch (...) {
+                sl.p = nullptr;
+            }
+            if (sl.p) sl.cap = cap;
+        }
+        try {
+            if (sl.p) {
+                std::memcpy(sl.p, src, bytes);
+                sl.ev = q->memcpy(dst, sl.p, bytes);
+                sl.pending = true;
+            } else {
+                q->memcpy(dst, src, bytes).wait_and_throw();
+            }
+        } catch (...) {
+            return false;
+        }
+        return true;
+    }
+
+    void release() {
+        for (Slot& sl : slots) {
+            if (sl.pending) {
+                try {
+                    sl.ev.wait_and_throw();
+                } catch (...) {}
+                sl.pending = false;
+            }
+            if (sl.p && alloc_q) {
+                try {
+                    sycl::free(sl.p, *alloc_q);
+                } catch (...) {}
+                sl.p = nullptr;
+                sl.cap = 0;
+            }
+        }
+        alloc_q.reset();
+        next = 0;
+    }
+};
+
+// SYCL port: how many queries the prompt path hands the FP32 attention kernel at once (STRATA_ATTN_BATCH, default 32; the
+// tensor-core kernel is opt-in and slower here).  Its scratch is batch x chunks x n_head x 258 floats, about 0.41 GB at 32 and
+// 1.65 GB at 128 on Flash-Next, independent of the prompt chunk, so the size that init allocates (attn_batch_for) and the size
+// the budget counts (bytes_needed, which sizes the expert cache and the prompt path's loan) must be the same number.
+// 128 reads a prompt 1.1-1.3% faster on two Arc Pro B65s with the lane-cell score phase, but its extra 1.2 GB comes out of
+// the expert cache on every card (an 8 GB A750 most), so the default stays 32.
+static int64_t attn_batch_setting() {
+    const char* v = std::getenv("STRATA_ATTN_BATCH");
+    const long long n = v ? std::atoll(v) : 32;
+    return (n >= 1 && n <= 1024) ? (int64_t)n : 32LL;
+}
+// A chunk of T tokens never runs more than T queries at once: the scratch of the rest would sit unused.
+static int64_t attn_batch_for(size_t T) {
+    return std::max<int64_t>(1, std::min<int64_t>(attn_batch_setting(), (int64_t)T));
+}
+
+struct Prefill::Impl {
+    const core::WeightTable* wt = nullptr;
+    const core::ModelGeometry* g = nullptr;
+    core::SessionState* ss = nullptr;
+    core::ExpertSource* src = nullptr;
+    const core::ExpertCache* cache = nullptr;
+    const int32_t* host_res = nullptr;
+    int64_t T = 0, T_max = 0;
+    bool borrowed = false, borrow_spill = false;
+    sycl::queue* cs = nullptr;
+    sycl::queue* copy = nullptr;
+    Gemm gemm;
+    std::vector<void*> owned;
+    // chunk buffers
+    float *emb = nullptr, *R = nullptr, *xn = nullptr, *lo = nullptr, *gated = nullptr, *inj = nullptr;
+    float* grs = nullptr;  // F-1: the hyper-connection read's row scales (T x 4)
+    uint16_t *xn16 = nullptr, *lo16 = nullptr;
+    float* mixed = nullptr;
+    uint16_t *mixed_bf = nullptr, *mixed_h = nullptr;
+    uint16_t *xn16_lo = nullptr, *lo16_lo = nullptr, *mixed_bf_lo = nullptr;  // bf16x2(): the BF16 GEMMs' low parts
+    float* bo = nullptr;
+    // GDN
+    float *qkv = nullptr, *z = nullptr, *ab = nullptr, *gate = nullptr, *beta = nullptr, *hbuf = nullptr, *y = nullptr;
+    uint16_t* y_h = nullptr;
+    // QSA
+    float *Kc = nullptr, *Vc = nullptr, *Qf = nullptr, *q = nullptr, *idx_raw = nullptr, *q_idx = nullptr,
+          *attn = nullptr;
+    uint16_t* attn_h = nullptr;
+    int32_t* steps_dev = nullptr;
+    std::vector<int32_t> steps_host;
+    int32_t* sel_ids = nullptr;
+    float* sel_scores = nullptr;  // [sel_batch, max_blocks]
+    int64_t sel_batch = 256, max_blocks = 0;
+    float* attn_scratch = nullptr;
+    int64_t attn_batch = 32, cap = 0;
+    // MoE
+    float *logits = nullptr, *w = nullptr, *GU = nullptr, *Dm = nullptr, *sgate = nullptr, *sup = nullptr,
+          *shared = nullptr, *sg = nullptr;
+    int32_t *ids = nullptr, *slot_dev = nullptr, *src_dev = nullptr;
+    uint16_t *Xs = nullptr, *Hh = nullptr, *sh_h = nullptr;
+    // step 2b (MMQ): the activations quantized per layer, H in FP32 and its group's quantized rows, the identity
+    // row map, the group bounds, the group buffers of gathered experts
+    void *Xq = nullptr, *Hq = nullptr;
+    float* H = nullptr;
+    int32_t *ids_identity = nullptr, *bounds_dev = nullptr;
+    uint8_t *grp_gu = nullptr, *grp_d = nullptr;
+    std::vector<int32_t> bounds_host;
+    std::unique_ptr<mmq::Context> mmq_ctx;
+    std::vector<int32_t> ids_host, slot_host, src_host, cnt, off;
+    // set_cpu_pool (STRATA_PREFILL_CPU_SHARE): a small chunk's CPU experts.
+    float *cpu_x = nullptr, *cpu_rows = nullptr;
+    size_t cpu_x_n = 0, cpu_rows_n = 0;
+    bool cpu_dead = false;
+    std::vector<uint8_t> cpu_nact;
+    std::vector<kernels::cpu::ActQ> cpu_actq;
+    std::vector<kernels::cpu::ExpertJobMulti> cpu_jobs;
+    double cpu_c_ms = 0, cpu_g_ms = 0, cpu_share_now = 0.5;
+    sycl::event* cpu_ev[2] = {};
+    bool cpu_pend = false;
+    double pend_cpu_ms = 0;
+    int64_t pend_n_cpu = 0, pend_n_gpu = 0;
+    static constexpr int CPU_RATIOS = 5;
+    int64_t cpu_layers = 0;
+    int64_t cpu_first_l = -1;
+    sycl::event* cpu_wall[4] = {};
+    int pend_wall = 0, pend_set = 0, pend_l = 0;
+    int64_t pend_wall_n = 0;
+    int last_arm = 0, last_l = 0;
+    double last_w = 0;
+    double cpu_ratio[CPU_RATIOS] = {};
+    int cpu_nratio = 0;
+    bool cpu_gate = false;
+    // The grouping tables in mapped pinned memory, [ids | slot | src] of T_max * K each, then the MMQ bounds: kernels
+    // read and write them in place.  A cudaMemcpyAsync of them queues behind the expert blobs the copy stream already
+    // holds (up to `ring` of them, ~70 us each), and the GPU idles meanwhile - measured 4.2 s of a 128K prompt's
+    // 70 s at the default ring, 0.7 s with a 16-slot one.  STRATA_GROUP_COPY=1: the copies (the A/B arm).
+    int32_t* grp_host = nullptr;
+    int32_t* grp_dev = nullptr;    // its device alias
+    size_t grp_n = 0, grp_tk = 0;  // int32s allocated; T_max * K (the offset of slot, and of src past it)
+    uint16_t* dq_gu[DQ] = {};
+    uint16_t* dq_d[DQ] = {};
+    uint8_t* stage_dev[RING_MAX] = {};
+    int ring = STAGE;                // the slots of this layout's ring (ring_slots)
+    std::unique_ptr<Stager> stager;  // the unpinned experts' host copies (step 4)
+    sycl::event* copied[RING_MAX] = {};
+    sycl::event* used[RING_MAX] = {};
+    bool stage_live[RING_MAX] = {};
+    int64_t pf_seq = 0, pf_drain = 0;     // prefetch_layer: layers counted across chunks; the last one whose routing drained the GPU
+    int64_t pf_fill[RING_MAX] = {};       // the layer count at which a bank slot was filled (0: never)
+    // STRATA_PF_EARLY_COPY / STRATA_PF_PREDICT: the copy queue's issue order of each slot's last copy - a held group whose
+    // slots were filled out of id order waits for the one issued last, not the one with the highest id
+    uint64_t copy_seq[RING_MAX] = {};
+    uint64_t copy_ctr = 0;
+    // STRATA_PF_PREDICT: the next layer's router on this layer's MoE input - its logits, top-10 ids and weights on the
+    // device (pred_cap tokens), and the ids in host memory (downloaded before the routing sync)
+    float* pred_logits = nullptr;
+    float* pred_w = nullptr;
+    int32_t* pred_ids = nullptr;
+    int32_t* pred_host = nullptr;
+    int64_t pred_cap = 0;
+    // PLE
+    float* ple_emb = nullptr;
+    std::vector<float> ple_pageable[2];  // the fallback when no more RAM can be pinned
+    float* ple_emb_host[2] = {};         // pinned, double-buffered: the next chunk's rows are read while this
+    sycl::event* ple_copied[2] = {};     // one runs; the event marks that buffer's upload done
+    std::vector<uint32_t> ple_rows[2];
+    float* ple_norm = nullptr;
+    uint8_t* region = nullptr;  // the attention/MoE scratch region (idle while the PLE block runs)
+    uint64_t region_bytes = 0;
+    PrefillStats* stats = nullptr;
+    // KV streaming: one layer's whole K/V, staged from the host copy per layer and chunk (identity layout)
+    strata::kernels::KvHostPools stage;
+    int64_t stage_cells = INT64_MAX;   // the cells the stage holds (STRATA_PF_STAGE_FIT; INT64_MAX: the whole context)
+    int32_t* ident_table = nullptr;
+    // layer split: the device, and the hand-off to the next stage (two pinned chunk buffers, used in turn)
+    int device = -1;
+    float* hand[2] = {};
+    // C-4: the chunk's token ids on the device, for one batched embedding gather
+    int32_t* tok_dev = nullptr;
+    std::vector<int32_t> tok_host;
+    SyclPinnedRing up_ring;
+    struct LmBufs {
+        int64_t S = 0;                       // tokens of a super-chunk (0: not allocated)
+        bool r_dev = false;                  // its residual rows in VRAM (else R_host, copied per sub-chunk)
+        void* dev = nullptr;                 // the one device allocation the pointers below are carved from
+        float *mixed = nullptr, *acc = nullptr, *inj = nullptr, *R = nullptr, *w = nullptr;
+        uint16_t* mixed_h = nullptr;         // the FFN half's FP16 rows (the FP16 path's inputs, port 2026-10-24)
+        int32_t *ids = nullptr, *tab = nullptr;
+        size_t tab_n = 0;
+        float* R_host = nullptr;
+        size_t R_host_n = 0;
+        int32_t* tab_host = nullptr;
+        size_t tab_host_n = 0;
+        int32_t* idsw_host = nullptr;
+        size_t idsw_host_n = 0;
+        int64_t free_mib = 0;                // VRAM free when the buffers were sized (the log line)
+        float* R2 = nullptr;
+        sycl::event ev_in[2] = {}, ev_done[2] = {}, ev_out[2] = {};
+    } lm;
+};
+
+namespace {
+// the staging pool of a streamed session: every page of one layer (same sequence in init and bytes_needed)
+// STRATA_KV_STAGE_OWN (A/B only): the staging pool gets its own allocation instead of borrowed expert slots, so a
+// streamed run lends the prompt path exactly the slots a resident one does (a lent expert runs on the CPU, which
+// rounds differently: without this an A/B compares two expert placements as well as two KV placements)
+bool stage_own() {
+    static const bool v = std::getenv("STRATA_KV_STAGE_OWN") != nullptr;
+    return v;
+}
+void take_stage(Alloc& o_borrowed, const core::SessionState& ss, const strata::kernels::QsaShapes& s,
+                strata::kernels::KvHostPools& st, bool& ok) {
+    const core::QsaState& q0 = ss.qsa_states[ss.qsa_primary()];
+    if (q0.kv_mode != 1) return;
+    if (stage_own() && o_borrowed.count_only) return;
+    Alloc own;
+    own.owned = o_borrowed.owned;
+    Alloc& o = stage_own() ? own : o_borrowed;
+    size_t pages = (size_t)q0.n_pages;
+    if (stage_fit_on() && g_stage_cells > 0)   // STRATA_PF_STAGE_FIT: the pages below the loan's end only (a prefix)
+        pages = std::min(pages, (size_t)((g_stage_cells + s.page_size - 1) / s.page_size));
+    const size_t rows = pages * s.n_head_kv * s.page_size;
+    if (q0.kv_q4) {
+        st.k_q4 = o.take<uint8_t>(rows * strata::kernels::kv_q4_bytes_per_head((int)s.head_dim), ok);
+        st.v_q4 = o.take<uint8_t>(rows * strata::kernels::kv_q4_bytes_per_head((int)s.head_dim), ok);
+    } else if (q0.kv_int8) {
+        st.k_q = o.take<int8_t>(rows * s.head_dim, ok);
+        st.v_q = o.take<int8_t>(rows * s.head_dim, ok);
+        st.k_scale = o.take<uint16_t>(rows * (s.head_dim / 64), ok);
+        st.v_scale = o.take<uint16_t>(rows * (s.head_dim / 64), ok);
+    } else {
+        st.k_pool = o.take<uint16_t>(rows * s.head_dim, ok);
+        st.v_pool = o.take<uint16_t>(rows * s.head_dim, ok);
+    }
+}
+strata::kernels::QsaAttnPools pools_of(const strata::kernels::KvHostPools& h, const int32_t* table) {
+    strata::kernels::QsaAttnPools p;
+    p.k_pool = h.k_pool;
+    p.v_pool = h.v_pool;
+    p.k_q = h.k_q;
+    p.v_q = h.v_q;
+    p.k_scale = h.k_scale;
+    p.v_scale = h.v_scale;
+    p.k_q4 = h.k_q4;
+    p.v_q4 = h.v_q4;
+    p.page_table = table;
+    return p;
+}
+}  // namespace
+
+Prefill::Prefill() : impl_(new Impl) {}
+Prefill::~Prefill() { release(); }
+
+bool Prefill::reserve_taps(const std::vector<int>& layers, int64_t cap_rows, int64_t n_embd, std::string& err) {
+    tap_layers_ = layers;
+    tap_cap_ = cap_rows;
+    if (tap_dev_ != nullptr) return true;
+    tap_dev_ = sycl::malloc_device<float>((size_t) cap_rows * layers.size() * (size_t) n_embd, default_queue());
+    if (tap_dev_ == nullptr) {
+        err = "prefill: the DFlash2 tap staging does not fit in VRAM";
+        return false;
+    }
+    return true;
+}
+
+void Prefill::clear_taps() {
+    if (tap_dev_ != nullptr) {
+        try { sycl::free(tap_dev_, default_queue()); } catch (...) {}
+        tap_dev_ = nullptr;
+    }
+    tap_layers_.clear();
+}
+
+void Prefill::reset() {
+    release();
+    impl_.reset(new Impl);
+    stats_ = PrefillStats{};
+}
+
+void Prefill::release() {
+    clear_taps();
+    if (!impl_) return;
+    lm_release();
+    if (impl_->lm.tab_host) {
+        sycl::free(impl_->lm.tab_host, default_queue());
+        impl_->lm.tab_host = nullptr;
+        impl_->lm.tab_host_n = 0;
+    }
+    if (impl_->lm.idsw_host) {
+        sycl::free(impl_->lm.idsw_host, default_queue());
+        impl_->lm.idsw_host = nullptr;
+        impl_->lm.idsw_host_n = 0;
+    }
+    if (impl_->lm.R_host) {
+        sycl::free(impl_->lm.R_host, default_queue());
+        impl_->lm.R_host = nullptr;
+        impl_->lm.R_host_n = 0;
+    }
+    if (impl_->cs) impl_->cs->wait();
+    if (impl_->copy) impl_->copy->wait();
+    impl_->up_ring.release();
+    for (int i = 0; i < RING_MAX; ++i) {
+        if (impl_->copied[i]) {
+            delete impl_->copied[i];
+            impl_->copied[i] = nullptr;
+        }
+        if (impl_->used[i]) {
+            delete impl_->used[i];
+            impl_->used[i] = nullptr;
+        }
+    }
+    for (void* p : {(void*) impl_->pred_logits, (void*) impl_->pred_w, (void*) impl_->pred_ids, (void*) impl_->pred_host})
+        if (p) sycl::free(p, default_queue());
+    impl_->pred_logits = impl_->pred_w = nullptr;
+    impl_->pred_ids = impl_->pred_host = nullptr;
+    impl_->pred_cap = 0;
+    for (int b = 0; b < 2; ++b) {
+        if (impl_->hand[b]) {
+            sycl::free(impl_->hand[b], default_queue());
+            impl_->hand[b] = nullptr;
+        }
+        if (impl_->ple_copied[b]) {
+            delete impl_->ple_copied[b];
+            impl_->ple_copied[b] = nullptr;
+        }
+        if (impl_->ple_emb_host[b] && impl_->ple_pageable[b].empty()) {
+            sycl::free(impl_->ple_emb_host[b], default_queue());
+            impl_->ple_emb_host[b] = nullptr;
+        }
+    }
+    if (impl_->copy) {
+        delete impl_->copy;
+        impl_->copy = nullptr;
+    }
+    if (impl_->grp_host) {
+        sycl::free(impl_->grp_host, default_queue());
+        impl_->grp_host = nullptr;
+    }
+    sycl::queue& cpu_q = impl_->cs ? *impl_->cs : default_queue();
+    if (impl_->cpu_x) {
+        sycl::free(impl_->cpu_x, cpu_q);
+        impl_->cpu_x = nullptr;
+        impl_->cpu_x_n = 0;
+    }
+    if (impl_->cpu_rows) {
+        sycl::free(impl_->cpu_rows, cpu_q);
+        impl_->cpu_rows = nullptr;
+        impl_->cpu_rows_n = 0;
+    }
+    for (sycl::event*& e : impl_->cpu_ev) {
+        delete e;
+        e = nullptr;
+    }
+    for (sycl::event*& e : impl_->cpu_wall) {
+        delete e;
+        e = nullptr;
+    }
+    for (void* p : impl_->owned) {
+        sycl::free(p, default_queue());
+    }
+    impl_->owned.clear();
+}
+
+namespace {
+constexpr int64_t GEMM_SCRATCH = 32ll << 20;  // FP16 elements for the largest dequantized dense weight
+constexpr size_t GEMM_WS = 32u << 20;         // cuBLAS workspace
+
+// THE ATTENTION HALF AND THE MoE HALF SHARE THEIR BUFFERS.  A layer runs its attention (GDN or QSA), writes it back
+// into the residual, and only then its MoE, so the three sets of scratch are never live at once: one region the size
+// of the largest holds them all.  That is ~260 KB of the ~680 KB a prompt token cost - which is what lets a chunk
+// grow (every expert is streamed once per chunk, so a bigger chunk streams fewer bytes per token).  The sizes are
+// counted with the same `take` sequence `init` uses; a mismatch makes `init` fail with "do not fit", never overlap.
+uint64_t gdn_set_bytes(size_t T) {
+    Alloc a;
+    a.count_only = true;
+    bool ok = true;
+    a.take<float>(T * C, ok);
+    a.take<float>(T * ZV, ok);
+    a.take<float>(T * 2 * HV, ok);
+    a.take<float>(T * HV, ok);
+    a.take<float>(T * HV, ok);
+    a.take<float>(T * C, ok);
+    a.take<float>(T * ZV, ok);
+    a.take<uint16_t>(T * ZV, ok);
+    return a.used;
+}
+uint64_t qsa_set_bytes(size_t T, int64_t cap, int64_t max_blocks, int64_t sel_batch, int64_t attn_batch,
+                       const strata::kernels::QsaShapes& s) {
+    Alloc a;
+    a.count_only = true;
+    bool ok = true;
+    a.take<float>(T * 512, ok);
+    a.take<float>(T * 512, ok);
+    a.take<float>(T * 12288, ok);
+    a.take<float>(T * ZV, ok);
+    a.take<float>(T * 128, ok);
+    a.take<float>(T * 512, ok);
+    a.take<float>(T * ZV, ok);
+    a.take<uint16_t>(T * ZV, ok);
+    a.take<int32_t>(T * (size_t)cap, ok);
+    a.take<float>((size_t)sel_batch * (size_t)max_blocks, ok);
+    a.take<float>((size_t)attn_batch * strata::kernels::qsa_decode_attn_scratch_floats(cap, s), ok);
+    return a.used;
+}
+// Step 2b: which layers' experts go through MMQ (both weight types covered; the Strata Q2_0 pack always - its blob
+// is converted to GGUF Q2_0 blocks on the gather), whether any layer keeps the FP16 path (IQ1_M), and the largest
+// gate/up and down matrices a group buffer slot holds.  STRATA_PREFILL_MMQ=0: the FP16 path everywhere (the A/B).
+constexpr int MMQ_GROUP = 16;  // experts per MMQ launch (the gather is per expert, as blobs arrive)
+// MMQ reads up to one 256-value tile past a matrix's last row when the row length is not a multiple of it (the down
+// product: 640 values).  Those bytes meet zero activations, which is harmless only if they decode to finite numbers -
+// llama.cpp zero-pads after every tensor, and so does a group buffer: this many zeroed bytes follow its last expert.
+constexpr size_t MMQ_TAIL = 4096;
+// J-column tile of ids before it compares the tile with the expert's rows (see mmq_ids_margin.hpp: the margin follows the
+// backend's tile bound).  An expert takes at most one row per token, so max_rows <= T.  Without the slack the table is an
+// exact-sized allocation that can end a 2 MiB page, and the over-read faults at the next one.
+size_t mmq_ids_rows(size_t T) {
+    if (T > (size_t) INT64_MAX / (size_t) K) return 0;
+    return (size_t) mmq::mmq_ids_table_rows((uint64_t) (T * (size_t) K), (uint64_t) T);
+}
+
+struct MmqPlan {
+    bool any = false, fallback = true;
+    std::vector<char> layer;  // per layer: MMQ
+    size_t gu_max = 0, d_max = 0;
+    // STRATA_MMQ_DIRECT=1: per layer, whether resident experts are read in their cache slots (pointer-table MMQ),
+    // and the bytes the down product reads past its matrix there (zeroed in the slot's guard before each group)
+    std::vector<char> direct;
+    std::vector<uint32_t> d_over;
+};
+const MmqPlan& mmq_plan() {
+    static const MmqPlan plan = [] {
+        MmqPlan p;
+        const auto& lay = strata::kernels::cpu::expert_layout();
+        const char* env = std::getenv("STRATA_PREFILL_MMQ");
+        const bool on = mmq::built() && (env == nullptr || std::atoi(env) != 0);
+        const int64_t layers = lay.native ? (int64_t)lay.fmt.size() : lay.n_layers;
+        p.layer.assign((size_t)std::max<int64_t>(layers, 0), 0);
+        p.fallback = !on || layers <= 0;
+        for (int64_t l = 0; on && l < layers; ++l) {
+            const int gt = lay.native ? lay.fmt[(size_t)l].gu_type : 42,
+                      dt = lay.native ? lay.fmt[(size_t)l].d_type : 42;
+            // #420: a tile on every GPU for these shapes (gate+up: 1280 rows, down: N rows), else the FP16 path
+            if (!mmq::fits(gt, 1280) || !mmq::fits(dt, N)) {
+                p.fallback = true;
+                continue;
+            }
+            p.layer[(size_t)l] = 1;
+            p.any = true;
+            p.gu_max = std::max(p.gu_max, mmq::matrix_bytes(gt, 1280, N));
+            p.d_max = std::max(p.d_max, mmq::matrix_bytes(dt, N, 640));
+        }
+        // STRATA_MMQ_DIRECT=1: a native layer's resident experts are read in place when the pointer-table MMQ covers
+        // both products, gate/up reads nothing past its matrix, the down over-read fits the slot guard, and the blob
+        // is exactly [gate | up | down] in MMQ's matrix sizes (the bytes a gather would copy)
+        p.direct.assign(p.layer.size(), 0);
+        p.d_over.assign(p.layer.size(), 0);
+        if (on && lay.native && mmq::direct_mode() == 1) {
+            int64_t nd = 0;
+            for (int64_t l = 0; l < layers; ++l) {
+                if (!p.layer[(size_t)l]) continue;
+                const auto& f = lay.fmt[(size_t)l];
+                const int gt = f.gu_type, dt = f.d_type;
+                if (!mmq::tab_fits(gt, 1280) || !mmq::tab_fits(dt, N)) continue;
+                if (mmq::overread_bytes(gt, N) != 0 || mmq::overread_bytes(dt, 640) > mmq::kSlotGuard) continue;
+                if (f.up_off != mmq::matrix_bytes(gt, 1280, N) / 2 || f.down_off != 2 * f.up_off) continue;
+                if (mmq::matrix_bytes(dt, N, 640) != f.bytes - f.down_off) continue;
+                p.direct[(size_t)l] = 1;
+                p.d_over[(size_t)l] = (uint32_t)mmq::overread_bytes(dt, 640);
+                ++nd;
+            }
+            std::fprintf(stderr,
+                         "strata: prompt MMQ reads resident experts in place (STRATA_MMQ_DIRECT=1): %lld of %lld "
+                         "layers\n",
+                         (long long)nd, (long long)layers);
+        }
+        return p;
+    }();
+    return plan;
+}
+// #136 P3: a layout whose chunks run the fused experts (STRATA_PF_FUSED=1, the Q2_0 pack, a streamed chunk of
+// stream_all_min() tokens or more).  Its GU, H and Xq hold only the fused path's grouping tables, int8 H and per-token
+// int8 activations, and Hq nothing: ~100 KB a token less than MMQ's FP32 GU / H and per-slot q8_1 rows, which is what
+// lets a bigger chunk or ring fit in the slots the prompt path borrows.  A last chunk below stream_all_min() still runs
+// MMQ in the same buffers, so each keeps MMQ's size for stream_all_min() - 1 tokens.  `src`: the layout streams experts
+// (Prefill::init got an ExpertSource; without one no chunk takes the streamed walk, so no chunk is fused).
+bool fused_layout(size_t T, bool src) {
+    return src && fused_ring() && mmq_plan().any && ring_slots(T) > STAGE && (int64_t)T >= stream_all_min();
+}
+// The MoE buffers MMQ and the fused path share: GU and H in floats, Xq and Hq in bytes.  Without `fused` (the
+// default): MMQ's, for T tokens.
+struct MoeBufs {
+    size_t gu, h, xq, hq;
+};
+MoeBufs moe_bufs(size_t T, int64_t n_expert, bool fused) {
+    if (!fused)
+        return {T * K * 1280, T * K * 640, mmq::q8_bytes((int64_t)(T * K), N), mmq::q8_bytes((int64_t)(T * K), 640)};
+    const size_t ts = (size_t)std::min<int64_t>((int64_t)T, stream_all_min() - 1);  // MMQ's last small chunk
+    return {std::max(ts * K * 1280, (fused::group_bytes((int64_t)(T * K), (int)n_expert) + 3) / 4),
+            std::max(ts * K * 640, (fused::act_bytes((int64_t)(T * K), 640) + 3) / 4),
+            std::max(mmq::q8_bytes((int64_t)(ts * K), N), fused::act_bytes((int64_t)T, N)),
+            mmq::q8_bytes((int64_t)(ts * K), 640)};
+}
+uint64_t moe_set_bytes(size_t T, int64_t n_expert, bool fused) {
+    const MmqPlan& mp = mmq_plan();
+    const MoeBufs mb = moe_bufs(T, n_expert, fused);
+    Alloc a;
+    a.count_only = true;
+    bool ok = true;
+    a.take<float>(T * n_expert, ok);
+    a.take<float>(T * K, ok);
+    a.take<int32_t>(T * K, ok);
+    a.take<int32_t>(T * K, ok);
+    a.take<int32_t>(T * K, ok);
+    if (mp.fallback) a.take<uint16_t>(T * K * N, ok);
+    a.take<float>(mb.gu, ok);
+    if (mp.fallback) a.take<uint16_t>(T * K * 640, ok);
+    a.take<float>(T * K * N, ok);
+    a.take<float>(T * 640, ok);
+    a.take<float>(T * 640, ok);
+    a.take<uint16_t>(T * 640, ok);
+    a.take<float>(T * N, ok);
+    a.take<float>(T, ok);
+    if (mp.any) {
+        a.take<uint8_t>(mb.xq, ok);
+        a.take<float>(mb.h, ok);
+        a.take<uint8_t>(mb.hq, ok);
+    }
+    return a.used;
+}
+}  // namespace
+
+bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, core::SessionState& ss,
+                   core::ExpertSource* src, const core::ExpertCache* cache, const int32_t* host_res, int64_t chunk,
+                   void* stream, std::string& err, void* borrow, uint64_t borrow_bytes, bool borrow_spill) try {
+    Impl& m = *impl_;
+    arm_cpu_share(cpu_pool_ != nullptr);
+    m.wt = &wt;
+    m.g = &g;
+    m.ss = &ss;
+    m.src = src;
+    m.cache = cache;
+    m.host_res = host_res;
+    m.T = chunk;
+    m.cs = stream ? (sycl::queue*)stream : &default_queue();
+    m.stats = &stats_;
+    if (g.n_embd != N || g.hc != HC || g.hc_lr != LR || g.n_expert < 1 || ss.k != K) {
+        err = "prefill: geometry differs from the artifact's";
+        return false;
+    }
+    m.device = 0;
+    if (stage_le_ < 0) stage_le_ = g.n_layers;
+    if (stage_lb_ < 0 || stage_lb_ >= stage_le_ || stage_le_ > g.n_layers ||
+        (stage_le_ < g.n_layers) != (next_ != nullptr)) {
+        err = "prefill: the stage's layer range is wrong";
+        return false;
+    }
+    for (int b = 0; next_ != nullptr && b < 2; ++b) {
+        if (!m.hand[b]) {
+            try {
+                m.hand[b] = (float*)sycl::malloc_host((size_t)chunk * D * 4, *m.cs);
+            } catch (...) {
+                m.hand[b] = nullptr;
+            }
+            if (!m.hand[b]) {
+                err = "prefill: the layer split's hand-off buffers";
+                return false;
+            }
+        }
+    }
+    if (m.tok_dev == nullptr) {
+        /*
+        DPCT1000:443: Error handling if-stmt was detected but could not be
+        rewritten.
+        */
+        try {
+            m.tok_dev = sycl::malloc_device<int32_t>((size_t)chunk, *m.cs);
+        } catch (const sycl::exception& exc) {
+            err = std::string("prefill: the token id buffer (") + exc.what() + ")";
+            return false;
+        }
+        if (!m.tok_dev) {
+            err = "prefill: the token id buffer allocation failed";
+            return false;
+        }
+        m.owned.push_back(m.tok_dev);
+        m.tok_host.resize((size_t)chunk);
+    }
+    /*
+    DPCT1025:445: The SYCL queue is created ignoring the flag and priority
+    options.
+    */
+    try {
+        m.copy = new sycl::queue(m.cs->get_context(), m.cs->get_device(), sycl::property::queue::in_order());
+    } catch (const sycl::exception& exc) {
+        err = std::string("prefill: copy stream: ") + exc.what();
+        return false;
+    }
+    const size_t T = (size_t)chunk;
+    m.T_max = chunk;
+    m.borrowed = borrow != nullptr;
+    m.borrow_spill = m.borrowed && borrow_spill;
+    bool ok = true;
+    // one-time: events, the stager, the host buffers (for the largest chunk), the identity page table
+    for (int i = 0; i < std::min(RING_MAX, std::max({ring_cap(), stage_slots(), stage_slots_t(0)})); ++i) {
+        if (!m.copied[i]) m.copied[i] = new sycl::event();
+        if (!m.used[i]) m.used[i] = new sycl::event();
+    }
+    if (!m.stager) {
+        m.stager = std::make_unique<Stager>();
+        const int hw = (int)std::thread::hardware_concurrency();
+        const char* stv = std::getenv("STRATA_STAGER_THREADS");  // D-5: the host copy threads of unpinned blobs
+        // A GGUF read in place (UD-Q4_K_XL beyond its RAM budget): most of a chunk's blobs are page faults on the
+        // SSD, so the copies need many reads in flight - 32 threads and a 128-deep ring read a 4K chunk in 29 s
+        // instead of 71 s on an RTX 5070 / NVMe PC (4 threads, 16 deep: the defaults, kept for every other source)
+        bool files = false;
+        for (int64_t l = 0; src != nullptr && !files && l < g.n_layers; ++l)
+            for (int64_t e = 0; !files && e < g.n_expert; ++e)
+                files = src->transient(l, e);
+        const int threads = stv ? std::clamp(std::atoi(stv), 1, 32) : files ? 32 : std::max(2, std::min(4, hw / 4));
+        if (files && std::getenv("STRATA_STAGER_RING") == nullptr) m.stager->kRing = 4 * threads;
+        if (!m.stager->init((size_t)MAXBLOB(), threads, m.cs)) ok = false;
+    }
+    m.steps_host.resize(T * strata::kernels::kStepCount);
+    m.ids_host.resize(T * K);
+    m.slot_host.resize(T * K);
+    m.src_host.resize(T * K);
+    m.cnt.resize(m.g->n_expert);
+    m.off.resize(m.g->n_expert + 1);
+    {
+        const size_t need = 3 * T * K + (size_t)(2 * (m.g->n_expert + m.g->n_expert / MMQ_GROUP + 2));
+        // SYCL port: the *copy* arm is the default.  On the mapped arm the GPU reads these tables straight out of
+        // mapped host memory, per layer; copying them first is measurably faster on a PCIe-attached pair and
+        // token-identical - 4,106 tokens 1,303 -> 1,335 tok/s, 16,380 tokens 1,622 -> 1,665, the 10,938-token chat
+        // prompt 1,576 -> 1,617, decode unchanged (round 46).  STRATA_GROUP_COPY=0 restores the mapped arm.
+        const char* gc = std::getenv("STRATA_GROUP_COPY");
+        const bool group_copy = (gc == nullptr || gc[0] != '0') && !predict_on();
+        if (m.grp_n < need && !group_copy) {
+            if (m.grp_host) sycl::free(m.grp_host, *m.cs);
+            m.grp_host = m.grp_dev = nullptr;
+            m.grp_n = m.grp_tk = 0;
+            void* h = nullptr;
+            try {
+                h = (void*)sycl::malloc_host(need * 4, *m.cs);
+                if (h) {
+                    m.grp_host = (int32_t*)h;
+                    m.grp_dev = (int32_t*)h;
+                    m.grp_n = need;
+                    m.grp_tk = T * K;
+                }
+            } catch (...) {
+                if (h) sycl::free(h, *m.cs);
+            }
+        }
+    }
+    for (int b = 0; b < 2; ++b) {
+        if (!m.ple_emb_host[b]) {
+            try {
+                m.ple_emb_host[b] = (float*)sycl::malloc_host((size_t)T * N * 4, *m.cs);
+            } catch (...) {
+                m.ple_emb_host[b] = nullptr;
+            }
+            if (!m.ple_emb_host[b]) {
+                m.ple_pageable[b].resize(T * N);
+                m.ple_emb_host[b] = m.ple_pageable[b].data();
+            }
+        }
+        if (!m.ple_copied[b]) {
+            m.ple_copied[b] = new sycl::event();
+        }
+        m.ple_rows[b].resize(T * strata::kernels::PLE_N_HEADS);
+    }
+    if (ss.qsa_states[ss.qsa_primary()].kv_mode == 1) {  // KV streaming: the staging pool's identity page table
+        const int64_t pages = ss.qsa_states[ss.qsa_primary()].n_pages;
+        std::vector<int32_t> ident((size_t)pages);
+        for (int64_t i = 0; i < pages; ++i)
+            ident[(size_t)i] = (int32_t)i;
+        try {
+            m.ident_table = (int32_t*)sycl::malloc_device(ident.size() * 4, *m.cs);
+            if (m.ident_table) {
+                m.cs->memcpy(m.ident_table, ident.data(), ident.size() * 4).wait();
+                m.owned.push_back(m.ident_table);
+            } else {
+                ok = false;
+            }
+        } catch (...) {
+            ok = false;
+        }
+    }
+    if (!ok) {
+        err = "prefill: host buffers or events for a chunk of " + std::to_string(chunk) + " tokens";
+        return false;
+    }
+    Alloc o;
+    o.base = (uint8_t*)borrow;
+    o.cap = borrow_bytes;
+    o.spill = m.borrow_spill;
+    o.owned = &m.owned;
+    {
+        uint16_t* gs = o.take<uint16_t>((size_t)GEMM_SCRATCH, ok);
+        void* ws = o.take<uint8_t>(GEMM_WS, ok);
+        if (!ok) {
+            err = "prefill: GEMM scratch does not fit";
+            return false;
+        }
+        if (!m.gemm.init_external(stream, gs, GEMM_SCRATCH, ws, GEMM_WS, err)) return false;
+    }
+    if (!carve(T, &o)) {
+        err = "prefill: device buffers for a chunk of " + std::to_string(chunk) + " tokens do not fit";
+        return false;
+    }
+    return true;
+} catch (sycl::exception const& exc) {
+    std::cerr << exc.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
+    std::exit(1);
+}
+
+// Every device buffer of a chunk of T tokens, from the Alloc `alloc` (after the GEMM scratch and workspace): `init`
+// once, and `relayout` for a request's own chunk.  The order is `bytes_needed`'s.
+bool Prefill::carve(size_t T, void* alloc) {
+    Impl& m = *impl_;
+    Alloc& o = *static_cast<Alloc*>(alloc);
+    const core::ModelGeometry& g = *m.g;
+    core::SessionState& ss = *m.ss;
+    bool ok = true;
+    m.emb = o.take<float>(T * N, ok);
+    m.R = o.take<float>(T * D, ok);
+    m.xn = gr_unfused() ? o.take<float>(T * D, ok) : nullptr;  // F-1: not needed (gr_mix_r reads R)
+    m.grs = o.take<float>(T * HC, ok);
+    m.xn16 = o.take<uint16_t>(T * D, ok);
+    m.lo = o.take<float>(T * LR, ok);
+    m.lo16 = o.take<uint16_t>(T * LR, ok);
+    m.gated = o.take<float>(T * D, ok);
+    m.inj = o.take<float>(T * HC, ok);
+    m.mixed = o.take<float>(T * N, ok);
+    m.mixed_bf = o.take<uint16_t>(T * N, ok);
+    m.mixed_h = o.take<uint16_t>(T * N, ok);
+    m.bo = o.take<float>(T * N, ok);
+    if (bf16x2_hc()) {
+        m.xn16_lo = o.take<uint16_t>(T * D, ok);
+        m.lo16_lo = o.take<uint16_t>(T * LR, ok);
+    }
+    if (bf16x2()) m.mixed_bf_lo = o.take<uint16_t>(T * N, ok);
+    m.steps_dev = o.take<int32_t>(T * strata::kernels::kStepCount, ok);
+    strata::kernels::QsaShapes s = strata::kernels::qsa_real_shapes();
+    s.n_head = g.n_head;
+    s.n_head_kv = g.n_head_kv;
+    s.head_dim = g.head_dim;
+    s.idx_n_head = g.idx_q_heads;
+    s.idx_dim = g.idx_key_dim;
+    m.cap = strata::kernels::qsa_selection_width(strata::kernels::kTopkMaxCells, s);
+    m.attn_batch = attn_batch_for(T);
+    m.max_blocks = ss.qsa_states[ss.qsa_primary()].max_cells / s.idx_block + 2;
+    {
+        // one region for the attention half's and the MoE half's scratch (see gdn_set_bytes)
+        const bool fz = fused_layout(T, m.src != nullptr);
+        const MoeBufs mb = moe_bufs(T, m.g->n_expert, fz);
+        const uint64_t region =
+            std::max({gdn_set_bytes(T), qsa_set_bytes(T, m.cap, m.max_blocks, m.sel_batch, m.attn_batch, s),
+                      moe_set_bytes(T, m.g->n_expert, fz)});
+        uint8_t* base = o.take<uint8_t>((size_t)region, ok);
+        m.region = base;
+        m.region_bytes = region;
+        Alloc a;
+        a.base = base;
+        a.cap = region;
+        a.owned = &m.owned;
+        m.qkv = a.take<float>(T * C, ok);
+        m.z = a.take<float>(T * ZV, ok);
+        m.ab = a.take<float>(T * 2 * HV, ok);
+        m.gate = a.take<float>(T * HV, ok);
+        m.beta = a.take<float>(T * HV, ok);
+        m.hbuf = a.take<float>(T * C, ok);
+        m.y = a.take<float>(T * ZV, ok);
+        m.y_h = a.take<uint16_t>(T * ZV, ok);
+        Alloc b;
+        b.base = base;
+        b.cap = region;
+        b.owned = &m.owned;
+        m.Kc = b.take<float>(T * 512, ok);
+        m.Vc = b.take<float>(T * 512, ok);
+        m.Qf = b.take<float>(T * 12288, ok);
+        m.q = b.take<float>(T * ZV, ok);
+        m.idx_raw = b.take<float>(T * 128, ok);
+        m.q_idx = b.take<float>(T * 512, ok);
+        m.attn = b.take<float>(T * ZV, ok);
+        m.attn_h = b.take<uint16_t>(T * ZV, ok);
+        m.sel_ids = b.take<int32_t>(T * (size_t)m.cap, ok);
+        m.sel_scores = b.take<float>((size_t)m.sel_batch * (size_t)m.max_blocks, ok);
+        m.attn_scratch =
+            b.take<float>((size_t)m.attn_batch * strata::kernels::qsa_decode_attn_scratch_floats(m.cap, s), ok);
+        Alloc c;
+        c.base = base;
+        c.cap = region;
+        c.owned = &m.owned;
+        m.logits = c.take<float>(T * m.g->n_expert, ok);
+        m.w = c.take<float>(T * K, ok);
+        m.ids = c.take<int32_t>(T * K, ok);
+        m.slot_dev = c.take<int32_t>(T * K, ok);
+        m.src_dev = c.take<int32_t>(T * K, ok);
+        const MmqPlan& mp = mmq_plan();
+        m.Xs = mp.fallback ? c.take<uint16_t>(T * K * N, ok) : nullptr;
+        m.GU = c.take<float>(mb.gu, ok);
+        m.Hh = mp.fallback ? c.take<uint16_t>(T * K * 640, ok) : nullptr;
+        m.Dm = c.take<float>(T * K * N, ok);
+        m.sgate = c.take<float>(T * 640, ok);
+        m.sup = c.take<float>(T * 640, ok);
+        m.sh_h = c.take<uint16_t>(T * 640, ok);
+        m.shared = c.take<float>(T * N, ok);
+        m.sg = c.take<float>(T, ok);
+        if (mp.any) {
+            m.Xq = c.take<uint8_t>(mb.xq, ok);
+            m.H = c.take<float>(mb.h, ok);
+            m.Hq = c.take<uint8_t>(mb.hq, ok);
+        }
+        if (base == nullptr) ok = false;
+    }
+    for (int i = 0; i < DQ; ++i) {
+        m.dq_gu[i] = o.take<uint16_t>(1280 * 2560, ok);
+        m.dq_d[i] = o.take<uint16_t>(2560 * 640, ok);
+    }
+    if (mmq_plan().any) {
+        const MmqPlan& mp = mmq_plan();
+        const size_t ids_rows = mmq_ids_rows(T);
+        if (ids_rows == 0) ok = false;
+        m.ids_identity = o.take<int32_t>(ids_rows, ok);
+        m.bounds_dev = o.take<int32_t>((size_t)(2 * (m.g->n_expert + m.g->n_expert / MMQ_GROUP + 2)), ok);
+        m.grp_gu = o.take<uint8_t>(MMQ_GROUP * mp.gu_max + MMQ_TAIL, ok);
+        m.grp_d = o.take<uint8_t>(MMQ_GROUP * mp.d_max + MMQ_TAIL, ok);
+        // (written at every run's start, not here: when serving, these are live expert-cache slots until a request
+        // lends them - a write now would corrupt a resident expert)
+        if (!m.mmq_ctx) m.mmq_ctx = std::make_unique<mmq::Context>();
+    }
+    m.ring = ring_slots(T);
+    const int ring_n = stage_slots(T);
+    for (int i = 0; i < ring_n; ++i) {
+        m.stage_dev[i] = o.take<uint8_t>((size_t)MAXBLOB(), ok);
+        m.stage_live[i] = false;  // a new buffer: nothing of an earlier layout to wait for
+    }
+    m.ple_emb = o.take<float>(T * N, ok);
+    m.ple_norm = o.take<float>((size_t)strata::kernels::NG_HC_DIM, ok);
+    take_stage(o, ss, s, m.stage, ok);
+    {
+        const core::QsaState& q0 = ss.qsa_states[ss.qsa_primary()];
+        m.stage_cells = q0.kv_mode == 1 && stage_fit_on() && g_stage_cells > 0 && g_stage_cells < (int64_t)q0.n_pages * s.page_size
+                            ? (g_stage_cells + s.page_size - 1) / s.page_size * s.page_size
+                            : INT64_MAX;
+    }
+    m.T = (int64_t)T;
+    return ok;
+}
+
+bool Prefill::relayout(int64_t chunk, void* borrow, uint64_t borrow_bytes, std::string& err, int64_t tail) try {
+    (void)tail;
+    Impl& m = *impl_;
+    if (m.borrow_spill) {
+        err = "prefill: a hybrid borrowed/owned layout cannot be changed between requests";
+        return false;
+    }
+    if (!m.borrowed || borrow == nullptr || chunk <= 0 || chunk > m.T_max) {
+        err = "prefill: relayout needs borrowed buffers and a chunk of at most " + std::to_string(m.T_max);
+        return false;
+    }
+    try {
+        if (m.cs) m.cs->wait();
+        if (m.copy) m.copy->wait();
+    } catch (...) {
+        err = "prefill: relayout: the stream failed";
+        return false;
+    }
+    bool ok = true;
+    Alloc o;
+    o.base = (uint8_t*)borrow;
+    o.cap = borrow_bytes;
+    o.owned = &m.owned;
+    uint16_t* gs = o.take<uint16_t>((size_t)GEMM_SCRATCH, ok);
+    void* ws = o.take<uint8_t>(GEMM_WS, ok);
+    if (ok) m.gemm.rebind(gs, GEMM_SCRATCH, ws, GEMM_WS);
+    if (!ok || !carve((size_t)chunk, &o)) {
+        err = "prefill: device buffers for a chunk of " + std::to_string(chunk) + " tokens do not fit";
+        return false;
+    }
+    return true;
+} catch (sycl::exception const& exc) {
+    std::cerr << exc.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
+    std::exit(1);
+}
+
+int64_t Prefill::chunk() const { return impl_->T; }
+
+bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t* next_tokens, int64_t n, int64_t cell0,
+                       std::string& err, const char** why) {
+    Impl& m = *impl_;
+    auto decline = [&](const char* reason) { if (why != nullptr) *why = reason; return false; };
+    static const bool off = [] {
+        const char* v = std::getenv("STRATA_MTP_BATCH");
+        return v != nullptr && v[0] == '0';
+    }();
+    core::QsaState& st = mtp.kv_state_rw();
+    if (off) return decline("STRATA_MTP_BATCH=0");
+    if (n <= 0 || m.g == nullptr || m.region == nullptr) return decline("no prefill state");
+    if (st.kv_mode != 0 || st.kv_hybrid) return decline("hybrid or non-zero kv_mode");
+    if (mtp.device() != m.device) return decline("cross-device drafter");
+    const auto t0 = Clock::now();
+    const core::ModelGeometry& g = *m.g;
+    const int64_t Nn = g.n_embd, HCN = g.hc * g.n_embd, KV = g.n_head_kv * g.head_dim;
+    constexpr int kQ8_0 = 8;  // GGML_TYPE_Q8_0
+    const float* w_ne = mtp.tensor_f32("pre_fc_norm_embedding.weight");
+    const void* w_fe = mtp.tensor_q8("fc_embedding.weight");
+    const float* w_nh = mtp.tensor_f32("pre_fc_norm_hidden.weight");
+    const void* w_fh = mtp.tensor_q8("fc_hidden.weight");
+    const float* w_hn = mtp.tensor_f32("attn_hyper_connection.hc_norm.weight");
+    const uint16_t* w_dn = mtp.tensor_bf16("attn_hyper_connection.input_mix_weight_down.weight");
+    const uint16_t* w_up = mtp.tensor_bf16("attn_hyper_connection.input_mix_weight_up.weight");
+    const void* w_k = mtp.tensor_q8("self_attn.k_proj.weight");
+    const void* w_v = mtp.tensor_q8("self_attn.v_proj.weight");
+    const float* w_kn = mtp.tensor_f32("self_attn.k_norm.weight");
+    if (!w_ne || !w_fe || !w_nh || !w_fh || !w_hn || !w_dn || !w_up || !w_k || !w_v || !w_kn) return false;
+    const core::NativeEmbed* nemb = core::native_embed();
+    const core::WeightRef* wemb = nemb ? nullptr : m.wt->find("token_embd.weight");
+    if (!nemb && (wemb == nullptr || wemb->codebook_iq4nl || wemb->ne0 != g.n_embd || wemb->group_elems <= 0 ||
+                  (wemb->code_bits != 2 && wemb->code_bits != 4 && wemb->code_bits != 8)))
+        return false;
+    // the cells the drafter's window can still reach
+    const int64_t r0 = std::max<int64_t>(0, mtp.first_needed() - cell0);
+    if (r0 >= n) return true;
+    // per row: emb/e2 (N), en16 (N half), hn/h2/Rm/gated (HCN), hn16/xn16 (HCN half), lo (LR) + lo16, grs, mixed (N) +
+    // mixed_h, K and V (KV each), the token id
+    // E-9: the drafter's Q8_0 matrices through Q8_1 x Q8_0 MMQ - its own pass's integer dot products (mmvq), so
+    // its K/V stay close to what the drafter computes itself; STRATA_MTP_BATCH_F16=1: FP16 GEMMs (the A/B)
+    static const bool f16_only = [] {
+        const char* v = std::getenv("STRATA_MTP_BATCH_F16");
+        return v && v[0] == '1';
+    }();
+    const bool q8 = !f16_only && mmq::built() && mmq::fits(kQ8_0, Nn) && mmq::fits(kQ8_0, KV);  // #420
+    const uint64_t per_row = 4 * (2 * Nn + 4 * HCN + LR + HC + Nn + 2 * KV + 1) + 2 * (Nn + 2 * HCN + LR + Nn) + 64 +
+                             (q8 ? (uint64_t)mmq::q8_bytes(g.hc, Nn) + 8 * g.hc : 0);  // (8 * hc: the row table twice, see its margin below)
+    const int64_t B = std::min<int64_t>(n - r0, (int64_t)(m.region_bytes / per_row) & ~(int64_t)63);
+    if (B < 64) return false;
+    uint8_t* q = m.region;
+    auto carve = [&](size_t bytes) {
+        void* p = q;
+        q += (bytes + 255) & ~(size_t)255;
+        return p;
+    };
+    float* emb = (float*)carve((size_t)B * Nn * 4);
+    float* e2 = (float*)carve((size_t)B * Nn * 4);
+    uint16_t* en16 = (uint16_t*)carve((size_t)B * Nn * 2);
+    float* hn = (float*)carve((size_t)B * HCN * 4);
+    float* h2 = (float*)carve((size_t)B * HCN * 4);
+    float* Rm = (float*)carve((size_t)B * HCN * 4);
+    float* gated = (float*)carve((size_t)B * HCN * 4);
+    uint16_t* hn16 = (uint16_t*)carve((size_t)B * HCN * 2);
+    uint16_t* xn16 = (uint16_t*)carve((size_t)B * HCN * 2);
+    float* lo = (float*)carve((size_t)B * LR * 4);
+    uint16_t* lo16 = (uint16_t*)carve((size_t)B * LR * 2);
+    float* grs = (float*)carve((size_t)B * HC * 4);
+    float* mixed = (float*)carve((size_t)B * Nn * 4);
+    uint16_t* mixed_h = (uint16_t*)carve((size_t)B * Nn * 2);
+    float* Kc = (float*)carve((size_t)B * KV * 4);
+    float* Vc = (float*)carve((size_t)B * KV * 4);
+    int32_t* tok = (int32_t*)carve((size_t)B * 4);
+    void* xq = q8 ? carve(mmq::q8_bytes(B * g.hc, Nn)) : nullptr;
+    // The row table is read past its end by llama.cpp's MMQ (a whole J-column tile from the start of each tile; the stream-k fixup up to roundup(max_rows, J)
+    // from the expert's first row; J up to 128): rows + the margin of mmq_ids_margin.hpp, max_rows <= B * hc (one expert, p.n = 1), the identity over all of it.
+    const uint64_t ids_rows = q8 ? mmq::mmq_ids_table_rows((uint64_t)(B * g.hc), (uint64_t)(B * g.hc)) : 0;
+    int32_t* ident = q8 ? (int32_t*)carve((size_t)ids_rows * 4) : nullptr;
+    int32_t* bnd = q8 ? (int32_t*)carve(16) : nullptr;
+    if ((uint64_t)(q - m.region) > m.region_bytes) return false;
+    if (!mtp.idle(err)) return false;  // the drafter's own stream (its graph uploads) before this writes its K/V
+    strata::kernels::QsaShapes s = strata::kernels::qsa_real_shapes();
+    s.n_head = g.n_head;
+    s.n_head_kv = g.n_head_kv;
+    s.head_dim = g.head_dim;
+    s.idx_n_head = g.idx_q_heads;
+    s.idx_dim = g.idx_key_dim;
+    std::vector<int32_t> tk((size_t)B);
+    if (q8) {
+        if (!m.mmq_ctx) m.mmq_ctx = std::make_unique<mmq::Context>();
+        mmq::iota(ident, (int64_t)ids_rows, m.cs);
+    }
+    // y[rows, n_out] = x[rows, k] . w^T for a Q8_0 matrix: MMQ from the FP32 rows (bounds slot 0: rows, 1: rows*hc)
+    auto proj = [&](const float* x, const uint16_t* x16, const void* w, float* y, int64_t rows, int64_t n_out,
+                    int64_t k, int slot) {
+        if (!q8) {
+            m.gemm.native(x16, kQ8_0, w, y, rows, n_out, k);
+            return;
+        }
+        mmq::quantize(x, nullptr, xq, kQ8_0, k, k, rows, m.cs);
+        mmq::Product p;
+        p.w = w;
+        p.type = kQ8_0;
+        p.w_rows = n_out;
+        p.w_cols = k;
+        p.expert_bytes = mmq::matrix_bytes(kQ8_0, n_out, k);
+        p.n = 1;
+        p.xq = xq;
+        p.bounds = bnd + 2 * slot;
+        p.ids = ident;
+        p.total_rows = rows;
+        p.max_rows = rows;
+        p.dst = y;
+        p.ld_dst = n_out;
+        m.mmq_ctx->run(p, m.cs);
+    };
+    for (int64_t b0 = r0; b0 < n; b0 += B) {
+        const int64_t nb = std::min(B, n - b0), c0 = cell0 + b0;
+        for (int64_t i = 0; i < nb; ++i)
+            tk[(size_t)i] = next_tokens[b0 + i];
+        const int32_t bh[4] = {0, (int32_t)nb, 0, (int32_t)(nb * g.hc)};
+        try {
+            if (q8) m.cs->memcpy(bnd, bh, sizeof bh);
+            m.cs->memcpy(tok, tk.data(), (size_t)nb * 4);
+        } catch (...) {
+            err = "prefill: the draft upload failed";
+            return false;
+        }
+        // the input branches: the next token's embedding, and this cell's final residual rows
+        if (nemb) {
+            nemb->gather_dev(tok, nb, emb, m.cs);
+        } else {
+            const auto* codes = (const uint8_t*)wemb->data;
+            const auto* scales = (const float*)(codes + wemb->codes_bytes);
+            const auto* offsets =
+                wemb->has_offset ? (const float*)(codes + wemb->codes_bytes + wemb->scales_bytes) : nullptr;
+            strata::kernels::embedding_gather_dev(
+                codes, scales, offsets, tok, (int)nb, wemb->ne0, wemb->code_bits, wemb->code_bias, wemb->group_elems,
+                (uint64_t)(wemb->ne0 / (8 / wemb->code_bits)), (uint64_t)(wemb->ne0 / wemb->group_elems), emb, m.cs);
+        }
+        rms_rows(emb, w_ne, nb, Nn, Nn, EPS, m.cs);
+        if (!q8) to_f16(emb, en16, nb * Nn, m.cs);
+        proj(emb, en16, w_fe, e2, nb, Nn, Nn, 0);
+        /*
+        DPCT1124:448: cudaMemcpyAsync is migrated to asynchronous memcpy API.
+        While the origin API might be synchronous, it depends on the type of
+        operand memory, so you may need to call wait() on event return by memcpy
+        API to ensure synchronization behavior.
+        */
+        m.cs->memcpy(hn, R_rows + (size_t)b0 * HCN, (size_t)nb * HCN * 4);
+        rms_rows(hn, w_nh, nb, HCN, HCN, EPS, m.cs);
+        if (!q8) to_f16(hn, hn16, nb * HCN, m.cs);
+        proj(hn, hn16, w_fh, h2, nb * g.hc, Nn, Nn, 1);  // every stream through fc_hidden
+        strata::kernels::add_streams_broadcast(h2, e2, Rm, Nn, (int)g.hc, (int)nb, m.cs);
+        // the attention hyper-connection's read (its mixed input only: this pass writes nothing back)
+        gr_norm_rs(Rm, w_hn, EPS, grs, xn16, nb, m.cs);
+        m.gemm.bf16(xn16, w_dn, lo, nb, LR, HCN);
+        gr_silu(lo, lo16, nb, m.cs);
+        m.gemm.bf16(lo16, w_up, gated, nb, HCN, LR);
+        gr_mix_r(Rm, grs, w_hn, gated, mixed, nullptr, nb, m.cs, mixed_h);
+        // K and V into the drafter's cache, as the prompt path's QSA layers append theirs
+        proj(mixed, mixed_h, w_k, Kc, nb, KV, Nn, 0);
+        proj(mixed, mixed_h, w_v, Vc, nb, KV, Nn, 0);
+        rms_rows(Kc, w_kn, nb * g.n_head_kv, g.head_dim, g.head_dim, EPS, m.cs);
+        rope(Kc, nb, g.n_head_kv, g.head_dim, KV, c0, strata::kernels::rope_scaling(), m.cs);
+        if (st.kv_rot) {  // rotated as the drafter's own decode stores them (mtp.cpp)
+            strata::kernels::fwht256_inplace_cuda(Kc, nb * g.n_head_kv, m.cs);
+            strata::kernels::fwht256_inplace_cuda(Vc, nb * g.n_head_kv, m.cs);
+        }
+        if (st.kv_q4) {
+            strata::kernels::kv_append_q4(st.k_q4, st.v_q4, st.page_table, c0, nb, Kc, Vc, s, m.cs, &st.host);
+        } else {
+            kv_append(Kc, Vc, nb, c0, st.page_table, s.page_size, st.kv_int8 ? nullptr : st.k_pool,
+                      st.kv_int8 ? nullptr : st.v_pool, st.k_q, st.v_q, st.k_scale, st.v_scale, m.cs, &st.host);
+        }
+    }
+    try {
+        m.cs->wait();
+    } catch (...) {
+        err = "prefill: the draft layer's K/V failed";
+        return false;
+    }
+    mtp.ms_prefill += ms_since(t0);
+    return true;
+}
+void Prefill::set_pinned_share(double share) { g_pinned_share = share; }
+void Prefill::set_ring_override(int slots) { g_ring_override = slots > 0 ? slots : 0; }
+void Prefill::set_stage_cells(int64_t cells) { g_stage_cells = cells > 0 ? cells : 0; }
+int64_t Prefill::stage_cells() const { return impl_ ? impl_->stage_cells : INT64_MAX; }
+bool Prefill::predict_enabled() { return predict_on(); }
+size_t Prefill::predict_max_tokens() { return predict_max_t(); }
+int Prefill::predict_bank_slots() { return predict_bank(); }
+bool Prefill::early_copy_enabled() { return early_copy_on(); }
+bool Prefill::shared_first_enabled() { return shared_first(); }
+bool Prefill::fold_quiet_enabled() { return fold_quiet(); }
+bool Prefill::stage_fit_enabled() { return stage_fit_on(); }
+double Prefill::pinned_share() { return g_pinned_share; }
+
+uint64_t Prefill::bytes_needed(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk, bool src, int64_t tail) {
+    (void)src;
+    (void)tail;
+    // the same allocation sequence as `init`, counted
+    const size_t T = (size_t)chunk;
+    bool ok = true;
+    Alloc o;
+    o.count_only = true;
+    o.take<uint16_t>((size_t)GEMM_SCRATCH, ok);
+    o.take<uint8_t>(GEMM_WS, ok);
+    auto f = [&](size_t n) { o.take<float>(n, ok); };
+    f(T * N);
+    f(T * D);
+    f(T * D);
+    o.take<uint16_t>(T * D, ok);
+    f(T * LR);
+    o.take<uint16_t>(T * LR, ok);
+    f(T * D);
+    f(T * HC);
+    f(T * N);
+    o.take<uint16_t>(T * N, ok);
+    o.take<uint16_t>(T * N, ok);
+    f(T * N);
+    if (bf16x2_hc()) {
+        o.take<uint16_t>(T * D, ok);
+        o.take<uint16_t>(T * LR, ok);
+    }
+    if (bf16x2()) o.take<uint16_t>(T * N, ok);
+    o.take<int32_t>(T * strata::kernels::kStepCount, ok);
+    strata::kernels::QsaShapes s = strata::kernels::qsa_real_shapes();
+    s.n_head = g.n_head;
+    s.n_head_kv = g.n_head_kv;
+    s.head_dim = g.head_dim;
+    s.idx_n_head = g.idx_q_heads;
+    s.idx_dim = g.idx_key_dim;
+    const int64_t cap = strata::kernels::qsa_selection_width(strata::kernels::kTopkMaxCells, s);
+    const int64_t max_blocks = ss.qsa_states[ss.qsa_primary()].max_cells / s.idx_block + 2;
+    o.take<uint8_t>((size_t)std::max({gdn_set_bytes(T), qsa_set_bytes(T, cap, max_blocks, 256, attn_batch_for(T), s),
+                                      moe_set_bytes(T, g.n_expert, fused_layout(T, true))}),
+                    ok);
+    for (int i = 0; i < DQ; ++i) {
+        o.take<uint16_t>(1280 * 2560, ok);
+        o.take<uint16_t>(2560 * 640, ok);
+    }
+    if (mmq_plan().any) {
+        const MmqPlan& mp = mmq_plan();
+        o.take<int32_t>(mmq_ids_rows(T), ok);
+        o.take<int32_t>((size_t)(2 * (g.n_expert + g.n_expert / MMQ_GROUP + 2)), ok);
+        o.take<uint8_t>(MMQ_GROUP * mp.gu_max + MMQ_TAIL, ok);
+        o.take<uint8_t>(MMQ_GROUP * mp.d_max + MMQ_TAIL, ok);
+    }
+    for (int i = 0; i < stage_slots(T); ++i)
+        o.take<uint8_t>((size_t)MAXBLOB(), ok);
+    f(T * N);
+    f((size_t)strata::kernels::NG_HC_DIM);
+    strata::kernels::KvHostPools stage;
+    take_stage(o, ss, s, stage, ok);
+    return o.used + (8u << 20);  // alignment slack
+}
+
+uint64_t Prefill::bytes_needed_owned(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk, bool src) {
+    return bytes_needed(g, ss, chunk, src);
+}
+
+uint64_t Prefill::bytes_needed_no_ring(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk, bool src) {
+    return bytes_needed(g, ss, chunk, src) - (uint64_t)stage_slots((size_t)chunk) * (uint64_t)MAXBLOB();
+}
+
+void Prefill::set_ring_budget(int slots, int64_t small_max) {
+    g_ring_budget = slots > 0 ? slots : 0;
+    g_ring_small_max = small_max > 0 ? small_max : 0;
+}
+int64_t Prefill::stream_all_min_tokens() { return stream_all_min(); }
+
+int64_t Prefill::ring_default_slots() {
+    const int r = g_pinned_share >= 0.9 ? (fused_ring() ? 1024 : 384) : 96;
+    return (int64_t)std::min(r, ring_cap());
+}
+
+int64_t Prefill::ring_cap_for(int64_t old_chunk) {
+    constexpr int64_t kKeepRingChunk = 6144;
+    return old_chunk >= kKeepRingChunk ? ring_default_slots() : ring_max_slots();
+}
+
+int64_t Prefill::ring_max_slots() {
+    return g_pinned_share >= 0.9 ? (int64_t)ring_budget_slots() : (int64_t)std::min(96, ring_cap());
+}
+
+int64_t Prefill::ring_slots_for(int64_t chunk) { return ring_slots((size_t)chunk); }
+void Prefill::set_cpu_pool(kernels::cpu::ExpertPool* pool) { cpu_pool_ = pool; }
+void Prefill::arm_cpu_share(bool applies, bool by_default) {
+    (void)by_default;  // SYCL: opt-in only via STRATA_PREFILL_CPU_SHARE so default path stays byte-identical
+    if (applies && cpu_share_on()) g_stream_min_share = cpu_share_max();
+}
+void Prefill::set_share_blocked(bool blocked) { g_share_blocked.store(blocked, std::memory_order_release); }
+
+bool Prefill::ring_bytes_enabled() { return ring_bytes_on(); }
+size_t Prefill::slot_guard_bytes() { return mmq::direct_slot_guard(); }
+
+bool Prefill::set_stage_helper(Prefill* /*helper*/, std::string& /*err*/) {
+    return true;
+}
+
+namespace {
+
+const core::WeightRef* need(const core::LayerView& v, const char* suffix, std::string& err) {
+    const core::WeightRef* r = v.get(suffix);
+    if (!r) err = v.name(suffix) + " is missing";
+    return r;
+}
+bool native_proj(Gemm& gm, const core::WeightRef* w, const uint16_t* X, float* Y, int64_t T, const std::string& name,
+                 std::string& err, int64_t ldy = 0) {
+    if (!w->native_data) {
+        err = "prefill: " + name + " has no native GGUF blocks (run with --native)";
+        return false;
+    }
+    gm.native(X, w->native_type, w->native_data, Y, T, w->ne1, w->ne0, ldy);
+    return true;
+}
+bool bf16_proj(Gemm& gm, const core::WeightRef* w, const uint16_t* X, float* Y, int64_t T, const std::string& name,
+               std::string& err, int64_t ldy = 0, const uint16_t* X_lo = nullptr) {
+    if (w->kind != core::WeightKind::Bf16InF32 || !w->data) {
+        err = "prefill: " + name + " is not a resident BF16 tensor";
+        return false;
+    }
+    gm.bf16(X, (const uint16_t*)w->data, Y, T, w->ne1 > 0 ? w->ne1 : 1, w->ne0, ldy);
+    if (X_lo) gm.bf16(X_lo, (const uint16_t*)w->data, Y, T, w->ne1 > 0 ? w->ne1 : 1, w->ne0, ldy, 1.0f);
+    return true;
+}
+
+}  // namespace
+
+namespace {
+// STRATA_PREFILL_TIMING=1: the prompt path's GPU time by phase.  Events are recorded on the compute stream in order;
+// the time between two consecutive marks is charged to the phase of the first, so a gap where the GPU waits (for the
+// host's expert grouping, or for an expert's copy) lands on the phase that was waiting.  Events are reused: the marks
+// are folded at every MoE layer's host sync, after which all of them have completed.
+enum PfPhase {
+    kPfStart,
+    kPfHc,
+    kPfGdn,
+    kPfQsa,
+    kPfQsaIdx,
+    kPfQsaSel,
+    kPfQsaAttn,
+    kPfRouter,
+    kPfHostGroup,
+    kPfGather,
+    kPfWaitCopy,
+    kPfDequant,
+    kPfGemmGU,
+    kPfGemmD,
+    kPfCombine,
+    kPfPle,
+    kPfKvStage,
+    kPfGdnConv,
+    kPfGdnRec,
+    kPfGdnOut,
+    kPfCount
+};
+const char* const kPfNames[kPfCount] = {
+    "embed+steps",   "hc read",       "gdn",      "qsa proj",       "qsa indexer",    "qsa select",   "qsa attn",
+    "router+shared", "host grouping", "gather",   "wait copy",      "dequant",        "gemm gate/up", "gemm down",
+    "combine",       "ple",           "kv stage", "gdn conv+gates", "gdn recurrence", "gdn out proj"};
+struct PfTimer {
+    bool on = std::getenv("STRATA_PREFILL_TIMING") != nullptr;
+    std::vector<sycl::event*> ev;
+    std::vector<int> ph;
+    size_t used = 0;
+    double ms[kPfCount] = {};
+    void mark(int phase, sycl::queue* s) {
+        if (!on) return;
+        if (used == ev.size()) {
+            ev.push_back(new sycl::event());
+            ph.push_back(0);
+        }
+        ph[used] = phase;
+        if (s && ev[used]) *ev[used] = s->ext_oneapi_submit_barrier();
+        ++used;
+    }
+    // every recorded mark has completed (the stream was synchronized): charge the gaps, keep the last mark
+    void fold() {
+        if (!on || used < 2) return;
+        static const bool quiet = std::getenv("STRATA_PREFILL_TIMING") == nullptr;
+        if (quiet && fold_quiet()) {   // STRATA_PF_FOLD_QUIET: nobody reads the sums: keep the last mark only
+            std::swap(ev[0], ev[used - 1]);
+            std::swap(ph[0], ph[used - 1]);
+            used = 1;
+            return;
+        }
+        for (size_t i = 0; i + 1 < used; ++i) {
+            try {
+                auto t_end = ev[i + 1]->get_profiling_info<sycl::info::event_profiling::command_end>();
+                auto t_start = ev[i]->get_profiling_info<sycl::info::event_profiling::command_start>();
+                float t = (float)(t_end - t_start) / 1000000.0f;
+                ms[ph[i]] += t;
+            } catch (...) {
+            }
+        }
+        std::swap(ev[0], ev[used - 1]);
+        std::swap(ph[0], ph[used - 1]);
+        used = 1;
+    }
+    ~PfTimer() {
+        for (sycl::event* e : ev)
+            delete e;
+    }
+};
+
+const char* lm_env_text() {
+    static const char* const e = std::getenv("STRATA_PREFILL_LAYER_MAJOR");
+    return e;
+}
+bool lm_env_explicit() { const char* e = lm_env_text(); return e != nullptr && e[0] != '\0'; }
+
+bool lm_even_env() {
+    static const bool v = [] { const char* e = std::getenv("STRATA_PREFILL_LM_EVEN"); return !(e && e[0] == '0'); }();
+    return v;
+}
+
+int64_t lm_tokens_env() {
+    static const int64_t v = [] { const char* e = std::getenv("STRATA_PREFILL_LM_TOKENS"); return e ? (int64_t) std::atoll(e) : (int64_t) 0; }();
+    return v;
+}
+int lm_r_env() {
+    static const int v = [] {
+        const char* e = std::getenv("STRATA_PREFILL_LM_R");
+        if (!e) return 0;
+        const std::string s(e);
+        return s == "vram" ? 1 : s == "host" ? 2 : 0;
+    }();
+    return v;
+}
+int64_t lm_margin_bytes(bool by_default) {
+    static const int64_t explicit_v = [] {
+        const char* e = std::getenv("STRATA_PREFILL_LM_MARGIN_MIB");
+        return e ? (int64_t) std::atoll(e) << 20 : (int64_t) -1;
+    }();
+    return explicit_v >= 0 ? explicit_v : (int64_t) (by_default ? 512 : 96) << 20;
+}
+constexpr int64_t kLmDefaultTokens = 8192;
+constexpr int64_t kLmDefaultOnTokens = 32768;
+inline int64_t lm_entries_max(int64_t rows, int64_t G) { return NE + rows / std::max<int64_t>(G, 1) + 2; }
+inline int64_t lm_table_ints(int64_t rows, int64_t G) { return 5 * rows + 3 * lm_entries_max(rows, G); }
+
+}  // namespace
+
+bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err) try {
+    err.clear();
+    Impl& m = *impl_;
+    const core::OnDevice on_device(m.device);
+    // the stall report asks this queue (the one the waits below block on) whether its work is done (#5718 follow-up)
+    const core::WatchedStream watched("the prompt path's compute stream", (void*)m.cs, m.device);
+    const core::ModelGeometry& g = *m.g;
+    core::SessionState& ss = *m.ss;
+    const auto t_start = Clock::now();
+    const int64_t LB = stage_lb_, LE = stage_le_;
+    if (pos0 + n > m.stage_cells) {   // STRATA_PF_STAGE_FIT: the loan's K/V stage ends before this read does
+        err = "prefill: the K/V stage of this loan holds " + std::to_string(m.stage_cells) + " cells, the read ends at " +
+              std::to_string(pos0 + n);
+        return false;
+    }
+    const KvaConfig& kva = kva_config();
+    const KvaEngine& kva_eng = kva_engine();
+    const int64_t kva_suffix = kva.effective_suffix();
+    bool kva_routine = false;
+    const char* kva_why_not = kva.decline(kva_eng, pos0, n, LB, LE < 0 ? -1 : LE, (int64_t)g.n_layers,
+                                          embd_rows != nullptr, !tap_layers_.empty(), &kva_routine,
+                                          g.n_layers != 48 || g.n_expert != 512);
+    if (kva_why_not == nullptr && (g.n_layers != 48 || g.n_expert != 512)) {
+        static std::atomic<bool> warned{false};
+        if (!warned.exchange(true))
+            std::fprintf(stderr, "strata prefill: WARNING: STRATA_KVA_ANY_MODEL=1: KVA was only measured on Qwen3.8-Flash-Next "
+                                 "(48 layers, 512 experts); this model has %lld layers and %lld experts\n",
+                         (long long)g.n_layers, (long long)g.n_expert);
+    }
+    const bool kva_run = kva_why_not == nullptr;
+    const int64_t kva_split = std::min<int64_t>(std::max<int64_t>(kva.split, 1), g.n_layers);
+    const int64_t kva_frontier = std::max<int64_t>(0, n - kva_suffix);
+    int64_t kva_positions = 0, kva_chunks = 0;
+    kva_floor_ = 0;
+    // the next stage reads chunk c on a thread while this one reads chunk c + 1 (declared first: an early return
+    // waits for it before anything it reads goes away)
+    std::string next_err;
+    std::future<bool> next_run;
+    int hand_buf = 0;
+    double host_sync_ms = 0, host_chunk_ms = 0, host_setup_ms = 0;  // STRATA_PREFILL_TIMING: the host's share
+    strata::kernels::QsaShapes s = strata::kernels::qsa_real_shapes();
+    s.n_head = g.n_head;
+    s.n_head_kv = g.n_head_kv;
+    s.head_dim = g.head_dim;
+    s.idx_n_head = g.idx_q_heads;
+    s.idx_dim = g.idx_key_dim;
+    const uint64_t gdn_floats = (uint64_t)g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size +
+                                (uint64_t)g.ssm_conv_channels * (g.ssm_d_conv - 1);
+    int32_t prev[2] = {ss.ple_prev[0], ss.ple_prev[1]};
+    PfTimer pt;
+    sycl::queue* cs = m.cs;
+    // the MMQ row table lives in the borrowed cache slots, which the refill after a prompt overwrites with experts:
+    // write it again for every prompt (a layout is reused as long as the chunk and the slots are the same)
+    if (m.ids_identity != nullptr) mmq::iota(m.ids_identity, (int64_t)mmq_ids_rows((size_t)m.T), m.cs);
+    // The PLE rows of a chunk are read from the model file on the host (an SSD read per missed row): the chunk
+    // after this one is read on a thread while the GPU runs this one, into the other of two buffers.  The rows
+    // depend only on the tokens (the two before a position name its n-grams), so this is the same data.
+    const bool ple_on = ss.ple.ready() && LB <= 1 && 1 < LE;
+    // the PLE block batched over the chunk: the pinned postops and a BF16 or GGUF-native key (else token by token);
+    // STRATA_PLE_BATCH=0 keeps the per-token block (the A/B)
+    static const bool ple_batch_env = [] {
+        const char* v = std::getenv("STRATA_PLE_BATCH");
+        return v == nullptr || std::atoi(v) != 0;
+    }();
+    const bool ple_batch =
+        ple_on && ple_batch_env && strata::kernels::ple_native_postops_enabled() &&
+        (ss.ple.w.key_bf16 != nullptr || ss.ple.w.key_native_data != nullptr) &&
+        m.region_bytes / ((uint64_t)(3 * strata::kernels::NG_HC_DIM + N + 4) * 4 + (uint64_t)N * 2 + 4096) >= 64;
+    const int32_t prev0[2] = {prev[0], prev[1]};
+    auto ple_gather = [&m, &ss, tokens, n, prev0](int64_t c0, int buf, std::string& e) -> bool {
+        const int64_t T = std::min(m.T, n - c0);
+        auto at = [&](int64_t i) { return i < 2 ? prev0[i] : (int32_t)tokens[i - 2]; };  // prev0, then the tokens
+        int32_t pv[2] = {at(c0), at(c0 + 1)};
+        for (int64_t t = 0; t < T; ++t) {
+            const int32_t tok = (int32_t)tokens[c0 + t];
+            strata::kernels::ngram_rows(&tok, pv, 1, ss.ple.consts,
+                                        m.ple_rows[buf].data() + t * strata::kernels::PLE_N_HEADS);
+            pv[0] = pv[1];
+            pv[1] = tok;
+        }
+        return ss.ple.table->gather_batch(m.ple_rows[buf].data(), (size_t)T, m.ple_emb_host[buf], e);
+    };
+    std::string ple_next_err;
+    std::future<bool> ple_next;  // declared after everything it reads: an early return waits for it
+    int ple_buf = 0;
+
+    std::vector<int> tap_slot;
+    if (!tap_layers_.empty() && stage_lb_ == 0 && (stage_le_ < 0 || stage_le_ == g.n_layers)) {
+        if (tap_dev_ == nullptr) {
+            tap_dev_ = sycl::malloc_device<float>((size_t) tap_cap_ * tap_layers_.size() * (size_t) g.n_embd, default_queue());
+            if (tap_dev_ == nullptr) { err = "prefill: the DFlash2 tap staging does not fit in VRAM"; return false; }
+        }
+        tap_slot.assign((size_t) g.n_layers, -1);
+        for (size_t i = 0; i < tap_layers_.size(); ++i) tap_slot[(size_t) tap_layers_[i]] = (int) i;
+    }
+
+    for (int64_t c0 = 0; c0 < n; c0 += m.T) {
+        if (should_stop && should_stop()) {
+            err = "cancelled";
+            return false;
+        }
+        if (std::getenv("STRATA_TRACE")) {
+            std::fprintf(stderr, "strata trace: prompt chunk %lld of %lld\n", (long long)c0, (long long)n);
+            std::fflush(stderr);
+        }
+        const int64_t T = std::min(m.T, n - c0), p0 = pos0 + c0;
+        const int64_t tap_t0 = tap_dev_ != nullptr ? std::min<int64_t>(T, std::max<int64_t>(0, tap_first_ - p0)) : T;
+        const int64_t tap_rows = T - tap_t0;
+        if (tap_rows > tap_cap_) { err = "prefill: the DFlash2 tap staging is smaller than the chunk's tapped rows"; return false; }
+        const bool kva_approx = kva_run && (p0 + T <= kva_frontier);
+        if (kva_approx) {
+            kva_positions += T;
+            ++kva_chunks;
+            kva_floor_ = p0 + T;
+        }
+        core::progress_at("reading the prompt (batched): preparing the chunk from token", p0);  // #251
+        ++stats_.chunks;
+        pt.mark(kPfStart, cs);
+        const auto tsetup = Clock::now();
+        // ---- embeddings, broadcast to the four streams - or, in a later stage of a layer split, the rows the
+        // previous stage handed on
+        if (hand_in_ != nullptr) {
+            try {
+                m.cs->memcpy(m.R, hand_in_ + (size_t)c0 * D, (size_t)T * D * 4);
+            } catch (...) {
+                err = "prefill: the layer split's hand-off upload failed";
+                return false;
+            }
+        }
+        // C-4: the whole chunk's rows in one gather (the same per-element arithmetic as the per-token path, so the
+        // same bits); a chunk with picture rows, or a token outside the table, takes the per-token path
+        bool batched = hand_in_ == nullptr && m.tok_dev != nullptr;
+        const core::NativeEmbed* nemb = core::native_embed();
+        const core::WeightRef* wemb = nemb ? nullptr : m.wt->find("token_embd.weight");
+        if (batched && nemb == nullptr &&
+            (wemb == nullptr || wemb->codebook_iq4nl || wemb->ne0 != g.n_embd || wemb->group_elems <= 0 ||
+             (wemb->code_bits != 2 && wemb->code_bits != 4 && wemb->code_bits != 8)))
+            batched = false;
+        for (int64_t t = 0; batched && t < T; ++t) {
+            const int64_t tok = tokens[c0 + t];
+            if ((embd_rows && embd_rows[p0 + t]) || tok < 0 || (wemb && tok >= wemb->ne1))
+                batched = false;
+            else
+                m.tok_host[(size_t)t] = (int32_t)tok;
+        }
+        if (batched) {
+            if (!m.up_ring.h2d(m.tok_dev, m.tok_host.data(), (size_t)T * sizeof(int32_t), m.cs)) {
+                err = "prefill: the token id upload failed";
+                return false;
+            }
+            if (nemb) {
+                nemb->gather_dev(m.tok_dev, T, m.emb, m.cs);
+            } else {
+                const auto* codes = (const uint8_t*)wemb->data;
+                const auto* scales = (const float*)(codes + wemb->codes_bytes);
+                const auto* offsets =
+                    wemb->has_offset ? (const float*)(codes + wemb->codes_bytes + wemb->scales_bytes) : nullptr;
+                strata::kernels::embedding_gather_dev(codes, scales, offsets, m.tok_dev, (int)T, wemb->ne0,
+                                                      wemb->code_bits, wemb->code_bias, wemb->group_elems,
+                                                      (uint64_t)(wemb->ne0 / (8 / wemb->code_bits)),
+                                                      (uint64_t)(wemb->ne0 / wemb->group_elems), m.emb, m.cs);
+            }
+        }
+        for (int64_t t = 0; hand_in_ == nullptr && !batched && t < T; ++t) {
+            const float* row = embd_rows ? embd_rows[p0 + t] : nullptr;
+            if (row) {
+                try {
+                    m.cs->memcpy(m.emb + t * N, row, (size_t)N * 4);
+                } catch (...) {
+                    err = "prefill: the image embedding upload failed";
+                    return false;
+                }
+            } else if (!core::embed_row(*m.wt, g, tokens[c0 + t], m.emb + t * N, m.cs, err)) {
+                return false;
+            }
+        }
+        if (hand_in_ == nullptr) gr_broadcast(m.emb, m.R, T, m.cs);
+        // ---- the PLE rows of the whole chunk, one batched SSD request (read ahead on a thread, see ple_gather)
+        if (ple_on) {
+            const auto tp = Clock::now();
+            if (!ple_next.valid()) {
+                if (!ple_gather(c0, ple_buf, err)) return false;
+            } else if (!ple_next.get()) {
+                err = ple_next_err;
+                return false;
+            }
+            /*
+            DPCT1124:459: cudaMemcpyAsync is migrated to asynchronous memcpy
+            API. While the origin API might be synchronous, it depends on the
+            type of operand memory, so you may need to call wait() on event
+            return by memcpy API to ensure synchronization behavior.
+            */
+            m.cs->memcpy(m.ple_emb, m.ple_emb_host[ple_buf], (size_t)T * N * 4);
+            *m.ple_copied[ple_buf] = m.cs->ext_oneapi_submit_barrier();
+            if (c0 + m.T < n) {
+                m.ple_copied[ple_buf ^ 1]->wait_and_throw();  // the other buffer's upload (a chunk
+                                                              // ago) is done
+                ple_next = std::async(std::launch::async, [&ple_gather, &ple_next_err, c1 = c0 + m.T, b = ple_buf ^ 1] {
+                    return ple_gather(c1, b, ple_next_err);
+                });
+            }
+            ple_buf ^= 1;
+            stats_.ms_ple += ms_since(tp);
+        }
+        for (int64_t t = 0; t < T; ++t) {
+            prev[0] = prev[1];
+            prev[1] = (int32_t)tokens[c0 + t];
+        }
+        // ---- the QSA step records of every position in the chunk
+        for (int64_t t = 0; t < T; ++t)
+            strata::kernels::qsa_step_fill(m.steps_host.data() + t * strata::kernels::kStepCount, p0 + t, s);
+        if (!m.up_ring.h2d(m.steps_dev, m.steps_host.data(), (size_t)T * strata::kernels::kStepCount * 4, m.cs)) {
+            err = "prefill: the QSA step records' upload failed";
+            return false;
+        }
+
+        int64_t qsa_index = 0, gdn_index = 0;
+        for (int64_t l = 0; l < LB; ++l)
+            (core::is_qsa_layer(g, l) ? qsa_index : gdn_index) += 1;
+        // step 3: this chunk's stream - every non-resident expert of every layer, layer by layer in id order (entry
+        // k lands in ring slot k % ring); a copy is issued once the entry `ring` before it is consumed (its slot's
+        // `used` event recorded), so the copy stream never waits on an event that is not queued yet
+        const strata::kernels::cpu::ExpertLayout& lay0 = strata::kernels::cpu::expert_layout();
+        const bool stream_all = m.ring > STAGE && T >= stream_all_min() && m.src != nullptr;
+        struct PoolHold {
+            bool held = false;
+            ~PoolHold() { if (held) g_cpu_pool_busy.store(false, std::memory_order_release); }
+        } pool_hold;
+        if (cpu_pool_ != nullptr && cpu_share_on() && !stream_all &&
+            !g_share_blocked.load(std::memory_order_acquire)) {
+            bool expect = false;
+            pool_hold.held = g_cpu_pool_busy.compare_exchange_strong(expect, true, std::memory_order_acq_rel);
+        }
+        struct StreamEntry {
+            int32_t l, e;
+            const uint8_t* blob;
+            int job;
+        };
+        std::vector<StreamEntry> seq;
+        std::vector<size_t> seq_start;
+        size_t issued = 0, consumed = 0;
+        if (stream_all) {
+            seq_start.assign((size_t)g.n_layers + 1, 0);
+            std::vector<Stager::Job> js;
+            auto kva_skips_layer = [&](int64_t l) {
+                return kva_approx && l >= kva_split &&
+                       (kva.only == KvaConfig::Only::All ||
+                        (kva.only == KvaConfig::Only::Gdn) == !core::is_qsa_layer(g, l));
+            };
+            for (int64_t l = LB; l < LE; ++l) {
+                seq_start[(size_t)l] = seq.size();
+                if (kva_skips_layer(l)) continue;
+                for (int32_t e = 0; e < m.g->n_expert; ++e) {
+                    if (m.host_res && m.cache && m.host_res[(size_t)l * m.g->n_expert + e] >= 0) continue;
+                    int job = -1;
+                    const uint8_t* b = nullptr;
+                    if (m.src->transient(l, e)) {  // CS-T: copied by the source into the stager's buffer
+                        job = (int)js.size();
+                        js.push_back({nullptr, (size_t)lay0.blob_bytes(l), m.src, (int32_t)l, e});
+                    } else {
+                        b = m.src->blob(l, e);
+                        if (!b) {
+                            err = "prefill: expert source has no blob";
+                            return false;
+                        }
+                        if (!m.src->pinned(l, e)) {
+                            job = (int)js.size();
+                            js.push_back({b, (size_t)lay0.blob_bytes(l)});
+                        }
+                    }
+                    seq.push_back({(int32_t)l, e, b, job});
+                }
+            }
+            for (int64_t l = LE; l <= g.n_layers; ++l)
+                seq_start[(size_t)l] = seq.size();
+            m.stager->start(std::move(js));
+        }
+        struct StagerDone {
+            Stager* st;
+            ~StagerDone() {
+                if (st) st->finish();
+            }
+        } chunk_stager_done{stream_all ? m.stager.get() : nullptr};
+        auto issue_until = [&](size_t limit) {
+            limit = std::min(limit, seq.size());
+            while (issued < limit) {
+                const StreamEntry& en = seq[issued];
+                const int sl = (int)(issued % (size_t)m.ring);
+                const auto th = Clock::now();
+                const size_t bytes = (size_t)lay0.blob_bytes(en.l);
+                if (m.stage_live[sl]) (m.copy)->ext_oneapi_submit_barrier({*m.used[sl]});
+                if (en.job < 0) {
+                    /*
+                    DPCT1124:460: cudaMemcpyAsync is migrated to asynchronous
+                    memcpy API. While the origin API might be synchronous, it
+                    depends on the type of operand memory, so you may need to
+                    call wait() on event return by memcpy API to ensure
+                    synchronization behavior.
+                    */
+                    m.copy->memcpy(m.stage_dev[sl], en.blob, bytes);
+                    ++stats_.experts_dma;
+                } else {
+                    const uint8_t* hb = m.stager->wait(en.job);
+                    /*
+                    DPCT1124:461: cudaMemcpyAsync is migrated to asynchronous
+                    memcpy API. While the origin API might be synchronous, it
+                    depends on the type of operand memory, so you may need to
+                    call wait() on event return by memcpy API to ensure
+                    synchronization behavior.
+                    */
+                    m.copy->memcpy(m.stage_dev[sl], hb, bytes);
+                    m.stager->issued_one(en.job, m.copy);
+                }
+                *m.copied[sl] = m.copy->ext_oneapi_submit_barrier();
+                m.stage_live[sl] = true;
+                stats_.ms_experts_host += ms_since(th);
+                ++stats_.experts_streamed;
+                ++issued;
+            }
+        };
+        // D-5: the stream is issued by its own host thread, so the thread launching the layers' kernels never waits
+        // behind a host copy of an unpinned blob (that wait left the GPU idle: the 'wait copy' / 'dequant' time of the
+        // i-quant prompts).  The same copies in the same order into the same slots, and a slot is refilled only once
+        // the compute stream has recorded that it is done with it: the same results.  STRATA_PREFILL_ISSUER=0: inline.
+        static const bool issuer_on = [] {
+            const char* v = std::getenv("STRATA_PREFILL_ISSUER");
+            return v == nullptr || std::atoi(v) != 0;
+        }();
+        std::atomic<size_t> a_issued{0}, a_consumed{0};
+        std::atomic<bool> a_stop{false};
+        double iss_ms = 0;
+        int64_t iss_streamed = 0, iss_dma = 0;
+        std::thread issuer;
+        struct IssuerJoin {
+            std::atomic<bool>* stop;
+            std::thread* t;
+            ~IssuerJoin() {
+                if (t->joinable()) {
+                    stop->store(true);
+                    t->join();
+                }
+            }
+        } issuer_join{&a_stop, &issuer};
+        const bool threaded_issue = stream_all && issuer_on;
+        if (threaded_issue) {
+            issuer = std::thread([&] {
+                const core::OnDevice od(m.device);
+                for (size_t idx = 0; idx < seq.size(); ++idx) {
+                    while (idx >= a_consumed.load(std::memory_order_acquire) + (size_t)m.ring) {
+                        if (a_stop.load(std::memory_order_acquire)) return;
+                        std::this_thread::yield();
+                    }
+                    const StreamEntry& en = seq[idx];
+                    const int sl = (int)(idx % (size_t)m.ring);
+                    const auto th = Clock::now();
+                    const size_t bytes = (size_t)lay0.blob_bytes(en.l);
+                    if (m.stage_live[sl]) (m.copy)->ext_oneapi_submit_barrier({*m.used[sl]});
+                    if (en.job < 0) {
+                        /*
+                        DPCT1124:462: cudaMemcpyAsync is migrated to
+                        asynchronous memcpy API. While the origin API might be
+                        synchronous, it depends on the type of operand memory,
+                        so you may need to call wait() on event return by memcpy
+                        API to ensure synchronization behavior.
+                        */
+                        m.copy->memcpy(m.stage_dev[sl], en.blob, bytes);
+                        ++iss_dma;
+                    } else {
+                        const uint8_t* hb = m.stager->wait(en.job);
+                        /*
+                        DPCT1124:463: cudaMemcpyAsync is migrated to
+                        asynchronous memcpy API. While the origin API might be
+                        synchronous, it depends on the type of operand memory,
+                        so you may need to call wait() on event return by memcpy
+                        API to ensure synchronization behavior.
+                        */
+                        m.copy->memcpy(m.stage_dev[sl], hb, bytes);
+                        m.stager->issued_one(en.job, m.copy);
+                    }
+                    *m.copied[sl] = m.copy->ext_oneapi_submit_barrier();
+                    m.stage_live[sl] = true;
+                    iss_ms += ms_since(th);
+                    ++iss_streamed;
+                    a_issued.store(idx + 1, std::memory_order_release);
+                }
+            });
+        } else if (stream_all) {
+            issue_until((size_t)m.ring);  // layer 0's first experts, behind the embedding and the PLE
+        }
+        // the consumer's side: entry k's copy is on the copy stream (the thread issued it), then k is given back
+        auto wait_issued = [&](size_t k) {
+            if (!threaded_issue) return;
+            while (a_issued.load(std::memory_order_acquire) <= k)
+                std::this_thread::yield();
+        };
+        auto give_back = [&](size_t upto) {
+            if (threaded_issue)
+                a_consumed.store(upto, std::memory_order_release);
+            else
+                issue_until(upto + (size_t)m.ring);
+        };
+        host_setup_ms += ms_since(tsetup);
+        bool normed = false;  // F-2: the previous half's write already normed R for this half (grs, xn16)
+        const bool pf_on = pf_bank() > 0 && !stream_all && !kva_approx &&
+                           (int64_t) T >= prefetch_min_t() && m.src != nullptr && m.cache != nullptr && m.host_res != nullptr &&
+                           stage_slots_t((size_t) m.T) > STAGE && m.ring <= STAGE;
+        // STRATA_PF_PREDICT (predict_on): this chunk predicts each next layer's routing when its layout has the banks
+        // (pf_bank_t of the layout's chunk), its walk is routed-only and on this GPU alone, and nothing takes MMQ
+        bool pred_on = !pf_on && pf_bank_t((size_t) m.T) > 0 && predict_on() && !stream_all && !kva_approx &&
+                       m.src != nullptr && m.cache != nullptr && m.host_res != nullptr &&
+                       !mmq_plan().any && stage_slots_t((size_t) m.T) > STAGE &&
+                       m.ring <= STAGE && (int64_t) T <= m.T;
+        const int pred_bank = pred_on ? pf_bank_t((size_t) m.T) : 0;
+        if (pred_on && m.pred_cap < m.T) {   // the next layer's routing buffers, for the layout's chunk (a few MB)
+            for (void* p : {(void*) m.pred_logits, (void*) m.pred_w, (void*) m.pred_ids, (void*) m.pred_host})
+                if (p) sycl::free(p, *m.cs);
+            m.pred_logits = m.pred_w = nullptr;
+            m.pred_ids = m.pred_host = nullptr;
+            m.pred_cap = 0;
+            const size_t tk = (size_t) m.T * K;
+            m.pred_logits = sycl::malloc_device<float>((size_t) m.T * m.g->n_expert, *m.cs);
+            m.pred_w = sycl::malloc_device<float>(tk, *m.cs);
+            m.pred_ids = sycl::malloc_device<int32_t>(tk, *m.cs);
+            m.pred_host = sycl::malloc_host<int32_t>(tk, *m.cs);
+            if (m.pred_logits && m.pred_w && m.pred_ids && m.pred_host) m.pred_cap = m.T;
+            else pred_on = false;
+        }
+        std::vector<int> pred_slot;   // the next layer's predicted copies: expert -> bank slot (-1: none)
+        int64_t pred_for = -1;        // the layer they are for
+        std::vector<int> pf_slot;
+        auto prefetch_layer = [&](int64_t l) {
+            if (pred_for == l && !pred_slot.empty()) {   // STRATA_PF_PREDICT: issued after the last layer's walk
+                pf_slot.swap(pred_slot);
+                pred_slot.clear();
+                pred_for = -1;
+                return;
+            }
+            pred_slot.clear();
+            pred_for = -1;
+            pf_slot.assign((size_t) m.g->n_expert, -1);
+            if (!pf_on) return;
+            const int base = (int) (m.pf_seq & 1) * pf_bank();
+            const size_t bytes = (size_t) lay0.blob_bytes(l);
+            int n = 0, waited = -1;
+            const auto th = Clock::now();
+            for (int32_t e = 0; e < m.g->n_expert && n < pf_bank(); ++e) {
+                if (m.host_res[(size_t) l * m.g->n_expert + e] >= 0) continue;
+                const uint8_t* b = m.src->pinned(l, e) ? m.src->blob(l, e) : nullptr;
+                if (!dma_direct(m.src, l, e, b, m.copy, bytes) || b == nullptr) break;   // the stager's: the walk copies it and all after
+                const int sl = base + n++;
+                if (m.stage_live[sl] && m.pf_fill[sl] >= m.pf_drain && sl != waited) {
+                    m.copy->ext_oneapi_submit_barrier({*m.used[sl]});
+                    waited = sl;
+                }
+                m.copy->memcpy(m.stage_dev[sl], b, bytes);
+                *m.copied[sl] = m.copy->ext_oneapi_submit_barrier();
+                m.stage_live[sl] = true;
+                m.copy_seq[sl] = ++m.copy_ctr;
+                m.pf_fill[sl] = m.pf_seq;
+                pf_slot[(size_t) e] = sl;
+                ++stats_.experts_dma;
+            }
+            stats_.ms_experts_host += ms_since(th);
+        };
+        for (int64_t l = LB; l < LE; ++l) {
+            ++m.pf_seq;
+            core::progress_beat();  // the serve watchdog: a prompt chunk of 8192 tokens is still moving
+            core::progress_at("reading the prompt (batched): layer", l, p0);  // #251: a stall names layer and chunk
+            const core::LayerView v(*m.wt, l);
+            const bool kva_layer = kva_approx && l >= kva_split &&
+                                   (kva.only == KvaConfig::Only::All ||
+                                    (kva.only == KvaConfig::Only::Gdn) == !core::is_qsa_layer(g, l));
+            const bool kva_moe_only = kva_layer && kva.skip == KvaConfig::Skip::Moe;
+            const bool kva_state_only = kva_layer && !kva_moe_only;
+            // ---- the PLE block at layer 1, token by token (its conv reads the previous tokens' rows)
+            if (l == 1 && ple_on && ple_batch) {
+                // the whole chunk at once, in sub-batches carved from the idle scratch region: the key and value
+                // projections as GEMMs (a token at a time they re-read ~52 MB of BF16 key per token on the IQ
+                // files), the rest with the per-token kernels' arithmetic (native_ple_postops_batch)
+                pt.mark(kPfPle, cs);
+                const auto tp = Clock::now();
+                const strata::kernels::PleWeights& pw = ss.ple.w;
+                constexpr int64_t HD = strata::kernels::NG_HC_DIM;
+                const uint64_t per_token = (uint64_t)(3 * HD + N + 4) * 4 + (uint64_t)N * (bf16x2() ? 4 : 2) + 4096;
+                const int64_t SB = std::min<int64_t>(T, (int64_t)(m.region_bytes / per_token));
+                for (int64_t s0 = 0; s0 < T; s0 += SB) {
+                    const int64_t nb = std::min(SB, T - s0);
+                    uint8_t* q = m.region;
+                    auto carve_f = [&](size_t n) {
+                        float* p = (float*)q;
+                        q += (n * 4 + 255) & ~(size_t)255;
+                        return p;
+                    };
+                    float* key = carve_f((size_t)nb * HD);
+                    float* qn = carve_f((size_t)nb * HD);
+                    float* gated = carve_f((size_t)nb * HD);
+                    float* val = carve_f((size_t)nb * N);
+                    float* gate = carve_f((size_t)nb * 4);
+                    uint16_t* e16 = (uint16_t*)carve_f((size_t)nb * N / 2);
+                    uint16_t* e16_lo = bf16x2() ? (uint16_t*)carve_f((size_t)nb * N / 2) : nullptr;
+                    const float* emb = m.ple_emb + s0 * N;
+                    if (pw.key_bf16 != nullptr) {
+                        to_bf16(emb, e16, nb * N, m.cs, e16_lo);
+                        m.gemm.bf16(e16, pw.key_bf16, key, nb, HD, N);
+                        if (e16_lo) m.gemm.bf16(e16_lo, pw.key_bf16, key, nb, HD, N, 0, 1.0f);
+                    } else {
+                        to_f16(emb, e16, nb * N, m.cs);
+                        m.gemm.native(e16, pw.key_native_type, pw.key_native_data, key, nb, HD, N);
+                        to_bf16(emb, e16, nb * N, m.cs, e16_lo);
+                    }
+                    m.gemm.bf16(e16, pw.value_bf16, val, nb, N, N);
+                    if (e16_lo) m.gemm.bf16(e16_lo, pw.value_bf16, val, nb, N, N, 0, 1.0f);
+                    try {
+                        strata::kernels::native_ple_postops_batch(key, m.R + s0 * D, val, ss.ple.hist, pw, qn, gated,
+                                                                  gate, (int)nb, m.cs);
+                    } catch (const std::exception& e) {
+                        err = std::string("prefill PLE: ") + e.what();
+                        return false;
+                    }
+                }
+                stats_.ms_ple += ms_since(tp);
+            } else if (l == 1 && ple_on) {
+                pt.mark(kPfPle, cs);
+                const auto tp = Clock::now();
+                for (int64_t t = 0; t < T; ++t) {
+                    strata::kernels::PleOut po;
+                    po.normalized = m.ple_norm;
+                    po.result = m.R + t * D;
+                    try {
+                        strata::kernels::ple_block(m.ple_emb + t * N, m.R + t * D, ss.ple.hist, ss.ple.w, po,
+                                                   ss.ple.scratch, m.cs);
+                    } catch (const std::exception& e) {
+                        err = std::string("prefill PLE: ") + e.what();
+                        return false;
+                    }
+                    strata::kernels::ple_history_advance(ss.ple.hist, m.ple_norm, m.cs);
+                }
+                stats_.ms_ple += ms_since(tp);
+            }
+            for (int half = 0; half < 2; ++half) {
+                if (kva_moe_only && half == 1) {
+                    normed = false;
+                    consumed = std::max(consumed, seq_start[(size_t)l + 1]);
+                    give_back(consumed);
+                    break;
+                }
+                // ---- the hyper-connection read of this half
+                const char* pre = half == 0 ? "hc_attn_" : "hc_ffn_";
+                const std::string sn = std::string(pre) + "norm.weight", sd = std::string(pre) + "down.weight",
+                                  su = std::string(pre) + "up.weight", si = std::string(pre) + "inject.weight";
+                const core::WeightRef *wn = need(v, sn.c_str(), err), *wd = need(v, sd.c_str(), err),
+                                      *wu = need(v, su.c_str(), err), *wi = need(v, si.c_str(), err);
+                if (!wn || !wd || !wu || !wi) return false;
+                pt.mark(kPfHc, cs);
+                if (gr_unfused())
+                    gr_norm(m.R, (const float*)wn->data, EPS, m.xn, m.xn16, T, m.cs, m.xn16_lo);
+                else if (!normed)
+                    gr_norm_rs(m.R, (const float*)wn->data, EPS, m.grs, m.xn16, T, m.cs, m.xn16_lo);
+                normed = false;
+                if (!bf16_proj(m.gemm, wd, m.xn16, m.lo, T, sd, err, 0, m.xn16_lo)) return false;
+                gr_silu(m.lo, m.lo16, T, m.cs, m.lo16_lo);
+                if (!bf16_proj(m.gemm, wu, m.lo16, m.gated, T, su, err, 0, m.lo16_lo)) return false;
+                if (!bf16_proj(m.gemm, wi, m.xn16, m.inj, T, si, err, 0, m.xn16_lo)) return false;
+                if (gr_unfused())
+                    gr_mix(m.xn, m.gated, m.mixed, m.mixed_bf, T, m.cs, m.mixed_h, m.mixed_bf_lo);
+                else
+                    gr_mix_r(m.R, m.grs, (const float*)wn->data, m.gated, m.mixed, m.mixed_bf, T, m.cs, m.mixed_h,
+                             m.mixed_bf_lo);
+
+                if (half == 0 && !core::is_qsa_layer(g, l)) {
+                    // ======================= GDN =======================
+                    const core::WeightRef *wqkv = need(v, "attn_qkv.weight", err),
+                                          *wg = need(v, "attn_gate.weight", err), *wo = need(v, "ssm_out.weight", err),
+                                          *wa = need(v, "ssm_alpha.weight", err), *wb = need(v, "ssm_beta.weight", err),
+                                          *wc = need(v, "ssm_conv1d.weight", err),
+                                          *wnm = need(v, "ssm_norm.weight", err), *wdt = need(v, "ssm_dt.bias", err),
+                                          *wsa = need(v, "ssm_a", err);
+                    if (!wqkv || !wg || !wo || !wa || !wb || !wc || !wnm || !wdt || !wsa) return false;
+                    pt.mark(kPfGdn, cs);
+                    float* state = ss.gdn_state + (size_t)(gdn_index - ss.gdn_ord0) * gdn_floats;
+                    float* conv = state + (uint64_t)g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size;
+                    if (!native_proj(m.gemm, wqkv, m.mixed_h, m.qkv, T, v.name("attn_qkv.weight"), err)) return false;
+                    static const bool kva_gdn_norm = [] {
+                        const char* v = std::getenv("STRATA_KVA_GDN_NORM");
+                        return v != nullptr && std::atoi(v) != 0;
+                    }();
+                    if ((!kva_state_only || kva_gdn_norm) &&
+                        !native_proj(m.gemm, wg, m.mixed_h, m.z, T, v.name("attn_gate.weight"), err)) return false;
+                    if (!bf16_proj(m.gemm, wa, m.mixed_bf, m.ab, T, v.name("ssm_alpha.weight"), err, 2 * HV,
+                                   m.mixed_bf_lo))
+                        return false;
+                    if (!bf16_proj(m.gemm, wb, m.mixed_bf, m.ab + HV, T, v.name("ssm_beta.weight"), err, 2 * HV,
+                                   m.mixed_bf_lo))
+                        return false;
+                    pt.mark(kPfGdnConv, cs);  // "gdn" is the projections in; the rest on their own lines
+                    gdn_gates(m.ab, (const float*)wdt->data, (const float*)wsa->data, m.gate, m.beta, T, m.cs);
+                    gdn_conv(conv, m.qkv, (const float*)wc->data, m.hbuf, T, EPS, m.cs);
+                    pt.mark(kPfGdnRec, cs);
+                    if (kva_state_only && !kva_gdn_norm)
+                        gdn_recurrence_state_only(state, m.hbuf, m.gate, m.beta, m.y, T, m.cs);
+                    else
+                        gdn_recurrence(state, m.hbuf, m.gate, m.beta, m.z, (const float*)wnm->data, EPS, m.y, m.y_h, T,
+                                       m.cs);
+                    pt.mark(kPfGdnOut, cs);
+                    if (!kva_state_only)
+                        if (!native_proj(m.gemm, wo, m.y_h, m.bo, T, v.name("ssm_out.weight"), err)) return false;
+                    ++gdn_index;
+                    if (kva_state_only) {
+                        consumed = std::max(consumed, seq_start[(size_t)l + 1]);
+                        give_back(consumed);
+                        break;
+                    }
+                } else if (half == 0) {
+                    // ======================= QSA =======================
+                    const core::QsaState& st = ss.qsa_states[qsa_index];
+                    const core::WeightRef *wq = need(v, "attn_q.weight", err), *wk = need(v, "attn_k.weight", err),
+                                          *wv = need(v, "attn_v.weight", err), *wo = need(v, "attn_output.weight", err),
+                                          *wik = need(v, "indexer.k_proj.weight", err),
+                                          *wiq = need(v, "indexer.q_proj.weight", err),
+                                          *wqn = need(v, "attn_q_norm.weight", err),
+                                          *wkn = need(v, "attn_k_norm.weight", err),
+                                          *wiqn = need(v, "indexer.q_norm.weight", err),
+                                          *wikn = need(v, "indexer.k_norm.weight", err);
+                    if (!wq || !wk || !wv || !wo || !wik || !wiq || !wqn || !wkn || !wiqn || !wikn) return false;
+                    pt.mark(kPfQsa, cs);
+                    if (!native_proj(m.gemm, wk, m.mixed_h, m.Kc, T, v.name("attn_k.weight"), err)) return false;
+                    if (!native_proj(m.gemm, wv, m.mixed_h, m.Vc, T, v.name("attn_v.weight"), err)) return false;
+                    if (!kva_state_only && !native_proj(m.gemm, wq, m.mixed_h, m.Qf, T, v.name("attn_q.weight"), err)) return false;
+                    if (!bf16_proj(m.gemm, wik, m.mixed_bf, m.idx_raw, T, v.name("indexer.k_proj.weight"), err, 0,
+                                   m.mixed_bf_lo))
+                        return false;
+                    if (!kva_state_only && !bf16_proj(m.gemm, wiq, m.mixed_bf, m.q_idx, T, v.name("indexer.q_proj.weight"), err, 0,
+                                   m.mixed_bf_lo))
+                        return false;
+                    rms_rows(m.Kc, (const float*)wkn->data, T * 2, 256, 256, EPS, m.cs);
+                    rope(m.Kc, T, 2, 256, 512, p0, strata::kernels::rope_scaling(), m.cs);
+                    // KV streaming: this layer's cells [0, p0) come in from the host copy to the staging pool, and the
+                    // chunk's cells go to the host copy, the staging pool, and the VRAM slots of resident blocks
+                    const bool staged = st.kv_mode == 1;
+                    if (staged) {
+                        pt.mark(kPfKvStage, cs);
+                        strata::kernels::kv_stage_from_host(pools_of(m.stage, m.ident_table), st.host,
+                                                            core::qsa_kv_format(st),
+                                                            (p0 + s.page_size - 1) / s.page_size, s, m.cs);
+                        pt.mark(kPfQsa, cs);
+                    }
+                    if (st.kv_hybrid) {  // K8V4: K INT8 unrotated, V rotated Q4_0 (only V and the output rotate)
+                        strata::kernels::fwht256_inplace_cuda(m.Vc, T * 2, m.cs);
+                        kv_append(m.Kc, m.Kc, T, p0, st.page_table, s.page_size, nullptr, nullptr, st.k_q, st.k_q,
+                                  st.k_scale, st.k_scale, m.cs, nullptr,  // mode 0: no host mirror
+                                  staged ? &m.stage : nullptr);
+                        strata::kernels::kv_append_q4(st.v_q4, st.v_q4, st.page_table, p0, T, m.Vc, m.Vc, s, m.cs,
+                                                      nullptr, staged ? &m.stage : nullptr);
+                    } else {
+                        if (st.kv_rot) {  // rotated K and V (kv_q4.hpp), the queries below too, the output back
+                            strata::kernels::fwht256_inplace_cuda(m.Kc, T * 2, m.cs);
+                            strata::kernels::fwht256_inplace_cuda(m.Vc, T * 2, m.cs);
+                        }
+                        if (st.kv_q4)
+                            strata::kernels::kv_append_q4(st.k_q4, st.v_q4, st.page_table, p0, T, m.Kc, m.Vc, s, m.cs,
+                                                          &st.host, staged ? &m.stage : nullptr);
+                        else
+                            kv_append(m.Kc, m.Vc, T, p0, st.page_table, s.page_size, st.kv_int8 ? nullptr : st.k_pool,
+                                      st.kv_int8 ? nullptr : st.v_pool, st.k_q, st.v_q, st.k_scale, st.v_scale, m.cs,
+                                      &st.host, staged ? &m.stage : nullptr);
+                    }
+                    split_q(m.Qf, m.q, T, m.cs);
+                    rms_rows(m.q, (const float*)wqn->data, T * 24, 256, 256, EPS, m.cs);
+                    rope(m.q, T, 24, 256, 6144, p0, strata::kernels::rope_scaling(), m.cs);
+                    if (st.kv_rot) strata::kernels::fwht256_inplace_cuda(m.q, T * 24, m.cs);
+                    rms_rows(m.q_idx, (const float*)wiqn->data, T * 4, 128, 128, EPS, m.cs);
+                    rope(m.q_idx, T, 4, 128, 512, p0, strata::kernels::rope_scaling(), m.cs);
+                    // the indexer appends, token by token; then scores + selection for many queries at once:
+                    // a query reads completed blocks (final once completed) and `dead` for its own tail block
+                    const strata::kernels::QsaIndexerBuffers ib{st.idx_tail, st.idx_dead, st.idx_pooled,
+                                                                st.idx_block_pos};
+                    pt.mark(kPfQsaIdx, cs);
+                    // C-2: the chunk's appends in three launches instead of one per token (the same end state:
+                    // the queries below read it only after the whole chunk is appended). STRATA_INDEXER_PER_TOKEN=1:
+                    // the old
+                    try {
+                        static const bool per_token = std::getenv("STRATA_INDEXER_PER_TOKEN") != nullptr;
+                        if (!per_token) {
+                            strata::kernels::native_qsa_indexer_append_batch(
+                                m.idx_raw, T, p0, 0, (const float*)wikn->data, EPS, ib, s, st.max_cells,
+                                strata::kernels::rope_scaling(), m.cs);
+                        }
+                        for (int64_t t = 0; per_token && t < T; ++t) {
+                            const int32_t* step_t = m.steps_dev + t * strata::kernels::kStepCount;
+                            strata::kernels::native_qsa_indexer_append(
+                                m.idx_raw + t * 128, step_t + strata::kernels::kStepPos, 0, (const float*)wikn->data,
+                                EPS, ib, s, st.max_cells, strata::kernels::rope_scaling(), m.cs);
+                        }
+                    } catch (const std::exception& e) {
+                        err = std::string("prefill indexer: ") + e.what();
+                        return false;
+                    }
+                    if (kva_state_only) {
+                        ++qsa_index;
+                        consumed = std::max(consumed, seq_start[(size_t)l + 1]);
+                        give_back(consumed);
+                        break;
+                    }
+                    pt.mark(kPfQsaSel, cs);
+                    for (int64_t t0 = 0; t0 < T; t0 += m.sel_batch) {
+                        const int64_t nb = std::min(m.sel_batch, T - t0);
+                        const int32_t* steps0 = m.steps_dev + t0 * strata::kernels::kStepCount;
+                        // C-1: the grid reaches the batch's last query's n_bid (they rise with the position)
+                        const int64_t active =
+                            (int64_t)m.steps_host[(size_t)((t0 + nb - 1) * strata::kernels::kStepCount +
+                                                           strata::kernels::kStepNBid)] +
+                            1;
+                        // the scores on tensor cores (3xTF32: FP32-level, not bitwise); STRATA_SELECT_OLD=1: the warp
+                        // kernel
+                        static const bool old_sel = std::getenv("STRATA_SELECT_OLD") != nullptr;
+                        if (old_sel || !strata::kernels::qsa_block_scores_tc(
+                                           st.idx_pooled, st.idx_dead, m.q_idx + t0 * 512, steps0, nb, m.max_blocks, s,
+                                           m.sel_scores, m.cs, active))
+                            strata::kernels::qsa_block_scores(st.idx_pooled, st.idx_dead, m.q_idx + t0 * 512, steps0,
+                                                              nb, m.max_blocks, s, m.sel_scores, m.cs, active);
+                        strata::kernels::qsa_block_topk(m.sel_scores, steps0, nb, m.max_blocks, m.cap, s,
+                                                        m.sel_ids + t0 * m.cap, m.cs, active);
+                    }
+                    // STRATA_SEL_OVERLAP (debug, D-1's question): how much do neighbouring queries' selections share?
+                    // Per tile of 16 queries: the union of their selected cells against the sum of their widths.
+                    if (static const bool ovl = std::getenv("STRATA_SEL_OVERLAP") != nullptr; ovl && qsa_index == 0) {
+                        std::vector<int32_t> ids((size_t)(T * m.cap));
+                        /*
+                        DPCT1124:464: cudaMemcpyAsync is migrated to
+                        asynchronous memcpy API. While the origin API might be
+                        synchronous, it depends on the type of operand memory,
+                        so you may need to call wait() on event return by memcpy
+                        API to ensure synchronization behavior.
+                        */
+                        m.cs->memcpy(ids.data(), m.sel_ids, ids.size() * 4);
+                        m.cs->wait();
+                        double sum_w = 0, sum_u = 0;
+                        for (int64_t t0 = 0; t0 + 16 <= T; t0 += 16) {
+                            std::vector<int32_t> u;
+                            for (int64_t t = t0; t < t0 + 16; ++t) {
+                                const int64_t w = m.steps_host[(size_t)(t * strata::kernels::kStepCount +
+                                                                        strata::kernels::kStepWidth)];
+                                sum_w += (double)w;
+                                u.insert(u.end(), ids.begin() + t * m.cap, ids.begin() + t * m.cap + w);
+                            }
+                            std::sort(u.begin(), u.end());
+                            sum_u += (double)(std::unique(u.begin(), u.end()) - u.begin());
+                        }
+                        std::fprintf(stderr,
+                                     "strata prefill: selection overlap at %lld: 16-query tiles read %.1f%% of the "
+                                     "cells one query at a time does\n",
+                                     (long long)p0, sum_w > 0 ? 100.0 * sum_u / sum_w : 0.0);
+                    }
+                    // STRATA_IDX_FP16_CHECK: would FP16 pooled indexer keys select the same cells? (the KV-streaming
+                    // design's last question). Every query is selected again from the pooled keys and `dead` rounded
+                    // to fp16 (exactly what an fp16 store reads back); the agreement with the fp32 selection is
+                    // printed cumulatively after each chunk's last QSA layer. Debug: syncs per layer.
+                    if (static const bool f16chk = std::getenv("STRATA_IDX_FP16_CHECK") != nullptr; f16chk) {
+                        static float *pooled16 = nullptr, *dead16 = nullptr;
+                        static int32_t* ids16 = nullptr;
+                        static double shared = 0, cells = 0;
+                        static long long queries = 0, same = 0, sel_queries = 0;
+                        const int64_t rows = st.idx_pooled_rows;
+                        if (pooled16 == nullptr) {
+                            try {
+                                pooled16 = (float*)sycl::malloc_device((size_t)rows * s.idx_dim * 4, *m.cs);
+                                dead16 = (float*)sycl::malloc_device((size_t)s.idx_dim * 4, *m.cs);
+                                ids16 = (int32_t*)sycl::malloc_device((size_t)(m.T * m.cap) * 4, *m.cs);
+                            } catch (...) {
+                                pooled16 = nullptr;
+                            }
+                            if (!pooled16 || !dead16 || !ids16) {
+                                err = "STRATA_IDX_FP16_CHECK: no room for its buffers";
+                                return false;
+                            }
+                        }
+                        round_f16(st.idx_pooled, pooled16, rows * s.idx_dim, m.cs);
+                        round_f16(st.idx_dead, dead16, s.idx_dim, m.cs);
+                        for (int64_t t0 = 0; t0 < T; t0 += m.sel_batch) {
+                            const int64_t nb = std::min(m.sel_batch, T - t0);
+                            const int32_t* steps0 = m.steps_dev + t0 * strata::kernels::kStepCount;
+                            strata::kernels::qsa_block_scores(pooled16, dead16, m.q_idx + t0 * 512, steps0, nb,
+                                                              m.max_blocks, s, m.sel_scores, m.cs);
+                            strata::kernels::qsa_block_topk(m.sel_scores, steps0, nb, m.max_blocks, m.cap, s,
+                                                            ids16 + t0 * m.cap, m.cs);
+                        }
+                        std::vector<int32_t> a((size_t)(T * m.cap)), b((size_t)(T * m.cap));
+                        /*
+                        DPCT1124:465: cudaMemcpyAsync is migrated to
+                        asynchronous memcpy API. While the origin API might be
+                        synchronous, it depends on the type of operand memory,
+                        so you may need to call wait() on event return by memcpy
+                        API to ensure synchronization behavior.
+                        */
+                        m.cs->memcpy(a.data(), m.sel_ids, a.size() * 4);
+                        /*
+                        DPCT1124:466: cudaMemcpyAsync is migrated to
+                        asynchronous memcpy API. While the origin API might be
+                        synchronous, it depends on the type of operand memory,
+                        so you may need to call wait() on event return by memcpy
+                        API to ensure synchronization behavior.
+                        */
+                        m.cs->memcpy(b.data(), ids16, b.size() * 4);
+                        m.cs->wait();
+                        for (int64_t t = 0; t < T; ++t) {
+                            const int64_t w =
+                                m.steps_host[(size_t)(t * strata::kernels::kStepCount + strata::kernels::kStepWidth)];
+                            const int32_t *x = a.data() + t * m.cap, *y = b.data() + t * m.cap;
+                            int64_t i = 0, j = 0, c = 0;
+                            while (i < w && j < w) {
+                                if (x[i] == y[j]) {
+                                    ++c;
+                                    ++i;
+                                    ++j;
+                                } else if (x[i] < y[j])
+                                    ++i;
+                                else
+                                    ++j;
+                            }
+                            ++queries;
+                            same += c == w;
+                            if (p0 + t + 1 > m.cap) {
+                                ++sel_queries;
+                                shared += (double)c;
+                                cells += (double)w;
+                            }
+                        }
+                        if (qsa_index + 1 == g.n_qsa_layers())
+                            std::fprintf(stderr,
+                                         "strata prefill: FP16 indexer keys: %lld of %lld selections identical; "
+                                         "where the selection is sparse, %.4f%% of cells shared (%lld queries)\n",
+                                         same, queries, cells > 0 ? 100.0 * shared / cells : 100.0, sel_queries);
+                    }
+                    // STRATA_QSA_DUMP=<file>: append every QSA layer's selected cells for the prompt's last
+                    // STRATA_QSA_DUMP_LAST (4096) positions - records of int32 {qsa layer, pos0, T, cap} + T*cap cells,
+                    // for tools/qsa_locality.py (how local the sparse attention's reads are: the KV-streaming question)
+                    if (static const char* dump = std::getenv("STRATA_QSA_DUMP"); dump != nullptr) {
+                        static const long long last = std::getenv("STRATA_QSA_DUMP_LAST")
+                                                          ? std::atoll(std::getenv("STRATA_QSA_DUMP_LAST"))
+                                                          : 4096;
+                        if (p0 + T > pos0 + n - last) {
+                            std::vector<int32_t> h((size_t)(T * m.cap));
+                            /*
+                            DPCT1124:467: cudaMemcpyAsync is migrated to
+                            asynchronous memcpy API. While the origin API might
+                            be synchronous, it depends on the type of operand
+                            memory, so you may need to call wait() on event
+                            return by memcpy API to ensure synchronization
+                            behavior.
+                            */
+                            m.cs->memcpy(h.data(), m.sel_ids, h.size() * 4);
+                            m.cs->wait();
+                            if (std::FILE* f = std::fopen(dump, "ab")) {
+                                const int32_t hdr[4] = {(int32_t)qsa_index, (int32_t)p0, (int32_t)T, (int32_t)m.cap};
+                                std::fwrite(hdr, 4, 4, f);
+                                std::fwrite(h.data(), 4, h.size(), f);
+                                std::fclose(f);
+                            }
+                        }
+                    }
+                    const strata::kernels::QsaAttnPools pools =
+                        staged ? pools_of(m.stage, m.ident_table) : core::qsa_attn_pools(st);
+                    pt.mark(kPfQsaAttn, cs);
+                    // perf-review D-1: the whole chunk on tensor cores, one block per (query, KV head), FP32-level
+                    // accuracy but not bitwise (qsa_prompt_attn.hpp). Q4_0 KV, or STRATA_PROMPT_ATTN_OLD=1: the
+                    // decode kernel, 32 queries at a time (K8V4 runs the tensor kernel's mode 3: INT8 K,
+                    // V dequantized from its q4_0 blocks to fp16 at gather)
+                    static const bool old_attn = std::getenv("STRATA_PROMPT_ATTN_OLD") != nullptr;
+                    if (old_attn || !strata::kernels::qsa_prompt_attn_batch(m.q, pools, m.sel_ids, m.steps_dev, m.cap,
+                                                                            s, m.attn, T, m.cs))
+                        for (int64_t t0 = 0; t0 < T; t0 += m.attn_batch) {
+                            const int64_t nb = std::min(m.attn_batch, T - t0);
+                            strata::kernels::qsa_decode_attn_batch(m.q + t0 * ZV, pools, m.sel_ids + t0 * m.cap,
+                                                                   m.steps_dev + t0 * strata::kernels::kStepCount,
+                                                                   m.cap, s, m.attn_scratch, m.attn + t0 * ZV, nb,
+                                                                   m.cs);
+                        }
+                    if (st.kv_rot || st.kv_hybrid) strata::kernels::fwht256_inplace_cuda(m.attn, T * 24, m.cs);
+                    pt.mark(kPfQsa, cs);
+                    gate_attn(m.attn, m.Qf, m.attn_h, T, m.cs);
+                    if (!native_proj(m.gemm, wo, m.attn_h, m.bo, T, v.name("attn_output.weight"), err)) return false;
+                    ++qsa_index;
+                } else {
+                    // ======================= MoE =======================
+                    prefetch_layer(l);
+                    const core::WeightRef *wr = need(v, "ffn_gate_inp.weight", err),
+                                          *wgi = need(v, "ffn_gate_inp_shexp.weight", err),
+                                          *wsg = need(v, "ffn_gate_shexp.weight", err),
+                                          *wsu = need(v, "ffn_up_shexp.weight", err),
+                                          *wsd = need(v, "ffn_down_shexp.weight", err);
+                    if (!wr || !wgi || !wsg || !wsu || !wsd) return false;
+                    pt.mark(kPfRouter, cs);
+                    if (!bf16_proj(m.gemm, wr, m.mixed_bf, m.logits, T, v.name("ffn_gate_inp.weight"), err, 0,
+                                   m.mixed_bf_lo))
+                        return false;
+                    route(m.logits, m.ids, m.w, T, m.g->n_expert, m.cs);
+                    // STRATA_PF_PREDICT: the next layer's router on this layer's MoE input, its top-10 into host memory (the
+                    // routing sync below covers the download); the walk's end copies what it picks
+                    const bool pred_next = pred_on && l + 1 < LE;
+                    if (pred_next) {
+                        const core::LayerView vn(*m.wt, l + 1);
+                        const core::WeightRef* wr1 = vn.get("ffn_gate_inp.weight");
+                        if (wr1) {
+                            if (!bf16_proj(m.gemm, wr1, m.mixed_bf, m.pred_logits, T, vn.name("ffn_gate_inp.weight"), err, 0, m.mixed_bf_lo))
+                                return false;
+                            route(m.pred_logits, m.pred_ids, m.pred_w, T, m.g->n_expert, m.cs);
+                            copy_i32(m.pred_host, m.pred_ids, T * K, m.cs);   // a kernel: not behind the copy engine's copies
+                        }
+                    }
+                    auto shared_expert = [&]() -> bool {
+                        if (!native_proj(m.gemm, wsg, m.mixed_h, m.sgate, T, v.name("ffn_gate_shexp.weight"), err))
+                            return false;
+                        if (!native_proj(m.gemm, wsu, m.mixed_h, m.sup, T, v.name("ffn_up_shexp.weight"), err))
+                            return false;
+                        swiglu_pair(m.sgate, m.sup, m.sh_h, T, m.cs);
+                        if (!native_proj(m.gemm, wsd, m.sh_h, m.shared, T, v.name("ffn_down_shexp.weight"), err))
+                            return false;
+                        if (wgi->kind != core::WeightKind::Bf16InF32) {
+                            err = "prefill: shared gate is not BF16";
+                            return false;
+                        }
+                        m.gemm.bf16(m.mixed_bf, (const uint16_t*)wgi->data, m.sg, T, 1, N);
+                        if (m.mixed_bf_lo) m.gemm.bf16(m.mixed_bf_lo, (const uint16_t*)wgi->data, m.sg, T, 1, N, 0, 1.0f);
+                        return true;
+                    };
+                    const bool defer_shared = !stream_all;
+                    if (!defer_shared && !shared_expert()) return false;
+                    // #136: STRATA_PF_FUSED=1 - the Q2_0 pack's experts on the fused int8 kernels (moe_fused.hpp),
+                    // grouped on the GPU: no host sync.  Only where every expert's place is known before the routing -
+                    // the streamed walk, in which every non-resident expert of the layer comes through the ring in id
+                    // order - and where the MMQ buffers exist: they hold the fused path's own (the per-token int8
+                    // activations in Xq, the int8 H in H, the grouping tables in GU).  Chunks below stream_all_min()
+                    // keep MMQ; without the variable nothing here runs.  A native pack's layer takes the native kernels
+                    // (moe_fused_iq.hpp) where they cover its two formats, else MMQ (or the FP16 path: IQ1_M).
+                    const strata::kernels::cpu::ExpertLayout& lay = strata::kernels::cpu::expert_layout();
+                    const bool use_mmq = mmq_plan().any && mmq_plan().layer[(size_t)l];
+                    const int mmq_gt = lay.native ? lay.fmt[(size_t)l].gu_type : 42;
+                    const int mmq_dt = lay.native ? lay.fmt[(size_t)l].d_type : 42;
+                    const bool fused_nat =
+                        use_mmq && stream_all && lay.native && fused::native_supported(mmq_gt, mmq_dt);
+                    const bool fused_l = (use_mmq && stream_all && !lay.native && fused::enabled()) || fused_nat;
+                    size_t n_order = 0;  // the routed experts (the debug report; unknown when fused)
+                    // set_cpu_pool (STRATA_PREFILL_CPU_SHARE): this layer's CPU experts (rows [T*K - rows_cpu, T*K)
+                    // of Dm), computed on a thread that reads on_cpu/cpu_blob; declared before cpu_fut so the future
+                    // joins before they are destroyed on any early exit.
+                    std::vector<char> on_cpu;
+                    std::vector<const uint8_t*> cpu_blob;
+                    double cpu_ms = 0;
+                    std::future<bool> cpu_fut;
+                    int64_t rows_cpu = 0, n_cpu = 0, n_stream = 0, cpu_at = 0;
+                    bool cpu_arm = true;
+                    int cpu_set = -1;
+                    bool cpu_cold = false;
+                    if (fused_l) {
+                        if (static bool said = false; !said) {
+                            said = true;
+                            std::fprintf(stderr,
+                                         "strata: prompt experts on the fused int8 kernels (STRATA_PF_FUSED=1, "
+                                         "#136)\n");
+                        }
+                        pt.mark(kPfGather, cs);
+                        // the layer's input to int8 once per token; the rows of each expert from the router's ids
+                        if (fused_nat)
+                            fused::quantize_act_native(m.mixed, T, N, m.Xq, m.cs);
+                        else
+                            fused::quantize_act(m.mixed, T, N, m.Xq, m.cs);
+                        fused::group(m.ids, T * K, (int)K, (int)m.g->n_expert, m.GU, m.slot_dev, m.src_dev, m.cs);
+                        // launches over the experts in id order, each at most kMaxBatch experts of which at most a
+                        // third of the ring streamed: the next batch's blobs arrive while one computes.  An expert
+                        // the routing did not pick has no tiles; its ring slot is given back with its batch.
+                        const size_t per = (size_t)std::max(1, m.ring / 3);
+                        size_t k = seq_start[(size_t)l];
+                        const size_t kend = seq_start[(size_t)l + 1];
+                        for (int32_t e = 0; e < m.g->n_expert;) {
+                            fused::Batch b;
+                            b.e0 = e;
+                            const size_t k0 = k;
+                            for (; e < m.g->n_expert && e - b.e0 < fused::kMaxBatch; ++e) {
+                                if (k < kend && seq[k].e == e) {
+                                    if (k - k0 == per) break;
+                                    b.blob[e - b.e0] = m.stage_dev[k % (size_t)m.ring];
+                                    ++k;
+                                } else {  // not streamed: resident (the walk streams all others)
+                                    b.blob[e - b.e0] = m.cache->device_slot(m.host_res[(size_t)l * m.g->n_expert + e]);
+                                    // counted whether routed or not (the routing stays on the GPU): at a streamed
+                                    // chunk's size (>= 1024 tokens x 10 of 512) nearly every expert is routed
+                                    ++stats_.experts_resident;
+                                }
+                            }
+                            b.e1 = e;
+                            if (k > k0) {
+                                // one copy stream, in order: the batch's last blob covers the others
+                                pt.mark(kPfWaitCopy, cs);
+                                wait_issued(k - 1);
+                                (m.cs)->ext_oneapi_submit_barrier({*m.copied[(k - 1) % (size_t)m.ring]});
+                            }
+                            pt.mark(kPfGemmGU, cs);
+                            if (fused_nat) {
+                                const auto& f = lay.fmt[(size_t)l];
+                                const fused::NativeGeom ng{f.gu_type, f.d_type, f.gu_row,
+                                                           f.d_row,   f.up_off, f.down_off};
+                                fused::experts_native(b, ng, (int)m.g->n_expert, T * K, m.GU, m.Xq, m.src_dev, m.H,
+                                                      m.Dm, m.cs);
+                            } else {
+                                fused::experts(b, (int)m.g->n_expert, T * K, m.GU, m.Xq, m.src_dev, m.H, m.Dm, m.cs);
+                            }
+                            for (size_t kk = k0; kk < k; ++kk)
+                                *m.used[kk % (size_t)m.ring] = m.cs->ext_oneapi_submit_barrier();
+                            if (k > k0) {
+                                consumed = k;
+                                give_back(consumed);
+                            }
+                        }
+                    } else {
+                        // group the (token, k) pairs by expert on the host
+                        pt.mark(kPfHostGroup, cs);
+                        // (the sync below also orders this layer's writes of slot/src/bounds after the previous
+                        // layer's kernels that read them)
+                        // (the mapped tables: STRATA_GROUP_COPY=0, or a chunk that predicts: STRATA_PF_PREDICT)
+                        static const bool mapped_env = [] { const char* v = std::getenv("STRATA_GROUP_COPY"); return v != nullptr && v[0] == '0'; }();
+                        const bool grp_mapped = m.grp_host != nullptr && (mapped_env || pred_on);
+                        int32_t* ids_h = grp_mapped ? m.grp_host : m.ids_host.data();
+                        int32_t* slot_h = grp_mapped ? m.grp_host + m.grp_tk : m.slot_host.data();
+                        int32_t* src_h = grp_mapped ? m.grp_host + 2 * m.grp_tk : m.src_host.data();
+                        if (grp_mapped) copy_i32(m.grp_dev, m.ids, T * K, m.cs);
+                        else
+                            m.cs->memcpy(m.ids_host.data(), m.ids, (size_t)T * K * 4);
+                        bool cpu_maybe = pool_hold.held && !stream_all && m.src != nullptr && !m.cpu_dead &&
+                                         lay.native && !lay.fmt.empty();
+                        auto cpu_share_off = [&](const char* what) {
+                            m.cpu_dead = true;
+                            cpu_maybe = false;
+                            std::fprintf(stderr,
+                                         "prefill: the CPU share is off for this run: the host could not give %s "
+                                         "(RAM is short); the GPU streams every expert\n",
+                                         what);
+                        };
+                        if (cpu_maybe && cpu_share_env() < 0.0) {
+                            constexpr int64_t CPU_PROBE = 29;
+                            constexpr int CPU_MIN_RATIOS = 3;
+                            const int64_t i = m.cpu_layers++;
+                            cpu_arm = m.cpu_nratio < CPU_MIN_RATIOS ? (i & 1) != 0 : (i % CPU_PROBE == 0) != m.cpu_gate;
+                            if (m.cpu_first_l < 0) m.cpu_first_l = l;
+                            cpu_cold = l == m.cpu_first_l;
+                            if (m.cpu_wall[0] == nullptr)
+                                for (sycl::event*& e : m.cpu_wall) e = new sycl::event();
+                            cpu_set = (int)(i & 1);
+                            *m.cpu_wall[2 * cpu_set] = m.cs->ext_oneapi_submit_barrier();
+                        }
+                        if (cpu_maybe && cpu_arm) {
+                            const size_t want = (size_t)T * N;
+                            if (m.cpu_x_n < want) {
+                                cpu_cold = true;
+                                if (m.cpu_x) sycl::free(m.cpu_x, *m.cs);
+                                m.cpu_x = nullptr;
+                                m.cpu_x_n = 0;
+                                try {
+                                    m.cpu_x = sycl::malloc_host<float>(want, *m.cs);
+                                } catch (...) {
+                                    m.cpu_x = nullptr;
+                                }
+                                if (!m.cpu_x) cpu_share_off("the activation buffer");
+                                else m.cpu_x_n = want;
+                            }
+                            if (cpu_maybe) m.cs->memcpy(m.cpu_x, m.mixed, want * sizeof(float));
+                        }
+                        m.cs->wait();
+                        m.pf_drain = m.pf_seq;
+                        if (cpu_maybe) {
+                            const size_t cap =
+                                (size_t)std::min<int64_t>(T * K, (int64_t)strata::kernels::cpu::MAXT * m.g->n_expert) * N;
+                            if (m.cpu_rows_n < cap) {
+                                if (m.cpu_rows) sycl::free(m.cpu_rows, *m.cs);
+                                m.cpu_rows = nullptr;
+                                m.cpu_rows_n = 0;
+                                try {
+                                    m.cpu_rows = sycl::malloc_host<float>(cap, *m.cs);
+                                } catch (...) {
+                                    m.cpu_rows = nullptr;
+                                }
+                                if (!m.cpu_rows) cpu_share_off("the rows buffer");
+                                else m.cpu_rows_n = cap;
+                            }
+                        }
+                        if (m.cpu_pend) {
+                            m.cpu_pend = false;
+                            float g_ms = 0;
+                            if (sycl_elapsed_ms(m.cpu_ev[0], m.cpu_ev[1], g_ms) && g_ms > 0.f) {
+                                constexpr double a = 0.25;
+                                const double c = m.pend_cpu_ms / (double)m.pend_n_cpu;
+                                const double g_per = g_ms / (double)m.pend_n_gpu;
+                                m.cpu_c_ms = m.cpu_c_ms > 0 ? m.cpu_c_ms + a * (c - m.cpu_c_ms) : c;
+                                m.cpu_g_ms = m.cpu_g_ms > 0 ? m.cpu_g_ms + a * (g_per - m.cpu_g_ms) : g_per;
+                                m.cpu_share_now = std::clamp(m.cpu_g_ms / (m.cpu_c_ms + m.cpu_g_ms), 0.05, 0.9);
+                            }
+                        }
+                        if (m.pend_wall) {
+                            float w_ms = 0;
+                            if (sycl_elapsed_ms(m.cpu_wall[2 * m.pend_set], m.cpu_wall[2 * m.pend_set + 1], w_ms) &&
+                                w_ms > 0.f) {
+                                const double w = w_ms / (double)m.pend_wall_n;
+                                if (m.last_arm != 0 && m.last_arm != m.pend_wall && m.pend_l > m.last_l) {
+                                    std::rotate(m.cpu_ratio, m.cpu_ratio + 1, m.cpu_ratio + Impl::CPU_RATIOS);
+                                    m.cpu_ratio[Impl::CPU_RATIOS - 1] = m.pend_wall == 2 ? w / m.last_w : m.last_w / w;
+                                    m.cpu_nratio = std::min(m.cpu_nratio + 1, Impl::CPU_RATIOS);
+                                    double v[Impl::CPU_RATIOS];
+                                    std::copy(m.cpu_ratio + Impl::CPU_RATIOS - m.cpu_nratio,
+                                              m.cpu_ratio + Impl::CPU_RATIOS, v);
+                                    std::nth_element(v, v + m.cpu_nratio / 2, v + m.cpu_nratio);
+                                    m.cpu_gate = v[m.cpu_nratio / 2] < 1.0;
+                                }
+                                if (static const bool dbg = std::getenv("STRATA_DBG_CPU_GATE") != nullptr; dbg)
+                                    std::fprintf(stderr,
+                                                 "cpu gate: layer %d %s, %lld non-resident, %.2f ms (%.4f a expert) -> %s\n",
+                                                 m.pend_l, m.pend_wall == 2 ? "shared" : "not shared",
+                                                 (long long)m.pend_wall_n, w_ms, w,
+                                                 m.cpu_gate ? "share" : "do not share");
+                                m.last_arm = m.pend_wall;
+                                m.last_l = m.pend_l;
+                                m.last_w = w;
+                            }
+                            m.pend_wall = 0;
+                        }
+                        pt.fold();
+
+                        // STRATA_PF_SHARED_FIRST: the shared expert at once, no mark (the fold below reads only marks that
+                        // are done; its time lands on the host grouping line)
+                        const bool shared_now = defer_shared && shared_first();
+                        if (shared_now && !shared_expert()) return false;
+                        std::fill(m.cnt.begin(), m.cnt.end(), 0);
+                        for (int64_t i = 0; i < T * K; ++i) {
+                            const int32_t e = ids_h[(size_t)i];
+                            if (e < 0 || e >= m.g->n_expert) {
+                                err = "prefill: routed id out of range";
+                                return false;
+                            }
+                            ++m.cnt[(size_t)e];
+                        }
+                        if (cpu_maybe) {
+                            std::vector<std::pair<int32_t, int32_t>> cand;  // (tokens, expert)
+                            int64_t nstream = 0;
+                            for (int32_t e = 0; e < m.g->n_expert; ++e) {
+                                const int32_t c = m.cnt[(size_t)e];
+                                if (c == 0 || (m.host_res && m.cache && m.host_res[(size_t)l * m.g->n_expert + e] >= 0))
+                                    continue;
+                                ++nstream;
+                                if (c <= strata::kernels::cpu::MAXT && (m.src->pinned(l, e) || !m.src->transient(l, e)))
+                                    cand.emplace_back(c, e);
+                            }
+                            std::sort(cand.begin(), cand.end());
+                            const double share =
+                                cpu_share_env() >= 0.0 ? cpu_share_env() : (cpu_arm ? m.cpu_share_now : 0.0);
+                            const size_t take = std::min(cand.size(), (size_t)std::llround(share * (double)nstream));
+                            n_stream = nstream;
+                            for (size_t i = 0; i < cand.size() && n_cpu < (int64_t)take; ++i) {
+                                const int32_t e = cand[i].second;
+                                const uint8_t* b = m.src->blob(l, e);
+                                if (b == nullptr) continue;
+                                if (on_cpu.empty()) {
+                                    on_cpu.assign((size_t)m.g->n_expert, 0);
+                                    cpu_blob.assign((size_t)m.g->n_expert, nullptr);
+                                }
+                                on_cpu[(size_t)e] = 1;
+                                cpu_blob[(size_t)e] = b;
+                                rows_cpu += cand[i].first;
+                                ++n_cpu;
+                            }
+                        }
+                        const int64_t rows_local = T * K - rows_cpu;
+                        cpu_at = rows_local;
+                        {
+                            int32_t r = 0;
+                            for (int32_t e = 0; e < m.g->n_expert; ++e)
+                                if (on_cpu.empty() || !on_cpu[(size_t)e]) {
+                                    m.off[(size_t)e] = r;
+                                    r += m.cnt[(size_t)e];
+                                }
+                            for (int32_t e = 0; e < m.g->n_expert && !on_cpu.empty(); ++e)
+                                if (on_cpu[(size_t)e]) {
+                                    m.off[(size_t)e] = r;
+                                    r += m.cnt[(size_t)e];
+                                }
+                            m.off[(size_t)m.g->n_expert] = r;
+                        }
+                        std::vector<int32_t> fill(m.off.begin(), m.off.end() - 1);
+                        for (int64_t i = 0; i < T * K; ++i) {
+                            const int32_t e = ids_h[(size_t)i];
+                            const int32_t p = fill[(size_t)e]++;
+                            slot_h[(size_t)i] = p;
+                            src_h[(size_t)p] = (int32_t)(i / K);
+                        }
+                        if (grp_mapped) {
+                            copy_i32(m.slot_dev, m.grp_dev + m.grp_tk, T * K, m.cs);
+                            copy_i32(m.src_dev, m.grp_dev + 2 * m.grp_tk, T * K, m.cs);
+                        } else {
+                            m.cs->memcpy(m.slot_dev, m.slot_host.data(), (size_t)T * K * 4);
+                            m.cs->memcpy(m.src_dev, m.src_host.data(), (size_t)T * K * 4);
+                        }
+                        // the experts, in id order: resident ones from VRAM, the others through the staging ring
+                        std::vector<int32_t> order;
+                        for (int32_t e = 0; e < m.g->n_expert; ++e)
+                            if (m.cnt[(size_t)e] > 0 && (on_cpu.empty() || !on_cpu[(size_t)e])) order.push_back(e);
+                        n_order = order.size();
+                        if (rows_cpu > 0) {
+                            const int64_t r0c = cpu_at;
+                            const strata::kernels::cpu::NativeFmt& cf = lay.fmt[(size_t)l];
+                            if (cpu_share_env() < 0.0) {
+                                if (m.cpu_ev[0] == nullptr) {
+                                    m.cpu_ev[0] = new sycl::event();
+                                    m.cpu_ev[1] = new sycl::event();
+                                }
+                                *m.cpu_ev[0] = m.cs->ext_oneapi_submit_barrier();
+                            }
+                            cpu_fut = std::async(
+                                std::launch::async, [&m, &on_cpu, &cpu_blob, &cf, &cpu_ms, src_h, T, r0c, this]() -> bool {
+                                    const auto t0 = Clock::now();
+                                    constexpr size_t AB = strata::kernels::cpu::kNativeActBytes;
+                                    const bool q2 = strata::kernels::cpu::q2_native_kernels(cf.gu_type);
+                                    if (q2 && m.cpu_actq.size() < (size_t)T) m.cpu_actq.resize((size_t)T);
+                                    if (!q2 && m.cpu_nact.size() < (size_t)T * AB) m.cpu_nact.resize((size_t)T * AB);
+                                    std::vector<char> need((size_t)T, 0);
+                                    for (int32_t e = 0; e < m.g->n_expert; ++e)
+                                        if (on_cpu[(size_t)e])
+                                            for (int32_t r = 0; r < m.cnt[(size_t)e]; ++r)
+                                                need[(size_t)src_h[(size_t)m.off[(size_t)e] + (size_t)r]] = 1;
+                                    for (int64_t t = 0; t < T; ++t)
+                                        if (need[(size_t)t] && q2)
+                                            strata::kernels::cpu::act_quant_any(m.cpu_x + (size_t)t * N, (int)N,
+                                                                                m.cpu_actq[(size_t)t]);
+                                        else if (need[(size_t)t])
+                                            strata::kernels::cpu::native_quant_act(
+                                                cf, m.cpu_x + (size_t)t * N, m.cpu_nact.data() + (size_t)t * AB);
+                                    m.cpu_jobs.clear();
+                                    for (int32_t e = 0; e < m.g->n_expert; ++e) {
+                                        if (!on_cpu[(size_t)e]) continue;
+                                        strata::kernels::cpu::ExpertJobMulti j;
+                                        j.blob = cpu_blob[(size_t)e];
+                                        j.nt = m.cnt[(size_t)e];
+                                        for (int r = 0; r < j.nt; ++r) {
+                                            const int64_t p = (int64_t)m.off[(size_t)e] + r;
+                                            if (q2) j.act[r] = &m.cpu_actq[(size_t)src_h[(size_t)p]];
+                                            else j.nact[r] = m.cpu_nact.data() + (size_t)src_h[(size_t)p] * AB;
+                                            j.out[r] = m.cpu_rows + (size_t)(p - r0c) * N;
+                                        }
+                                        m.cpu_jobs.push_back(j);
+                                    }
+                                    cpu_pool_->run_split_multi_native(cf, m.cpu_jobs.data(), (int)m.cpu_jobs.size());
+                                    cpu_ms = ms_since(t0);
+                                    return true;
+                                });
+                        }
+                        const size_t mmq_gub = use_mmq ? mmq::matrix_bytes(mmq_gt, 1280, N) : 0;
+                        const size_t mmq_db = use_mmq ? mmq::matrix_bytes(mmq_dt, N, 640) : 0;
+                        pt.mark(kPfGather, cs);
+                        if (use_mmq) {
+                            // step 2b: the layer's activations as q8_1 rows in expert order, straight from `mixed`
+                            if (rows_local > 0) mmq::quantize(m.mixed, m.src_dev, m.Xq, mmq_gt, N, N, rows_local, m.cs);
+                            // each group's rows: absolute bounds (gate/up reads the layer's rows), relative ones (down
+                            // reads the group's own quantized H)
+                            const size_t n = order.size(), ng = (n + MMQ_GROUP - 1) / MMQ_GROUP;
+                            m.bounds_host.resize(n + 1 + ng * (MMQ_GROUP + 1));
+                            for (size_t j = 0; j < n; ++j)
+                                m.bounds_host[j] = m.off[(size_t)order[j]];
+                            m.bounds_host[n] = (int32_t)rows_local;
+                            for (size_t g = 0; g < ng; ++g)
+                                for (size_t i = 0; i <= MMQ_GROUP; ++i)
+                                    m.bounds_host[n + 1 + g * (MMQ_GROUP + 1) + i] =
+                                        m.bounds_host[std::min(n, g * MMQ_GROUP + i)] - m.bounds_host[g * MMQ_GROUP];
+                            if (grp_mapped) {
+                                int32_t* bh = m.grp_host + 3 * m.grp_tk;
+                                std::memcpy(bh, m.bounds_host.data(), m.bounds_host.size() * 4);
+                                copy_i32(m.bounds_dev, m.grp_dev + 3 * m.grp_tk, (int64_t)m.bounds_host.size(), m.cs);
+                            } else {
+                                m.cs->memcpy(m.bounds_dev, m.bounds_host.data(), m.bounds_host.size() * 4);
+                            }
+                        } else {
+                            if (rows_local > 0) gather_rows16(m.mixed_h, m.src_dev, m.Xs, rows_local, N, m.cs);
+                        }
+                        if (defer_shared && !shared_now) {
+                            pt.mark(kPfRouter, cs);   // keep the existing router+shared timing attribution
+                            if (!shared_expert()) return false;
+                            pt.mark(kPfHostGroup, cs);
+                        } else if (shared_now) {
+                            pt.mark(kPfHostGroup, cs);
+                        }
+                        // STRATA_PF_EARLY_COPY: this layer's mirrored experts are copied now, in id order into the walk's ring
+                        // from its first slot (the walk takes them from early_slot and stages the rest after them); every
+                        // ring slot's last reader finished before the routing sync above.  After the routing tables' upload:
+                        // a memcpy on the compute queue waits behind the copy engine's queued copies (measured: the
+                        // uploads behind ~90 early copies held every layer ~2 ms); the ids' download at the next routing
+                        // sync comes after this layer's groups waited for all of them
+                        std::vector<int> early_slot;
+                        int early_next = -1;   // the walk's next ring slot after them (-1: none issued)
+                        if (early_copy_on() && !stream_all && !use_mmq && !fused_l &&
+                            m.cache != nullptr && m.host_res != nullptr && m.src != nullptr) {
+                            const int st_n = stage_slots_t((size_t) m.T), st_w0 = walk_base_t((size_t) m.T);
+                            const int room = st_n - st_w0;
+                            const size_t nbytes = (size_t) lay.blob_bytes(l);
+                            int n = 0;
+                            for (int32_t e = 0; e < m.g->n_expert && n < room; ++e) {
+                                if (m.cnt[(size_t) e] == 0 || m.host_res[(size_t) l * m.g->n_expert + e] >= 0) continue;
+                                if (!on_cpu.empty() && on_cpu[(size_t) e]) continue;
+                                if (!pf_slot.empty() && pf_slot[(size_t) e] >= 0) continue;   // prefetched or predicted
+                                const uint8_t* b = m.src->pinned(l, e) ? m.src->blob(l, e) : nullptr;
+                                if (!dma_direct(m.src, l, e, b, m.copy, nbytes) || b == nullptr) continue;   // the stager's: the walk copies it
+                                if (early_slot.empty()) early_slot.assign((size_t) m.g->n_expert, -1);
+                                const int sl = st_w0 + n++;
+                                if (m.stage_live[sl]) m.copy->ext_oneapi_submit_barrier({*m.used[sl]});
+                                m.copy->memcpy(m.stage_dev[sl], b, nbytes);
+                                *m.copied[sl] = m.copy->ext_oneapi_submit_barrier();
+                                m.stage_live[sl] = true;
+                                m.copy_seq[sl] = ++m.copy_ctr;
+                                early_slot[(size_t) e] = sl;
+                                ++stats_.experts_dma;
+                            }
+                            if (n > 0) early_next = st_w0 + n % room;
+                        }
+                        // Stage ahead: the copy stream moves blobs host -> device while the compute stream works.
+                        const int stage_n = stage_slots_t((size_t) m.T);
+                        const int stage_w0 = walk_base_t((size_t) m.T);
+                        int stage_next = early_next >= 0 ? early_next : stage_w0;
+                        std::vector<int> stage_of(order.size(), -1);
+                        // the unpinned ones are copied to pinned buffers by the stager's threads, in this order
+                        std::vector<int> job_of(order.size(), -1);
+                        const size_t lbytes = (size_t)lay.blob_bytes(l);
+                        std::vector<char> direct_of(order.size(), 0);
+                        std::vector<const uint8_t*> direct_blob(order.size(), nullptr);
+                        if (!stream_all) {
+                            std::vector<Stager::Job> js;
+                            for (size_t j = 0; j < order.size(); ++j) {
+                                const int32_t e = order[j];
+                                if (m.host_res && m.cache && m.host_res[(size_t)l * m.g->n_expert + e] >= 0) continue;
+                                if (!pf_slot.empty() && pf_slot[(size_t)e] >= 0) continue;
+                                if (!early_slot.empty() && early_slot[(size_t)e] >= 0) continue;
+                                if (m.src->transient(l, e)) {  // CS-T: copied by the source
+                                    job_of[j] = (int)js.size();
+                                    js.push_back({nullptr, lbytes, m.src, (int32_t)l, e});
+                                    continue;
+                                }
+                                const uint8_t* b = m.src->blob(l, e);
+                                if (!b) {
+                                    err = "prefill: expert source has no blob";
+                                    return false;
+                                }
+                                if (dma_direct(m.src, l, e, b, m.copy, lbytes)) {
+                                    direct_of[j] = 1;
+                                    direct_blob[j] = b;
+                                    continue;
+                                }
+                                job_of[j] = (int)js.size();
+                                js.push_back({b, lbytes});
+                            }
+                            m.stager->start(std::move(js));
+                        }
+                        StagerDone stager_done{stream_all ? nullptr : m.stager.get()};
+                        auto stage_one = [&](size_t j) -> bool {
+                            const int32_t e = order[j];
+                            const bool resident =
+                                m.host_res && m.cache && m.host_res[(size_t)l * m.g->n_expert + e] >= 0;
+                            if (resident) return true;
+                            if (!pf_slot.empty() && pf_slot[(size_t) e] >= 0) {   // bank slot: already copied
+                                stage_of[j] = pf_slot[(size_t) e];
+                                pf_slot[(size_t) e] = -1;
+                                ++stats_.experts_streamed;
+                                return true;
+                            }
+                            if (!early_slot.empty() && early_slot[(size_t) e] >= 0) {   // STRATA_PF_EARLY_COPY: issued after the sync
+                                stage_of[j] = early_slot[(size_t) e];
+                                early_slot[(size_t) e] = -1;
+                                ++stats_.experts_streamed;
+                                return true;
+                            }
+                            const int sl = stage_next;
+                            stage_next = stage_w0 + (stage_next - stage_w0 + 1) % (stage_n - stage_w0);
+                            const auto th = Clock::now();
+                            if (direct_of[j] && direct_blob[j] != nullptr) {
+                                // DMA straight from the page-locked arena: the copy stream only waits for the slot
+                                if (m.stage_live[sl]) (m.copy)->ext_oneapi_submit_barrier({*m.used[sl]});
+                                m.copy->memcpy(m.stage_dev[sl], direct_blob[j], lbytes);
+                                ++stats_.experts_dma;
+                            } else {
+                                // copied to a pinned buffer by the stager (waits only if it is behind), then DMA
+                                const uint8_t* hb = m.stager->wait(job_of[j]);
+                                if (!hb) {
+                                    err = "prefill: missing stager job for unpinned expert";
+                                    return false;
+                                }
+                                if (m.stage_live[sl]) (m.copy)->ext_oneapi_submit_barrier({*m.used[sl]});
+                                m.copy->memcpy(m.stage_dev[sl], hb, lbytes);
+                                m.stager->issued_one(job_of[j], m.copy);
+                            }
+                            *m.copied[sl] = m.copy->ext_oneapi_submit_barrier();
+                            m.stage_live[sl] = true;
+                            m.copy_seq[sl] = ++m.copy_ctr;
+                            stage_of[j] = sl;
+                            stats_.ms_experts_host += ms_since(th);
+                            ++stats_.experts_streamed;
+                            return true;
+                        };
+                        // one expert's products from its blob on the device; `slot` (a ring slot, or -1 for a resident
+                        // expert) is released once the blob is read
+                        // STRATA_MMQ_DIRECT=1: a resident expert with guard room in its slot is not gathered - the
+                        // group's pointer tables give MMQ each expert's own address (group position q), the others are
+                        // gathered at compact positions c = 0..ns-1 of the group buffers, as before (same bytes)
+                        const bool direct = use_mmq && lay.native && m.cache && mmq_plan().direct[(size_t)l];
+                        mmq::WeightTab tgu{}, td{};
+                        mmq::GuardTab gd{};
+                        int ns = 0;
+
+                        const bool xmx_fmt = lay.native && [&]() {
+                            const auto& f = lay.fmt[(size_t)l];
+                            return (f.gu_type == 18 || f.gu_type == 21 || f.gu_type == 22 || f.gu_type == 23 ||
+                                    f.gu_type == 16 || f.gu_type == 17 || f.gu_type == 29) &&
+                                   (f.d_type == 20 || f.d_type == 42 || f.d_type == 23) &&
+                                   f.n_embd == N && f.n_ff == 640;
+                        }();
+
+                        static const int pf_xmx_opt = [] {
+                            const char* v = std::getenv("STRATA_PF_XMX");
+                            return v ? std::atoi(v) : 0;
+                        }();
+
+                        const bool use_xmx = !use_mmq && pf_xmx_opt > 0 && xmx_fmt;
+
+                        const uint8_t* xg_g[strata::kernels::kXmxGroupMax];
+                        const uint8_t* xg_u[strata::kernels::kXmxGroupMax];
+                        const uint8_t* xg_d[strata::kernels::kXmxGroupMax];
+                        int32_t xg_c[strata::kernels::kXmxGroupMax];
+                        int xg_slots[strata::kernels::kXmxGroupMax];
+                        int xg_n = 0, xg_ns = 0;
+                        int64_t xg_r0 = 0;
+
+                        auto xflush = [&]() {
+                            if (xg_n == 0) return;
+                            const auto& f = lay.fmt[(size_t)l];
+                            int64_t nr = 0;
+                            for (int i = 0; i < xg_n; ++i) nr += xg_c[i];
+
+                            static const bool debug = [] {
+                                const char* e1 = std::getenv("STRATA_XMXG_DEBUG");
+                                const char* e2 = std::getenv("STRATA_DEBUG");
+                                return (e1 && std::atoi(e1) != 0) || (e2 && std::atoi(e2) != 0);
+                            }();
+                            if (debug) {
+                                std::fprintf(stderr,
+                                             "[prefill:xmxg] layer %ld: flushing group of %d experts, total_rows=%ld, r0=%ld\n",
+                                             (long)l, xg_n, (long)nr, (long)xg_r0);
+                            }
+
+                            if (xg_ns > 0) {   // the copies land in order on m.copy: waiting on the last slot covers the group
+                                pt.mark(kPfWaitCopy, cs);
+                                int last = xg_slots[xg_ns - 1];
+                                if (early_copy_on() || pred_on)   // slots filled out of id order: the copy issued last
+                                    for (int i = 0; i < xg_ns; ++i)
+                                        if (m.copy_seq[xg_slots[i]] > m.copy_seq[last]) last = xg_slots[i];
+                                (m.cs)->ext_oneapi_submit_barrier({*m.copied[last]});
+                            }
+
+                            pt.mark(kPfGemmGU, cs);
+                            strata::kernels::iq_xmx_grouped(f.gu_type, xg_g, xg_u, xg_c, xg_n, m.Xs + xg_r0 * N,
+                                                            m.GU + xg_r0 * 1280, 1280, (int)N, m.cs);
+                            swiglu_interleaved(m.GU + xg_r0 * 1280, m.Hh + xg_r0 * 640, nr, m.cs);
+                            pt.mark(kPfGemmD, cs);
+                            strata::kernels::iq_xmx_grouped(f.d_type, xg_d, nullptr, xg_c, xg_n, m.Hh + xg_r0 * 640,
+                                                            m.Dm + xg_r0 * N, (int)N, 640, m.cs);
+
+                            if (xg_ns > 0) {
+                                auto bar = m.cs->ext_oneapi_submit_barrier();
+                                for (int i = 0; i < xg_ns; ++i) *m.used[xg_slots[i]] = bar;
+                            }
+                            xg_n = 0;
+                            xg_ns = 0;
+                        };
+
+                        auto compute = [&](size_t j, const uint8_t* blob_dev, int slot, int32_t cslot) -> bool {
+                            const int32_t e = order[j];
+                            if (use_xmx) {
+                                if (static bool said = false; !said) {
+                                    said = true;
+                                    std::fprintf(stderr, "strata: prompt experts on the fused grouped XMX (STRATA_PF_XMX=%d)\n", pf_xmx_opt);
+                                }
+                                const auto& f = lay.fmt[(size_t)l];
+                                if (xg_n == 0) xg_r0 = m.off[(size_t)e];
+                                xg_g[xg_n] = blob_dev;
+                                xg_u[xg_n] = blob_dev + f.up_off;
+                                xg_d[xg_n] = blob_dev + f.down_off;
+                                xg_c[xg_n] = (int32_t)m.cnt[(size_t)e];
+                                ++xg_n;
+                                if (slot >= 0) xg_slots[xg_ns++] = slot;
+                                if (xg_n == strata::kernels::kXmxGroupMax || j + 1 == order.size() || (!stream_all && slot >= 0)) {
+                                    xflush();
+                                }
+                                return true;
+                            }
+                            pt.mark(kPfDequant, cs);
+                            if (use_mmq) {
+                                // gather the expert into its group slot (GGUF blocks, unchanged or converted)
+                                const size_t q = j % MMQ_GROUP;
+                                if (direct) {
+                                    const auto& f = lay.fmt[(size_t)l];
+                                    uint8_t* gp = cslot >= 0 && ((uintptr_t)blob_dev | (uintptr_t)f.down_off) % 16 == 0
+                                                      ? m.cache->slot_tail(cslot, f.bytes, mmq_plan().d_over[(size_t)l])
+                                                      : nullptr;
+                                    if (gp) {   // read in its slot: the guard after the blob is zeroed at the group end
+                                        tgu.p[q] = blob_dev;
+                                        td.p[q] = blob_dev + f.down_off;
+                                        gd.p[gd.n++] = gp;
+                                        ++stats_.experts_direct;
+                                    } else {
+                                        const int c = ns++;
+                                        tgu.p[q] = m.grp_gu + (size_t)c * mmq_gub;
+                                        td.p[q] = m.grp_d + (size_t)c * mmq_db;
+                                        mmq::gather_native(blob_dev, blob_dev + f.up_off, mmq_gub / 2,
+                                                           blob_dev + f.down_off, mmq_db,
+                                                           m.grp_gu + (size_t)c * mmq_gub,
+                                                           m.grp_d + (size_t)c * mmq_db, m.cs);
+                                    }
+                                    if (slot >= 0) *m.used[slot] = m.cs->ext_oneapi_submit_barrier();
+                                    if (q + 1 < MMQ_GROUP && j + 1 < order.size()) return true;
+                                } else {
+                                    if (lay.native) {
+                                        const auto& f = lay.fmt[(size_t)l];
+                                        mmq::gather_native(blob_dev, blob_dev + f.up_off, mmq_gub / 2,
+                                                           blob_dev + f.down_off, mmq_db, m.grp_gu + q * mmq_gub,
+                                                           m.grp_d + q * mmq_db, m.cs);
+                                    } else {
+                                        mmq::gather_strata_q2(blob_dev, m.grp_gu + q * mmq_gub, m.grp_d + q * mmq_db, m.cs);
+                                    }
+                                    if (slot >= 0) *m.used[slot] = m.cs->ext_oneapi_submit_barrier();
+                                    if (q + 1 < MMQ_GROUP && j + 1 < order.size()) return true;
+                                }
+                                // the group's products: gate/up, swiglu, the group's H to q8_1, down
+                                const size_t j0 = j - q, g = j0 / MMQ_GROUP, n = order.size();
+                                const int ngx = (int)(q + 1);
+                                const int64_t r0 = m.bounds_host[j0], nr = m.bounds_host[j + 1] - r0;
+                                int64_t maxr = 0;
+                                for (size_t i = j0; i <= j; ++i)
+                                    maxr = std::max<int64_t>(maxr, m.cnt[(size_t)order[i]]);
+                                pt.mark(kPfGemmGU, cs);
+                                if (direct) {
+                                    // one launch: the direct experts' guards (their down over-read) and the zeroed tail
+                                    // after the last gathered expert (see MMQ_TAIL)
+                                    mmq::prep_group(gd, mmq_plan().d_over[(size_t)l],
+                                                    ns ? m.grp_gu + (size_t)ns * mmq_gub : nullptr,
+                                                    ns ? m.grp_d + (size_t)ns * mmq_db : nullptr, MMQ_TAIL, m.cs);
+                                } else {
+                                    // the zeroed tail after the group's last expert (see MMQ_TAIL)
+                                    m.cs->memset(m.grp_gu + (size_t)ngx * mmq_gub, 0, MMQ_TAIL);
+                                    m.cs->memset(m.grp_d + (size_t)ngx * mmq_db, 0, MMQ_TAIL);
+                                }
+                                mmq::Product gu;
+                                gu.w = m.grp_gu;
+                                gu.type = mmq_gt;
+                                gu.w_rows = 1280;
+                                gu.w_cols = N;
+                                gu.expert_bytes = mmq_gub;
+                                gu.n = ngx;
+                                gu.xq = m.Xq;
+                                gu.bounds = m.bounds_dev + j0;
+                                gu.ids = m.ids_identity;
+                                gu.total_rows = T * K;
+                                gu.max_rows = maxr;
+                                gu.dst = m.GU;
+                                gu.ld_dst = 1280;
+                                if (direct) gu.tab = &tgu;
+                                m.mmq_ctx->run(gu, m.cs);
+                                mmq::swiglu(m.GU + r0 * 1280, m.H + r0 * 640, nr, 640, !lay.native, m.cs);
+                                pt.mark(kPfGemmD, cs);
+                                mmq::quantize(m.H + r0 * 640, nullptr, m.Hq, mmq_dt, 640, 640, nr, m.cs);
+                                mmq::Product dn;
+                                dn.w = m.grp_d;
+                                dn.type = mmq_dt;
+                                dn.w_rows = N;
+                                dn.w_cols = 640;
+                                dn.expert_bytes = mmq_db;
+                                dn.n = ngx;
+                                dn.xq = m.Hq;
+                                dn.bounds = m.bounds_dev + n + 1 + g * (MMQ_GROUP + 1);
+                                dn.ids = m.ids_identity;
+                                dn.total_rows = nr;
+                                dn.max_rows = maxr;
+                                dn.dst = m.Dm + r0 * N;
+                                dn.ld_dst = N;
+                                if (direct) dn.tab = &td;
+                                m.mmq_ctx->run(dn, m.cs);
+                                if (direct) {
+                                    tgu = mmq::WeightTab{};
+                                    td = mmq::WeightTab{};
+                                    gd = mmq::GuardTab{};
+                                    ns = 0;
+                                }
+                                return true;
+                            }
+                            const int q = (int)(j % DQ);
+                            if (lay.native) {
+                                // plan v0.3 P6: a native pack's layer, dequantized by llama.cpp's own formulas
+                                const auto& f = lay.fmt[(size_t)l];
+                                strata::kernels::iq_dequant_gu_f16(f.gu_type, blob_dev, blob_dev + f.up_off, f.n_ff,
+                                                                   f.n_embd, m.dq_gu[q], m.cs);
+                                strata::kernels::iq_dequant_f16(f.d_type, blob_dev + f.down_off, f.n_embd * f.n_ff,
+                                                                m.dq_d[q], m.cs);
+                            } else {
+                                blob_dequant_f16(blob_dev, m.dq_gu[q], m.dq_d[q], m.cs);
+                            }
+                            if (slot >= 0) *m.used[slot] = m.cs->ext_oneapi_submit_barrier();
+                            const int64_t o0 = m.off[(size_t)e], ne = m.cnt[(size_t)e];
+                            pt.mark(kPfGemmGU, cs);
+                            m.gemm.f16(m.Xs + o0 * N, m.dq_gu[q], m.GU + o0 * 1280, ne, 1280, N);
+                            swiglu_interleaved(m.GU + o0 * 1280, m.Hh + o0 * 640, ne, m.cs);
+                            pt.mark(kPfGemmD, cs);
+                            m.gemm.f16(m.Hh + o0 * 640, m.dq_d[q], m.Dm + o0 * N, ne, N, 640);
+                            return true;
+                        };
+                        if (!stream_all) {
+                            size_t staged = 0;
+                            const size_t lookahead = (size_t)(stage_n - stage_w0 - 1);
+                            for (size_t j = 0; j < order.size(); ++j) {
+                                while (staged < order.size() && staged <= j + lookahead) {
+                                    if (!stage_one(staged)) return false;
+                                    ++staged;
+                                }
+                                const int32_t e = order[j];
+                                if (stage_of[j] < 0) {
+                                    ++stats_.experts_resident;
+                                    const int32_t cslot = m.cache ? m.host_res[(size_t)l * m.g->n_expert + e] : -1;
+                                    if (!compute(j, m.cache->device_slot(cslot), -1, cslot))
+                                        return false;
+                                } else {
+                                    pt.mark(kPfWaitCopy, cs);
+                                    (m.cs)->ext_oneapi_submit_barrier({*m.copied[stage_of[j]]});
+                                    if (!compute(j, m.stage_dev[stage_of[j]], stage_of[j], -1)) return false;
+                                }
+                            }
+                            // STRATA_PF_PREDICT: the next layer's predicted mirrored experts, behind this layer's copies, into
+                            // the bank of its parity (read two layers back: done before this layer's routing sync)
+                            if (pred_next) {
+                                const int64_t l1 = l + 1;
+                                const size_t nbytes = (size_t) lay.blob_bytes(l1);
+                                std::vector<char> want((size_t) m.g->n_expert, 0);
+                                for (int64_t i = 0; i < T * K; ++i) {
+                                    const int32_t e = m.pred_host[(size_t) i];
+                                    if (e >= 0 && e < m.g->n_expert) want[(size_t) e] = 1;
+                                }
+                                pred_slot.assign((size_t) m.g->n_expert, -1);
+                                const int base = (int) (l1 & 1) * pred_bank;
+                                int n = 0;
+                                for (int32_t e = 0; e < m.g->n_expert && n < pred_bank; ++e) {
+                                    if (!want[(size_t) e] || (m.host_res && m.host_res[(size_t) l1 * m.g->n_expert + e] >= 0)) continue;
+                                    const uint8_t* b = m.src->pinned(l1, e) ? m.src->blob(l1, e) : nullptr;
+                                    if (!dma_direct(m.src, l1, e, b, m.copy, nbytes) || b == nullptr) continue;
+                                    const int sl = base + n++;
+                                    m.copy->memcpy(m.stage_dev[sl], b, nbytes);
+                                    *m.copied[sl] = m.copy->ext_oneapi_submit_barrier();
+                                    m.stage_live[sl] = true;
+                                    m.copy_seq[sl] = ++m.copy_ctr;
+                                    pred_slot[(size_t) e] = sl;
+                                    ++stats_.experts_dma;
+                                }
+                                pred_for = l1;
+                            }
+                        } else {
+                            // the streamed walk: this layer's entries [k, kend) in id order; an entry the routing did
+                            // not pick only gives its slot back
+                            size_t k = seq_start[(size_t)l];
+                            const size_t kend = seq_start[(size_t)l + 1];
+                            auto release_to = [&](int32_t e_stop) {
+                                while (k < kend && seq[k].e < e_stop) {
+                                    if (use_xmx && xg_ns > 0 &&
+                                        (size_t)(k - a_consumed.load(std::memory_order_relaxed)) + 16 >= (size_t)m.ring) {
+                                        xflush();
+                                    }
+                                    *m.used[k % (size_t)m.ring] = m.cs->ext_oneapi_submit_barrier();
+                                    consumed = ++k;
+                                    if (xg_ns == 0) give_back(consumed);
+                                }
+                            };
+                            for (size_t j = 0; j < order.size(); ++j) {
+                                const int32_t e = order[j];
+                                release_to(e);
+                                if (k < kend && seq[k].e == e) {
+                                    const int sl = (int)(k % (size_t)m.ring);
+                                    pt.mark(kPfWaitCopy, cs);
+                                    wait_issued(k);
+                                    (m.cs)->ext_oneapi_submit_barrier({*m.copied[sl]});
+                                    if (!compute(j, m.stage_dev[sl], sl, -1)) return false;
+                                    consumed = ++k;
+                                    if (xg_ns == 0) give_back(consumed);
+                                } else {
+                                    ++stats_.experts_resident;
+                                    const int32_t cslot = m.cache ? m.host_res[(size_t)l * m.g->n_expert + e] : -1;
+                                    if (!compute(j, m.cache->device_slot(cslot), -1, cslot))
+                                        return false;
+                                    if (xg_ns == 0) give_back(consumed);
+                                }
+                            }
+                            release_to(m.g->n_expert);
+                        }
+                        if (use_xmx) {
+                            xflush();
+                            give_back(consumed);
+                        }
+                    }
+                    pt.mark(kPfCombine, cs);
+                    if (cpu_fut.valid()) {  // set_cpu_pool: the CPU's rows into Dm's tail
+                        if (cpu_share_env() < 0.0 && m.cpu_ev[1]) *m.cpu_ev[1] = m.cs->ext_oneapi_submit_barrier();
+                        if (!cpu_fut.get()) {
+                            err = "prefill: a CPU expert has no blob";
+                            return false;
+                        }
+                        if (cpu_share_env() < 0.0 && n_stream > n_cpu) {
+                            m.cpu_pend = true;
+                            m.pend_cpu_ms = cpu_ms;
+                            m.pend_n_cpu = n_cpu;
+                            m.pend_n_gpu = n_stream - n_cpu;
+                        }
+                        stats_.cpu_share = cpu_share_env() >= 0.0 ? cpu_share_env() : m.cpu_share_now;
+                        m.cs->memcpy(m.Dm + (size_t)cpu_at * N, m.cpu_rows, (size_t)rows_cpu * N * sizeof(float));
+                        stats_.experts_cpu += n_cpu;
+                    }
+                    if (cpu_set >= 0 && n_stream > 0 && (!cpu_arm || n_cpu > 0) && !cpu_cold) {
+                        *m.cpu_wall[2 * cpu_set + 1] = m.cs->ext_oneapi_submit_barrier();
+                        m.pend_wall = cpu_arm ? 2 : 1;
+                        m.pend_set = cpu_set;
+                        m.pend_l = (int)l;
+                        m.pend_wall_n = n_stream;
+                    }
+                    moe_combine(m.Dm, m.slot_dev, m.w, m.shared, m.sg, m.bo, T, m.cs);
+                    // debug: STRATA_DBG_NAN=1 reports the first layer of a chunk whose MoE produced non-finite values
+                    if (static const bool dbg = std::getenv("STRATA_DBG_NAN") != nullptr; dbg) {
+                        m.cs->wait();
+                        auto bad = [&](const float* d, int64_t n) {
+                            std::vector<float> h((size_t)n);
+                            default_queue().memcpy(h.data(), d, (size_t)n * 4).wait();
+                            int64_t c = 0;
+                            for (float v : h)
+                                c += !sycl::isfinite(v);
+                            return c;
+                        };
+                        // (fused: GU and H hold the grouping tables and int8 rows, not floats)
+                        // (the CPU's rows, the last rows_cpu of GU and H, are never written by the GPU: not checked)
+                        const int64_t gpu_rows = T * K - rows_cpu;
+                        const int64_t bgu = fused_l ? 0 : bad(m.GU, gpu_rows * 1280), bdm = bad(m.Dm, T * K * N),
+                                      bbo = bad(m.bo, T * N);
+                        const int64_t bh = m.H && !fused_l ? bad(m.H, gpu_rows * 640) : -1;
+                        static int64_t reported = -1;
+                        if ((bgu || bdm || bbo || bh > 0) && reported != stats_.chunks) {
+                            reported = stats_.chunks;
+                            std::fprintf(
+                                stderr,
+                                "strata dbg: layer %lld (mmq %d, types %d/%d, %zu experts): non-finite GU %lld "
+                                "H %lld Dm %lld bo %lld of T %lld\n",
+                                (long long)l, (int)use_mmq, mmq_gt, mmq_dt, n_order, (long long)bgu, (long long)bh,
+                                (long long)bdm, (long long)bbo, (long long)T);
+                        }
+                    }
+                }
+                // ---- the hyper-connection write of this half; F-2: fused with the next half's norm when nothing else
+                // touches R in between (not the stage's last half, not before the PLE block of layer 1, not under a
+                // control vector)
+                const int64_t nl = half == 0 ? l : l + 1;
+                const bool fuse = !gr_unfused() && nl < LE && !(half == 1 && nl == 1 && ple_on) &&
+                                  !(half == 1 && strata::kernels::cvec().covers(l));
+                const core::WeightRef* wnn = nullptr;
+                if (fuse) {
+                    const core::LayerView vn(*m.wt, nl);
+                    wnn = need(vn, half == 0 ? "hc_ffn_norm.weight" : "hc_attn_norm.weight", err);
+                    if (!wnn) return false;
+                }
+                if (wnn) {
+                    gr_write_norm_rs(m.R, m.bo, m.inj, HC, (const float*)wnn->data, EPS, m.grs, m.xn16, T, m.cs,
+                                     m.xn16_lo);
+                    normed = true;
+                } else {
+                    gr_write(m.R, m.bo, m.inj, HC, T, m.cs);
+                }
+                if (half == 1 && strata::kernels::cvec().covers(l))  // --control-vector-scaled
+                    strata::kernels::cvec_apply(m.R, l, T, D, nullptr, 0, nullptr, 0, false, m.cs);
+#if defined(STRATA_HAVE_DFLASH2)
+                if (half == 1 && tap_rows > 0 && !tap_slot.empty() && tap_slot[(size_t) l] >= 0)
+                    strata::kernels::df2_tap_rows(m.R + (size_t) tap_t0 * D, tap_dev_ + (size_t) tap_slot[(size_t) l] * N,
+                                                  (int64_t) tap_layers_.size() * N, N, (int) HC, (int) tap_rows, m.cs);
+#endif
+            }
+        }
+        if (issuer.joinable()) {
+            issuer.join();
+            stats_.ms_experts_host += iss_ms;
+            stats_.experts_streamed += iss_streamed;
+            stats_.experts_dma += iss_dma;
+        }
+        stats_.tokens += T;
+        core::progress_at("reading the prompt (batched): finishing the chunk from token", p0);
+        pt.mark(kPfStart, cs);
+        if (next_ != nullptr) {
+            // the rows to the host buffer the next stage read two chunks ago (it has finished: waited below)
+            float* h = m.hand[hand_buf];
+            /*
+            DPCT1124:474: cudaMemcpyAsync is migrated to asynchronous memcpy
+            API. While the origin API might be synchronous, it depends on the
+            type of operand memory, so you may need to call wait() on event
+            return by memcpy API to ensure synchronization behavior.
+            */
+            try {
+                m.cs->memcpy(h, m.R, (size_t)T * D * 4);
+                m.cs->wait();
+            } catch (const sycl::exception& exc) {
+                err = std::string("prefill: the layer split's hand-off: ") + exc.what();
+                return false;
+            }
+            // this stage's state is at the chunk's end now (synced) and moves on with the next chunk below
+            if (on_stage_chunk && !on_stage_chunk(p0 + T, err)) return false;
+            if (next_run.valid() && !next_run.get()) {
+                err = next_err;
+                return false;
+            }
+            next_->hand_in_ = h;
+            next_run = std::async(std::launch::async, [this, tokens, c0, T, p0, &next_err] {
+                return next_->run(tokens + c0, T, p0, next_err);
+            });
+            hand_buf ^= 1;
+            continue;  // the last stage reports the chunk (on_chunk)
+        }
+        if (const char* dump = std::getenv("STRATA_PREFILL_DUMP_R")) {  // debug: the final residuals, every 64th
+            m.cs->wait();                                               // position (A/B quality of this path)
+            if (std::FILE* f = std::fopen(dump, c0 == 0 ? "wb" : "ab")) {
+                std::vector<float> row((size_t)D);
+                for (int64_t t = (64 - p0 % 64) % 64; t < T; t += 64) {
+                    default_queue().memcpy(row.data(), m.R + t * D, (size_t)D * 4).wait();
+                    const int64_t pos = p0 + t;
+                    std::fwrite(&pos, sizeof pos, 1, f);
+                    std::fwrite(row.data(), 4, row.size(), f);
+                }
+                std::fclose(f);
+            }
+        }
+        if (on_chunk || on_stage_chunk || (tap_rows > 0 && on_taps)) {
+            const auto toc = Clock::now();
+            try {
+                m.cs->wait();
+            } catch (const sycl::exception& exc) {
+                err = std::string("prefill: ") + exc.what();
+                return false;
+            }
+            const auto toc2 = Clock::now();
+            if (tap_rows > 0 && on_taps && !on_taps(tap_dev_, tap_rows, p0 + tap_t0, err)) return false;
+            if (on_stage_chunk && !on_stage_chunk(p0 + T, err)) return false;
+            if (on_chunk && !on_chunk(m.R, T, p0, err)) return false;
+            host_sync_ms += std::chrono::duration<double, std::milli>(toc2 - toc).count();
+            host_chunk_ms += ms_since(toc2);
+        }
+    }
+    if (next_run.valid() && !next_run.get()) {
+        err = next_err;
+        return false;
+    }
+    ss.ple_prev[0] = prev[0];
+    ss.ple_prev[1] = prev[1];
+    if (std::getenv("STRATA_DBG_NAN") != nullptr) {  // debug: the state the prompt leaves for the token path
+        m.cs->wait();
+        auto bad = [&](const float* d, int64_t n) {
+            std::vector<float> h((size_t)n);
+            default_queue().memcpy(h.data(), d, (size_t)n * 4).wait();
+            int64_t c = 0;
+            double mx = 0;
+            for (float v : h) {
+                c += !sycl::isfinite(v);
+                if (sycl::isfinite(v)) mx = std::max(mx, (double)std::fabs(v));
+            }
+            std::fprintf(stderr, " %lld non-finite (max |x| %.3g)", (long long)c, mx);
+        };
+        const int64_t last = (n - 1) % m.T;
+        std::fprintf(stderr, "strata dbg: prompt end: last residual row");
+        bad(m.R + last * D, D);
+        if (ss.ple.ready()) {
+            std::fprintf(stderr, "; PLE history");
+            bad(ss.ple.hist, (int64_t)strata::kernels::NG_HIST * strata::kernels::NG_HC_DIM);
+        }
+        std::fprintf(stderr, "; GDN state 0");
+        bad(ss.gdn_state, 64 * 1024);
+        std::fprintf(stderr, "\n");
+    }
+    try {
+        m.cs->wait();
+    } catch (const sycl::exception& exc) {
+        err = std::string("prefill: ") + exc.what();
+        return false;
+    }
+    // (PR #121) an expert copy that failed on the copy stream surfaces here, not in the next request
+    /*
+    DPCT1000:454: Error handling if-stmt was detected but could not be
+    rewritten.
+    */
+    try {
+        m.copy->wait();
+    } catch (const sycl::exception& exc) {
+        err = std::string("prefill: expert copy stream: ") + exc.what();
+        return false;
+    }
+    stats_.ms_total += ms_since(t_start);
+    if (pt.on) {
+        pt.fold();
+        double total = 0.0;
+        for (double v : pt.ms)
+            total += v;
+        std::string line;
+        char b[96];
+        for (int i = 0; i < kPfCount; ++i) {
+            if (pt.ms[i] <= 0.0) continue;
+            std::snprintf(b, sizeof b, " %s %.0f (%.1f%%)", kPfNames[i], pt.ms[i],
+                          total > 0 ? 100.0 * pt.ms[i] / total : 0.0);
+            line += b;
+        }
+        std::fprintf(
+            stderr, "strata prefill timing: %lld tokens, GPU timeline %.0f ms, wall %.0f ms, host staging %.0f ms:%s\n",
+            (long long)n, total, ms_since(t_start), stats_.ms_experts_host, line.c_str());
+        std::fprintf(stderr,
+                     "strata prefill timing: host: chunk setup (PLE rows, the expert stream plan) %.0f ms, "
+                     "waiting for each chunk %.0f ms, after each chunk (the draft layer, progress) %.0f ms, "
+                     "PLE %.0f ms\n",
+                     host_setup_ms, host_sync_ms, host_chunk_ms, stats_.ms_ple);
+    }
+    if (kva_run) {
+        const char* mode = kva.skip == KvaConfig::Skip::Moe ? "moe-skip"
+                         : kva.mode == KvaConfig::Mode::Oracle ? "oracle"
+                         : kva.mode == KvaConfig::Mode::Linear ? "linear" : "identity";
+        const char* only = kva.only == KvaConfig::Only::Gdn ? ", gdn layers only"
+                         : kva.only == KvaConfig::Only::Qsa ? ", qsa layers only" : "";
+        std::fprintf(stderr, "strata prefill: KVA %s: split %lld, suffix %lld, approximated %lld of %lld positions "
+                             "in %lld of %lld chunks, mode %s%s\n",
+                     kva_run ? "on" : "off (capture)", (long long) kva_split, (long long) kva_suffix,
+                     (long long) kva_positions, (long long) n, (long long) kva_chunks,
+                     (long long) (n > 0 && m.T > 0 ? (n + m.T - 1) / m.T : 0), mode, only);
+        if (kva_positions > 0) {
+            static std::atomic<bool> said{false};
+            if (!said.exchange(true))
+                std::fprintf(stderr, "strata prefill: KVA: the late layers (%lld and up) hold approximated cells for "
+                                     "the first %lld positions of this prompt; a follow-up turn that continues from "
+                                     "this state reads its new tokens exactly on top of them (nothing is approximated "
+                                     "twice); STRATA_KVA=0 reads every prompt exactly\n",
+                             (long long) kva_split, (long long) kva_positions);
+        }
+    } else if (kva.on && (kva.explicit_on || (n >= kva.min_prompt && !kva_routine && kva_eng.blocked.empty()))) {
+        if (kva_why_not == kKvaShapeReason)
+            std::fprintf(stderr, "strata prefill: KVA configured but NOT applied: this model's shape (%lld layers, %lld experts) "
+                                 "is not one KVA was measured on (STRATA_KVA_ANY_MODEL=1 allows it)\n",
+                         (long long) g.n_layers, (long long) g.n_expert);
+        else
+            std::fprintf(stderr, "strata prefill: KVA configured but NOT applied: %s (prompt %lld positions, "
+                                 "min_prompt %lld, suffix %lld, split %lld)\n",
+                         kva_why_not != nullptr ? kva_why_not : "not applicable", (long long) n, (long long) kva.min_prompt,
+                         (long long) kva_suffix, (long long) kva_split);
+    }
+    if (std::getenv("STRATA_STATE_HASH_GDN") != nullptr) {  // debug: the GDN states as the prompt path leaves them
+        m.cs->wait();
+        std::vector<uint8_t> b((size_t)gdn_floats * 4);
+        std::string line;
+        char h[8];
+        for (int64_t i = 0; i < ss.gdn_alloc; ++i) {
+            default_queue().memcpy(b.data(), ss.gdn_state + (size_t)i * gdn_floats, b.size()).wait();
+            uint64_t x = 1469598103934665603ull;
+            for (uint8_t c : b)
+                x = (x ^ c) * 1099511628211ull;
+            std::snprintf(h, sizeof(h), "%04llx ", (unsigned long long)(x & 0xffff));
+            line += h;
+        }
+        std::fprintf(stderr, "strata prefill: GDN_HASH %s\n", line.c_str());
+    }
+    // STRATA_MMQ_DIRECT=1 with STRATA_MMQ_DIRECT_LOG=1 (a check, not a default): each stage's totals so far - how many
+    // resident experts its prompt MMQ read in their slots, of all its resident and streamed ones
+    if (mmq::direct_mode() == 1) {
+        static const bool log = [] { const char* v = std::getenv("STRATA_MMQ_DIRECT_LOG"); return v && std::atoi(v) != 0; }();
+        for (const Prefill* p = this; log && p != nullptr; p = p->next_)
+            std::fprintf(stderr, "strata prefill: layers %lld..%lld: %lld of %lld resident experts read in place, %lld "
+                                 "streamed (STRATA_MMQ_DIRECT, totals)\n", (long long) p->stage_lb_,
+                         (long long) p->stage_le_, (long long) p->stats_.experts_direct,
+                         (long long) p->stats_.experts_resident, (long long) p->stats_.experts_streamed);
+    }
+    return true;
+} catch (sycl::exception const& exc) {
+    std::cerr << exc.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
+    std::exit(1);
+}
+
+void Prefill::lm_release() {
+    if (!impl_) return;
+    Impl& m = *impl_;
+    const core::OnDevice on_device(m.device);
+    if (m.lm.dev) {
+        if (m.cs) m.cs->wait();
+        sycl::free(m.lm.dev, *m.cs);
+    }
+    m.lm.dev = nullptr;
+    m.lm.mixed = m.lm.acc = m.lm.inj = m.lm.R = m.lm.w = m.lm.R2 = nullptr;
+    m.lm.mixed_h = nullptr;
+    m.lm.ids = m.lm.tab = nullptr;
+    m.lm.S = 0;
+}
+
+int64_t Prefill::lm_prepare(int64_t n, std::string& why, int64_t cap) {
+    if (!impl_) { why = "not initialized"; return 0; }
+    Impl& m = *impl_;
+    if (m.g == nullptr) { why = "not initialized"; return 0; }
+    const core::ModelGeometry& g = *m.g;
+    const core::OnDevice on_device(m.device);
+    const bool split = stage_lb_ != 0 || stage_le_ != g.n_layers || next_ != nullptr;
+    if (hand_in_ != nullptr) { why = "a layer split's chunk hand-off is in use"; return 0; }
+    if (helper_ != nullptr) { why = "a peer GPU"; return 0; }
+    if (split && m.ss->ple.ready() && stage_lb_ <= 1 && !(stage_lb_ == 0 && stage_le_ >= 2)) {
+        why = "a layer split whose PLE layer is not in the first stage";
+        return 0;
+    }
+    if (embd_rows != nullptr) { why = "an image prompt"; return 0; }
+    if (!tap_layers_.empty()) { why = "the DFlash2 drafter's prompt taps"; return 0; }
+    if (kva_config().on) { why = "STRATA_KVA is on"; return 0; }
+    if (stop_at_chunk) { why = "a batch read that yields at chunk boundaries"; return 0; }
+    if (force_chunk_ > 0) { why = "a --prefill-pipe plan sets the chunks of this read"; return 0; }
+#if STRATA_EXPERT_NIBBLE_BUILT
+    for (int64_t l = 0; l < g.n_layers; ++l)
+        if (core::nibble::layer(l).on) { why = "STRATA_EXPERT_NIBBLE (the experts are 4-bit slots)"; return 0; }
+#endif
+    if (std::getenv("STRATA_DBG_FEAT") || std::getenv("STRATA_DBG_ROUTE_OVERRIDE") || std::getenv("STRATA_PREFILL_DUMP_R_ALL")) {
+        why = "a routing or row debug dump";
+        return 0;
+    }
+    const MmqPlan& mp = mmq_plan();
+    if ((int64_t) mp.layer.size() < g.n_layers) { why = "the expert plan has fewer layers than the model"; return 0; }
+    int64_t n_mmq = 0;
+    for (int64_t l = 0; l < g.n_layers; ++l) n_mmq += mp.layer[(size_t) l] ? 1 : 0;
+    if (n_mmq > 0 && (!m.grp_gu || !m.grp_d || !m.Xq || !m.H || !m.Hq)) { why = "the MMQ buffers are missing"; return 0; }
+    if (n_mmq < g.n_layers) {
+        bool dq_ok = true;
+        for (int i = 0; i < DQ; ++i) dq_ok = dq_ok && m.dq_gu[i] && m.dq_d[i];
+        if (!m.Xs || !m.Hh || !dq_ok) { why = "the FP16 expert path's buffers are missing"; return 0; }
+    }
+    {
+        const strata::kernels::cpu::ExpertLayout& lay = strata::kernels::cpu::expert_layout();
+        for (int64_t l = 0; l < g.n_layers; ++l) {
+            if (!lay.native) continue;
+            const auto& f = lay.fmt[(size_t) l];
+            if (f.had_gu || f.had_d) { why = "an APR (Hadamard-folded) layer"; return 0; }
+            if (f.tail_off || mmq::fp4_activations(f.gu_type)) { why = "an NVFP4 layer"; return 0; }
+        }
+    }
+    if (fused_layout(m.T, m.src != nullptr)) { why = "the fused expert layout"; return 0; }
+    if (!m.GU || !m.Dm || (n_mmq > 0 && !m.ids_identity)) { why = "the MoE buffers are missing"; return 0; }
+    const int64_t min_s = lm_tokens_env() > 0 ? m.T : 2 * m.T;
+    if (n < min_s) { why = "a short prompt"; return 0; }
+    const int64_t want = lm_tokens_env() > 0 ? lm_tokens_env() : (lm_by_default_ ? kLmDefaultOnTokens : kLmDefaultTokens);
+    int64_t S = std::max<int64_t>(min_s, want / m.T * m.T);
+    S = std::min<int64_t>(S, (n + m.T - 1) / m.T * m.T);
+    if (cap > 0) {
+        if (cap % m.T != 0 || cap < min_s) { why = "the layer split's stages read different chunks"; return 0; }
+        S = std::min(S, cap);
+    }
+    const int64_t G = m.T * K;
+    const auto dev_bytes = [&](int64_t s, bool r_dev) {
+        const uint64_t per = (uint64_t) (2 * N + HC + 2 * K) * 4 + (uint64_t) N * 2 + (r_dev ? (uint64_t) D * 4 : 0);
+        return (uint64_t) s * per + (uint64_t) lm_table_ints(s * K, G) * 4 + 4096 +
+               (r_dev ? 0 : (uint64_t) m.T * D * 4 + 256);
+    };
+    size_t free_b = 0, total_b = 0;
+    auto dev = m.cs->get_device();
+    total_b = dev.get_info<sycl::info::device::global_mem_size>();
+    if (dev.has(sycl::aspect::ext_intel_free_memory)) {
+        free_b = dev.get_info<sycl::ext::intel::info::device::free_memory>();
+    } else {
+        free_b = total_b / 2;
+    }
+    const int64_t room = (int64_t) free_b - lm_margin_bytes(lm_by_default_);
+    m.lm.free_mib = (int64_t) (free_b >> 20);
+    auto fit = [&](bool r_dev) {
+        int64_t s = S;
+        while (s >= min_s && (int64_t) dev_bytes(s, r_dev) > room) s -= m.T;
+        return s >= min_s ? s : (int64_t) 0;
+    };
+    const int mode = stage_lb_ > 0 ? 2 : lm_r_env();
+    bool r_dev = false;
+    int64_t s_use = 0;
+    if (mode == 1) { s_use = fit(true); r_dev = true; }
+    else if (mode == 2) { s_use = fit(false); }
+    else {
+        const int64_t sv = fit(true);
+        if (sv == S) { s_use = sv; r_dev = true; } else s_use = fit(false);
+    }
+    if (s_use <= 0) {
+        why = "no VRAM for a super-chunk (" + std::to_string(free_b >> 20) + " MiB free)";
+        return 0;
+    }
+    Impl::LmBufs& lb = m.lm;
+    const size_t idsw = (size_t) (2 * s_use * K), tab = (size_t) lm_table_ints(s_use * K, G);
+    auto host_grow = [&](int32_t*& p, size_t& have, size_t want_n) -> bool {
+        if (have >= want_n) return true;
+        if (p) sycl::free(p, *m.cs);
+        p = nullptr;
+        have = 0;
+        try {
+            p = (int32_t*) sycl::malloc_host(want_n * 4, *m.cs);
+        } catch (...) {
+            p = nullptr;
+        }
+        if (!p) return false;
+        have = want_n;
+        return true;
+    };
+    if (!host_grow(lb.idsw_host, lb.idsw_host_n, idsw) || !host_grow(lb.tab_host, lb.tab_host_n, tab)) {
+        why = "no pinned RAM for the routing tables"; return 0;
+    }
+    if (!r_dev) {
+        int32_t* rh = (int32_t*) lb.R_host;
+        if (!host_grow(rh, lb.R_host_n, (size_t) s_use * D)) { why = "no pinned RAM for the residual rows"; lb.R_host = nullptr; return 0; }
+        lb.R_host = (float*) rh;
+    }
+    const uint64_t bytes = dev_bytes(s_use, r_dev);
+    void* d = nullptr;
+    try {
+        d = sycl::malloc_device(bytes, *m.cs);
+    } catch (...) {
+        d = nullptr;
+    }
+    if (!d) {
+        why = "the super-chunk's buffers (" + std::to_string(bytes >> 20) + " MiB) do not fit";
+        return 0;
+    }
+    lb.dev = d;
+    uint8_t* q = (uint8_t*) d;
+    auto carve_b = [&](size_t b) { uint8_t* p = q; q += (b + 255) & ~(size_t) 255; return p; };
+    lb.mixed = (float*) carve_b((size_t) s_use * N * 4);
+    lb.acc = (float*) carve_b((size_t) s_use * N * 4);
+    lb.mixed_h = (uint16_t*) carve_b((size_t) s_use * N * 2);
+    lb.inj = (float*) carve_b((size_t) s_use * HC * 4);
+    lb.ids = (int32_t*) carve_b((size_t) s_use * K * 4);
+    lb.w = (float*) carve_b((size_t) s_use * K * 4);
+    lb.R = r_dev ? (float*) carve_b((size_t) s_use * D * 4) : nullptr;
+    lb.tab = (int32_t*) carve_b(tab * 4);
+    lb.tab_n = tab;
+    lb.R2 = r_dev ? nullptr : (float*) carve_b((size_t) m.T * D * 4);
+    lb.r_dev = r_dev;
+    lb.S = s_use;
+    return s_use;
+}
+
+int64_t Prefill::lm_prepare_chain(int64_t n, std::string& why) {
+    for (Prefill* p = this; p->next_ != nullptr; p = p->next_)
+        if (p->next_run_.valid()) { why = "a layer split's chunk hand-off is in flight"; return 0; }
+    for (Prefill* p = next_; p != nullptr; p = p->next_) {
+        p->hand_in_ = nullptr;
+        p->hand_pieces_ = 0;
+    }
+    int64_t cap = 0;
+    for (int round = 0; round < 4; ++round) {
+        bool same = true;
+        for (Prefill* p = this; p != nullptr; p = p->next_) {
+            Impl::LmBufs& lb = p->impl_->lm;
+            if (lb.S > 0 && lb.S == cap) continue;
+            if (lb.S > 0) p->lm_release();
+            const int64_t s = p->lm_prepare(n, why, cap);
+            if (s <= 0) {
+                if (p != this)
+                    why = "layers " + std::to_string(p->stage_lb_) + ".." + std::to_string(p->stage_le_) + ": " + why;
+                lm_release_chain();
+                return 0;
+            }
+            if (cap > 0 && s != cap) same = false;
+            cap = s;
+        }
+        if (same) {
+            const int64_t T = impl_->T;
+            const int64_t k = (n + cap - 1) / cap;
+            const int64_t even = ((n + k - 1) / k + T - 1) / T * T;
+            if (k < 2 || even >= cap || !lm_even_env()) return cap;
+            for (Prefill* p = this; p != nullptr; p = p->next_) {
+                p->lm_release();
+                if (p->lm_prepare(n, why, even) != even) {
+                    if (p != this)
+                        why = "layers " + std::to_string(p->stage_lb_) + ".." + std::to_string(p->stage_le_) + ": " + why;
+                    lm_release_chain();
+                    return 0;
+                }
+            }
+            return even;
+        }
+    }
+    why = "the layer split's stages found no common super-chunk";
+    lm_release_chain();
+    return 0;
+}
+
+void Prefill::lm_release_chain() {
+    for (Prefill* p = this; p != nullptr; p = p->next_)
+        if (p->impl_) p->lm_release();
+}
+
+bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err) {
+    err.clear();
+    Impl& m = *impl_;
+    const core::OnDevice on_device(m.device);
+    // the stall report asks this queue (the one the waits below block on) whether its work is done (#5718 follow-up)
+    const core::WatchedStream watched("the prompt path's compute stream", (void*)m.cs, m.device);
+    const core::ModelGeometry& g = *m.g;
+    core::SessionState& ss = *m.ss;
+    const auto t_start = Clock::now();
+    sycl::queue* cs = m.cs;
+    Impl::LmBufs& lb = m.lm;
+    const int64_t S = lb.S, L = g.n_layers;
+    const int64_t LB = stage_lb_, LE = stage_le_;
+    if (pos0 + n > m.stage_cells) {   // STRATA_PF_STAGE_FIT: the loan's K/V stage ends before this read does
+        err = "prefill: the K/V stage of this loan holds " + std::to_string(m.stage_cells) + " cells, the read ends at " +
+              std::to_string(pos0 + n);
+        return false;
+    }
+    if (hand_in_ == nullptr) stopped_at_ = -1;
+    strata::kernels::QsaShapes s = core::qsa_shapes(g);
+    const uint64_t gdn_floats = (uint64_t)g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size +
+                                (uint64_t)g.ssm_conv_channels * (g.ssm_d_conv - 1);
+    int32_t prev[2] = {ss.ple_prev[0], ss.ple_prev[1]};
+    PfTimer pt;
+    if (m.ids_identity) mmq::iota(m.ids_identity, (int64_t)mmq_ids_rows((size_t)m.T), m.cs);
+    const bool ple_on = ss.ple.ready();
+    static const bool ple_batch_env = [] {
+        const char* v = std::getenv("STRATA_PLE_BATCH");
+        return v == nullptr || std::atoi(v) != 0;
+    }();
+    const bool ple_batch = ple_on && ple_batch_env && strata::kernels::ple_native_postops_enabled() &&
+                           (ss.ple.w.key_bf16 != nullptr || ss.ple.w.key_native_data != nullptr) &&
+                           m.region_bytes / ((uint64_t) (3 * strata::kernels::NG_HC_DIM + N + 4) * 4 + (uint64_t) N * 2 + 4096) >= 64;
+    const int32_t prev0[2] = {prev[0], prev[1]};
+    auto ple_gather = [&m, &ss, tokens, n, prev0](int64_t c0, int buf, std::string& e) -> bool {
+        const int64_t T = std::min(m.T, n - c0);
+        auto at = [&](int64_t i) { return i < 2 ? prev0[i] : (int32_t) tokens[i - 2]; };
+        int32_t pv[2] = {at(c0), at(c0 + 1)};
+        for (int64_t t = 0; t < T; ++t) {
+            const int32_t tok = (int32_t) tokens[c0 + t];
+            strata::kernels::ngram_rows(&tok, pv, 1, ss.ple.consts,
+                                        m.ple_rows[buf].data() + t * strata::kernels::PLE_N_HEADS);
+            pv[0] = pv[1];
+            pv[1] = tok;
+        }
+        return ss.ple.table->gather_batch(m.ple_rows[buf].data(), (size_t) T, m.ple_emb_host[buf], e);
+    };
+    std::string ple_next_err;
+    std::future<bool> ple_next;
+    int ple_buf = 0;
+    auto ple_land = [&](int64_t c0, int64_t T) -> bool {
+        const auto tp = Clock::now();
+        if (!ple_next.get()) { err = ple_next_err; return false; }
+        try {
+            m.cs->memcpy(m.ple_emb, m.ple_emb_host[ple_buf], (size_t) T * N * 4);
+        } catch (const sycl::exception& exc) {
+            err = std::string("prefill: the PLE rows' upload failed: ") + exc.what();
+            return false;
+        }
+        *m.ple_copied[ple_buf] = m.cs->ext_oneapi_submit_barrier();
+        if (c0 + m.T < n) {
+            try {
+                m.ple_copied[ple_buf ^ 1]->wait();
+            } catch (const sycl::exception& exc) {
+                err = std::string("prefill: the PLE rows' upload failed: ") + exc.what();
+                return false;
+            }
+            ple_next = std::async(std::launch::async, [&ple_gather, &ple_next_err, c1 = c0 + m.T, b = ple_buf ^ 1] {
+                strata::aux_cpus::pin_current_thread();
+                return ple_gather(c1, b, ple_next_err);
+            });
+        }
+        ple_buf ^= 1;
+        stats_.ms_ple += ms_since(tp);
+        return true;
+    };
+    struct Restore {
+        Impl& m;
+        float *R, *mixed, *inj;
+        uint16_t* mixed_h;
+        ~Restore() { m.R = R; m.mixed = mixed; m.inj = inj; m.mixed_h = mixed_h; }
+    } restore{m, m.R, m.mixed, m.inj, m.mixed_h};
+    float* const R_chunk = m.R;
+    const strata::kernels::cpu::ExpertLayout& lay = strata::kernels::cpu::expert_layout();
+    double ms_attn = 0, ms_experts = 0, ms_host_tables = 0, ms_wait_a = 0;
+    std::vector<int> pf_job((size_t) NE, -1);
+    static const bool pf_on = [] { const char* e = std::getenv("STRATA_LM_PREFETCH"); return e == nullptr || e[0] != '0'; }();
+    auto lm_prefetch = [&](int64_t l) -> bool {
+        std::fill(pf_job.begin(), pf_job.end(), -1);
+        if (m.src == nullptr || !pf_on) return true;
+        std::vector<Stager::Job> js;
+        const bool pdirect = false;
+        for (int32_t e = 0; e < NE; ++e) {
+            if ((m.host_res && m.cache && m.host_res[(size_t) l * NE + e] >= 0) || m.src->pinned(l, e)) continue;
+            pf_job[(size_t) e] = (int) js.size();
+            if (pdirect || m.src->transient(l, e)) {
+                js.push_back({nullptr, (size_t) lay.blob_bytes(l), m.src, (int32_t) l, e});
+                continue;
+            }
+            const uint8_t* b = m.src->blob(l, e);
+            if (!b) { err = "prefill (layer-major): expert source has no blob"; return false; }
+            js.push_back({b, (size_t) lay.blob_bytes(l)});
+        }
+        m.stager->start(std::move(js));
+        return true;
+    };
+    struct StagerStop {
+        Stager* st;
+        ~StagerStop() { if (st) st->finish(); }
+    } stager_stop{m.stager.get()};
+    int64_t lm_streamed = 0, lm_resident = 0, lm_groups = 0, lm_supers = 0, lm_groups_f16 = 0;
+    uint64_t lm_bytes = 0;
+    const int64_t G = m.T * K;
+
+    auto lm_experts = [&](int64_t l, int64_t Sn) -> bool {
+        const auto th0 = Clock::now();
+        const int64_t rows = Sn * K;
+        int32_t* idsw = lb.idsw_host;
+        m.cs->memcpy(idsw, lb.ids, (size_t) rows * 4);
+        m.cs->memcpy(idsw + rows, lb.w, (size_t) rows * 4);
+        core::progress_at("reading the prompt (layer-major): waiting for the GPU (attention, router) at layer", l, pos0);
+        try {
+            m.cs->wait();
+        } catch (const sycl::exception& exc) {
+            err = std::string("prefill (layer-major): ") + exc.what();
+            return false;
+        }
+        core::progress_at("reading the prompt (layer-major): the experts of layer", l, pos0);
+        pt.fold();
+        ms_wait_a += ms_since(th0);
+        const auto th1 = Clock::now();
+        const int32_t* ids_h = idsw;
+        const float* w_h = (const float*) (idsw + rows);
+        std::vector<int32_t> cnt((size_t) NE, 0), off((size_t) NE + 1, 0);
+        for (int64_t i = 0; i < rows; ++i) {
+            const int32_t e = ids_h[(size_t) i];
+            if (e < 0 || e >= NE) { err = "prefill (layer-major): routed id out of range"; return false; }
+            ++cnt[(size_t) e];
+        }
+        for (int32_t e = 0; e < NE; ++e) off[(size_t) e + 1] = off[(size_t) e] + cnt[(size_t) e];
+        std::vector<int32_t> uniq;
+        for (int32_t e = 0; e < NE; ++e)
+            if (cnt[(size_t) e] > 0) uniq.push_back(e);
+        auto resident = [&](int32_t e) { return m.host_res && m.cache && m.host_res[(size_t) l * NE + e] >= 0; };
+        std::vector<int> job_of(uniq.size(), -1), stage_of(uniq.size(), -1);
+        for (size_t u = 0; u < uniq.size(); ++u) job_of[u] = pf_job[(size_t) uniq[u]];
+        for (int32_t e = 0; e < NE; ++e)
+            if (cnt[(size_t) e] == 0 && pf_job[(size_t) e] >= 0) m.stager->skip(pf_job[(size_t) e]);
+        if (!pf_on && m.src != nullptr) {
+            std::vector<Stager::Job> js;
+            const bool pdirect = false;
+            for (size_t u = 0; u < uniq.size(); ++u) {
+                const int32_t e = uniq[u];
+                if (resident(e) || m.src->pinned(l, e)) continue;
+                job_of[u] = (int) js.size();
+                if (pdirect || m.src->transient(l, e)) {
+                    js.push_back({nullptr, (size_t) lay.blob_bytes(l), m.src, (int32_t) l, e});
+                    continue;
+                }
+                const uint8_t* b = m.src->blob(l, e);
+                if (!b) { err = "prefill (layer-major): expert source has no blob"; return false; }
+                js.push_back({b, (size_t) lay.blob_bytes(l)});
+            }
+            m.stager->start(std::move(js));
+        }
+        struct StagerDone {
+            Stager* st;
+            ~StagerDone() { if (st) st->finish(); }
+        } stager_done{m.stager.get()};
+        int32_t* th = lb.tab_host;
+        int32_t* row_tok = th;
+        std::vector<float> row_w((size_t) rows);
+        {
+            std::vector<int32_t> fill(off.begin(), off.end() - 1);
+            for (int64_t i = 0; i < rows; ++i) {
+                const int32_t e = ids_h[(size_t) i];
+                const int32_t p = fill[(size_t) e]++;
+                row_tok[p] = (int32_t) (i / K);
+                row_w[(size_t) p] = w_h[(size_t) i];
+            }
+        }
+        struct Entry { int32_t e, r0, nr; };
+        std::vector<Entry> ents;
+        for (int32_t e = 0; e < NE; ++e)
+            for (int32_t r = off[(size_t) e]; r < off[(size_t) e + 1]; r += (int32_t) G)
+                ents.push_back({e, r, (int32_t) std::min<int64_t>(G, off[(size_t) e + 1] - r)});
+        struct Grp { size_t j0, j1; int32_t r0, nr, maxr; int64_t b_at, u_at, uo_at, nu; };
+        std::vector<Grp> grps;
+        for (size_t j = 0; j < ents.size();) {
+            Grp gp{};
+            gp.j0 = j;
+            gp.r0 = ents[j].r0;
+            int32_t nr = 0, maxr = 0;
+            while (j < ents.size() && j - gp.j0 < (size_t) MMQ_GROUP && nr + ents[j].nr <= G) {
+                nr += ents[j].nr;
+                maxr = std::max(maxr, ents[j].nr);
+                ++j;
+            }
+            gp.j1 = j;
+            gp.nr = nr;
+            gp.maxr = maxr;
+            grps.push_back(gp);
+        }
+        const int64_t E = (int64_t) ents.size();
+        if (E > lm_entries_max(rows, G)) { err = "prefill (layer-major): more expert entries than the tables hold"; return false; }
+        int64_t at = rows;
+        int32_t* bounds = th + at;
+        int64_t b_used = 0;
+        at += 2 * lm_entries_max(rows, G);
+        int32_t* u_tok = th + at;
+        at += rows;
+        int32_t* u_off = th + at;
+        at += rows + lm_entries_max(rows, G);
+        int32_t* u_rows = th + at;
+        at += rows;
+        float* u_w = (float*) (th + at);
+        at += rows;
+        if (at > (int64_t) lb.tab_n || at > (int64_t) lb.tab_host_n) { err = "prefill (layer-major): the tables overflow"; return false; }
+        int64_t u_used = 0, uo_used = 0;
+        std::vector<int32_t> slot((size_t) Sn, -1), fillp;
+        for (Grp& gp : grps) {
+            gp.b_at = b_used;
+            for (size_t j = gp.j0; j < gp.j1; ++j) bounds[b_used++] = ents[j].r0 - gp.r0;
+            bounds[b_used++] = gp.nr;
+            gp.u_at = u_used;
+            gp.uo_at = uo_used;
+            int32_t* ut = u_tok + u_used;
+            int32_t* uo = u_off + uo_used;
+            int64_t nu = 0;
+            for (int32_t r = 0; r < gp.nr; ++r) {
+                const int32_t t = row_tok[gp.r0 + r];
+                if (slot[(size_t) t] < 0) { slot[(size_t) t] = (int32_t) nu; ut[nu] = t; uo[nu] = 0; ++nu; }
+                ++uo[slot[(size_t) t]];
+            }
+            fillp.assign((size_t) nu, 0);
+            for (int64_t i = 0, acc_n = 0; i < nu; ++i) { const int32_t c = uo[i]; uo[i] = (int32_t) acc_n; fillp[(size_t) i] = (int32_t) acc_n; acc_n += c; }
+            uo[nu] = gp.nr;
+            for (int32_t r = 0; r < gp.nr; ++r) {
+                const int32_t p = fillp[(size_t) slot[(size_t) row_tok[gp.r0 + r]]]++;
+                u_rows[gp.r0 + p] = r;
+                u_w[gp.r0 + p] = row_w[(size_t) (gp.r0 + r)];
+            }
+            for (int64_t i = 0; i < nu; ++i) slot[(size_t) ut[i]] = -1;
+            gp.nu = nu;
+            u_used += nu;
+            uo_used += nu + 1;
+        }
+        m.cs->memcpy(lb.tab, th, (size_t) at * 4);
+        const int32_t* d_row_tok = lb.tab;
+        const int32_t* d_bounds = lb.tab + rows;
+        const int32_t* d_u_tok = lb.tab + rows + 2 * lm_entries_max(rows, G);
+        const int32_t* d_u_off = d_u_tok + rows;
+        const int32_t* d_u_rows = d_u_off + rows + lm_entries_max(rows, G);
+        const float* d_u_w = (const float*) (d_u_rows + rows);
+        ms_host_tables += ms_since(th1);
+        std::vector<size_t> last_ent;
+        for (size_t j = 0; j < ents.size(); ++j) {
+            if (j == 0 || ents[j - 1].e != ents[j].e) last_ent.push_back(j);
+            else last_ent.back() = j;
+        }
+        int stage_next = 0;
+        auto stage_one = [&](size_t u) -> bool {
+            const int32_t e = uniq[u];
+            if (resident(e)) return true;
+            if (m.src == nullptr) { err = "prefill (layer-major): an expert is neither resident nor in a source"; return false; }
+            const int sl = stage_next;
+            stage_next = (stage_next + 1) % STAGE;
+            const auto tq = Clock::now();
+            const bool pinned = m.src->pinned(l, e);
+            const uint8_t* b = pinned ? m.src->blob(l, e) : nullptr;
+            if (pinned && !b) { err = "prefill (layer-major): expert source has no blob"; return false; }
+            if (m.stage_live[sl]) m.copy->ext_oneapi_submit_barrier({*m.used[sl]});
+            if (pinned) {
+                m.copy->memcpy(m.stage_dev[sl], b, (size_t) lay.blob_bytes(l));
+                ++stats_.experts_dma;
+            } else {
+                if (job_of[u] < 0) {
+                    err = "prefill (layer-major): missing stager job for unpinned expert";
+                    return false;
+                }
+                m.stager->pass(job_of[u]);
+                const uint8_t* hb = m.stager->wait(job_of[u]);
+                if (!hb) {
+                    err = "prefill (layer-major): failed waiting for stager job";
+                    return false;
+                }
+                m.copy->memcpy(m.stage_dev[sl], hb, (size_t) lay.blob_bytes(l));
+                m.stager->issued_one(job_of[u], m.copy);
+            }
+            *m.copied[sl] = m.copy->ext_oneapi_submit_barrier();
+            m.stage_live[sl] = true;
+            stage_of[u] = sl;
+            stats_.ms_experts_host += ms_since(tq);
+            ++stats_.experts_streamed;
+            ++lm_streamed;
+            lm_bytes += (uint64_t) lay.blob_bytes(l);
+            return true;
+        };
+        const int mmq_gt = lay.native ? lay.fmt[(size_t) l].gu_type : 42;
+        const int mmq_dt = lay.native ? lay.fmt[(size_t) l].d_type : 42;
+        const bool fp16_l = !mmq_plan().layer[(size_t) l];
+        const size_t mmq_gub = fp16_l ? 0 : mmq::matrix_bytes(mmq_gt, 1280, N), mmq_db = fp16_l ? 0 : mmq::matrix_bytes(mmq_dt, N, 640);
+        size_t staged = 0, u = 0;
+        const uint8_t* blob_dev = nullptr;
+        size_t gi = 0;
+        int dq = -1;
+        for (size_t j = 0; j < ents.size(); ++j) {
+            const int32_t e = ents[j].e;
+            if (j == 0 || ents[j - 1].e != e) {
+                if (j > 0) ++u;
+                while (staged < uniq.size() && staged <= u + (size_t) STAGE - 1) {
+                    if (!stage_one(staged)) return false;
+                    ++staged;
+                }
+                if (stage_of[u] < 0) {
+                    blob_dev = m.cache->device_slot(m.host_res[(size_t) l * NE + e]);
+                    ++stats_.experts_resident;
+                    ++lm_resident;
+                } else {
+                    pt.mark(kPfWaitCopy, cs);
+                    m.cs->ext_oneapi_submit_barrier({*m.copied[stage_of[u]]});
+                    blob_dev = m.stage_dev[stage_of[u]];
+                }
+            }
+            const Grp& gp = grps[gi];
+            pt.mark(kPfDequant, cs);
+            if (fp16_l) {
+                if (j == 0 || ents[j - 1].e != e) {
+                    dq = (dq + 1) % DQ;
+                    if (lay.native) {
+                        const auto& f = lay.fmt[(size_t) l];
+                        strata::kernels::iq_dequant_gu_f16(f.gu_type, blob_dev, blob_dev + f.up_off, f.n_ff, f.n_embd,
+                                                           m.dq_gu[dq], m.cs, nullptr);
+                        strata::kernels::iq_dequant_f16(f.d_type, blob_dev + f.down_off, f.n_embd * f.n_ff, m.dq_d[dq], m.cs,
+                                                        nullptr);
+                    } else {
+                        blob_dequant_f16(blob_dev, m.dq_gu[dq], m.dq_d[dq], m.cs);
+                    }
+                    if (stage_of[u] >= 0) {
+                        *m.used[stage_of[u]] = m.cs->ext_oneapi_submit_barrier();
+                    }
+                }
+                const int64_t o = ents[j].r0 - gp.r0, nr = ents[j].nr;
+                gather_rows16(lb.mixed_h, d_row_tok + ents[j].r0, m.Xs + o * N, nr, N, m.cs);
+                pt.mark(kPfGemmGU, cs);
+                m.gemm.f16(m.Xs + o * N, m.dq_gu[dq], m.GU + o * 1280, nr, 1280, N);
+                swiglu_interleaved(m.GU + o * 1280, m.Hh + o * 640, nr, m.cs);
+                pt.mark(kPfGemmD, cs);
+                m.gemm.f16(m.Hh + o * 640, m.dq_d[dq], m.Dm + o * N, nr, N, 640);
+                if (j + 1 < gp.j1) continue;
+                pt.mark(kPfCombine, cs);
+                moe_scatter_add(m.Dm, d_u_tok + gp.u_at, d_u_off + gp.uo_at, d_u_rows + gp.r0,
+                                d_u_w + gp.r0, gp.nu, lb.acc, m.cs);
+                ++lm_groups;
+                ++lm_groups_f16;
+                ++gi;
+                core::progress_beat();
+                continue;
+            }
+            const size_t q = j - gp.j0;
+            if (lay.native) {
+                const auto& f = lay.fmt[(size_t) l];
+                mmq::gather_native(blob_dev, blob_dev + f.up_off, mmq_gub / 2, blob_dev + f.down_off, mmq_db,
+                                   m.grp_gu + q * mmq_gub, m.grp_d + q * mmq_db, m.cs);
+            } else {
+                mmq::gather_strata_q2(blob_dev, m.grp_gu + q * mmq_gub, m.grp_d + q * mmq_db, m.cs);
+            }
+            if (j == last_ent[u] && stage_of[u] >= 0) {
+                *m.used[stage_of[u]] = m.cs->ext_oneapi_submit_barrier();
+            }
+            if (j + 1 < gp.j1) continue;
+            const int ngx = (int) (gp.j1 - gp.j0);
+            pt.mark(kPfGemmGU, cs);
+            m.cs->memset(m.grp_gu + (size_t) ngx * mmq_gub, 0, MMQ_TAIL);
+            m.cs->memset(m.grp_d + (size_t) ngx * mmq_db, 0, MMQ_TAIL);
+            mmq::quantize(lb.mixed, d_row_tok + gp.r0, m.Xq, mmq_gt, N, N, gp.nr, m.cs);
+            mmq::Product gu;
+            gu.w = m.grp_gu; gu.type = mmq_gt; gu.w_rows = 1280; gu.w_cols = N; gu.expert_bytes = mmq_gub;
+            gu.n = ngx; gu.xq = m.Xq; gu.bounds = d_bounds + gp.b_at; gu.ids = m.ids_identity;
+            gu.total_rows = gp.nr; gu.max_rows = gp.maxr; gu.dst = m.GU; gu.ld_dst = 1280;
+            m.mmq_ctx->run(gu, m.cs);
+            mmq::swiglu(m.GU, m.H, gp.nr, 640, !lay.native, m.cs);
+            pt.mark(kPfGemmD, cs);
+            mmq::quantize(m.H, nullptr, m.Hq, mmq_dt, 640, 640, gp.nr, m.cs);
+            mmq::Product dn;
+            dn.w = m.grp_d; dn.type = mmq_dt; dn.w_rows = N; dn.w_cols = 640; dn.expert_bytes = mmq_db;
+            dn.n = ngx; dn.xq = m.Hq; dn.bounds = d_bounds + gp.b_at; dn.ids = m.ids_identity;
+            dn.total_rows = gp.nr; dn.max_rows = gp.maxr; dn.dst = m.Dm; dn.ld_dst = N;
+            m.mmq_ctx->run(dn, m.cs);
+            pt.mark(kPfCombine, cs);
+            moe_scatter_add(m.Dm, d_u_tok + gp.u_at, d_u_off + gp.uo_at, d_u_rows + gp.r0,
+                            d_u_w + gp.r0, gp.nu, lb.acc, m.cs);
+            ++lm_groups;
+            ++gi;
+            core::progress_beat();
+        }
+        ms_experts += ms_since(th0);
+        return true;
+    };
+
+    for (int64_t sc0 = 0; sc0 < n; sc0 += S) {
+        const int64_t Sn = std::min(S, n - sc0);
+        const int64_t nc = (Sn + m.T - 1) / m.T;
+        ++lm_supers;
+        lm_mid_ = true;
+        for (int64_t l = LB; l <= LE; ++l) {
+            const auto ta = Clock::now();
+            if (l < LE && !lm_prefetch(l)) return false;
+            auto r_buf = [&](int64_t c) { return (c & 1) ? lb.R2 : R_chunk; };
+            auto issue_up = [&](int64_t c) {
+                const int64_t cc0 = sc0 + c * m.T, TT = std::min(m.T, n - cc0);
+                m.copy->memcpy(r_buf(c), lb.R_host + (size_t) (c * m.T) * D, (size_t) TT * D * 4);
+                lb.ev_in[c & 1] = m.copy->ext_oneapi_submit_barrier();
+            };
+            if (!lb.r_dev && l > 0) issue_up(0);
+            int64_t qsa_index = 0, gdn_index = 0;
+            for (int64_t i = 0; i < std::min(l, L); ++i) (core::is_qsa_layer(g, i) ? qsa_index : gdn_index) += 1;
+            const int64_t qsa_index0 = qsa_index, gdn_index0 = gdn_index;
+            for (int64_t c = 0; c < nc; ++c) {
+                if (should_stop && should_stop()) { err = "cancelled"; return false; }
+                core::progress_beat();
+                core::progress_at("reading the prompt (layer-major): layer", l, pos0 + sc0 + c * m.T);
+                qsa_index = qsa_index0;
+                gdn_index = gdn_index0;
+                const int64_t c0 = sc0 + c * m.T;
+                const int64_t T = std::min(m.T, n - c0), p0 = pos0 + c0;
+                const int64_t t0 = c * m.T;
+                m.R = lb.r_dev ? lb.R + t0 * D : r_buf(c);
+                if (!lb.r_dev) {
+                    if (l > 0) {
+                        if (c + 1 < nc) issue_up(c + 1);
+                        m.cs->ext_oneapi_submit_barrier({lb.ev_in[c & 1]});
+                    } else {
+                        m.cs->ext_oneapi_submit_barrier({lb.ev_out[c & 1]});
+                    }
+                }
+                m.mixed = lb.mixed + t0 * N;
+                m.mixed_h = lb.mixed_h + t0 * N;
+                m.inj = lb.inj + t0 * HC;
+                float* const acc = lb.acc + t0 * N;
+                if (l == 0) {
+                    pt.mark(kPfStart, cs);
+                    bool batched = m.tok_dev != nullptr;
+                    const core::NativeEmbed* nemb = core::native_embed();
+                    const core::WeightRef* wemb = nemb ? nullptr : m.wt->find("token_embd.weight");
+                    if (batched && nemb == nullptr &&
+                        (wemb == nullptr || wemb->codebook_iq4nl || wemb->ne0 != g.n_embd || wemb->group_elems <= 0 ||
+                         (wemb->code_bits != 2 && wemb->code_bits != 4 && wemb->code_bits != 8)))
+                        batched = false;
+                    for (int64_t t = 0; batched && t < T; ++t) {
+                        const int64_t tok = tokens[c0 + t];
+                        if (tok < 0 || (wemb && tok >= wemb->ne1)) batched = false;
+                        else m.tok_host[(size_t) t] = (int32_t) tok;
+                    }
+                    if (batched) {
+                        if (!m.up_ring.h2d(m.tok_dev, m.tok_host.data(), (size_t) T * sizeof(int32_t), m.cs)) {
+                            err = "prefill: the token id upload failed";
+                            return false;
+                        }
+                        if (nemb) {
+                            nemb->gather_dev(m.tok_dev, T, m.emb, m.cs);
+                        } else {
+                            const auto* codes = (const uint8_t*) wemb->data;
+                            const auto* scales = (const float*) (codes + wemb->codes_bytes);
+                            const auto* offsets = wemb->has_offset ? (const float*) (codes + wemb->codes_bytes + wemb->scales_bytes)
+                                                                   : nullptr;
+                            strata::kernels::embedding_gather_dev(codes, scales, offsets, m.tok_dev, (int) T, wemb->ne0,
+                                                                  wemb->code_bits, wemb->code_bias, wemb->group_elems,
+                                                                  (uint64_t) (wemb->ne0 / (8 / wemb->code_bits)),
+                                                                  (uint64_t) (wemb->ne0 / wemb->group_elems), m.emb, m.cs);
+                        }
+                    }
+                    for (int64_t t = 0; !batched && t < T; ++t)
+                        if (!core::embed_row(*m.wt, g, tokens[c0 + t], m.emb + t * N, m.cs, err)) return false;
+                    gr_broadcast(m.emb, m.R, T, m.cs);
+                    if (ple_on && !ple_next.valid())
+                        ple_next = std::async(std::launch::async, [&ple_gather, &ple_next_err, c0, b = ple_buf] {
+                            strata::aux_cpus::pin_current_thread();
+                            return ple_gather(c0, b, ple_next_err);
+                        });
+                    for (int64_t t = 0; t < T; ++t) { prev[0] = prev[1]; prev[1] = (int32_t) tokens[c0 + t]; }
+                } else if (l > LB) {
+                    gr_write(m.R, acc, m.inj, HC, T, m.cs);
+                    if (strata::kernels::cvec().covers(l - 1))
+                        strata::kernels::cvec_apply(m.R, l - 1, T, D, nullptr, 0, nullptr, 0, false, m.cs);
+                }
+                if (l == LE && next_ != nullptr) {
+                    stats_.tokens += T;
+                    ++stats_.chunks;
+                    if (c == 0 && next_run_.valid() && !next_run_.get()) { err = next_err_; return false; }
+                    lb.ev_done[c & 1] = m.cs->ext_oneapi_submit_barrier();
+                    m.copy->ext_oneapi_submit_barrier({lb.ev_done[c & 1]});
+                    m.copy->memcpy(next_->impl_->lm.R_host + (size_t) t0 * D, m.R, (size_t) T * D * 4);
+                    lb.ev_out[c & 1] = m.copy->ext_oneapi_submit_barrier();
+                    continue;
+                }
+                if (l == LE) {
+                    stats_.tokens += T;
+                    ++stats_.chunks;
+                    if (const char* dump = std::getenv("STRATA_PREFILL_DUMP_R")) {
+                        m.cs->wait();
+                        if (std::FILE* f = std::fopen(dump, c0 == 0 ? "wb" : "ab")) {
+                            std::vector<float> row((size_t) D);
+                            for (int64_t t = (64 - p0 % 64) % 64; t < T; t += 64) {
+                                default_queue().memcpy(row.data(), m.R + t * D, (size_t) D * 4).wait();
+                                const int64_t pos = p0 + t;
+                                std::fwrite(&pos, sizeof pos, 1, f);
+                                std::fwrite(row.data(), 4, row.size(), f);
+                            }
+                            std::fclose(f);
+                        }
+                    }
+                    if (on_chunk || on_stage_chunk) {
+                        try {
+                            m.cs->wait();
+                        } catch (const sycl::exception& exc) {
+                            err = std::string("prefill: ") + exc.what();
+                            return false;
+                        }
+                        lm_mid_ = c + 1 < nc;
+                        if (on_stage_chunk && !lm_mid_ && !on_stage_chunk(p0 + T, err)) return false;
+                        if (on_chunk && !on_chunk(m.R, T, p0, err)) return false;
+                    }
+                    continue;
+                }
+                const core::LayerView v(*m.wt, l);
+                if (l == 1 && ple_on && !ple_land(c0, T)) return false;
+                if (l == 1 && ple_on && ple_batch) {
+                    pt.mark(kPfPle, cs);
+                    const auto tp = Clock::now();
+                    const strata::kernels::PleWeights& pw = ss.ple.w;
+                    constexpr int64_t HD = strata::kernels::NG_HC_DIM;
+                    const uint64_t per_token = (uint64_t) (3 * HD + N + 4) * 4 + (uint64_t) N * (bf16x2() ? 4 : 2) + 4096;
+                    const int64_t SB = std::min<int64_t>(T, (int64_t) (m.region_bytes / per_token));
+                    for (int64_t s0 = 0; s0 < T; s0 += SB) {
+                        const int64_t nb = std::min(SB, T - s0);
+                        uint8_t* q = m.region;
+                        auto carve_f = [&](size_t nn) { float* p = (float*) q; q += (nn * 4 + 255) & ~(size_t) 255; return p; };
+                        float* key = carve_f((size_t) nb * HD);
+                        float* qn = carve_f((size_t) nb * HD);
+                        float* gated = carve_f((size_t) nb * HD);
+                        float* val = carve_f((size_t) nb * N);
+                        float* gate = carve_f((size_t) nb * 4);
+                        uint16_t* e16 = (uint16_t*) carve_f((size_t) nb * N / 2);
+                        uint16_t* e16_lo = bf16x2() ? (uint16_t*) carve_f((size_t) nb * N / 2) : nullptr;
+                        const float* emb = m.ple_emb + s0 * N;
+                        if (pw.key_bf16 != nullptr) {
+                            to_bf16(emb, e16, nb * N, m.cs, e16_lo);
+                            m.gemm.bf16(e16, pw.key_bf16, key, nb, HD, N);
+                            if (e16_lo) m.gemm.bf16(e16_lo, pw.key_bf16, key, nb, HD, N, 0, 1.0f);
+                        } else {
+                            to_f16(emb, e16, nb * N, m.cs);
+                            m.gemm.native(e16, pw.key_native_type, pw.key_native_data, key, nb, HD, N);
+                            to_bf16(emb, e16, nb * N, m.cs, e16_lo);
+                        }
+                        m.gemm.bf16(e16, pw.value_bf16, val, nb, N, N);
+                        if (e16_lo) m.gemm.bf16(e16_lo, pw.value_bf16, val, nb, N, N, 0, 1.0f);
+                        try {
+                            strata::kernels::native_ple_postops_batch(key, m.R + s0 * D, val, ss.ple.hist, pw, qn, gated,
+                                                                      gate, (int) nb, m.cs);
+                        } catch (const std::exception& e) { err = std::string("prefill PLE: ") + e.what(); return false; }
+                    }
+                    stats_.ms_ple += ms_since(tp);
+                } else if (l == 1 && ple_on) {
+                    pt.mark(kPfPle, cs);
+                    const auto tp = Clock::now();
+                    for (int64_t t = 0; t < T; ++t) {
+                        strata::kernels::PleOut po;
+                        po.normalized = m.ple_norm;
+                        po.result = m.R + t * D;
+                        try {
+                            strata::kernels::ple_block(m.ple_emb + t * N, m.R + t * D, ss.ple.hist, ss.ple.w, po,
+                                                       ss.ple.scratch, m.cs);
+                        } catch (const std::exception& e) { err = std::string("prefill PLE: ") + e.what(); return false; }
+                        strata::kernels::ple_history_advance(ss.ple.hist, m.ple_norm, m.cs);
+                    }
+                    stats_.ms_ple += ms_since(tp);
+                }
+                if (core::is_qsa_layer(g, l)) {
+                    for (int64_t t = 0; t < T; ++t)
+                        strata::kernels::qsa_step_fill(m.steps_host.data() + t * strata::kernels::kStepCount, p0 + t, s);
+                    if (!m.up_ring.h2d(m.steps_dev, m.steps_host.data(), (size_t) T * strata::kernels::kStepCount * 4, m.cs)) {
+                        err = "prefill: the QSA step records' upload failed";
+                        return false;
+                    }
+                }
+                bool normed = false;
+                for (int half = 0; half < 2; ++half) {
+                    const char* pre = half == 0 ? "hc_attn_" : "hc_ffn_";
+                    const std::string sn = std::string(pre) + "norm.weight", sd = std::string(pre) + "down.weight",
+                                      su = std::string(pre) + "up.weight", si = std::string(pre) + "inject.weight";
+                    const core::WeightRef *wn = need(v, sn.c_str(), err), *wd = need(v, sd.c_str(), err),
+                                          *wu = need(v, su.c_str(), err), *wi = need(v, si.c_str(), err);
+                    if (!wn || !wd || !wu || !wi) return false;
+                    pt.mark(kPfHc, cs);
+                    if (gr_unfused()) gr_norm(m.R, (const float*) wn->data, EPS, m.xn, m.xn16, T, m.cs, m.xn16_lo);
+                    else if (!normed) gr_norm_rs(m.R, (const float*) wn->data, EPS, m.grs, m.xn16, T, m.cs, m.xn16_lo);
+                    normed = false;
+                    if (!bf16_proj(m.gemm, wd, m.xn16, m.lo, T, sd, err, 0, m.xn16_lo)) return false;
+                    gr_silu(m.lo, m.lo16, T, m.cs, m.lo16_lo);
+                    if (!bf16_proj(m.gemm, wu, m.lo16, m.gated, T, su, err, 0, m.lo16_lo)) return false;
+                    if (!bf16_proj(m.gemm, wi, m.xn16, m.inj, T, si, err, 0, m.xn16_lo)) return false;
+                    if (gr_unfused()) gr_mix(m.xn, m.gated, m.mixed, m.mixed_bf, T, m.cs, m.mixed_h, m.mixed_bf_lo);
+                    else gr_mix_r(m.R, m.grs, (const float*) wn->data, m.gated, m.mixed, m.mixed_bf, T, m.cs, m.mixed_h,
+                                  m.mixed_bf_lo);
+                    if (half == 0 && !core::is_qsa_layer(g, l)) {
+                        const core::WeightRef *wqkv = need(v, "attn_qkv.weight", err), *wg = need(v, "attn_gate.weight", err),
+                                              *wo = need(v, "ssm_out.weight", err), *wa = need(v, "ssm_alpha.weight", err),
+                                              *wb = need(v, "ssm_beta.weight", err), *wc = need(v, "ssm_conv1d.weight", err),
+                                              *wnm = need(v, "ssm_norm.weight", err), *wdt = need(v, "ssm_dt.bias", err),
+                                              *wsa = need(v, "ssm_a", err);
+                        if (!wqkv || !wg || !wo || !wa || !wb || !wc || !wnm || !wdt || !wsa) return false;
+                        pt.mark(kPfGdn, cs);
+                        float* state = ss.gdn_state + (size_t) (gdn_index - ss.gdn_ord0) * gdn_floats;
+                        float* conv = state + (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size;
+                        if (!native_proj(m.gemm, wqkv, m.mixed_h, m.qkv, T, v.name("attn_qkv.weight"), err)) return false;
+                        if (!native_proj(m.gemm, wg, m.mixed_h, m.z, T, v.name("attn_gate.weight"), err)) return false;
+                        if (!bf16_proj(m.gemm, wa, m.mixed_bf, m.ab, T, v.name("ssm_alpha.weight"), err, 2 * HV, m.mixed_bf_lo)) return false;
+                        if (!bf16_proj(m.gemm, wb, m.mixed_bf, m.ab + HV, T, v.name("ssm_beta.weight"), err, 2 * HV, m.mixed_bf_lo)) return false;
+                        pt.mark(kPfGdnConv, cs);
+                        gdn_gates(m.ab, (const float*) wdt->data, (const float*) wsa->data, m.gate, m.beta, T, m.cs);
+                        gdn_conv(conv, m.qkv, (const float*) wc->data, m.hbuf, T, EPS, m.cs);
+                        pt.mark(kPfGdnRec, cs);
+                        gdn_recurrence(state, m.hbuf, m.gate, m.beta, m.z, (const float*) wnm->data, EPS, m.y, m.y_h, T, m.cs);
+                        pt.mark(kPfGdnOut, cs);
+                        if (!native_proj(m.gemm, wo, m.y_h, m.bo, T, v.name("ssm_out.weight"), err)) return false;
+                        ++gdn_index;
+                    } else if (half == 0) {
+                        const core::QsaState& st = ss.qsa_states[qsa_index];
+                        const core::WeightRef *wq = need(v, "attn_q.weight", err), *wk = need(v, "attn_k.weight", err),
+                                              *wv = need(v, "attn_v.weight", err), *wo = need(v, "attn_output.weight", err),
+                                              *wik = need(v, "indexer.k_proj.weight", err),
+                                              *wiq = need(v, "indexer.q_proj.weight", err),
+                                              *wqn = need(v, "attn_q_norm.weight", err), *wkn = need(v, "attn_k_norm.weight", err),
+                                              *wiqn = need(v, "indexer.q_norm.weight", err),
+                                              *wikn = need(v, "indexer.k_norm.weight", err);
+                        if (!wq || !wk || !wv || !wo || !wik || !wiq || !wqn || !wkn || !wiqn || !wikn) return false;
+                        pt.mark(kPfQsa, cs);
+                        if (!native_proj(m.gemm, wk, m.mixed_h, m.Kc, T, v.name("attn_k.weight"), err)) return false;
+                        if (!native_proj(m.gemm, wv, m.mixed_h, m.Vc, T, v.name("attn_v.weight"), err)) return false;
+                        if (!native_proj(m.gemm, wq, m.mixed_h, m.Qf, T, v.name("attn_q.weight"), err)) return false;
+                        if (!bf16_proj(m.gemm, wik, m.mixed_bf, m.idx_raw, T, v.name("indexer.k_proj.weight"), err, 0, m.mixed_bf_lo)) return false;
+                        if (!bf16_proj(m.gemm, wiq, m.mixed_bf, m.q_idx, T, v.name("indexer.q_proj.weight"), err, 0, m.mixed_bf_lo)) return false;
+                        rms_rows(m.Kc, (const float*) wkn->data, T * 2, 256, 256, EPS, m.cs);
+                        rope(m.Kc, T, 2, 256, 512, p0, strata::kernels::rope_scaling(), m.cs);
+                        const bool staged = st.kv_mode == 1;
+                        if (staged) {
+                            pt.mark(kPfKvStage, cs);
+                            strata::kernels::kv_stage_from_host(pools_of(m.stage, m.ident_table), st.host,
+                                                                core::qsa_kv_format(st),
+                                                                (p0 + s.page_size - 1) / s.page_size, s, m.cs);
+                            pt.mark(kPfQsa, cs);
+                        }
+                        if (st.kv_hybrid) {
+                            strata::kernels::fwht256_inplace_cuda(m.Vc, T * 2, m.cs);
+                            kv_append(m.Kc, m.Kc, T, p0, st.page_table, s.page_size, nullptr, nullptr,
+                                      st.k_q, st.k_q, st.k_scale, st.k_scale, m.cs, nullptr,
+                                      staged ? &m.stage : nullptr);
+                            strata::kernels::kv_append_q4(st.v_q4, st.v_q4, st.page_table, p0, T, m.Vc, m.Vc, s, m.cs,
+                                                          nullptr, staged ? &m.stage : nullptr);
+                        } else {
+                            if (st.kv_rot) {
+                                strata::kernels::fwht256_inplace_cuda(m.Kc, T * 2, m.cs);
+                                strata::kernels::fwht256_inplace_cuda(m.Vc, T * 2, m.cs);
+                            }
+                            if (st.kv_q4)
+                                strata::kernels::kv_append_q4(st.k_q4, st.v_q4, st.page_table, p0, T, m.Kc, m.Vc, s, m.cs,
+                                                              &st.host, staged ? &m.stage : nullptr);
+                            else
+                                kv_append(m.Kc, m.Vc, T, p0, st.page_table, s.page_size, st.kv_int8 ? nullptr : st.k_pool,
+                                          st.kv_int8 ? nullptr : st.v_pool, st.k_q, st.v_q, st.k_scale, st.v_scale, m.cs,
+                                          &st.host, staged ? &m.stage : nullptr);
+                        }
+                        split_q(m.Qf, m.q, T, m.cs);
+                        rms_rows(m.q, (const float*) wqn->data, T * 24, 256, 256, EPS, m.cs);
+                        rope(m.q, T, 24, 256, 6144, p0, strata::kernels::rope_scaling(), m.cs);
+                        if (st.kv_rot) strata::kernels::fwht256_inplace_cuda(m.q, T * 24, m.cs);
+                        rms_rows(m.q_idx, (const float*) wiqn->data, T * 4, 128, 128, EPS, m.cs);
+                        rope(m.q_idx, T, 4, 128, 512, p0, strata::kernels::rope_scaling(), m.cs);
+                        const strata::kernels::QsaIndexerBuffers ib{st.idx_tail, st.idx_dead, st.idx_pooled, st.idx_block_pos};
+                        pt.mark(kPfQsaIdx, cs);
+                        try {
+                            static const bool per_token = std::getenv("STRATA_INDEXER_PER_TOKEN") != nullptr;
+                            if (!per_token) {
+                                strata::kernels::native_qsa_indexer_append_batch(m.idx_raw, T, p0, 0, (const float*) wikn->data,
+                                                                                 EPS, ib, s, st.max_cells,
+                                                                                 strata::kernels::rope_scaling(), m.cs);
+                            }
+                            for (int64_t t = 0; per_token && t < T; ++t) {
+                                const int32_t* step_t = m.steps_dev + t * strata::kernels::kStepCount;
+                                strata::kernels::native_qsa_indexer_append(m.idx_raw + t * 128, step_t + strata::kernels::kStepPos, 0,
+                                                                           (const float*) wikn->data, EPS, ib, s, st.max_cells,
+                                                                           strata::kernels::rope_scaling(), m.cs);
+                            }
+                        } catch (const std::exception& e) { err = std::string("prefill indexer: ") + e.what(); return false; }
+                        pt.mark(kPfQsaSel, cs);
+                        for (int64_t q0 = 0; q0 < T; q0 += m.sel_batch) {
+                            const int64_t nb = std::min(m.sel_batch, T - q0);
+                            const int32_t* steps0 = m.steps_dev + q0 * strata::kernels::kStepCount;
+                            const int64_t active = (int64_t) m.steps_host[(size_t) ((q0 + nb - 1) * strata::kernels::kStepCount +
+                                                                                    strata::kernels::kStepNBid)] + 1;
+                            static const bool old_sel = std::getenv("STRATA_SELECT_OLD") != nullptr;
+                            if (old_sel || !strata::kernels::qsa_block_scores_tc(st.idx_pooled, st.idx_dead, m.q_idx + q0 * 512,
+                                                                                 steps0, nb, m.max_blocks, s, m.sel_scores,
+                                                                                 m.cs, active))
+                                strata::kernels::qsa_block_scores(st.idx_pooled, st.idx_dead, m.q_idx + q0 * 512, steps0, nb,
+                                                                  m.max_blocks, s, m.sel_scores, m.cs, active);
+                            strata::kernels::qsa_block_topk(m.sel_scores, steps0, nb, m.max_blocks, m.cap, s,
+                                                            m.sel_ids + q0 * m.cap, m.cs, active);
+                        }
+                        const strata::kernels::QsaAttnPools pools = staged ? pools_of(m.stage, m.ident_table)
+                                                                           : core::qsa_attn_pools(st);
+                        pt.mark(kPfQsaAttn, cs);
+                        static const bool old_attn = std::getenv("STRATA_PROMPT_ATTN_OLD") != nullptr;
+                        if (old_attn || !strata::kernels::qsa_prompt_attn_batch(m.q, pools, m.sel_ids, m.steps_dev, m.cap, s,
+                                                                                m.attn, T, m.cs))
+                            for (int64_t q0 = 0; q0 < T; q0 += m.attn_batch) {
+                                const int64_t nb = std::min(m.attn_batch, T - q0);
+                                strata::kernels::qsa_decode_attn_batch(m.q + q0 * ZV, pools, m.sel_ids + q0 * m.cap,
+                                                                       m.steps_dev + q0 * strata::kernels::kStepCount, m.cap,
+                                                                       s, m.attn_scratch, m.attn + q0 * ZV, nb, m.cs);
+                            }
+                        if (st.kv_rot || st.kv_hybrid) strata::kernels::fwht256_inplace_cuda(m.attn, T * 24, m.cs);
+                        pt.mark(kPfQsa, cs);
+                        gate_attn(m.attn, m.Qf, m.attn_h, T, m.cs);
+                        if (!native_proj(m.gemm, wo, m.attn_h, m.bo, T, v.name("attn_output.weight"), err)) return false;
+                        ++qsa_index;
+                    } else {
+                        const core::WeightRef *wr = need(v, "ffn_gate_inp.weight", err),
+                                              *wgi = need(v, "ffn_gate_inp_shexp.weight", err),
+                                              *wsg = need(v, "ffn_gate_shexp.weight", err),
+                                              *wsu = need(v, "ffn_up_shexp.weight", err),
+                                              *wsd = need(v, "ffn_down_shexp.weight", err);
+                        if (!wr || !wgi || !wsg || !wsu || !wsd) return false;
+                        pt.mark(kPfRouter, cs);
+                        if (!bf16_proj(m.gemm, wr, m.mixed_bf, m.logits, T, v.name("ffn_gate_inp.weight"), err, 0, m.mixed_bf_lo)) return false;
+                        route(m.logits, lb.ids + t0 * K, lb.w + t0 * K, T, m.g->n_expert, m.cs);
+                        if (!native_proj(m.gemm, wsg, m.mixed_h, m.sgate, T, v.name("ffn_gate_shexp.weight"), err)) return false;
+                        if (!native_proj(m.gemm, wsu, m.mixed_h, m.sup, T, v.name("ffn_up_shexp.weight"), err)) return false;
+                        swiglu_pair(m.sgate, m.sup, m.sh_h, T, m.cs);
+                        if (!native_proj(m.gemm, wsd, m.sh_h, m.shared, T, v.name("ffn_down_shexp.weight"), err)) return false;
+                        if (wgi->kind != core::WeightKind::Bf16InF32) { err = "prefill: shared gate is not BF16"; return false; }
+                        m.gemm.bf16(m.mixed_bf, (const uint16_t*) wgi->data, m.sg, T, 1, N);
+                        if (m.mixed_bf_lo) m.gemm.bf16(m.mixed_bf_lo, (const uint16_t*) wgi->data, m.sg, T, 1, N, 0, 1.0f);
+                        moe_shared_init(m.shared, m.sg, acc, T, m.cs);
+                        break;
+                    }
+                    const core::WeightRef* wnn = nullptr;
+                    if (!gr_unfused()) {
+                        wnn = need(v, "hc_ffn_norm.weight", err);
+                        if (!wnn) return false;
+                    }
+                    if (wnn) {
+                        gr_write_norm_rs(m.R, m.bo, m.inj, HC, (const float*) wnn->data, EPS, m.grs, m.xn16, T, m.cs,
+                                         m.xn16_lo);
+                        normed = true;
+                    } else {
+                        gr_write(m.R, m.bo, m.inj, HC, T, m.cs);
+                    }
+                }
+                if (!lb.r_dev) {
+                    lb.ev_done[c & 1] = m.cs->ext_oneapi_submit_barrier();
+                    m.copy->ext_oneapi_submit_barrier({lb.ev_done[c & 1]});
+                    m.copy->memcpy(lb.R_host + (size_t) t0 * D, m.R, (size_t) T * D * 4);
+                    lb.ev_out[c & 1] = m.copy->ext_oneapi_submit_barrier();
+                }
+            }
+            ms_attn += ms_since(ta);
+            if (l == LE) break;
+            if (!lm_experts(l, Sn)) return false;
+        }
+        if (next_ != nullptr) {
+            if (m.cs) m.cs->wait();
+            if (m.copy) m.copy->wait();
+            if (on_stage_chunk && !on_stage_chunk(pos0 + sc0 + Sn, err)) return false;
+            next_err_.clear();
+            next_run_ = std::async(std::launch::async, [this, tokens, sc0, Sn, pos0] {
+                strata::aux_cpus::pin_current_thread();
+                return next_->run_layer_major(tokens + sc0, Sn, pos0 + sc0, next_err_);
+            });
+        }
+    }
+    lm_mid_ = false;
+    ss.ple_prev[0] = prev[0];
+    ss.ple_prev[1] = prev[1];
+    if (ple_next.valid()) ple_next.wait();
+    if (m.cs) m.cs->wait();
+    if (m.copy) m.copy->wait();
+    stats_.ms_total += ms_since(t_start);
+    std::fprintf(stderr, "strata prefill: layer-major (layers %lld..%lld): %lld tokens in %lld super-chunk(s) of up to %lld (R in %s, %lld MiB VRAM free before), "
+                         "%lld expert blobs streamed (%.1f MB), %lld resident, %lld expert groups (%lld on the FP16 path); %.0f ms (host: "
+                         "enqueueing the attention halves %.0f, the experts %.0f: waiting for the attention halves "
+                         "%.0f, the routing tables %.0f)\n",
+                 (long long) LB, (long long) LE, (long long) n, (long long) lm_supers, (long long) S,
+                 lb.r_dev ? "VRAM" : "pinned RAM", (long long) lb.free_mib,
+                 (long long) lm_streamed, (double) lm_bytes / 1e6, (long long) lm_resident, (long long) lm_groups,
+                 (long long) lm_groups_f16, ms_since(t_start), ms_attn, ms_experts, ms_wait_a, ms_host_tables);
+    if (pt.on) {
+        pt.fold();
+        double total = 0.0;
+        for (double x : pt.ms) total += x;
+        std::string line;
+        char b[96];
+        for (int i = 0; i < kPfCount; ++i) {
+            if (pt.ms[i] <= 0.0) continue;
+            std::snprintf(b, sizeof b, " %s %.0f (%.1f%%)", kPfNames[i], pt.ms[i], total > 0 ? 100.0 * pt.ms[i] / total : 0.0);
+            line += b;
+        }
+        std::fprintf(stderr, "strata prefill timing (layer-major): %lld tokens, GPU timeline %.0f ms:%s\n",
+                     (long long) n, total, line.c_str());
+    }
+    return true;
+}
+
+bool Prefill::drain_pipeline(std::string& err) {
+    bool ok = true;
+    if (next_run_.valid()) {
+        if (!next_run_.get()) {
+            err = next_err_;
+            ok = false;
+        }
+    }
+    if (next_ != nullptr) {
+        std::string tail_err;
+        if (!next_->drain_pipeline(tail_err)) {
+            if (ok) err = tail_err;
+            ok = false;
+        }
+    }
+    return ok;
+}
+
+bool Prefill::reserve_uploads(int64_t T) {
+    (void) T;
+    return true;
+}
+
+int Prefill::stage_count() const {
+    int stages = 1;
+    for (const Prefill* p = next_; p != nullptr; p = p->next_) ++stages;
+    return stages;
+}
+
+bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err) {
+    static strata::kernels::two_pass::RequestStatus tp_status(std::getenv("STRATA_SELECT_TWO_PASS"));
+    (void)tp_status.on("SYCL");  // the two-pass scorer is CUDA-only: say once that a set switch is not used
+    constexpr bool lm_hip = false;
+    if (hand_in_ == nullptr && impl_ &&
+        strata::prefill_layer_major_resolve(lm_env_text(), lm_hip, stage_count(), strata::qwen_defaults_026())) {
+        const bool by_default = !lm_env_explicit();
+        for (Prefill* p = this; p != nullptr; p = p->next_) p->lm_by_default_ = by_default;
+        std::string why;
+        if (by_default) {
+            static bool noted = false;
+            if (!noted) {
+                noted = true;
+                std::fprintf(stderr, "strata prefill: layer-major prefill is on for this layer split (each layer's experts are read once per "
+                                     "super-chunk of up to %lld tokens, not once per chunk; STRATA_PREFILL_LAYER_MAJOR=0 or STRATA_DEFAULTS=026 "
+                                     "turns it off)\n", (long long) kLmDefaultOnTokens);
+            }
+        }
+        if (lm_prepare_chain(n, why) > 0) {
+            bool ok = run_layer_major(tokens, n, pos0, err);
+            std::string drain_err;
+            if (!drain_pipeline(drain_err) && ok) {
+                ok = false;
+                err = drain_err;
+            }
+            for (Prefill* p = this; p != nullptr; p = p->next_) p->lm_mid_ = false;
+            lm_release_chain();
+            return ok;
+        }
+        static std::string said;
+        if (why != said && !(by_default && why == "a short prompt")) {
+            said = why;
+            std::fprintf(stderr, "strata prefill: layer-major off for this prompt: %s\n", why.c_str());
+        }
+    }
+    const bool body_ok = run_impl(tokens, n, pos0, err);
+
+    std::string drain_err;
+    const bool drain_ok = drain_pipeline(drain_err);
+
+    if (!body_ok) return false;
+    if (!drain_ok) {
+        err = drain_err;
+        return false;
+    }
+    return true;
+}
+
+}  // namespace strata::prefill

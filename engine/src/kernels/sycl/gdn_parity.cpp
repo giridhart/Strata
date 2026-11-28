@@ -1,0 +1,652 @@
+// src/kernels/gdn_parity.cpp - P2.S2's test for the GDN recurrence, the conv and the two norms.
+//
+// `ref/gdn.py` carries eleven PROPERTY checks, several of which exist because a rival reading of the SOURCE
+// produces well-formed output.  The four that the kernels here can be wrong about are re-pinned below, each
+// asserted OBSERVABLE against a deliberately-wrong computation before the kernel is judged:
+//
+//   1. MODULO head pairing, h % h_k, not INTERLEAVE.  With H_k=2 and H_v=4 the two give [0,1,0,1] and
+//      [0,0,1,1]: they differ at h=1 and h=2.  Both produce a full-rank state of the right shape.
+//   2. Decay applied BEFORE the rank-1 update.  Applying it after is a one-line move that keeps every shape
+//      and every magnitude.
+//   3. The conv's SLIDE DIRECTION.  `kernel[0]` must read the OLDEST state row and the new input must land in
+//      the LAST state row; reversing either is invisible on a symmetric state, so the state rows here are
+//      labelled so each position is identifiable.
+//   4. `l2_norm`'s `+ eps` is an absolute floor on the SQUARED NORM, not on the mean.  The mean reading
+//      differs by sqrt(S) = 11.3x at S = 128.  `ref/gdn.py` PROPERTY 1 instruments the derivation, so it is
+//      not taken on trust there either.
+//
+// It also checks the STATE LAYOUT, which is the one place these kernels intentionally differ from the
+// reference: (S, h_v, S) with j fastest instead of (S, S, h_v).  A layout mix-up is silent, so the state is
+// filled with a value that encodes its own coordinates.
+#include <sycl/sycl.hpp>
+#include "strata/kernels/gdn.hpp"
+#include "strata/kernels/verify_kernels.hpp"
+#include "strata/prefill/kernels.hpp"
+
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <random>
+#include <string>
+#include <vector>
+
+namespace {
+
+float sigmoid_f(float x) { return 1.0f / (1.0f + std::exp(-x)); }
+
+/// The reference's `gdn_step`, with switches for the rival readings.
+///
+/// `state` is passed in the REFERENCE layout (S, S, h_v) - i.e. (i, j, h) - so that this function is a
+/// transcription of `ref/gdn.py` and not of the kernel.
+void ref_step(std::vector<double>& state, const std::vector<float>& q, const std::vector<float>& k,
+              const std::vector<float>& v, const std::vector<float>& gate, const std::vector<float>& beta, int S,
+              int h_k, int h_v, std::vector<float>& o, bool modulo_heads, bool decay_first) {
+    auto at = [&](int i, int j, int h) -> double& { return state[(size_t)(i * S + j) * h_v + h]; };
+    std::vector<float> oo((size_t)h_v * S, 0.0f);
+    for (int h = 0; h < h_v; ++h) {
+        const int src = modulo_heads ? (h % h_k) : (h / (h_v / h_k));
+        const double dec = std::exp((double)gate[(size_t)h]);
+        const double b = (double)beta[(size_t)h];
+        for (int j = 0; j < S; ++j) {
+            if (decay_first)
+                for (int i = 0; i < S; ++i)
+                    at(i, j, h) *= dec;
+            double sk = 0;
+            for (int i = 0; i < S; ++i)
+                sk += at(i, j, h) * (double)k[(size_t)(src * S + i)];
+            const double d = ((double)v[(size_t)(h * S + j)] - sk) * b;
+            for (int i = 0; i < S; ++i)
+                at(i, j, h) += (double)k[(size_t)(src * S + i)] * d;
+            if (!decay_first)
+                for (int i = 0; i < S; ++i)
+                    at(i, j, h) *= dec;
+            double dot = 0;
+            for (int i = 0; i < S; ++i)
+                dot += at(i, j, h) * (double)q[(size_t)(src * S + i)];
+            oo[(size_t)(h * S + j)] = (float)dot;
+        }
+    }
+    o = oo;
+}
+
+/// `ref/gdn.py::conv_step` in its own (d_conv, C) row-major orientation.
+void ref_conv(std::vector<float>& cs, const std::vector<float>& x, const std::vector<float>& kern, int C, int dc,
+              std::vector<float>& out) {
+    out.assign((size_t)C, 0.0f);
+    for (int c = 0; c < C; ++c) {
+        double acc = 0;
+        for (int i = 0; i < dc - 1; ++i)
+            acc += (double)cs[(size_t)(i * C + c)] * (double)kern[(size_t)(i * C + c)];
+        acc += (double)x[(size_t)c] * (double)kern[(size_t)((dc - 1) * C + c)];
+        out[(size_t)c] = (float)acc;
+        for (int i = 0; i < dc - 2; ++i)
+            cs[(size_t)(i * C + c)] = cs[(size_t)((i + 1) * C + c)];
+        cs[(size_t)((dc - 2) * C + c)] = x[(size_t)c];
+    }
+}
+
+double rel_l1(const std::vector<float>& a, const std::vector<float>& b) {
+    double d = 0, m = 0;
+    for (size_t i = 0; i < a.size(); ++i) {
+        d += std::fabs((double)a[i] - (double)b[i]);
+        m += std::fabs((double)a[i]);
+    }
+    return d / (m > 1e-30 ? m : 1e-30);
+}
+
+// Compare every state element and every token/head output, including FP16 bits.
+// Fixtures have nonzero initial state, modulo-paired heads, signed q/k/v, and
+// both shallow and deep decay. A tolerance is diagnostic only, never a pass.
+int prefill_case(int T, int seed, int repeats) {
+    constexpr int S = 128, HK = 16, HV = 48, C = 10240;
+    sycl::queue q{sycl::default_selector_v, sycl::property::queue::in_order()};
+    // Variant 6 runs on Intel GPUs only (the engine throws elsewhere): skip, not fail, on any other device.
+    const auto dev = q.get_device();
+    const auto sizes = dev.get_info<sycl::info::device::sub_group_sizes>();
+    if (!dev.is_gpu() || dev.get_info<sycl::info::device::vendor_id>() != 0x8086 ||
+        std::find(sizes.begin(), sizes.end(), size_t(32)) == sizes.end() ||
+        std::find(sizes.begin(), sizes.end(), size_t(16)) == sizes.end()) {
+        static bool said = false;
+        if (!said) std::printf("prefill gdn: skipped (needs an Intel GPU with sub-groups 16 and 32)\n");
+        said = true;
+        return 0;
+    }
+    std::mt19937 rng(seed);
+    std::normal_distribution<float> gauss(0.0f, 1.0f);
+    std::vector<float> st(size_t(S) * HV * S), h(size_t(T) * C),
+        gate(size_t(T) * HV), beta(gate.size()), z(size_t(T) * HV * S), gamma(S);
+    for (auto& x : st) x = gauss(rng) * 0.03f;
+    for (int t = 0; t < T; ++t) {
+        for (int j = 0; j < C; ++j) h[size_t(t) * C + j] = gauss(rng) * (j < 2 * HK * S ? 0.08f : 0.7f);
+    }
+    for (auto& x : gate) x = -(seed % 2 ? 0.02f : 2.0f) * (1.0f + std::fabs(gauss(rng)));
+    for (auto& x : beta) x = 0.1f + float(rng() % 800) / 1000.0f;
+    for (auto& x : z) x = gauss(rng);
+    for (auto& x : gamma) x = 1.0f + 0.2f * gauss(rng);
+    auto copy = [&](const std::vector<float>& src) {
+        auto* ptr = sycl::malloc_device<float>(src.size(), q);
+        if (!ptr) throw std::bad_alloc();
+        q.memcpy(ptr, src.data(), src.size() * sizeof(float)).wait_and_throw();
+        return ptr;
+    };
+    float *dst = copy(st), *dh = copy(h), *dg = copy(gate), *db = copy(beta), *dz = copy(z), *dgm = copy(gamma);
+    float* dy = sycl::malloc_device<float>(z.size(), q);
+    uint16_t* dy16 = sycl::malloc_device<uint16_t>(z.size(), q);
+    if (!dy || !dy16) throw std::bad_alloc();
+    std::vector<float> refst(st.size()), refy(z.size()), gotst(st.size()), goty(z.size());
+    std::vector<uint16_t> ref16(z.size()), got16(z.size());
+    auto run = [&](int variant, std::vector<float>& ost, std::vector<float>& oy, std::vector<uint16_t>& o16) {
+        // Warm up the compiled kernel before measuring; every run resets state.
+        q.memcpy(dst, st.data(), st.size() * sizeof(float)).wait_and_throw();
+        if (variant == -1)
+            strata::prefill::gdn_recurrence(dst, dh, dg, db, dz, dgm, 1e-6f, dy, dy16, T, &q);
+        else
+            strata::prefill::gdn_recurrence_variant(variant, dst, dh, dg, db, dz, dgm,
+                                                   1e-6f, dy, dy16, T, &q);
+        q.wait_and_throw();
+        double elapsed = 0;
+        for (int i = 0; i < repeats; ++i) {
+            q.memcpy(dst, st.data(), st.size() * sizeof(float)).wait_and_throw();
+            const auto start = std::chrono::steady_clock::now();
+            if (variant == -1)
+                strata::prefill::gdn_recurrence(dst, dh, dg, db, dz, dgm, 1e-6f, dy, dy16, T, &q);
+            else
+                strata::prefill::gdn_recurrence_variant(variant, dst, dh, dg, db, dz, dgm,
+                                                       1e-6f, dy, dy16, T, &q);
+            q.wait_and_throw();
+            elapsed += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+        }
+        q.memcpy(ost.data(), dst, ost.size() * sizeof(float)).wait_and_throw();
+        q.memcpy(oy.data(), dy, oy.size() * sizeof(float)).wait_and_throw();
+        q.memcpy(o16.data(), dy16, o16.size() * sizeof(uint16_t)).wait_and_throw();
+        return elapsed / repeats;
+    };
+    const double base_ms = run(0, refst, refy, ref16);
+    const double xe_ms = run(6, gotst, goty, got16);
+    size_t state_bad = 0, y_bad = 0, half_bad = 0;
+    double max_abs = 0, max_rel = 0;
+    auto compare = [&](const std::vector<float>& a, const std::vector<float>& b, size_t& mismatches) {
+        for (size_t i = 0; i < a.size(); ++i) {
+            if (!std::isfinite(a[i]) || !std::isfinite(b[i]) ||
+                std::memcmp(&a[i], &b[i], sizeof(float)) != 0) ++mismatches;
+            const double diff = std::fabs(double(a[i]) - b[i]);
+            max_abs = std::max(max_abs, diff);
+            max_rel = std::max(max_rel, diff / std::max(std::fabs(double(a[i])), 1e-20));
+        }
+    };
+    compare(refst, gotst, state_bad);
+    compare(refy, goty, y_bad);
+    for (size_t i = 0; i < ref16.size(); ++i) half_bad += ref16[i] != got16[i];
+    std::printf("prefill T=%d seed=%d heads=%d: state=%zu y=%zu fp16=%zu mismatches; max_abs=%.9g max_rel=%.9g; baseline=%.3f ms xe=%.3f ms\n",
+                T, seed, HV, state_bad, y_bad, half_bad, max_abs, max_rel, base_ms, xe_ms);
+    // T=7 additionally checks the production entry point (variant 6 on Alchemist or under STRATA_GDN_XE=1,
+    // else variant 0) and T=0's no-op contract.
+    int extra_bad = 0;
+    if (T == 7) {
+        run(-1, gotst, goty, got16);
+        // Both variants must match anyway; compare production to baseline.
+        extra_bad += std::memcmp(refst.data(), gotst.data(), refst.size() * sizeof(float)) != 0;
+        extra_bad += std::memcmp(refy.data(), goty.data(), refy.size() * sizeof(float)) != 0;
+        extra_bad += ref16 != got16;
+        q.memcpy(dst, st.data(), st.size() * sizeof(float)).wait_and_throw();
+        strata::prefill::gdn_recurrence_variant(6, dst, dh, dg, db, dz, dgm,
+                                               1e-6f, dy, dy16, 0, &q);
+        q.memcpy(gotst.data(), dst, st.size() * sizeof(float)).wait_and_throw();
+        extra_bad += gotst != st;
+        const auto saved_y = goty;
+        const auto saved16 = got16;
+        q.memcpy(goty.data(), dy, goty.size() * sizeof(float)).wait_and_throw();
+        q.memcpy(got16.data(), dy16, got16.size() * sizeof(uint16_t)).wait_and_throw();
+        extra_bad += goty != saved_y || got16 != saved16;
+        std::printf("prefill production + T=0: %s\n", extra_bad ? "FAIL" : "OK");
+    }
+    for (auto ptr : {dst, dh, dg, db, dz, dgm, dy}) sycl::free(ptr, q);
+    sycl::free(dy16, q);
+    return state_bad || y_bad || half_bad || extra_bad ? 1 : 0;
+}
+
+}  // namespace
+
+int main(int argc, char** argv) {
+    auto gpus = sycl::device::get_devices(sycl::info::device_type::gpu);
+    sycl::device dev = gpus.empty() ? sycl::device(sycl::default_selector_v) : gpus.front();
+    sycl::queue stream(dev, sycl::property::queue::in_order{});
+    bool selftest = false, prefill_only = false;
+    int prefill_tokens = 0, prefill_repeat = 1;
+    for (int i = 1; i < argc; ++i) {
+        const std::string arg(argv[i]);
+        if (arg == "--selftest")
+            selftest = true;
+        else if (arg == "--prefill-only")
+            prefill_only = true;
+        else if ((arg == "--prefill-tokens" || arg == "--prefill-repeat") && i + 1 < argc) {
+            char* end = nullptr;
+            const long n = std::strtol(argv[++i], &end, 10);
+            if (!end || *end || n < 1 || n > (arg == "--prefill-tokens" ? 32768 : 1000)) return 2;
+            (arg == "--prefill-tokens" ? prefill_tokens : prefill_repeat) = int(n);
+        } else {
+            std::fprintf(stderr, "usage: gdn_parity [--selftest] [--prefill-only] [--prefill-tokens N] [--prefill-repeat N]\n");
+            return 2;
+        }
+    }
+
+    std::printf("device: %s (%s), sub-groups:", dev.get_info<sycl::info::device::name>().c_str(),
+                dev.is_cpu() ? "CPU" : dev.is_gpu() ? "GPU" : "other");
+    for (auto n : dev.get_info<sycl::info::device::sub_group_sizes>()) std::printf(" %zu", n);
+    std::printf("\n");
+    int prefill_bad = 0;
+    for (int t : prefill_tokens ? std::vector<int>{prefill_tokens} : std::vector<int>{1, 7, 256, 1000})
+        for (int seed : {2025, 2026}) prefill_bad += prefill_case(t, seed, prefill_repeat);
+    std::printf("prefill gdn: %d failures\n", prefill_bad);
+    if (prefill_only) {
+        if (selftest && !prefill_bad) std::printf("gdn_parity OK\n");
+        return prefill_bad ? 1 : 0;
+    }
+
+    const int S = 128, h_k = 16, h_v = 48;  // the artifact's real geometry
+    std::mt19937 rng(2024);
+    std::normal_distribution<float> gauss(0.0f, 1.0f);
+    int bad = prefill_bad;
+
+    // ================= 1. the recurrence =================
+    {
+        // The state encodes its own coordinates, so a layout mix-up cannot pass: reading (i,j,h) where the
+        // buffer holds (i,h,j) gives a DIFFERENT number, not a wrong-but-plausible one.
+        std::vector<double> st_ref((size_t)S * S * h_v);
+        std::vector<float> st_dev((size_t)S * h_v * S);
+        for (int i = 0; i < S; ++i)
+            for (int j = 0; j < S; ++j)
+                for (int h = 0; h < h_v; ++h) {
+                    const float val = (float)(0.001 * (i + 2 * j + 3 * h) - 1.0);
+                    st_ref[(size_t)(i * S + j) * h_v + h] = val;
+                    st_dev[(size_t)(i * h_v + h) * S + j] = val;  // (S, h_v, S), j fastest
+                }
+
+        std::vector<float> q((size_t)h_k * S), k((size_t)h_k * S), v((size_t)h_v * S), gate((size_t)h_v),
+            beta((size_t)h_v);
+        for (auto& x : q)
+            x = gauss(rng) * 0.1f;
+        for (auto& x : k)
+            x = gauss(rng) * 0.1f;
+        for (auto& x : v)
+            x = gauss(rng);
+        for (auto& x : gate)
+            x = -(2.0f + 4.0f * (float)(rng() % 100) / 100.0f);  // dec in (0.0025, 0.135]
+        for (auto& x : beta)
+            x = (float)(rng() % 100) / 100.0f;
+
+        std::vector<float> want_o;
+        std::vector<double> st_mod = st_ref;
+        ref_step(st_mod, q, k, v, gate, beta, S, h_k, h_v, want_o, true, true);
+
+        // the traps
+        {
+            std::vector<double> a = st_ref;
+            std::vector<float> oo;
+            ref_step(a, q, k, v, gate, beta, S, h_k, h_v, oo, false, true);
+            const double rel = rel_l1(want_o, oo);
+            std::printf("  %-42s %-4s (%.2f%% apart)\n", "modulo vs interleave head pairing",
+                        rel > 0.05 ? "yes" : "*** NO ***", rel * 100);
+            if (!(rel > 0.05)) ++bad;
+        }
+        {
+            std::vector<double> a = st_ref;
+            std::vector<float> oo;
+            ref_step(a, q, k, v, gate, beta, S, h_k, h_v, oo, true, false);
+            const double rel = rel_l1(want_o, oo);
+            std::printf("  %-42s %-4s (%.2f%% apart)\n", "decay before vs after the update",
+                        rel > 0.05 ? "yes" : "*** NO ***", rel * 100);
+            // The two readings differ by exactly `k (x) (beta * v * (1 - dec))`, so the fixture is only able
+            // to see the trap when `dec` is far from 1 and `beta` is far from 0.  The first version used
+            // gate in [-0.99, 0] - dec in [0.37, 1] - and managed 3.25%, which is a threshold the wrong
+            // reading nearly clears.  Deep decay is also the realistic regime: `ssm_a = -exp(A_log) < 0` and
+            // softplus is positive, so gate is comfortably negative in the real model.
+            if (!(rel > 0.05)) ++bad;
+        }
+
+        // the kernel
+        float* d_st = sycl::malloc_device<float>(st_dev.size(), stream);
+        float* d_q = sycl::malloc_device<float>(q.size(), stream);
+        float* d_k = sycl::malloc_device<float>(k.size(), stream);
+        float* d_v = sycl::malloc_device<float>(v.size(), stream);
+        float* d_g = sycl::malloc_device<float>(gate.size(), stream);
+        float* d_b = sycl::malloc_device<float>(beta.size(), stream);
+        float* d_o = sycl::malloc_device<float>((size_t)h_v * S, stream);
+        stream.memcpy(d_st, st_dev.data(), st_dev.size() * sizeof(float)).wait();
+        stream.memcpy(d_q, q.data(), q.size() * sizeof(float)).wait();
+        stream.memcpy(d_k, k.data(), k.size() * sizeof(float)).wait();
+        stream.memcpy(d_v, v.data(), v.size() * sizeof(float)).wait();
+        stream.memcpy(d_g, gate.data(), gate.size() * sizeof(float)).wait();
+        stream.memcpy(d_b, beta.data(), beta.size() * sizeof(float)).wait();
+
+        strata::kernels::GdnShapes sh{S, h_k, h_v};
+        strata::kernels::gdn_step(d_st, d_q, d_k, d_v, d_g, d_b, d_o, sh, &stream);
+
+        std::vector<float> got_o((size_t)h_v * S), got_st(st_dev.size());
+        stream.memcpy(got_o.data(), d_o, got_o.size() * sizeof(float)).wait();
+        stream.memcpy(got_st.data(), d_st, got_st.size() * sizeof(float)).wait();
+
+        // o, and the STATE read back through the declared layout
+        const double rel_o = rel_l1(want_o, got_o);
+        double rel_st = 0, mag_st = 0;
+        for (int i = 0; i < S; ++i)
+            for (int j = 0; j < S; ++j)
+                for (int h = 0; h < h_v; ++h) {
+                    const size_t dev = (size_t)(i * h_v + h) * S + j;
+                    const double w = st_mod[(size_t)(i * S + j) * h_v + h];
+                    rel_st += std::fabs(w - (double)got_st[dev]);
+                    mag_st += std::fabs(w);
+                }
+        rel_st /= (mag_st > 1e-30 ? mag_st : 1e-30);
+        std::printf("\n  %-42s rel %.3e\n", "o vs reference", rel_o);
+        std::printf("  %-42s rel %.3e\n", "state (read via (S,h_v,S)) vs reference", rel_st);
+        // The kernel accumulates in f32 and the reference in f64, and the state is a RECURRENCE over 128
+        // terms, so 1e-5 is the arithmetic's floor here and not a structural allowance.
+        if (!(rel_o <= 1e-5)) {
+            std::printf("    *** o over 1e-5 ***\n");
+            ++bad;
+        }
+        if (!(rel_st <= 1e-5)) {
+            std::printf("    *** state over 1e-5 ***\n");
+            ++bad;
+        }
+
+        // a zero state stays zero, and a zero gate/beta leaves the state untouched (the reference's
+        // PROPERTY 4 setup) - a cheap independent invariant that no layout can fake
+        {
+            std::vector<float> zero(st_dev.size(), 0.0f), zg((size_t)h_v, 0.0f), zb((size_t)h_v, 0.0f);
+            stream.memcpy(d_st, zero.data(), zero.size() * sizeof(float)).wait();
+            stream.memcpy(d_g, zg.data(), zg.size() * sizeof(float)).wait();
+            stream.memcpy(d_b, zb.data(), zb.size() * sizeof(float)).wait();
+            strata::kernels::gdn_step(d_st, d_q, d_k, d_v, d_g, d_b, d_o, sh, &stream);
+            std::vector<float> zz(zero.size());
+            stream.memcpy(zz.data(), d_st, zz.size() * sizeof(float)).wait();
+            double nz = 0;
+            for (float x : zz)
+                nz += std::fabs(x);
+            const bool ok = nz == 0.0;
+            std::printf("  %-42s %s\n", "gate=beta=0 from a zero state is a no-op", ok ? "yes" : "*** NO ***");
+            if (!ok) ++bad;
+        }
+
+        // ephemeral state: unchanged when the state is untouched but beta=1 — the delta rule writing k*d
+        sycl::free(d_st, stream);
+        sycl::free(d_q, stream);
+        sycl::free(d_k, stream);
+        sycl::free(d_v, stream);
+        sycl::free(d_g, stream);
+        sycl::free(d_b, stream);
+        sycl::free(d_o, stream);
+    }
+
+    // ================= 2. the conv =================
+    {
+        const int C = 24, dc = 4;  // small, so the host reference is a plain loop
+        // TWO DIFFERENT LAYOUTS MEET HERE, and this is where the first version of this test failed at 0.136.
+        // `ref/gdn.py` carries the conv state as (d_conv-1, C) ROW-MAJOR - (i, c) at i*C + c - because it is
+        // numpy.  The kernel carries it as (C, d_conv-1) with c fastest - c*(dc-1) + i - because that is
+        // ggml's `ne = {d_conv-1, C}` with ne0 fast, and it is a runtime buffer so either is legal.  The
+        // mapping between them is written out below rather than assumed, in both directions.
+        std::vector<float> cs_ref((size_t)(dc - 1) * C), x((size_t)C), kern((size_t)dc * C);
+        for (int i = 0; i < dc - 1; ++i)
+            for (int c = 0; c < C; ++c)
+                cs_ref[(size_t)(i * C + c)] = (float)(10 * (i + 1) + c);  // labelled
+        for (int c = 0; c < C; ++c)
+            x[(size_t)c] = (float)(100 + c);
+        for (size_t i = 0; i < kern.size(); ++i)
+            kern[i] = gauss(rng);
+
+        auto to_dev_layout = [&](const std::vector<float>& r) {
+            std::vector<float> d(r.size());
+            for (int i = 0; i < dc - 1; ++i)
+                for (int c = 0; c < C; ++c)
+                    d[(size_t)(c * (dc - 1) + i)] = r[(size_t)(i * C + c)];
+            return d;
+        };
+        [[maybe_unused]] auto to_ref_layout = [&](const std::vector<float>& d) {
+            std::vector<float> r(d.size());
+            for (int i = 0; i < dc - 1; ++i)
+                for (int c = 0; c < C; ++c)
+                    r[(size_t)(i * C + c)] = d[(size_t)(c * (dc - 1) + i)];
+            return r;
+        };
+
+        std::vector<float> cs = to_dev_layout(cs_ref);
+        std::vector<float> want;
+        std::vector<float> cs_want_ref = cs_ref;
+        ref_conv(cs_want_ref, x, kern, C, dc, want);
+        const std::vector<float> cs_want = to_dev_layout(cs_want_ref);
+
+        // THE LAYOUT: the manifest's `ssm_conv1d.weight` has ne = [d_conv, C], so ne0 = d_conv is fast.
+        // The kernel takes `kW[c*dc + i]`; the reference's `kern` is (dc, C) row-major.  The transcription
+        // below is the ONLY place the two meet.
+        std::vector<float> kW((size_t)C * dc);
+        for (int c = 0; c < C; ++c)
+            for (int i = 0; i < dc; ++i)
+                kW[(size_t)(c * dc + i)] = kern[(size_t)(i * C + c)];
+        // and the rival reading, which must differ or the fixture cannot see a transposed weight
+        std::vector<float> kW_wrong((size_t)C * dc);
+        for (size_t i = 0; i < kern.size(); ++i)
+            kW_wrong[i] = kern[i];
+        {
+            // apply the WRONG layout by hand: tap i of channel c is kW[c*dc+i] read as kW[i*C+c]
+            std::vector<float> cs2 = cs;
+            std::vector<float> out_bad((size_t)C, 0.0f);
+            for (int c = 0; c < C; ++c) {
+                double a = 0;
+                for (int i = 0; i < dc - 1; ++i)
+                    a += (double)cs2[(size_t)(i * C + c)] * (double)kW_wrong[(size_t)(c * dc + i)];
+                a += (double)x[(size_t)c] * (double)kW_wrong[(size_t)(c * dc + dc - 1)];
+                out_bad[(size_t)c] = (float)a;
+            }
+            const double rel = rel_l1(want, out_bad);
+            std::printf("\n  %-42s %-4s (%.1f%% apart)\n", "conv weight layout is observable",
+                        rel > 0.05 ? "yes" : "*** NO ***", rel * 100);
+            if (!(rel > 0.05)) ++bad;
+        }
+
+        float* d_cs = sycl::malloc_device<float>(cs.size(), stream);
+        float* d_x = sycl::malloc_device<float>(x.size(), stream);
+        float* d_w = sycl::malloc_device<float>(kW.size(), stream);
+        float* d_o = sycl::malloc_device<float>((size_t)C, stream);
+        stream.memcpy(d_cs, cs.data(), cs.size() * sizeof(float)).wait();
+        stream.memcpy(d_x, x.data(), x.size() * sizeof(float)).wait();
+        stream.memcpy(d_w, kW.data(), kW.size() * sizeof(float)).wait();
+        strata::kernels::gdn_conv_step(d_cs, d_x, d_w, d_o, C, dc, &stream);
+        std::vector<float> got((size_t)C), got_cs(cs.size());
+        stream.memcpy(got.data(), d_o, got.size() * sizeof(float)).wait();
+        stream.memcpy(got_cs.data(), d_cs, got_cs.size() * sizeof(float)).wait();
+        const double rel_out = rel_l1(want, got), rel_cs = rel_l1(cs_want, got_cs);
+        std::printf("  %-42s rel %.3e\n", "conv out vs reference", rel_out);
+        std::printf("  %-42s rel %.3e\n", "conv state slide (mapped) vs reference", rel_cs);
+        if (!(rel_out <= 1e-6)) {
+            std::printf("    *** conv out ***\n");
+            ++bad;
+        }
+        if (!(rel_cs <= 1e-6)) {
+            std::printf("    *** conv state ***\n");
+            ++bad;
+        }
+        sycl::free(d_cs, stream);
+        sycl::free(d_x, stream);
+        sycl::free(d_w, stream);
+        sycl::free(d_o, stream);
+    }
+
+    // ================= 3. l2_norm =================
+    {
+        const int rows = 16, cols = 128;
+        std::vector<float> x((size_t)rows * cols), x_ref;
+        for (auto& val : x)
+            val = gauss(rng) * 3.0f;
+        x_ref = x;
+        const float eps = 1e-6f;
+        for (int r = 0; r < rows; ++r) {
+            double acc = 0;
+            for (int i = 0; i < cols; ++i)
+                acc += (double)x_ref[(size_t)(r * cols + i)] * (double)x_ref[(size_t)(r * cols + i)];
+            const float inv = (float)(1.0 / std::sqrt(acc + (double)eps));
+            for (int i = 0; i < cols; ++i)
+                x_ref[(size_t)(r * cols + i)] *= inv;
+        }
+        // The rival reading puts THE SAME eps on the MEAN instead of on the squared norm, which at
+        // ||x||^2 ~ 1152 and cols = 128 changes the divisor from sqrt(1152) to sqrt(9) - a factor of 11.3, so
+        // the trap is large here.  It would be a much smaller correction on a near-zero row, where the floor
+        // is the whole answer; that regime is not what this fixture exercises.
+        std::vector<float> x_mean = x;
+        for (int r = 0; r < rows; ++r) {
+            double acc = 0;
+            for (int i = 0; i < cols; ++i)
+                acc += (double)x_mean[(size_t)(r * cols + i)] * (double)x_mean[(size_t)(r * cols + i)];
+            const float inv = (float)(1.0 / std::sqrt(acc / cols + (double)eps));
+            for (int i = 0; i < cols; ++i)
+                x_mean[(size_t)(r * cols + i)] *= inv;
+        }
+        const double rel_trap = rel_l1(x_ref, x_mean);
+        std::printf("\n  %-42s %-4s (%.1f%% apart)\n", "eps on sum vs on mean is observable",
+                    rel_trap > 0.05 ? "yes" : "*** NO ***", rel_trap * 100);
+        if (!(rel_trap > 0.05)) ++bad;
+
+        float* d_x = sycl::malloc_device<float>(x.size(), stream);
+        stream.memcpy(d_x, x.data(), x.size() * sizeof(float)).wait();
+        strata::kernels::gdn_l2_norm(d_x, rows, cols, eps, &stream);
+        std::vector<float> got(x.size());
+        stream.memcpy(got.data(), d_x, got.size() * sizeof(float)).wait();
+        const double rel = rel_l1(x_ref, got);
+        std::printf("  %-42s rel %.3e\n", "l2_norm vs reference", rel);
+        if (!(rel <= 1e-6)) ++bad;
+        sycl::free(d_x, stream);
+    }
+
+    // ================= 4. the closing norm =================
+    {
+        const int S2 = 128, hv2 = 8;
+        std::vector<float> o((size_t)hv2 * S2), z((size_t)hv2 * S2), sn((size_t)S2), y_ref((size_t)hv2 * S2);
+        for (auto& val : o)
+            val = gauss(rng);
+        for (auto& val : z)
+            val = gauss(rng);
+        for (auto& val : sn)
+            val = 1.0f + 0.1f * gauss(rng);
+        const float eps = 1e-6f;
+        for (int h = 0; h < hv2; ++h) {
+            double acc = 0;
+            for (int i = 0; i < S2; ++i)
+                acc += (double)o[(size_t)(h * S2 + i)] * (double)o[(size_t)(h * S2 + i)];
+            const float inv = (float)(1.0 / std::sqrt(acc / S2 + (double)eps));
+            for (int i = 0; i < S2; ++i)
+                y_ref[(size_t)(h * S2 + i)] =
+                    o[(size_t)(h * S2 + i)] * inv * sn[(size_t)i] * sigmoid_f(z[(size_t)(h * S2 + i)]);
+        }
+        float* d_o = sycl::malloc_device<float>(o.size(), stream);
+        float* d_z = sycl::malloc_device<float>(z.size(), stream);
+        float* d_sn = sycl::malloc_device<float>(sn.size(), stream);
+        float* d_y = sycl::malloc_device<float>(y_ref.size(), stream);
+        stream.memcpy(d_o, o.data(), o.size() * sizeof(float)).wait();
+        stream.memcpy(d_z, z.data(), z.size() * sizeof(float)).wait();
+        stream.memcpy(d_sn, sn.data(), sn.size() * sizeof(float)).wait();
+        strata::kernels::gdn_out_norm(d_o, d_z, d_sn, d_y, hv2, S2, eps, &stream);
+        std::vector<float> got(y_ref.size());
+        stream.memcpy(got.data(), d_y, got.size() * sizeof(float)).wait();
+        const double rel = rel_l1(y_ref, got);
+        std::printf("\n  %-42s rel %.3e\n", "out norm (rms * ssm_norm * sigmoid z)", rel);
+        if (!(rel <= 1e-6)) ++bad;
+
+        // SiLU instead of sigmoid is the qwen3.5 reading; `ref/gdn.py` says this artifact does NOT use it
+        std::vector<float> y_silu(y_ref.size());
+        for (int h = 0; h < hv2; ++h) {
+            double acc = 0;
+            for (int i = 0; i < S2; ++i)
+                acc += (double)o[(size_t)(h * S2 + i)] * (double)o[(size_t)(h * S2 + i)];
+            const float inv = (float)(1.0 / std::sqrt(acc / S2 + (double)eps));
+            for (int i = 0; i < S2; ++i) {
+                const float zz = z[(size_t)(h * S2 + i)];
+                y_silu[(size_t)(h * S2 + i)] =
+                    o[(size_t)(h * S2 + i)] * inv * sn[(size_t)i] * (zz / (1.0f + std::exp(-zz)));
+            }
+        }
+        const double rel_silu = rel_l1(y_ref, y_silu);
+        std::printf("  %-42s %-4s (%.2f%% apart)\n", "sigmoid vs SiLU on the gate is observable",
+                    rel_silu > 0.05 ? "yes" : "*** NO ***", rel_silu * 100);
+        if (!(rel_silu > 0.05)) ++bad;
+        sycl::free(d_o, stream);
+        sycl::free(d_z, stream);
+        sycl::free(d_sn, stream);
+        sycl::free(d_y, stream);
+    }
+
+    // ================= 6. the layer-batched commit (engine-latency), bitwise against the per-layer calls =================
+    // gdn_commit_layers runs every layer's conv-history commit and state commit in one launch each; the per-layer loop
+    // (gdn_conv_commit + gdn_step_norm_multi with n_keep, no outputs) is the reference.  Several layers with their own
+    // state, rows and gate/beta; n_keep 1..T; memcmp on the whole state arena (states and conv histories).
+    {
+        const int qk = S * h_k, C = 2 * qk + S * h_v, L = 5, MT = strata::kernels::kVerifyMaxT;
+        const int64_t conv_off = (int64_t)S * h_v * S, stride = conv_off + (int64_t)C * 3;
+        std::vector<float> st0((size_t)(stride * L)), hb((size_t)L * MT * C), qkv((size_t)L * MT * C),
+            gt((size_t)L * MT * h_v), bt((size_t)L * MT * h_v), zdummy((size_t)MT * S * h_v), gm(S, 1.0f);
+        for (auto& x : st0) x = gauss(rng) * 0.1f;
+        for (auto& x : hb) x = gauss(rng) * 0.1f;
+        for (auto& x : qkv) x = gauss(rng);
+        for (auto& x : gt) x = -(0.5f + (float)(rng() % 100) / 50.0f);
+        for (auto& x : bt) x = (float)(rng() % 100) / 100.0f;
+        float *d_a = sycl::malloc_device<float>(st0.size(), stream);
+        float *d_b = sycl::malloc_device<float>(st0.size(), stream);
+        float *d_h = sycl::malloc_device<float>(hb.size(), stream);
+        float *d_qkv = sycl::malloc_device<float>(qkv.size(), stream);
+        float *d_g = sycl::malloc_device<float>(gt.size(), stream);
+        float *d_bt = sycl::malloc_device<float>(bt.size(), stream);
+        float *d_z = sycl::malloc_device<float>(zdummy.size(), stream);
+        float *d_y = sycl::malloc_device<float>(zdummy.size(), stream);
+        float *d_gm = sycl::malloc_device<float>(gm.size(), stream);
+        int32_t *d_nk = sycl::malloc_device<int32_t>(1, stream);
+        stream.memcpy(d_h, hb.data(), hb.size() * sizeof(float));
+        stream.memcpy(d_qkv, qkv.data(), qkv.size() * sizeof(float));
+        stream.memcpy(d_g, gt.data(), gt.size() * sizeof(float));
+        stream.memcpy(d_bt, bt.data(), bt.size() * sizeof(float));
+        stream.memcpy(d_gm, gm.data(), gm.size() * sizeof(float));
+        stream.memset(d_z, 0, zdummy.size() * sizeof(float)).wait();
+        int lb_bad = 0, lb_n = 0;
+        bool launched = true;
+        for (int nk = 1; nk <= MT && launched; ++nk) {
+            stream.memcpy(d_nk, &nk, sizeof(int32_t));
+            stream.memcpy(d_a, st0.data(), st0.size() * sizeof(float));
+            stream.memcpy(d_b, st0.data(), st0.size() * sizeof(float)).wait();
+            for (int l = 0; l < L; ++l) {   // the reference: the per-layer calls
+                float* stl = d_a + (size_t)l * stride;
+                strata::kernels::gdn_conv_commit(stl + conv_off, d_qkv + (size_t)l * MT * C, C, d_nk, &stream);
+                strata::kernels::gdn_step_norm_multi(stl, d_h + (size_t)l * MT * C, C, d_g + (size_t)l * MT * h_v,
+                                                     d_bt + (size_t)l * MT * h_v, d_z, d_gm, 1e-6f, d_y, h_k, h_v, MT, d_nk,
+                                                     &stream, MT);
+            }
+            launched = strata::kernels::gdn_commit_layers(d_b, stride, conv_off, d_qkv, (int64_t)MT * C, d_h, (int64_t)MT * C,
+                                                          d_g, d_bt, (int64_t)MT * h_v, C, h_k, h_v, MT, L, d_nk, &stream);
+            if (!launched) break;
+            stream.wait();
+            std::vector<float> a(st0.size()), b(st0.size());
+            stream.memcpy(a.data(), d_a, a.size() * sizeof(float));
+            stream.memcpy(b.data(), d_b, b.size() * sizeof(float)).wait();
+            ++lb_n;
+            if (std::memcmp(a.data(), b.data(), a.size() * sizeof(float)) != 0 || std::memcmp(a.data(), st0.data(), a.size() * sizeof(float)) == 0) {
+                std::printf("    *** gdn_commit_layers n_keep=%d differs from the per-layer commit (or wrote nothing) ***\n", nk);
+                ++lb_bad;
+            }
+        }
+        sycl::free(d_a, stream); sycl::free(d_b, stream); sycl::free(d_h, stream); sycl::free(d_qkv, stream);
+        sycl::free(d_g, stream); sycl::free(d_bt, stream); sycl::free(d_z, stream); sycl::free(d_y, stream);
+        sycl::free(d_gm, stream); sycl::free(d_nk, stream);
+        if (launched)
+            std::printf("  %-42s %s (%d cases, %d layers)\n", "gdn_commit_layers == per-layer commit", lb_bad ? "*** NO ***" : "bitwise",
+                        lb_n, L);
+        else
+            std::printf("  %-42s skipped (the per-layer commit is not the state-only kernel here)\n", "gdn_commit_layers");
+        bad += lb_bad;
+    }
+
+    std::printf("\ngdn: %d failures\n", bad);
+    if (bad) return 1;
+    if (selftest) std::printf("gdn_parity OK\n");
+    return 0;
+}

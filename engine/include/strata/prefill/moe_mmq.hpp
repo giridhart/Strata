@@ -95,7 +95,7 @@ public:
     void run(const Product& p, void* stream);
 
 private:
-    void* ctx_ = nullptr;
+    [[maybe_unused]] void* ctx_ = nullptr;
 };
 
 /// A GGUF-native expert (gate at `gate`, up at `up`, down at `down`, each its GGUF rows) into a group buffer's
@@ -180,3 +180,4 @@ struct GuardTab {
 void prep_group(const GuardTab& g, size_t guard_bytes, void* tail_gu, void* tail_d, size_t tail_bytes, void* stream);
 
 }  // namespace strata::prefill::mmq
+

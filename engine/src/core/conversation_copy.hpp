@@ -5,7 +5,9 @@
 #include "strata/platform/aux_cpus.hpp"
 #include "strata/platform/home_cpus.hpp"
 
+#if !defined(STRATA_ENABLE_SYCL)
 #include <cuda_runtime.h>
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -30,6 +32,7 @@ void conversation_checkpoint_test_hook(void (*hook)(int point));
 }
 namespace strata::core::conversation_detail {
 
+#if !defined(STRATA_ENABLE_SYCL)
 /// The private copy streams and ordering events (below) belong to a thread, but a thread can be short-lived: the layer
 /// split's later stages run each prompt chunk on a fresh std::async thread, and a checkpoint part is saved on it.  The
 /// handles used to be created per thread and never destroyed, so every such thread left one stream and one event per
@@ -128,6 +131,7 @@ inline long test_copy_fail_at() {
     static const long v = [] { const char* e = std::getenv("STRATA_TEST_COPY_FAIL_AT"); return e ? std::atol(e) : 0L; }();
     return v;
 }
+#endif
 
 /// First thing a background copy thread does (STRATA_CKPT_ASYNC, STRATA_PARK_ASYNC): a thread the host creates
 /// inherits the host's one CPU (strata/platform/aux_cpus.hpp), where its memcpys would take turns with the decode.
@@ -142,6 +146,7 @@ inline void background_thread_placement() {
 #endif
 }
 
+#if !defined(STRATA_ENABLE_SYCL)
 /// `queued`: the copy is only queued on the private stream, and the caller synchronizes the device (or orders a
 /// later launch after it with order_after_queued) before anything reads the target or writes the source.
 inline cudaError_t copy_nonblocking(void* dst, const void* src, size_t bytes, bool queued = false) {
@@ -158,6 +163,7 @@ inline cudaError_t copy_nonblocking(void* dst, const void* src, size_t bytes, bo
     core::progress_beat();   // #2049: a parked conversation is many of these; each one that lands is progress
     return e;
 }
+#endif
 
 /// #2049 #2065 #1971: a host-to-host copy that tells the watchdog it is moving.  Parked state (the running
 /// checkpoints, the K/V segments) sits in ordinary pageable memory for the whole session; when the OS has written
@@ -252,6 +258,7 @@ inline std::vector<ConversationCheckpoint> copy_checkpoints_beating(const std::v
     return out;
 }
 
+#if !defined(STRATA_ENABLE_SYCL)
 /// Work queued on the legacy stream after this call starts after every copy this thread queued on the current
 /// device's private stream (an event the legacy stream waits for; no host wait).
 inline cudaError_t order_after_queued() {
@@ -280,5 +287,6 @@ inline cudaError_t order_after_queued() {
     if (e != cudaSuccess) return e;
     return cudaStreamWaitEvent(nullptr, events[(size_t) dev], 0);
 }
+#endif
 
 } // namespace strata::core::conversation_detail

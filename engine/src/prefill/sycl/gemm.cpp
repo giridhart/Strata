@@ -1,0 +1,672 @@
+// src/prefill/gemm.cu - see include/strata/prefill/gemm.hpp.
+#include <sycl/sycl.hpp>
+#include <sycl/ext/oneapi/matrix/matrix-unified.hpp>
+#include "strata/core/sycl_arch.hpp"
+#include "strata/kernels/bf16_bits.hpp"
+#include "strata/kernels/bf16_gemv.hpp"
+#include "strata/prefill/gemm.hpp"
+#include "strata/kernels/dequant_bf16.hpp"
+#include "strata/kernels/xmx_gemm.hpp"
+
+#if defined(__HIPCC__) && defined(STRATA_HIPBLASLT_AVAILABLE)
+// The HIP compatibility shim maps CUDA shuffle spellings to Strata helpers.
+// hipBLASLt's public headers declare native HIP shuffle functions, so keep
+// those declarations from being macro-expanded in this translation unit.
+#undef __shfl_xor_sync
+#undef __shfl_down_sync
+#undef __shfl_up_sync
+#undef __shfl_sync
+#undef __ballot_sync
+#endif
+
+#include <atomic>
+#include <climits>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <memory>
+
+#if defined(__HIPCC__) && defined(STRATA_HIPBLASLT_AVAILABLE)
+#include "hipblaslt_tuning.hpp"
+#include <hip/hip_runtime_api.h>
+#include <hipblaslt/hipblaslt.h>
+#include <hipblaslt/hipblaslt-ext.hpp>
+#include <map>
+#include <set>
+#include <tuple>
+#endif
+
+namespace strata::prefill {
+namespace {
+
+// #247/#325: on Windows (seen on gfx1201), hipBLAS can return success with the correct BF16/FP16 product for some
+
+#if defined(__HIPCC__) && defined(STRATA_HIPBLASLT_AVAILABLE)
+struct HipLtCallKey {
+    strata::prefill::hipblaslt::InputType type;
+    int t;
+    int n;
+    int k;
+    int ldy;
+    uint32_t beta_bits;
+
+    bool operator<(const HipLtCallKey& other) const {
+        return std::tie(type, n, k, ldy, t, beta_bits) <
+               std::tie(other.type, other.n, other.k, other.ldy, other.t, other.beta_bits);
+    }
+};
+
+struct HipLtCachedAlgo {
+    bool supported = false;
+    hipblasLtMatmulAlgo_t algo{};
+    size_t workspace_bytes = 0;
+};
+
+struct HipLtState {
+    hipblasLtHandle_t handle = nullptr;
+    void* workspace = nullptr;
+    size_t workspace_bytes = 0;
+    strata::prefill::hipblaslt::TuningTable table;
+    std::map<HipLtCallKey, HipLtCachedAlgo> cache;
+    uint64_t lt_launches = 0;
+    uint64_t fallbacks = 0;
+    std::set<std::tuple<strata::prefill::hipblaslt::InputType, int, int, int, int>> fallback_shapes;
+
+    ~HipLtState() {
+        if (std::getenv("STRATA_HIPBLASLT_VERBOSE")) {
+            std::fprintf(stderr,
+                         "prefill gemm: hipBLASLt summary launches=%llu fallbacks=%llu unique_fallback_shapes=%zu\n",
+                         (unsigned long long)lt_launches, (unsigned long long)fallbacks, fallback_shapes.size());
+            for (const auto& shape : fallback_shapes) {
+                const auto type = std::get<0>(shape);
+                std::fprintf(stderr, "prefill gemm: fallback shape dtype=%s T=%d N=%d K=%d ldy=%d\n",
+                             type == strata::prefill::hipblaslt::InputType::bf16 ? "bf16" : "f16", std::get<1>(shape),
+                             std::get<2>(shape), std::get<3>(shape), std::get<4>(shape));
+            }
+        }
+        if (handle) hipblasLtDestroy(handle);
+    }
+};
+
+struct HipLtDescriptors {
+    hipblasLtMatmulDesc_t op = nullptr;
+    hipblasLtMatrixLayout_t a = nullptr;
+    hipblasLtMatrixLayout_t b = nullptr;
+    hipblasLtMatrixLayout_t c = nullptr;
+
+    ~HipLtDescriptors() {
+        if (op) hipblasLtMatmulDescDestroy(op);
+        if (a) hipblasLtMatrixLayoutDestroy(a);
+        if (b) hipblasLtMatrixLayoutDestroy(b);
+        if (c) hipblasLtMatrixLayoutDestroy(c);
+    }
+
+    bool init(hipDataType type, int t, int n, int k, int ldy) {
+        const hipblasOperation_t trans_a = HIPBLAS_OP_T;
+        const hipblasOperation_t trans_b = HIPBLAS_OP_N;
+        if (hipblasLtMatmulDescCreate(&op, HIPBLAS_COMPUTE_32F, HIP_R_32F) != HIPBLAS_STATUS_SUCCESS ||
+            hipblasLtMatmulDescSetAttribute(op, HIPBLASLT_MATMUL_DESC_TRANSA, &trans_a, sizeof(trans_a)) !=
+                HIPBLAS_STATUS_SUCCESS ||
+            hipblasLtMatmulDescSetAttribute(op, HIPBLASLT_MATMUL_DESC_TRANSB, &trans_b, sizeof(trans_b)) !=
+                HIPBLAS_STATUS_SUCCESS ||
+            hipblasLtMatrixLayoutCreate(&a, type, k, n, k) != HIPBLAS_STATUS_SUCCESS ||
+            hipblasLtMatrixLayoutCreate(&b, type, k, t, k) != HIPBLAS_STATUS_SUCCESS ||
+            hipblasLtMatrixLayoutCreate(&c, HIP_R_32F, n, t, ldy) != HIPBLAS_STATUS_SUCCESS) {
+            return false;
+        }
+        return true;
+    }
+};
+
+std::unique_ptr<HipLtState> create_hipblaslt_state(void* workspace, size_t workspace_bytes) {
+    const char* path = std::getenv("STRATA_HIPBLASLT_TUNING");
+    if (!path || !*path) return nullptr;
+
+    auto state = std::make_unique<HipLtState>();
+    state->workspace = workspace;
+    state->workspace_bytes = workspace_bytes;
+    if (hipblasLtCreate(&state->handle) != HIPBLAS_STATUS_SUCCESS) {
+        std::fprintf(stderr, "prefill gemm: hipBLASLt handle creation failed; using hipBLASEx\n");
+        return nullptr;
+    }
+
+    int version = 0;
+    if (hipblasLtGetVersion(state->handle, &version) != HIPBLAS_STATUS_SUCCESS) {
+        std::fprintf(stderr, "prefill gemm: hipBLASLt version query failed; using hipBLASEx\n");
+        return nullptr;
+    }
+    int device = 0;
+    hipDeviceProp_t properties{};
+    if (hipGetDevice(&device) != hipSuccess || hipGetDeviceProperties(&properties, device) != hipSuccess) {
+        std::fprintf(stderr, "prefill gemm: HIP device query failed; using hipBLASEx\n");
+        return nullptr;
+    }
+    std::string arch(properties.gcnArchName);
+    const auto suffix = arch.find(':');
+    if (suffix != std::string::npos) arch.resize(suffix);
+
+    std::string error;
+    if (!state->table.load(path, arch, version, error)) {
+        std::fprintf(stderr, "prefill gemm: %s; using hipBLASEx\n", error.c_str());
+        return nullptr;
+    }
+    std::fprintf(stderr, "prefill gemm: hipBLASLt tuning enabled (%zu rows, %s, version %d)\n",
+                 state->table.rows().size(), arch.c_str(), version);
+    return state;
+}
+
+HipLtCachedAlgo resolve_hipblaslt_algo(HipLtState& state, strata::prefill::hipblaslt::InputType type, int t, int n,
+                                       int k, int ldy, float beta) {
+    uint32_t beta_bits = 0;
+    static_assert(sizeof(beta_bits) == sizeof(beta));
+    std::memcpy(&beta_bits, &beta, sizeof(beta));
+    const HipLtCallKey key{type, t, n, k, ldy, beta_bits};
+    const auto cached = state.cache.find(key);
+    if (cached != state.cache.end()) return cached->second;
+
+    HipLtCachedAlgo resolved;
+    const bool verbose = std::getenv("STRATA_HIPBLASLT_VERBOSE") != nullptr;
+    const auto* row = state.table.closest(type, n, k, ldy, t);
+    if (!row) {
+        if (verbose) {
+            std::fprintf(stderr, "prefill gemm: Lt fallback; no calibration for dtype=%s T=%d N=%d K=%d ldy=%d\n",
+                         type == strata::prefill::hipblaslt::InputType::bf16 ? "bf16" : "f16", t, n, k, ldy);
+        }
+        return state.cache.emplace(key, resolved).first->second;
+    }
+
+    HipLtDescriptors desc;
+    const hipDataType input_type = type == strata::prefill::hipblaslt::InputType::bf16 ? HIP_R_16BF : HIP_R_16F;
+    if (!desc.init(input_type, t, n, k, ldy)) {
+        return state.cache.emplace(key, resolved).first->second;
+    }
+
+    std::vector<int> solution_ids{row->solution_id};
+    std::vector<hipblasLtMatmulHeuristicResult_t> candidates;
+    if (hipblaslt_ext::getAlgosFromIndex(state.handle, solution_ids, candidates) != HIPBLAS_STATUS_SUCCESS ||
+        candidates.empty() || candidates.front().state != HIPBLAS_STATUS_SUCCESS ||
+        hipblaslt_ext::getIndexFromAlgo(candidates.front().algo) != row->solution_id) {
+        if (verbose) {
+            std::fprintf(stderr, "prefill gemm: Lt fallback; solution %d unavailable for T=%d N=%d K=%d ldy=%d\n",
+                         row->solution_id, t, n, k, ldy);
+        }
+        return state.cache.emplace(key, resolved).first->second;
+    }
+
+    const float alpha = 1.0f;
+    size_t required_workspace = 0;
+    auto algo = candidates.front().algo;
+    if (hipblaslt_ext::matmulIsAlgoSupported(state.handle, desc.op, &alpha, desc.a, desc.b, &beta, desc.c, desc.c, algo,
+                                             required_workspace) != HIPBLAS_STATUS_SUCCESS) {
+        if (verbose) {
+            std::fprintf(stderr,
+                         "prefill gemm: Lt fallback; solution %d rejects actual T=%d N=%d K=%d ldy=%d beta=%.9g\n",
+                         row->solution_id, t, n, k, ldy, beta);
+        }
+        return state.cache.emplace(key, resolved).first->second;
+    }
+
+    resolved.supported = true;
+    resolved.algo = algo;
+    resolved.workspace_bytes = required_workspace;
+    if (verbose) {
+        std::fprintf(stderr, "prefill gemm: Lt solution=%d dtype=%s T=%d N=%d K=%d ldy=%d beta=%.9g workspace=%zu\n",
+                     row->solution_id, type == strata::prefill::hipblaslt::InputType::bf16 ? "bf16" : "f16", t, n, k,
+                     ldy, beta, required_workspace);
+    }
+    return state.cache.emplace(key, resolved).first->second;
+}
+
+bool try_hipblaslt(void* opaque_state, strata::prefill::hipblaslt::InputType type, const uint16_t* x, const uint16_t* w,
+                   float* y, int64_t t, int64_t n, int64_t k, int64_t ldy, float beta, void* stream) {
+    auto* state = static_cast<HipLtState*>(opaque_state);
+    if (!state || t <= 0 || n <= 0 || k <= 0 || t > INT_MAX || n > INT_MAX || k > INT_MAX || ldy > INT_MAX || ldy < n) {
+        return false;
+    }
+    const auto resolved = resolve_hipblaslt_algo(*state, type, (int)t, (int)n, (int)k, (int)ldy, beta);
+    if (!resolved.supported) {
+        ++state->fallbacks;
+        state->fallback_shapes.emplace(type, (int)t, (int)n, (int)k, (int)ldy);
+        return false;
+    }
+    if (resolved.workspace_bytes > state->workspace_bytes) {
+        ++state->fallbacks;
+        state->fallback_shapes.emplace(type, (int)t, (int)n, (int)k, (int)ldy);
+        if (std::getenv("STRATA_HIPBLASLT_VERBOSE")) {
+            std::fprintf(stderr, "prefill gemm: Lt fallback; solution needs %zu workspace bytes, have %zu\n",
+                         resolved.workspace_bytes, state->workspace_bytes);
+        }
+        return false;
+    }
+
+    HipLtDescriptors desc;
+    const hipDataType input_type = type == strata::prefill::hipblaslt::InputType::bf16 ? HIP_R_16BF : HIP_R_16F;
+    if (!desc.init(input_type, (int)t, (int)n, (int)k, (int)ldy)) return false;
+    const float alpha = 1.0f;
+    const hipblasStatus_t status =
+        hipblasLtMatmul(state->handle, desc.op, &alpha, w, desc.a, x, desc.b, &beta, y, desc.c, y, desc.c,
+                        &resolved.algo, state->workspace, state->workspace_bytes, (hipStream_t)stream);
+    if (status == HIPBLAS_STATUS_SUCCESS) {
+        ++state->lt_launches;
+        return true;
+    }
+
+    std::fprintf(stderr, "prefill gemm: hipBLASLt launch failed with status %d\n", (int)status);
+    if (beta != 0.0f) {
+        std::fprintf(stderr, "prefill gemm: refusing a fallback after hipBLASLt failed with nonzero beta\n");
+        std::exit(1);
+    }
+    auto* mutable_state = static_cast<HipLtState*>(opaque_state);
+    uint32_t beta_bits = 0;
+    std::memcpy(&beta_bits, &beta, sizeof(beta_bits));
+    auto cached = mutable_state->cache.find(HipLtCallKey{type, (int)t, (int)n, (int)k, (int)ldy, beta_bits});
+    if (cached != mutable_state->cache.end()) cached->second.supported = false;
+    ++mutable_state->fallbacks;
+    mutable_state->fallback_shapes.emplace(type, (int)t, (int)n, (int)k, (int)ldy);
+    return false;
+}
+#endif
+
+}  // namespace
+
+Gemm::~Gemm() {
+#if defined(__HIPCC__) && defined(STRATA_HIPBLASLT_AVAILABLE)
+    delete static_cast<HipLtState*>(hipblaslt_state_);
+#endif
+    if (!external_) {
+        auto* q = static_cast<sycl::queue*>(stream_);
+        if (q) {
+            if (scratch_) sycl::free(scratch_, *q);
+            if (workspace_) sycl::free(workspace_, *q);
+        }
+    }
+}
+
+bool Gemm::init_external(void* stream, uint16_t* scratch, int64_t scratch_elems, void* workspace, size_t ws_bytes,
+                         std::string& err) {
+    (void)ws_bytes;
+    (void)err;
+    stream_ = stream;
+    handle_ = stream;
+    external_ = true;
+    workspace_ = workspace;
+    scratch_ = scratch;
+    scratch_elems_ = scratch_elems;
+#if defined(__HIPCC__) && defined(STRATA_HIPBLASLT_AVAILABLE)
+    hipblaslt_state_ = create_hipblaslt_state(workspace_, ws_bytes).release();
+#endif
+    return true;
+}
+
+void Gemm::rebind(uint16_t* scratch, int64_t scratch_elems, void* workspace, size_t ws_bytes) {
+    (void)ws_bytes;
+    scratch_ = scratch;
+    scratch_elems_ = scratch_elems;
+    workspace_ = workspace;
+#if defined(__HIPCC__) && defined(STRATA_HIPBLASLT_AVAILABLE)
+    if (hipblaslt_state_) {
+        auto* state = static_cast<HipLtState*>(hipblaslt_state_);
+        state->workspace = workspace_;
+        state->workspace_bytes = ws_bytes;
+    }
+#endif
+}
+
+bool Gemm::init(void* stream, int64_t scratch_elems, std::string& err) {
+    auto* q = static_cast<sycl::queue*>(stream);
+    if (!q) {
+        err = "prefill gemm: invalid sycl queue pointer";
+        return false;
+    }
+    stream_ = stream;
+    handle_ = stream;
+    const size_t ws = 32u << 20;
+    try {
+        workspace_ = sycl::malloc_device(ws, *q);
+        if (!workspace_) {
+            err = "prefill gemm: workspace allocation of 32 MiB failed";
+            return false;
+        }
+        if (scratch_elems > 0) {
+            scratch_ = (uint16_t*)sycl::malloc_device((size_t)scratch_elems * 2, *q);
+            if (!scratch_) {
+                err = "prefill gemm: dequant scratch of " + std::to_string(scratch_elems * 2 >> 20) + " MiB failed";
+                return false;
+            }
+        }
+    } catch (const sycl::exception& exc) {
+        err = std::string("prefill gemm: ") + exc.what();
+        return false;
+    }
+#if defined(__HIPCC__) && defined(STRATA_HIPBLASLT_AVAILABLE)
+    hipblaslt_state_ = create_hipblaslt_state(workspace_, ws).release();
+#endif
+    scratch_elems_ = scratch_elems;
+    return true;
+}
+
+template <bool IS_BF16>
+void sycl_prefill_gemm_kernel(const uint16_t* __restrict__ X, const uint16_t* __restrict__ W, float* __restrict__ Y,
+                              int64_t T, int64_t N, int64_t K, int64_t ldy, float alpha, float beta,
+                              sycl::nd_item<2> item) {
+    const int64_t t = (int64_t)item.get_group(0) * item.get_local_range(0) + item.get_local_id(0);
+    const int64_t n = (int64_t)item.get_group(1) * item.get_local_range(1) + item.get_local_id(1);
+    if (t >= T || n >= N) return;
+
+    const uint16_t* x_row = X + t * K;
+    const uint16_t* w_row = W + n * K;
+
+    float sum = 0.0f;
+    int64_t k = 0;
+#pragma unroll 4
+    for (; k + 4 <= K; k += 4) {
+        if constexpr (IS_BF16) {
+            sum += strata::kernels::f32_from_bf16(x_row[k + 0]) * strata::kernels::f32_from_bf16(w_row[k + 0]) +
+                   strata::kernels::f32_from_bf16(x_row[k + 1]) * strata::kernels::f32_from_bf16(w_row[k + 1]) +
+                   strata::kernels::f32_from_bf16(x_row[k + 2]) * strata::kernels::f32_from_bf16(w_row[k + 2]) +
+                   strata::kernels::f32_from_bf16(x_row[k + 3]) * strata::kernels::f32_from_bf16(w_row[k + 3]);
+        } else {
+            sum += static_cast<float>(sycl::bit_cast<sycl::half>(x_row[k + 0])) *
+                       static_cast<float>(sycl::bit_cast<sycl::half>(w_row[k + 0])) +
+                   static_cast<float>(sycl::bit_cast<sycl::half>(x_row[k + 1])) *
+                       static_cast<float>(sycl::bit_cast<sycl::half>(w_row[k + 1])) +
+                   static_cast<float>(sycl::bit_cast<sycl::half>(x_row[k + 2])) *
+                       static_cast<float>(sycl::bit_cast<sycl::half>(w_row[k + 2])) +
+                   static_cast<float>(sycl::bit_cast<sycl::half>(x_row[k + 3])) *
+                       static_cast<float>(sycl::bit_cast<sycl::half>(w_row[k + 3]));
+        }
+    }
+    for (; k < K; ++k) {
+        if constexpr (IS_BF16) {
+            sum += strata::kernels::f32_from_bf16(x_row[k]) * strata::kernels::f32_from_bf16(w_row[k]);
+        } else {
+            sum += static_cast<float>(sycl::bit_cast<sycl::half>(x_row[k])) *
+                   static_cast<float>(sycl::bit_cast<sycl::half>(w_row[k]));
+        }
+    }
+
+    const int64_t y_idx = t * ldy + n;
+    if (beta == 0.0f) {
+        Y[y_idx] = alpha * sum;
+    } else {
+        Y[y_idx] = alpha * sum + beta * Y[y_idx];
+    }
+}
+
+template <bool IS_BF16, int SGM = 4, int SGN = 2, int TM = 8, int TN = 16, int KS = 32>
+void xmx_prefill_gemm_kernel(const uint16_t* __restrict__ X, const uint16_t* __restrict__ W, float* __restrict__ Y,
+                             int64_t T, int64_t N, int64_t K, int64_t ldy, float alpha, float beta,
+                             sycl::nd_item<2> item, sycl::local_accessor<uint16_t, 1> sa,
+                             sycl::local_accessor<uint16_t, 1> sb, sycl::local_accessor<float, 1> se) {
+    auto sg = item.get_sub_group();
+    constexpr int BM = SGM * TM;  // 32
+    constexpr int BN = SGN * TN;  // 32
+    constexpr int SG = 16;
+    constexpr int WG = SGM * SGN * SG;  // 128
+    constexpr int LDA = KS + 8;
+    constexpr int LDB = KS + 8;
+
+    const int t0 = (int)item.get_group(0) * BM;
+    const int n0 = (int)item.get_group(1) * BN;
+    const int lid = (int)item.get_local_linear_id();
+    const int sgid = lid / SG;
+    const int sgm = sgid / SGN;
+    const int sgn = sgid % SGN;
+
+    sycl::ext::oneapi::experimental::matrix::joint_matrix<
+        sycl::sub_group, float, sycl::ext::oneapi::experimental::matrix::use::accumulator, TM, TN>
+        acc;
+    sycl::ext::oneapi::experimental::matrix::joint_matrix_fill(sg, acc, 0.0f);
+
+    uint16_t* pa = sa.template get_multi_ptr<sycl::access::decorated::no>().get();
+    uint16_t* pb = sb.template get_multi_ptr<sycl::access::decorated::no>().get();
+
+    for (int k0 = 0; k0 < K; k0 += KS) {
+        // Cooperatively load X [BM x KS] into SLM pa
+        for (int v = lid; v < BM * (KS / 8); v += WG) {
+            const int r = v / (KS / 8), c = (v % (KS / 8)) * 8;
+            if (t0 + r < T && k0 + c < K) {
+                *reinterpret_cast<sycl::vec<uint16_t, 8>*>(pa + r * LDA + c) =
+                    *reinterpret_cast<const sycl::vec<uint16_t, 8>*>(X + (size_t)(t0 + r) * K + k0 + c);
+            } else {
+                *reinterpret_cast<sycl::vec<uint16_t, 8>*>(pa + r * LDA + c) = sycl::vec<uint16_t, 8>(0);
+            }
+        }
+        // Cooperatively load W [BN x KS] into SLM pb
+        for (int v = lid; v < BN * (KS / 8); v += WG) {
+            const int r = v / (KS / 8), c = (v % (KS / 8)) * 8;
+            if (n0 + r < N && k0 + c < K) {
+                *reinterpret_cast<sycl::vec<uint16_t, 8>*>(pb + r * LDB + c) =
+                    *reinterpret_cast<const sycl::vec<uint16_t, 8>*>(W + (size_t)(n0 + r) * K + k0 + c);
+            } else {
+                *reinterpret_cast<sycl::vec<uint16_t, 8>*>(pb + r * LDB + c) = sycl::vec<uint16_t, 8>(0);
+            }
+        }
+        item.barrier(sycl::access::fence_space::local_space);
+
+        // Compute KS in 16-step DPAS operations
+        for (int kk = 0; kk < KS; kk += 16) {
+            using elem_t = std::conditional_t<IS_BF16, sycl::ext::oneapi::bfloat16, sycl::half>;
+            sycl::ext::oneapi::experimental::matrix::joint_matrix<
+                sycl::sub_group, elem_t, sycl::ext::oneapi::experimental::matrix::use::a, TM, 16,
+                sycl::ext::oneapi::experimental::matrix::layout::row_major>
+                sub_a;
+            sycl::ext::oneapi::experimental::matrix::joint_matrix<
+                sycl::sub_group, elem_t, sycl::ext::oneapi::experimental::matrix::use::b, 16, TN,
+                sycl::ext::oneapi::experimental::matrix::layout::col_major>
+                sub_b;
+
+            auto lptr_a =
+                sycl::address_space_cast<sycl::access::address_space::local_space, sycl::access::decorated::no>(
+                    reinterpret_cast<elem_t*>(pa + (sgm * TM) * LDA + kk));
+            auto lptr_b =
+                sycl::address_space_cast<sycl::access::address_space::local_space, sycl::access::decorated::no>(
+                    reinterpret_cast<elem_t*>(pb + (sgn * TN) * LDB + kk));
+
+            sycl::ext::oneapi::experimental::matrix::joint_matrix_load(sg, sub_a, lptr_a, LDA);
+            sycl::ext::oneapi::experimental::matrix::joint_matrix_load(sg, sub_b, lptr_b, LDB);
+            sycl::ext::oneapi::experimental::matrix::joint_matrix_mad(sg, acc, sub_a, sub_b, acc);
+        }
+        item.barrier(sycl::access::fence_space::local_space);
+    }
+
+    const int r = t0 + sgm * TM;
+    const int c = n0 + sgn * TN;
+    if (r < T && c < N) {
+        if (r + TM <= T && c + TN <= N && beta == 0.0f && alpha == 1.0f) {
+            auto ptr_c =
+                sycl::address_space_cast<sycl::access::address_space::global_space, sycl::access::decorated::no>(
+                    Y + (size_t)r * ldy + c);
+            sycl::ext::oneapi::experimental::matrix::joint_matrix_store(
+                sg, acc, ptr_c, ldy, sycl::ext::oneapi::experimental::matrix::layout::row_major);
+        } else {
+            // Partial row stores or non-trivial alpha/beta through SLM
+            float* st = se.template get_multi_ptr<sycl::access::decorated::no>().get() + sgid * TM * TN;
+            auto ptr_tmp =
+                sycl::address_space_cast<sycl::access::address_space::local_space, sycl::access::decorated::no>(st);
+            sycl::ext::oneapi::experimental::matrix::joint_matrix_store(
+                sg, acc, ptr_tmp, TN, sycl::ext::oneapi::experimental::matrix::layout::row_major);
+            sycl::group_barrier(sg);
+            const size_t ln = sg.get_local_linear_id();
+            for (int rr = 0; rr < TM; ++rr) {
+                if ((size_t)(r + rr) < (size_t)T && c + ln < (size_t)N) {
+                    const size_t idx = (size_t)(r + rr) * ldy + c + ln;
+                    if (beta == 0.0f) {
+                        Y[idx] = alpha * st[rr * TN + ln];
+                    } else {
+                        Y[idx] = alpha * st[rr * TN + ln] + beta * Y[idx];
+                    }
+                }
+            }
+            sycl::group_barrier(sg);
+        }
+    }
+}
+
+void Gemm::bf16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy,
+                float beta) {
+    if (T <= 0 || N <= 0 || K <= 0) return;
+    if (ldy <= 0) ldy = N;
+    auto* q = static_cast<sycl::queue*>(stream_);
+    if (!q) return;
+
+    if (T == 1 && beta == 0.0f && ldy == N) {
+        strata::kernels::bf16_gemv(X, W, Y, K, N, stream_);
+        return;
+    }
+
+    if ((beta == 0.0f || beta == 1.0f) &&
+        strata::kernels::xmx_available(stream_, strata::kernels::XmxType::bf16) &&
+        strata::kernels::xmx_gemm_ok(X, W, Y, N, K, ldy)) {
+        strata::kernels::xmx_gemm(strata::kernels::XmxType::bf16, X, W, Y, T, N, K, ldy, stream_, beta != 0.0f);
+        return;
+    }
+
+    static const bool xmx_enabled = [] {
+        const char* v = std::getenv("STRATA_PREFILL_XMX_GEMM");
+        if (v) return std::atoi(v) != 0;
+        return strata::sycl_arch::IS_XE2;
+    }();
+    static const bool gemm_debug = [] {
+        const char* v = std::getenv("STRATA_PREFILL_XMX_DEBUG");
+        if (v && std::atoi(v) != 0) return true;
+        const char* d = std::getenv("STRATA_DEBUG");
+        return d && std::atoi(d) != 0;
+    }();
+
+    const bool use_xmx = xmx_enabled && (K % 16 == 0) && (K >= 16);
+
+    if (gemm_debug) {
+        static std::atomic<bool> logged{false};
+        if (!logged.exchange(true)) {
+            std::fprintf(stderr, "Gemm [DEBUG]: XMX status - enabled=%d, IS_XE2=%d (GEMM path: %s)\n",
+                         xmx_enabled, (int)strata::sycl_arch::IS_XE2,
+                         xmx_enabled ? "XMX SLM-tiled DPAS" : "Scalar FMA");
+        }
+        if (!use_xmx && xmx_enabled) {
+            std::fprintf(stderr,
+                         "Gemm [DEBUG]: Gemm::bf16 fallback to scalar kernel for T=%ld, N=%ld, K=%ld (requires K mod 16 == 0)\n",
+                         (long)T, (long)N, (long)K);
+        }
+    }
+
+    if (use_xmx) {
+        constexpr int BM = 32, BN = 32, KS = 32, TM = 8, TN = 16;
+        constexpr int LDA = KS + 8, LDB = KS + 8;
+        constexpr int WG = 128;
+        const size_t group_t = ((size_t)T + BM - 1) / BM;
+        const size_t group_n = ((size_t)N + BN - 1) / BN;
+        q->submit([&](sycl::handler& h) {
+            sycl::local_accessor<uint16_t, 1> sa(BM * LDA, h);
+            sycl::local_accessor<uint16_t, 1> sb(BN * LDB, h);
+            sycl::local_accessor<float, 1> se(8 * TM * TN, h);
+            h.parallel_for(sycl::nd_range<2>(sycl::range<2>(group_t, group_n * WG), sycl::range<2>(1, WG)),
+                           [=](sycl::nd_item<2> item) [[sycl::reqd_sub_group_size(16)]] {
+                               xmx_prefill_gemm_kernel<true>(X, W, Y, T, N, K, ldy, 1.0f, beta, item, sa, sb, se);
+                           });
+        });
+        return;
+    }
+
+    const size_t local_t = 1;
+    const size_t local_n = 256;
+    const size_t global_t = (size_t)T;
+    const size_t global_n = ((size_t)N + local_n - 1) / local_n * local_n;
+    q->parallel_for(sycl::nd_range<2>(sycl::range<2>(global_t, global_n), sycl::range<2>(local_t, local_n)),
+                    [=](sycl::nd_item<2> item) [[sycl::reqd_sub_group_size(strata::sycl_arch::SUB_GROUP_SIZE)]] {
+                        sycl_prefill_gemm_kernel<true>(X, W, Y, T, N, K, ldy, 1.0f, beta, item);
+                    });
+}
+
+void Gemm::f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy,
+               float beta) {
+    if (T <= 0 || N <= 0 || K <= 0) return;
+    if (ldy <= 0) ldy = N;
+    auto* q = static_cast<sycl::queue*>(stream_);
+    if (!q) return;
+
+    if ((beta == 0.0f || beta == 1.0f) &&
+        strata::kernels::xmx_available(stream_, strata::kernels::XmxType::f16) &&
+        strata::kernels::xmx_gemm_ok(X, W, Y, N, K, ldy)) {
+        strata::kernels::xmx_gemm(strata::kernels::XmxType::f16, X, W, Y, T, N, K, ldy, stream_, beta != 0.0f);
+        return;
+    }
+
+    static const bool xmx_enabled = [] {
+        const char* v = std::getenv("STRATA_PREFILL_XMX_GEMM");
+        if (v) return std::atoi(v) != 0;
+        return strata::sycl_arch::IS_XE2;
+    }();
+    static const bool gemm_debug = [] {
+        const char* v = std::getenv("STRATA_PREFILL_XMX_DEBUG");
+        if (v && std::atoi(v) != 0) return true;
+        const char* d = std::getenv("STRATA_DEBUG");
+        return d && std::atoi(d) != 0;
+    }();
+
+    const bool use_xmx = xmx_enabled && (K % 16 == 0) && (K >= 16);
+
+    if (gemm_debug) {
+        static std::atomic<bool> logged{false};
+        if (!logged.exchange(true)) {
+            std::fprintf(stderr, "Gemm [DEBUG]: XMX status - enabled=%d, IS_XE2=%d (GEMM path: %s)\n",
+                         xmx_enabled, (int)strata::sycl_arch::IS_XE2,
+                         xmx_enabled ? "XMX SLM-tiled DPAS" : "Scalar FMA");
+        }
+        if (!use_xmx && xmx_enabled) {
+            std::fprintf(stderr,
+                         "Gemm [DEBUG]: Gemm::f16 fallback to scalar kernel for T=%ld, N=%ld, K=%ld (requires K mod 16 == 0)\n",
+                         (long)T, (long)N, (long)K);
+        }
+    }
+
+    if (use_xmx) {
+        constexpr int BM = 32, BN = 32, KS = 32, TM = 8, TN = 16;
+        constexpr int LDA = KS + 8, LDB = KS + 8;
+        constexpr int WG = 128;
+        const size_t group_t = ((size_t)T + BM - 1) / BM;
+        const size_t group_n = ((size_t)N + BN - 1) / BN;
+        q->submit([&](sycl::handler& h) {
+            sycl::local_accessor<uint16_t, 1> sa(BM * LDA, h);
+            sycl::local_accessor<uint16_t, 1> sb(BN * LDB, h);
+            sycl::local_accessor<float, 1> se(8 * TM * TN, h);
+            h.parallel_for(sycl::nd_range<2>(sycl::range<2>(group_t, group_n * WG), sycl::range<2>(1, WG)),
+                           [=](sycl::nd_item<2> item) [[sycl::reqd_sub_group_size(16)]] {
+                               xmx_prefill_gemm_kernel<false>(X, W, Y, T, N, K, ldy, 1.0f, beta, item, sa, sb, se);
+                           });
+        });
+        return;
+    }
+
+    const size_t local_t = 1;
+    const size_t local_n = 256;
+    const size_t global_t = (size_t)T;
+    const size_t global_n = ((size_t)N + local_n - 1) / local_n * local_n;
+    q->parallel_for(sycl::nd_range<2>(sycl::range<2>(global_t, global_n), sycl::range<2>(local_t, local_n)),
+                    [=](sycl::nd_item<2> item) [[sycl::reqd_sub_group_size(strata::sycl_arch::SUB_GROUP_SIZE)]] {
+                        sycl_prefill_gemm_kernel<false>(X, W, Y, T, N, K, ldy, 1.0f, beta, item);
+                    });
+}
+
+void Gemm::native(const uint16_t* X, int ggml_type, const void* W_blocks, float* Y, int64_t T, int64_t N, int64_t K,
+                  int64_t ldy, float beta) {
+    if (N * K > scratch_elems_) {
+        // Too large for the scratch at once: in row slices.
+        const int64_t rows = scratch_elems_ / K;
+        if (rows <= 0) {
+            std::fprintf(stderr, "prefill gemm: scratch too small for K=%lld\n", (long long)K);
+            std::exit(1);
+        }
+        if (ldy <= 0) ldy = N;
+        for (int64_t r0 = 0; r0 < N; r0 += rows) {
+            const int64_t n = (N - r0 < rows) ? N - r0 : rows;
+            strata::kernels::dequant_f16(ggml_type, W_blocks, r0, n, K, scratch_, stream_);
+            f16(X, scratch_, Y + r0, T, n, K, ldy, beta);
+        }
+        return;
+    }
+    strata::kernels::dequant_f16(ggml_type, W_blocks, 0, N, K, scratch_, stream_);
+    f16(X, scratch_, Y, T, N, K, ldy, beta);
+}
+
+}  // namespace strata::prefill

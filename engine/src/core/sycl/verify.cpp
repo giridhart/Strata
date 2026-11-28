@@ -1,0 +1,2996 @@
+#include "strata/core/mock_cuda_graph.hpp"
+// src/core/verify.cpp - see include/strata/core/verify.hpp.
+#include <sycl/sycl.hpp>
+#include "strata/core/verify.hpp"
+#include "strata/core/sycl_doorbell.hpp"
+#include "strata/core/defaults_026.hpp"
+#include "strata/core/sm120_series.hpp"
+
+namespace {
+inline sycl::queue& get_default_queue() {
+    static sycl::queue q{sycl::default_selector_v, sycl::property_list{sycl::property::queue::in_order{},
+                                                                       sycl::property::queue::enable_profiling{}}};
+    return q;
+}
+}  // namespace
+#if defined(_WIN32)
+#include <intrin.h>
+#endif
+
+#include "strata/core/native_head.hpp"
+#include "strata/core/on_device.hpp"
+#include "strata/kernels/iq_kernels.hpp"
+#include "strata/kernels/resident_plan_mirror.hpp"
+#include "strata/kernels/cpu/expert_layout.hpp"
+#include "strata/kernels/bf16_gemv.hpp"
+#include "strata/kernels/native_router.hpp"
+#include "strata/kernels/native_moe.hpp"
+#include "strata/kernels/cpu/expert.hpp"
+#include "strata/kernels/elementwise.hpp"
+#include "strata/kernels/fused_gr.hpp"
+#include "strata/kernels/cvec.hpp"
+#include "strata/kernels/gr.hpp"
+#include "strata/kernels/kv_q4.hpp"
+#include "strata/kernels/kv_q8.hpp"
+#include "strata/kernels/kv_stream.hpp"
+#include "strata/kernels/route_prior.hpp"
+#include "strata/kernels/native_mmvq.hpp"
+#include "strata/kernels/native_qsa.hpp"
+#include "strata/kernels/native_qsa_indexer.hpp"
+#include "strata/kernels/native_rope.hpp"
+#include "strata/kernels/ngram.hpp"
+#include "strata/kernels/ple.hpp"
+#include "strata/kernels/qsa.hpp"
+#include "strata/kernels/qsa_decode_attn.hpp"
+#include "strata/kernels/qsa_select.hpp"
+#include "strata/kernels/quantize_act.hpp"
+#include "strata/kernels/rope.hpp"
+#include "strata/kernels/s2_expert_grouped.hpp"
+#include "strata/kernels/sampler.hpp"
+#include "strata/core/progress.hpp"
+#include "strata/kernels/shared_expert.hpp"
+#include "strata/kernels/verify_kernels.hpp"
+#if defined(STRATA_HAVE_DFLASH2)
+#include "strata/kernels/dflash2.hpp"
+#endif
+
+#include <algorithm>
+#include <atomic>
+#include <map>
+#include <string>
+#include <thread>
+#include <vector>
+#include <chrono>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <exception>
+#include <immintrin.h>
+
+namespace strata::core {
+namespace {
+
+constexpr float EPS = 1e-6f;
+using Clock = std::chrono::steady_clock;
+double ms_since(Clock::time_point t) { return std::chrono::duration<double, std::milli>(Clock::now() - t).count(); }
+const bool g_dbg = std::getenv("STRATA_VERIFY_DEBUG") != nullptr;
+#define VDBG(...)                                             \
+    do {                                                      \
+        if (g_dbg) {                                          \
+            std::fprintf(stderr, "verify dbg: " __VA_ARGS__); \
+            std::fflush(stderr);                              \
+        }                                                     \
+    } while (0)
+
+// STRATA_ROUTE_PRIOR=lambda: residency-biased routing (opt-in on non-CUDA per upstream policy).
+inline float g_route_prior(sycl::queue* q = nullptr) {
+    (void)q;
+    static const char* const env_s = std::getenv("STRATA_ROUTE_PRIOR");
+    static const float env = env_s ? (float)std::atof(env_s) : 0.0f;
+    return env;
+}
+
+// STRATA_SELECT_LONG=1 (opt-in): decode select past select_long_at() cells takes long-context QSA select
+inline bool select_long_on() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_SELECT_LONG");
+        if (v == nullptr || v[0] != '1') return false;
+        if (strata::kernels::qsa_topk_multi_scratch_ints(1) <= 0) {
+            std::fprintf(stderr, "strata verify: STRATA_SELECT_LONG=1 needs the SYCL multi-CTA kernels; ignored\n");
+            return false;
+        }
+        return true;
+    }();
+    return on;
+}
+
+// STRATA_SELECT_LONG_AT: threshold in cells (default 65536; 0: always)
+inline int64_t select_long_at() {
+    static const int64_t at = [] {
+        const char* v = std::getenv("STRATA_SELECT_LONG_AT");
+        return v != nullptr && v[0] != 0 ? (int64_t)std::atoll(v) : (int64_t)65536;
+    }();
+    return at;
+}
+
+enum class VerifyGraphMode {
+    Direct = 0,
+    Split = 1,
+    Whole = 2
+};
+
+inline VerifyGraphMode verify_graph_mode() {
+    static const VerifyGraphMode mode = [] {
+        const char* v = std::getenv("STRATA_VERIFY_GRAPH");
+        if (!v || v[0] == '\0' || std::strcmp(v, "0") == 0 || std::strcmp(v, "direct") == 0 || std::strcmp(v, "off") == 0) {
+            return VerifyGraphMode::Direct;
+        }
+        if (std::strcmp(v, "whole") == 0 || std::strcmp(v, "monolithic") == 0 || std::strcmp(v, "2") == 0) {
+            return VerifyGraphMode::Whole;
+        }
+        return VerifyGraphMode::Split;
+    }();
+    return mode;
+}
+
+inline int verify_graph_chunk_layers() {
+    static const int n = [] {
+        const char* v = std::getenv("STRATA_VERIFY_GRAPH_CHUNK");
+        if (!v || v[0] == '\0') {
+            const char* v2 = std::getenv("STRATA_GRAPH_CHUNK_LAYERS");
+            if (v2 && v2[0] != '\0') return std::max(1, std::atoi(v2));
+            return 1;
+        }
+        return std::max(1, std::atoi(v));
+    }();
+    return n;
+}
+
+// Opt-in HotRod exact switches (all OFF by default):
+// STRATA_PCIE_EARLY=1 (or =force to also attempt inside graph capture): overlap pcie_mode==2 fetch_blobs on pf_cs_ beside VRAM experts.
+inline int pcie_early_env() {
+    static const int mode = [] {
+        const char* v = std::getenv("STRATA_PCIE_EARLY");
+        if (!v || !*v || std::strcmp(v, "0") == 0) return 0;
+        if (std::strcmp(v, "force") == 0 || std::strcmp(v, "2") == 0) return 2;
+        return 1;
+    }();
+    return mode;
+}
+
+// STRATA_FUSE_WAIT=1: fuse wait_flag_ge(m_flagA_) + copy_i32_from_mapped into wait_copy_i32_from_mapped.
+inline bool fuse_wait_env() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_FUSE_WAIT");
+        return v != nullptr && std::atoi(v) != 0;
+    }();
+    return on;
+}
+
+// STRATA_PCIE_BALANCE=1: dynamically pick each layer's PCIe miss count from measured host+GPU times.
+inline bool pcie_balance_env() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_PCIE_BALANCE");
+        return v != nullptr && std::atoi(v) != 0;
+    }();
+    return on;
+}
+
+struct Bump {
+    uint8_t* base = nullptr;
+    uint64_t used = 0;
+    template <typename T>
+    T* take(uint64_t n) {
+        T* p = base ? (T*)(base + used) : nullptr;
+        used += (n * sizeof(T) + 255) & ~255ull;
+        return p;
+    }
+};
+
+bool mapped(size_t bytes, void** h, void** d) {
+    try {
+        *h = strata::host_malloc_polled(bytes, get_default_queue());
+        if (!*h) return false;
+    } catch (...) {
+        return false;
+    }
+    std::memset(*h, 0, bytes);
+    *d = *h;
+    return true;
+}
+
+strata::kernels::QsaShapes shapes_of(const ModelGeometry& g) {
+    strata::kernels::QsaShapes s = strata::kernels::qsa_real_shapes();
+    s.n_head = g.n_head;
+    s.n_head_kv = g.n_head_kv;
+    s.head_dim = g.head_dim;
+    s.idx_n_head = g.idx_q_heads;
+    s.idx_dim = g.idx_key_dim;
+    return s;
+}
+
+const WeightRef* need(const LayerView& v, const char* suffix, std::string& err) {
+    const WeightRef* r = v.get(suffix);
+    if (r == nullptr && err.empty()) err = v.name(suffix) + " is missing";
+    return r;
+}
+
+bool native_of(const WeightRef* w, const std::string& name, std::string& err) {
+    if (w == nullptr) return false;
+    if (w->native_data == nullptr) {
+        err = "verify: " + name + " is not served natively (run with --native)";
+        return false;
+    }
+    return true;
+}
+
+}  // namespace
+
+namespace {
+std::atomic<const Verifier*> g_diag_verifier{nullptr};
+void diag_active_verifier(std::FILE* f) {
+    if (const Verifier* v = g_diag_verifier.load()) v->diag(f);
+}
+// #267: every live verifier (a layer split has one per stage), for the release before the engine ends
+constexpr int kLiveMax = 16;
+std::atomic<Verifier*> g_live[kLiveMax];
+void release_live_verifiers(std::FILE* f) {
+    for (auto& slot : g_live)
+        if (Verifier* v = slot.load()) {
+            const Clock::time_point t0 = Clock::now();
+            const bool done = v->release_gpu_waits(10000);
+            if (f != nullptr) {
+                const std::string detail = done ? ("finished in " + std::to_string((long long)ms_since(t0)) + " ms")
+                                                : "did not finish within 10 s";
+                std::fprintf(f, "strata: released the verify window's GPU waits (#267): the GPU %s\n", detail.c_str());
+            }
+        }
+    if (f != nullptr) std::fflush(f);
+}
+std::string released_note(bool drained) {
+    return drained ? "; its GPU waits were released and the GPU finished (#267)"
+                   : "; its GPU waits were released but the GPU did not finish within 10 s (#267)";
+}
+// #267 test hook: STRATA_TEST_VERIFY_STALL=N withholds the last layer's flag in the N-th window (1-based), so the
+// GPU spins on a flag nobody raises - the bounded window wait and the release are then what ends it.  Unset: never.
+const int64_t g_test_stall = [] {
+    const char* e = std::getenv("STRATA_TEST_VERIFY_STALL");
+    return e != nullptr ? (int64_t)std::atoll(e) : (int64_t)0;
+}();
+}  // namespace
+
+bool Verifier::release_gpu_waits(int timeout_ms) try {
+    released_.store(true);
+    VDBG("release_gpu_waits: timeout_ms=%d, current *h_seq_=%u, *h_flag_=%u, *h_flagA_=%u, *h_flagB_=%u\n",
+         timeout_ms,
+         h_seq_ ? *(volatile uint32_t*)h_seq_ : 0u,
+         h_flag_ ? *(volatile uint32_t*)h_flag_ : 0u,
+         h_flagA_ ? *(volatile uint32_t*)h_flagA_ : 0u,
+         h_flagB_ ? *(volatile uint32_t*)h_flagB_ : 0u);
+    // the words the spin kernels read (wait_flag_ge, wait_flag_ge_or) are mapped host memory, so a store here
+    // reaches them with no API call; UINT32_MAX is past every ring.  (E-6's skip words are device memory, but
+    // wait_flag_ge_or also returns on its flag.)  A host function raising flag B later only raises.
+    for (uint32_t* p : {h_flag_, h_flagA_, h_flagB_})
+        if (p != nullptr) *(volatile uint32_t*)p = UINT32_MAX;
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    _mm_sfence();
+    const OnDevice on_device(device_);
+    const Clock::time_point t0 = Clock::now();
+    for (sycl::queue* s : {cs_, copy_, pf_cs_}) {
+        if (!s) continue;
+        while (true) {
+            bool empty = false;
+            try {
+                empty = s->ext_oneapi_empty();
+            } catch (...) {
+            }
+            if (empty) break;
+            if (ms_since(t0) > timeout_ms) {
+                VDBG("release_gpu_waits: TIMED OUT waiting for queue %p to empty after %.1f ms\n",
+                     (void*)s, ms_since(t0));
+                return false;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    }
+    VDBG("release_gpu_waits: queues emptied successfully in %.2f ms\n", ms_since(t0));
+    return true;
+} catch (const std::exception& exc) {
+    std::cerr << "Verifier::release_gpu_waits exception: " << exc.what() << std::endl;
+    return false;
+} catch (...) {
+    return false;
+}
+
+void Verifier::diag(std::FILE* f) const {
+    auto rd = [](const uint32_t* p) { return p ? *(const volatile uint32_t*)p : 0u; };
+    // #251: outside a verify stage these are the LAST window's numbers (it finished), not the stalled work's
+    const char* where = progress().where.load();
+    const bool current = where != nullptr && std::strncmp(where, "verify window", 13) == 0;
+    bool cs_empty = false, copy_empty = false;
+    try { if (cs_) cs_empty = cs_->ext_oneapi_empty(); } catch (...) {}
+    try { if (copy_) copy_empty = copy_->ext_oneapi_empty(); } catch (...) {}
+    std::fprintf(f,
+                 "  verify window%s: %d tokens at position %lld, host at layer step %u; the GPU rang %u; flags: "
+                 "served %u, plan (A) %u, copies (B) %u; queues: cs empty=%d, copy empty=%d\n",
+                 current ? "" : " (last window, not the current stage)", last_t_, (long long)last_pos0_, cur_layer_ + 1,
+                 rd(h_seq_), rd(h_flag_), rd(h_flagA_), rd(h_flagB_), (int)cs_empty, (int)copy_empty);
+    if (sink_.counts) {
+        std::fprintf(f, "  plan sink: groups=%d, entries=%d, fetches=%d\n",
+                     sink_.counts[0], sink_.counts[1], sink_.counts[2]);
+    }
+}
+
+Verifier::~Verifier() {
+    const Verifier* self = this;
+    g_diag_verifier.compare_exchange_strong(self, nullptr);
+    for (auto& slot : g_live) {
+        Verifier* me = this;
+        slot.compare_exchange_strong(me, nullptr);
+    }
+    for (auto& e : exec_)
+        if (e) cudaGraphExecDestroy_mock(e);
+    for (auto& e : exec_res_)
+        if (e) cudaGraphExecDestroy_mock(e);
+    for (auto& e : exec_tree_)
+        if (e) cudaGraphExecDestroy_mock(e);
+    for (auto& e : exec_tree_res_)
+        if (e) cudaGraphExecDestroy_mock(e);
+    if (tree_gdn_snap_) {
+        sycl::free(tree_gdn_snap_, get_default_queue());
+        tree_gdn_snap_ = nullptr;
+    }
+    if (tap_dev_) {
+        sycl::free(tap_dev_, get_default_queue());
+        tap_dev_ = nullptr;
+    }
+    for (auto& chunks : exec_chunks_) {
+        for (void* e : chunks)
+            if (e) cudaGraphExecDestroy_mock(e);
+        chunks.clear();
+    }
+    if (commit_exec_) cudaGraphExecDestroy_mock(commit_exec_);
+    if (cs_) {
+        cs_->wait();
+        delete cs_;
+        cs_ = nullptr;
+    }
+    if (copy_) {
+        copy_->wait();
+        delete copy_;
+        copy_ = nullptr;
+    }
+    if (pf_cs_) {
+        try { pf_cs_->wait(); } catch (...) {}
+        delete pf_cs_;
+        pf_cs_ = nullptr;
+    }
+    if (commit_done_) {
+        delete commit_done_;
+        commit_done_ = nullptr;
+    }
+    if (arena_) {
+        sycl::free(arena_, get_default_queue());
+        arena_ = nullptr;
+    }
+    void* hosts[] = {h_tok_, h_step_, h_step_append_, h_tree_, h_pos_,  h_commit_, h_ple_,   h_out_,       h_x_,
+                     h_ids_, h_w_,    h_seq_,  h_flag_,   h_ymiss_, h_flagA_,     h_plan_,
+                     h_flagB_, h_plan_err_, h_nf_};
+    for (void* h : hosts)
+        if (h) strata::host_free_polled(h, get_default_queue());
+}
+
+bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState& ss, const VerifyHits& hits,
+                    const NativeHead* head, int max_t, std::string& err) try {
+    g_diag_verifier.store(this);
+    diag_verify_fn().store(&diag_active_verifier);
+    for (auto& slot : g_live) {
+        Verifier* none = nullptr;
+        if (slot.load() == this || slot.compare_exchange_strong(none, this)) break;
+    }
+    release_gpu_fn().store(&release_live_verifiers);
+    device_ = 0;                        // a layer split's stage on another GPU
+                                        // GPU: its streams, graphs and
+                                        // buffers live there
+    strata::kernels::fused_gr_check();  // once per card: which bitwise-equal hyper-connection read runs there
+    {   // once per card, here: record_window reads the cached value
+        const float rp = g_route_prior();
+        if (rp > 0.0f)
+            std::fprintf(stderr, "strata verify: residency-biased routing is on (STRATA_ROUTE_PRIOR=%.1f: changes which experts run)\n", (double) rp);
+    }
+    wt_ = &wt;
+    g_ = &g;
+    ss_ = &ss;
+    hits_ = hits;
+    head_ = head;
+    max_t_ = max_t;
+    sampling_.greedy = true;  // a fresh verifier samples greedily until set_sampling says otherwise
+    sampling_.temperature = 0.0f;
+    if (max_t < 2 || max_t > strata::kernels::kVerifyMaxT || max_t > strata::kernels::cpu::MAXT) {
+        err = "verify: the window must hold 2.." + std::to_string(strata::kernels::kVerifyMaxT) + " tokens";
+        return false;
+    }
+    if (hits.d_res == nullptr || hits.cache_base == nullptr || hits.blob <= 0) {
+        err =
+            "verify: needs the profile-filled VRAM expert tier (--expert-profile and --expert-cache); with "
+            "--expert-cache auto, no VRAM was left for it: lower --max-context, use --kv k8v4 or images on the CPU";
+        return false;
+    }
+    std::string why;
+    if (!layer_verify_compatible(why)) {
+        err = "verify: " + why + " (the verify window reproduces the default native decode path)";
+        return false;
+    }
+    if (!strata::kernels::fused_gr_supported(g.n_embd, g.hc, g.hc_lr) || ss.k != 10 || g.ssm_state_size != 128 ||
+        g.ssm_d_conv != 4) {
+        err = "verify: geometry differs from the artifact's";
+        return false;
+    }
+    if (le_ < 0) le_ = g.n_layers;
+    if (lb_ < 0 || lb_ >= le_ || le_ > g.n_layers || (lb_ > 0 && hand_in_ == nullptr) ||
+        (le_ < g.n_layers && hand_out_ == nullptr)) {
+        err = "verify: the stage's layer range or its hand-off buffers are wrong";
+        return false;
+    }
+    const WeightRef* wo = wt.find("output.weight");
+    if (wo == nullptr) {
+        err = "verify: output.weight is missing";
+        return false;
+    }
+    n_vocab_ = wo->ne1;
+    gdn_idx_.assign((size_t)g.n_layers, -1);
+    qsa_idx_.assign((size_t)g.n_layers, -1);
+    {
+        int64_t qi = 0, gi = 0;
+        for (int64_t l = 0; l < g.n_layers; ++l) {
+            if (is_qsa_layer(g, l))
+                qsa_idx_[(size_t)l] = qi++;
+            else
+                gdn_idx_[(size_t)l] = gi++;
+        }
+    }
+
+    const strata::kernels::QsaShapes s = shapes_of(g);
+    cap_ = strata::kernels::qsa_selection_width(strata::kernels::kTopkMaxCells, s);
+    max_blocks_ = ss.qsa_states[ss.qsa_primary()].max_cells / s.idx_block + 2;
+    attn_scratch_floats_ = (int64_t)strata::kernels::qsa_decode_attn_scratch_floats(cap_, s);
+
+    const uint64_t T = (uint64_t)max_t, N = (uint64_t)g.n_embd, HC = (uint64_t)g.hc, K = (uint64_t)ss.k;
+    const uint64_t C = (uint64_t)g.ssm_conv_channels, ZV = (uint64_t)g.ssm_value_dim, HV = (uint64_t)g.ssm_v_heads;
+    const uint64_t NH = (uint64_t)g.n_head, HD = (uint64_t)g.head_dim, NKV = (uint64_t)g.n_head_kv;
+    const uint64_t IQ = (uint64_t)g.idx_q_heads, ID = (uint64_t)g.idx_key_dim;
+    const uint64_t nG = (uint64_t)g.n_gdn_layers(), nQ = (uint64_t)g.n_qsa_layers();
+    const uint64_t HS = (uint64_t)strata::kernels::NG_HIST * strata::kernels::NG_HC_DIM;
+    const uint64_t TS = (uint64_t)(s.idx_block - 1) * ID;
+    const int max_in = (int)std::max<uint64_t>(std::max<uint64_t>(N, ZV), NH * HD);
+
+    // ---- mapped staging
+    bool ok = mapped(T * 4, (void**)&h_tok_, (void**)&m_tok_) &&
+              mapped(T * strata::kernels::kStepCount * 4, (void**)&h_step_, (void**)&m_step_) &&
+              mapped(T * strata::kernels::kStepCount * 4, (void**)&h_step_append_, (void**)&m_step_append_) &&
+              mapped(sizeof(strata::kernels::VerifyTreeMap) + 64, (void**)&h_tree_, (void**)&m_tree_) &&
+              mapped(T * (NH + NKV + IQ) * 4, (void**)&h_pos_, (void**)&m_pos_) &&
+              mapped((2 + T) * 4 + 16, (void**)&h_commit_, (void**)&m_commit_) &&
+              mapped(T * N * 4, (void**)&h_ple_, (void**)&m_ple_) &&
+              mapped(T * 4 + 16, (void**)&h_out_, (void**)&m_out_) &&
+              mapped((size_t)strata::kernels::kVerifyMaxT * strata::kernels::kNonfiniteBlocks * 4, (void**)&h_nf_,
+                     (void**)&m_nf_) &&
+              mapped(T * N * 4, (void**)&h_x_, (void**)&m_x_) &&
+              mapped(T * K * 4, (void**)&h_ids_, (void**)&m_ids_) && mapped(T * K * 4, (void**)&h_w_, (void**)&m_w_) &&
+              mapped(64, (void**)&h_seq_, (void**)&m_seq_) && mapped(64, (void**)&h_flag_, (void**)&m_flag_) &&
+              mapped(64, (void**)&h_flagA_, (void**)&m_flagA_) && mapped(64, (void**)&h_flagB_, (void**)&m_flagB_) &&
+              mapped(T * K * N * 4, (void**)&h_ymiss_, (void**)&m_ymiss_);
+    if (!ok) {
+        err = "verify: mapped staging allocation failed";
+        return false;
+    }
+    // the GPU plan: counts(4) | start(cap+1) | dst(cap) | tok(cap) | pad | ptr(cap u64) | ptr2(cap u64) | start2(cap+1)
+    {
+        const int64_t cap = (int64_t)(T * K);
+        const int64_t i32 = 4 + (cap + 1) + cap + cap;
+        const int64_t ptr_off = (i32 + 1) & ~1ll;
+        plan_i32_ = ptr_off + 4 * cap + (cap + 1) + 1;
+        if (!mapped((size_t)plan_i32_ * 4 * 2 + 64, (void**)&h_plan_, (void**)&m_plan_)) {
+            err = "verify: mapped plan allocation failed";
+            return false;
+        }
+        sink_.counts = h_plan_;
+        sink_.start = h_plan_ + 4;
+        sink_.dst = sink_.start + cap + 1;
+        sink_.tok = sink_.dst + cap;
+        sink_.ptr = (unsigned long long*)(h_plan_ + ptr_off);
+        sink_.ptr2 = sink_.ptr + cap;
+        sink_.start2 = h_plan_ + ptr_off + 4 * cap;
+        sink_.cap = cap;
+        sink_.publish = &Verifier::publish_plan;
+        sink_.fetch = &Verifier::fetch_dma;
+        sink_.ctx = this;
+    }
+
+    // STRATA_MIRROR_STAGE (default on with the native pack; =0 off): the device plan's host-mirrored groups are copied into
+    // VRAM by a streaming kernel before the expert launch, which then reads every group from VRAM.
+    {
+        const char* v = std::getenv("STRATA_MIRROR_STAGE");
+        auto set_nonzero = [](const char* k) { const char* e = std::getenv(k); return e != nullptr && e[0] != '\0' && e[0] != '0'; };
+        // (only the lean window plans on the device without a host: STRATA_VERIFY_NO_HOST implies device_plan_)
+        mstage_on_ = strata::kernels::cpu::expert_layout().native && !(v != nullptr && v[0] == '0') &&
+                     set_nonzero("STRATA_VERIFY_NO_HOST");
+    }
+
+    // ---- the device arena: the same sequence counted, then carved
+    auto carve = [&](Bump& b) {
+        tok_ = b.take<int32_t>(T);
+        step_ = b.take<int32_t>(T * strata::kernels::kStepCount);
+        step_append_ = b.take<int32_t>(T * strata::kernels::kStepCount);
+        tree_d_ = (strata::kernels::VerifyTreeMap*)b.take<uint8_t>(sizeof(strata::kernels::VerifyTreeMap));
+        pos_ = b.take<int32_t>(T * (NH + NKV + IQ));
+        commit_ = b.take<int32_t>(2 + T);
+        ple_ = b.take<float>(T * N);
+        emb_ = b.take<float>(T * N);
+        R_ = b.take<float>(T * HC * N);
+        mixed_ = b.take<float>(T * N);
+        bo_ = b.take<float>(T * N);
+        inj_ = b.take<float>(T * HC);
+        inj2_ = b.take<float>(T * HC);
+        lo_ = b.take<float>(T * (uint64_t)g.hc_lr);
+        rs_ = b.take<float>(T * HC);
+        xn_ = b.take<float>(T * HC * N);
+        xq_ = b.take<uint8_t>(strata::kernels::native_q8_1_bytes(max_in, (int)T));
+        qkv_L_ = b.take<float>(nG * T * C);
+        h_L_ = b.take<float>(nG * T * C);
+        gate_L_ = b.take<float>(nG * T * HV);
+        beta_L_ = b.take<float>(nG * T * HV);
+        z_ = b.take<float>(T * ZV);
+        y_ = b.take<float>(T * ZV);
+        y_dummy_ = b.take<float>(T * ZV);
+        qfull_ = b.take<float>(T * NH * 2 * HD);
+        qcur_ = b.take<float>(T * NH * HD);
+        kcur_ = b.take<float>(T * NKV * HD);
+        vcur_ = b.take<float>(T * NKV * HD);
+        idx_raw_L_ = b.take<float>(nQ * T * ID);
+        qidx_ = b.take<float>(T * IQ * ID);
+        scores_ = b.take<float>(T * (uint64_t)max_blocks_);
+        sel_ = b.take<int32_t>(T * (uint64_t)cap_);
+        if (select_long_on() && strata::kernels::qsa_topk_multi_scratch_ints(T) > 0)
+            topk_scratch_ = b.take<int32_t>(strata::kernels::qsa_topk_multi_scratch_ints(T));
+        attn_ = b.take<float>(T * NH * HD);
+        attn32_ = b.take<float>(T * NH * HD);
+        attn_scratch_ = b.take<float>(T * (uint64_t)attn_scratch_floats_);
+        tail_snap_ = b.take<float>(nQ * TS);
+        logits_ = b.take<float>(T * (uint64_t)g.n_expert);
+        w_ = b.take<float>(T * K);
+        ids_ = b.take<int32_t>(T * K);
+        shared_ = b.take<float>(T * N);
+        parts_ = b.take<float>(T * K * N);
+        hit_out_ = b.take<float>(T * K * N);
+        hit_slot_ = b.take<int32_t>(T * K);
+        hit_dst_ = b.take<int32_t>(T * K);
+        hit_count_ = b.take<int32_t>(4);
+        plan_ = b.take<int32_t>(2 * ((uint64_t)plan_i32_ + 16));
+        staging_ = b.take<uint8_t>((uint64_t)kStagingBlobs * strata::kernels::cpu::expert_layout().max_blob);
+        if (mstage_on_) {   // STRATA_MIRROR_STAGE: a blob per possible group, and each plan group's copy sources
+            mstage_stride_ = (long long)((strata::kernels::cpu::expert_layout().max_blob + 255) / 256 * 256);
+            mstage_ = b.take<uint8_t>(T * K * (uint64_t)mstage_stride_);
+            msrc_ = b.take<unsigned long long>(2 * T * K);
+        }
+        hit_xq_ = b.take<uint8_t>(T * (N / 32) * 34);
+        hit_xs_ = b.take<float>(T * (N / 32));
+        nat_xq_ = b.take<uint8_t>(T * (N / 32) * 36);
+        hit_scratch_ = b.take<uint8_t>(
+            std::max<uint64_t>(strata::kernels::moe_hit_grouped_scratch_bytes((int64_t)(T * K), g.n_embd, g.n_ff),
+                               strata::kernels::native_expert_scratch_bytes((int64_t)(T * K), g.n_ff)));
+        head_mixed_ = b.take<float>(T * N);
+        head_inj_ = b.take<float>(HC);
+        sh_bf16_ = b.take<uint16_t>(T * N);
+        sh_gate_ = b.take<float>(T * (uint64_t)g.n_ff);
+        sh_up_ = b.take<float>(T * (uint64_t)g.n_ff);
+        sh_g_ = b.take<float>(T + 4);
+        head_logits_ = b.take<float>(T * (uint64_t)n_vocab_);
+        hist_snap_ = b.take<float>(T * HS);
+    };
+    Bump count;
+    carve(count);
+    try {
+        arena_ = (void*)sycl::malloc_device(count.used, get_default_queue());
+        if (!arena_) {
+            err = "verify: the device arena (" + std::to_string(count.used >> 20) + " MiB) does not fit";
+            return false;
+        }
+    } catch (...) {
+        err = "verify: the device arena (" + std::to_string(count.used >> 20) + " MiB) does not fit";
+        return false;
+    }
+    get_default_queue().memset(arena_, 0, count.used).wait();
+    prof_on_ = std::getenv("STRATA_VERIFY_PROFILE") != nullptr;
+    if (prof_on_) {
+        const size_t np = (size_t)g.n_layers * kProfPer + 4;
+        try {
+            prof_ = (unsigned long long*)sycl::malloc_device(np * 8, get_default_queue());
+            if (prof_) {
+                get_default_queue().memset(prof_, 0, np * 8).wait();
+                prof_h_.assign(np, 0);
+            } else {
+                prof_on_ = false;
+            }
+        } catch (...) {
+            prof_on_ = false;
+            prof_ = nullptr;
+        }
+    }
+    Bump real;
+    real.base = (uint8_t*)arena_;
+    carve(real);
+    // DFlash2 taps (set_taps): off, and nothing is allocated or recorded, otherwise
+    if (!tap_req_.empty() && lb_ == 0 && le_ == g.n_layers) {
+        tap_layers_.clear();
+        for (int l : tap_req_) if (l >= 0 && l < g.n_layers - 1) tap_layers_.push_back(l);
+        tap_slot_.assign((size_t) g.n_layers, -1);
+        for (size_t i = 0; i < tap_layers_.size(); ++i) tap_slot_[(size_t) tap_layers_[i]] = (int) i;
+        const size_t nt = tap_layers_.size();
+        if (nt == 0 || (tap_dev_ = sycl::malloc_device<float>((size_t) T * nt * N, get_default_queue())) == nullptr) {
+            err = "verify: DFlash2 tap buffer allocation failed";
+            return false;
+        }
+        tap_on_ = true;
+    }
+    sink_.staging = (unsigned long long)staging_;
+    sink_.staging_cap = kStagingBlobs;
+    (void)TS;
+    try {
+        copy_ = new sycl::queue(sycl::default_selector_v, sycl::property_list{sycl::property::queue::in_order{}});
+    } catch (const sycl::exception& e) {
+        err = std::string("verify: copy stream create failed: ") + e.what();
+        return false;
+    }
+    try {
+        cs_ = new sycl::queue(sycl::default_selector_v, sycl::property_list{sycl::property::queue::in_order{}});
+    } catch (const sycl::exception& e) {
+        err = std::string("verify: stream create failed: ") + e.what();
+        return false;
+    }
+    if (pcie_early_env() > 0) {
+        try {
+            pf_cs_ = new sycl::queue(cs_->get_context(), cs_->get_device(),
+                                     sycl::property_list{sycl::property::queue::in_order{}});
+            std::fprintf(stderr,
+                         "strata hotrod: STRATA_PCIE_EARLY=%d (exact: pcie_mode==2 fetch overlaps VRAM experts on side queue%s)\n",
+                         pcie_early_env(),
+                         verify_graph_mode() != VerifyGraphMode::Direct && pcie_early_env() == 1
+                             ? "; note: use STRATA_VERIFY_GRAPH=direct to activate"
+                             : "");
+        } catch (const sycl::exception& e) {
+            pf_cs_ = nullptr;
+            std::fprintf(stderr, "strata hotrod: STRATA_PCIE_EARLY side queue failed (%s); staying on main queue\n",
+                         e.what());
+        }
+    }
+    if (fuse_wait_env()) {
+        std::fprintf(stderr, "strata hotrod: STRATA_FUSE_WAIT=1 (exact: fused wait_copy_i32_from_mapped)\n");
+    }
+    if (pcie_balance_env() && bal_disp_ != nullptr && !bal_disp_->pcie_model.on) {
+        bal_disp_->pcie_model.on = true;
+        std::fprintf(stderr, "strata hotrod: STRATA_PCIE_BALANCE=1 (exact: dynamic per-layer PCIe/CPU balance)\n");
+    }
+    try {
+        commit_done_ = new sycl::event();
+    } catch (...) {
+        err = "verify: event create failed";
+        return false;
+    }
+    // E-6: a layer whose routed experts are all resident is planned on the device (STRATA_VERIFY_DEVICE_PLAN=1: on;
+    // exact, but neutral on RIBPC 1-2 GPUs: off by default)
+    {
+        const char* v = std::getenv("STRATA_VERIFY_DEVICE_PLAN");
+        const char* nh = std::getenv("STRATA_VERIFY_NO_HOST");
+        device_plan_ = (v != nullptr && std::atoi(v) != 0) || (nh != nullptr && *nh && std::strcmp(nh, "0") != 0);
+    }
+    {
+        const char* v = std::getenv("STRATA_VERIFY_RESIDENT_GRAPH");
+        const bool user_res = (v != nullptr && std::strtol(v, nullptr, 10) != 0);
+        const bool graph_enabled = verify_graph_mode() != VerifyGraphMode::Direct;
+        res_graph_ = hits.h_res != nullptr && hits.d_res != nullptr &&
+                     ((v == nullptr && graph_enabled) || user_res);
+    }
+    if (device_plan_ || res_graph_) {
+        bool ok2 = true;
+        try {
+            skip_ = (uint32_t*)sycl::malloc_device(64, get_default_queue());
+            if (!skip_)
+                ok2 = false;
+            else
+                get_default_queue().memset(skip_, 0, 64).wait();
+        } catch (...) {
+            ok2 = false;
+        }
+        if (ok2 && hits.slot_off != nullptr && hits.n_slots > 0) {
+            try {
+                slot_off_d_ = sycl::malloc_device<unsigned long long>((size_t)hits.n_slots, get_default_queue());
+                if (!slot_off_d_)
+                    ok2 = false;
+                else
+                    get_default_queue()
+                        .memcpy(slot_off_d_, hits.slot_off, (size_t)hits.n_slots * sizeof(unsigned long long))
+                        .wait();
+            } catch (...) {
+                ok2 = false;
+            }
+        }
+        if (!ok2) {
+            device_plan_ = false;
+            res_graph_ = false;
+        }
+    }
+    if (mstage_ != nullptr && !device_plan_) mstage_ = nullptr;   // (only the device plan stages)
+    if (mstage_ != nullptr && !split_) {   // STRATA_MIRROR_RING=R (blobs): keep the fetched mirrored experts in VRAM
+        const int rn = strata::kernels::mirror_ring_granted();   // (what the expert cache left it: generate.cpp)
+        if (rn > 0) {
+            std::string rerr;
+            mring_ = strata::kernels::mirror_ring_create(rn, mstage_stride_, rerr);
+            if (!mring_) std::fprintf(stderr, "strata verify: the mirrored experts' VRAM ring is off (%s)\n", rerr.c_str());
+            else std::fprintf(stderr, "strata verify: a VRAM ring of %d blobs (%.1f MiB) keeps the mirrored experts the windows fetch "
+                                      "(STRATA_MIRROR_RING=N sets it, 0 turns it off)\n", rn, (double)rn * (double)mstage_stride_ / 1048576.0);
+        }
+    }
+    if (mstage_ != nullptr)
+        std::fprintf(stderr, "strata verify: host-mirrored experts staged in VRAM (%.1f MiB) by a 16-byte-load copy before "
+                             "the expert kernels read them (STRATA_MIRROR_STAGE=0 turns it off)\n",
+                     (double)max_t * (double)ss.k * (double)mstage_stride_ / 1048576.0);
+    std::fprintf(stderr, "strata verify: window up to %d tokens, %.1f MiB of device buffers\n", max_t,
+                 (double)count.used / 1048576.0);
+    VDBG("init complete: max_t=%d, N=%lld, HC=%lld, K=%lld, n_layers=%lld, device_plan=%d, is_lean=%d, h_seq=%p, m_seq=%p, h_flag=%p, h_flagA=%p, h_flagB=%p, cs=%p, copy=%p\n",
+         max_t, (long long)g.n_embd, (long long)g.hc, (long long)ss.k, (long long)g.n_layers, (int)device_plan_, (int)is_lean(),
+         (void*)h_seq_, (void*)m_seq_, (void*)h_flag_, (void*)h_flagA_, (void*)h_flagB_, (void*)cs_, (void*)copy_);
+    return true;
+} catch (const std::exception& exc) {
+    std::cerr << "Verifier::init exception: " << exc.what() << std::endl;
+    return false;
+} catch (...) {
+    return false;
+}
+
+void Verifier::set_pcie_balance(ExpertDispatch* disp) {
+    bal_disp_ = disp;
+    if (pcie_balance_env() && bal_disp_ != nullptr && !bal_disp_->pcie_model.on) {
+        bal_disp_->pcie_model.on = true;
+        std::fprintf(stderr, "strata hotrod: STRATA_PCIE_BALANCE=1 (exact: dynamic per-layer PCIe/CPU balance)\n");
+    }
+}
+
+const float* Verifier::final_R(int t) const { return R_ + (size_t)t * (size_t)(g_->hc * g_->n_embd); }
+float* Verifier::Rt(int t) const { return R_ + (size_t)t * (size_t)(g_->hc * g_->n_embd); }
+
+void Verifier::stamp(int64_t l, int i, int grp, sycl::queue* cs) {
+    if (prof_on_ && grp == 0) strata::kernels::gpu_stamp(prof_, (int)(l * kProfPer + i), cs);
+}
+
+bool Verifier::all_resident() const {
+    if (!hits_.h_res || !g_) return false;
+    const int64_t ne = g_->n_expert;
+    const int64_t start = lb_ * ne;
+    const int64_t end = (le_ < 0 ? g_->n_layers : le_) * ne;
+    for (int64_t i = start; i < end; ++i) {
+        if (hits_.h_res[i] < 0) return false;
+    }
+    return true;
+}
+
+// ================================ THE WINDOW, AS CAPTURED ================================
+//
+// Plan v0.3 P6 (split window): with `groups_ == 2` the window's tokens are cut into two groups A = [0, T/2 up) and
+bool Verifier::is_lean() const {
+    static const bool lean_env = [] { const char* v = std::getenv("STRATA_VERIFY_LEAN"); return !(v && v[0] == '0'); }();
+    static const bool no_host_env = [] { const char* v = std::getenv("STRATA_VERIFY_NO_HOST"); return v && *v && std::strcmp(v, "0") != 0; }();
+    return lean_env && no_host_env && device_plan_ && !batch_rec_;
+}
+
+// B = the rest, and the stream is ordered
+//
+//     pre(0,A) pre(0,B) | post(0,A) pre(1,A) | post(0,B) pre(1,B) | post(1,A) pre(2,A) | ...
+//
+// so the CPU computes A's experts of layer l while the GPU runs B's mixer and router of layer l, and B's experts
+// while the GPU combines A and runs A's layer l+1.  B's mixer only needs A's mixer of the same layer (K/V, GDN
+// state), never A's experts, so nothing waits that did not wait before.  Every token's arithmetic is unchanged.
+bool Verifier::record_window_prologue(int T, sycl::queue* cs, std::string& err) try {
+    VDBG("prologue: begin\n");
+    using namespace strata::kernels;
+    const ModelGeometry& g = *g_;
+    const WeightTable& wt = *wt_;
+    SessionState& ss = *ss_;
+    const int64_t N = g.n_embd, HC = g.hc, MT = max_t_;
+    const int64_t NH = g.n_head, NKV = g.n_head_kv, IQ = g.idx_q_heads;
+    const bool ple_on = ss.ple.ready() && ple_stage();
+    const int G = (!tree_rec_ && split_ && T >= 2) ? 2 : 1;
+    if (!tree_rec_) groups_[T] = G;
+
+    // ---- the window's inputs, from mapped staging
+    VDBG("prologue: copy tok_\n");
+    copy_i32_from_mapped(tok_, m_tok_, T, cs);
+    if (tree_rec_)
+        copy_from_mapped((float*)tree_d_, (const float*)m_tree_,
+                         (int64_t)(sizeof(VerifyTreeMap) / sizeof(float)), cs);
+    VDBG("prologue: copy step_\n");
+    copy_i32_from_mapped(step_, m_step_, (int64_t)T * kStepCount, cs);
+    if (tree_rec_) copy_i32_from_mapped(step_append_, m_step_append_, (int64_t)T * kStepCount, cs);
+    VDBG("prologue: copy pos_\n");
+    copy_i32_from_mapped(pos_, m_pos_, (int64_t)MT * (NH + NKV + IQ), cs);
+    if (ple_on) {
+        VDBG("prologue: copy ple_\n");
+        copy_from_mapped(ple_, m_ple_, (int64_t)T * N, cs);
+    }
+
+    // ---- the embeddings, broadcast to the hc streams - or, in a later stage of a layer split, the previous stage's
+    // residual, pending write and inject (see set_stage)
+    const int64_t HB = Verifier::handoff_floats(g);
+    if (lb_ > 0) {
+        VDBG("prologue: hand_in copies\n");
+        for (int t = 0; t < T; ++t) {
+            copy_from_mapped(Rt(t), hand_in_ + (size_t)t * HB, HC * N, cs);
+            copy_from_mapped(bo_ + (size_t)t * N, hand_in_ + (size_t)t * HB + HC * N, N, cs);
+            copy_from_mapped(inj2_ + (size_t)t * HC, hand_in_ + (size_t)t * HB + HC * N + N, HC, cs);
+        }
+    } else if (const NativeEmbed* ne = native_embed()) {  // plan v0.3 P6: the GGUF-form table
+        VDBG("prologue: native_embed gather_dev\n");
+        ne->gather_dev(tok_, T, emb_, cs);
+        VDBG("prologue: native_embed broadcast_streams\n");
+        broadcast_streams(emb_, R_, N, (int)HC, T, cs);
+    } else {
+        VDBG("prologue: embedding_gather_dev\n");
+        const WeightRef* w = wt.find("token_embd.weight");
+        if (w == nullptr || w->codebook_iq4nl || (w->code_bits != 2 && w->code_bits != 4 && w->code_bits != 8)) {
+            err = "verify: token_embd.weight is missing or not an S2/S4/S8 tensor";
+            return false;
+        }
+        const auto* codes = (const uint8_t*)w->data;
+        const auto* scales = (const float*)(codes + w->codes_bytes);
+        const auto* offsets = w->has_offset ? (const float*)(codes + w->codes_bytes + w->scales_bytes) : nullptr;
+        const uint64_t row_codes = (uint64_t)(w->ne0 / (8 / w->code_bits));
+        const uint64_t row_groups = (uint64_t)(w->ne0 / w->group_elems);
+        embedding_gather_dev(codes, scales, offsets, tok_, T, w->ne0, w->code_bits, w->code_bias, w->group_elems,
+                             row_codes, row_groups, emb_, cs);
+        broadcast_streams(emb_, R_, N, (int)HC, T, cs);
+    }
+    VDBG("prologue: end\n");
+    return true;
+} catch (const std::exception& exc) {
+    err = std::string("Verifier::record_window_prologue: ") + exc.what();
+    return false;
+} catch (...) {
+    err = "Verifier::record_window_prologue: unknown exception";
+    return false;
+}
+
+
+bool Verifier::record_layer_pre(int T, int64_t l, int grp, sycl::queue* cs, std::string& err) try {
+    VDBG("layer_pre (l=%lld, grp=%d): begin\n", (long long)l, grp);
+    progress_at("verify window: layer pre", l);
+    progress_beat();
+    using namespace strata::kernels;
+    const ModelGeometry& g = *g_;
+    const WeightTable& wt = *wt_;
+    SessionState& ss = *ss_;
+    const int64_t N = g.n_embd, HC = g.hc, K = ss.k, C = g.ssm_conv_channels, ZV = g.ssm_value_dim;
+    const int64_t HV = g.ssm_v_heads, HK = g.ssm_k_heads, NH = g.n_head, HD = g.head_dim, NKV = g.n_head_kv;
+    const int64_t IQ = g.idx_q_heads, ID = g.idx_key_dim, NE = g.n_expert, MT = max_t_;
+    const QsaShapes s = shapes_of(g);
+    const GrShapes gs{g.n_embd, g.hc, g.hc_lr};
+    const uint64_t gdn_floats = (uint64_t)g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size +
+                                (uint64_t)g.ssm_conv_channels * (g.ssm_d_conv - 1);
+    const int64_t HS = (int64_t)NG_HIST * NG_HC_DIM;
+    const int64_t TS = (s.idx_block - 1) * ID;
+    const bool ple_on = ss.ple.ready() && ple_stage();
+    const int G = (!tree_rec_ && split_ && T >= 2) ? 2 : 1;
+    static const bool dec_batch = [] {
+        const char* v = std::getenv("STRATA_DEC_BATCH");
+        return v == nullptr || std::atoi(v) != 0;
+    }();
+    static const bool g_no_batch_kv = std::getenv("STRATA_NO_BATCH_KV_STEP") != nullptr;
+    const bool lean = is_lean();
+    const int32_t* pos_k = pos_ + MT * NH;
+    const int32_t* pos_i = pos_ + MT * (NH + NKV);
+
+    const int tb_[2] = {0, (T + 1) / 2}, te_[2] = {G == 2 ? (T + 1) / 2 : T, T};
+    const int tb = tb_[grp], te = te_[grp], n = te - tb;
+
+        stamp(l, 0, grp, cs);
+        const LayerView v(wt, l);
+        const char* pfx[2] = {"hc_attn_", "hc_ffn_"};
+        const WeightRef *wn[2], *wd[2], *wu[2], *wi[2];
+        for (int h = 0; h < 2; ++h) {
+            wn[h] = need(v, (std::string(pfx[h]) + "norm.weight").c_str(), err);
+            wd[h] = need(v, (std::string(pfx[h]) + "down.weight").c_str(), err);
+            wu[h] = need(v, (std::string(pfx[h]) + "up.weight").c_str(), err);
+            wi[h] = need(v, (std::string(pfx[h]) + "inject.weight").c_str(), err);
+            if (!wn[h] || !wd[h] || !wu[h] || !wi[h]) return false;
+        }
+        // the previous layer's FFN write, folded into this layer's first read (a control vector after it has
+        // already applied it)
+        bool pending = l > 0 && !cvec().covers(l - 1);
+        if (l == 1 && ple_on) {
+            float* normalized = (float*)((uint8_t*)ss.ple.scratch + ple_block_scratch_bytes());
+            for (int t = tb; t < te; ++t) {
+                gr_write(Rt(t), bo_ + t * N, inj2_ + t * HC, gs, Rt(t), cs);
+                if (tree_rec_ && t > 0) copy_indexed(ss.ple.hist, hist_snap_, HS, &tree_d_->parent[t], HS, cs);
+                PleOut po;
+                po.normalized = normalized;
+                po.result = Rt(t);
+                try {
+                    ple_block(ple_ + t * N, Rt(t), ss.ple.hist, ss.ple.w, po, ss.ple.scratch, cs);
+                    ple_history_advance(ss.ple.hist, normalized, cs);
+                } catch (const std::exception& e) {
+                    /*
+                    DPCT1109:30: Virtual functions cannot be called in SYCL
+                    device code. You need to adjust the code.
+                    */
+                    err = std::string("verify PLE: ") + e.what();
+                    return false;
+                }
+                copy_from_mapped(hist_snap_ + (size_t)t * HS, ss.ple.hist, HS, cs);
+            }
+            pending = false;
+        }
+        /*
+        DPCT1110:31: The total declared local variable size in device function
+        operator() exceeds 128 bytes and may cause high register pressure.
+        Consult with your hardware vendor to find the total register size
+        available and adjust the code, or use smaller sub-group size to avoid
+        high register pressure.
+        */
+        auto gr_read_group = [&](int half, bool apply, float* inj_prev, float* inj_out) {
+            FusedGrArgs fa[kFusedGrMaxT];
+            for (int t = tb; t < te; ++t) {
+                FusedGrArgs& a = fa[t - tb];
+                a.R = Rt(t);
+                a.R_out = Rt(t);
+                a.apply = apply;
+                a.bo_prev = bo_ + t * N;
+                a.inj_prev = inj_prev + t * HC;
+                a.w_norm = (const float*)wn[half]->data;
+                a.w_down = (const uint16_t*)wd[half]->data;
+                a.w_up = (const uint16_t*)wu[half]->data;
+                a.w_inject = (const uint16_t*)wi[half]->data;
+                a.eps = EPS;
+                a.lo = lo_ + t * g.hc_lr;
+                a.rs = rs_ + t * HC;
+                a.inject_out = inj_out + t * HC;
+                a.mixed = mixed_ + t * N;
+            }
+            fused_gr_read_multi(fa, n, xn_ + (size_t)tb * HC * N, cs, (prof_on_ && grp == 0) ? prof_ : nullptr,
+                                (int)(l * kProfPer + (half == 0 ? 27 : 30)));
+        };
+        VDBG("layer_pre (l=%lld, grp=%d): gr_read_group 0 start\n", (long long)l, grp);
+        gr_read_group(0, pending, inj2_, inj_);
+        VDBG("layer_pre (l=%lld, grp=%d): gr_read_group 0 done\n", (long long)l, grp);
+        progress_beat();
+        stamp(l, 1, grp, cs);
+        float* xm = mixed_ + tb * N;
+        try {
+            if (!is_qsa_layer(g, l)) {
+                // ======================= GDN =======================
+                VDBG("layer_pre (l=%lld, grp=%d): GDN start\n", (long long)l, grp);
+                const WeightRef *wqkv = need(v, "attn_qkv.weight", err), *wg = need(v, "attn_gate.weight", err),
+                                *wout = need(v, "ssm_out.weight", err), *wa = need(v, "ssm_alpha.weight", err),
+                                *wb = need(v, "ssm_beta.weight", err), *wc = need(v, "ssm_conv1d.weight", err),
+                                *wnm = need(v, "ssm_norm.weight", err), *wdt = need(v, "ssm_dt.bias", err),
+                                *wsa = need(v, "ssm_a", err);
+                if (!wqkv || !wg || !wout || !wa || !wb || !wc || !wnm || !wdt || !wsa) return false;
+                if (!native_of(wqkv, v.name("attn_qkv.weight"), err) ||
+                    !native_of(wg, v.name("attn_gate.weight"), err) || !native_of(wout, v.name("ssm_out.weight"), err))
+                    return false;
+                const int64_t gi = gdn_idx_[(size_t)l];
+                float* state = ss.gdn_state + (size_t)(gi - ss.gdn_ord0) * gdn_floats;
+                float* conv = state + (uint64_t)g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size;
+                float* qkv = qkv_L_ + (size_t)gi * MT * C;
+                float* hb = h_L_ + (size_t)gi * MT * C;
+                float* gate = gate_L_ + (size_t)gi * MT * HV;
+                float* beta = beta_L_ + (size_t)gi * MT * HV;
+                VDBG("layer_pre (l=%lld, grp=%d): GDN native_quantize_q8_1 xm\n", (long long)l, grp);
+                native_quantize_q8_1(xm, xq_, (int)N, n, cs);
+                VDBG("layer_pre (l=%lld, grp=%d): GDN native_mmvq wqkv\n", (long long)l, grp);
+                native_mmvq(wqkv->native_type, wqkv->native_data, xq_, qkv + (size_t)tb * C, (int)N, (int)C, n, cs);
+                stamp(l, 2, grp, cs);
+                VDBG("layer_pre (l=%lld, grp=%d): GDN conv\n", (long long)l, grp);
+                if (tree_rec_)
+                    gdn_conv_l2_tree(conv, qkv, (const float*)wc->data, hb, (int)C, (int)(2 * HK), EPS, n, tree_d_,
+                                     cs, tb);
+                else
+                    gdn_conv_l2_multi(conv, qkv, (const float*)wc->data, hb, (int)C, (int)(2 * HK), EPS, n, cs, tb);
+                stamp(l, 3, grp, cs);
+                VDBG("layer_pre (l=%lld, grp=%d): GDN ab\n", (long long)l, grp);
+                gdn_ab_multi(xm, (const uint16_t*)wa->data, (const uint16_t*)wb->data, (const float*)wdt->data,
+                             (const float*)wsa->data, gate + (size_t)tb * HV, beta + (size_t)tb * HV, (int)N, (int)HV,
+                             n, cs);
+                stamp(l, 4, grp, cs);
+                VDBG("layer_pre (l=%lld, grp=%d): GDN native_mmvq wg\n", (long long)l, grp);
+                native_mmvq(wg->native_type, wg->native_data, xq_, z_ + (size_t)tb * ZV, (int)N, (int)ZV, n, cs);
+                stamp(l, 5, grp, cs);
+                VDBG("layer_pre (l=%lld, grp=%d): GDN step norm\n", (long long)l, grp);
+                // the recurrence from the untouched state over tokens [0, te); outputs only for this group's
+                if (tree_rec_)
+                    gdn_step_norm_tree(state, tree_gdn_snap_, hb, (int)C, gate, beta, z_, (const float*)wnm->data, EPS,
+                                       y_, (int)HK, (int)HV, te, tree_d_, cs);
+                else
+                    gdn_step_norm_multi(state, hb, (int)C, gate, beta, z_, (const float*)wnm->data, EPS, y_, (int)HK,
+                                        (int)HV, te, nullptr, cs, tb);
+                stamp(l, 6, grp, cs);
+                VDBG("layer_pre (l=%lld, grp=%d): GDN native_quantize_q8_1 y_\n", (long long)l, grp);
+                native_quantize_q8_1(y_ + (size_t)tb * ZV, xq_, (int)ZV, n, cs);
+                VDBG("layer_pre (l=%lld, grp=%d): GDN native_mmvq wout\n", (long long)l, grp);
+                native_mmvq(wout->native_type, wout->native_data, xq_, bo_ + tb * N, (int)ZV, (int)N, n, cs);
+                VDBG("layer_pre (l=%lld, grp=%d): GDN done\n", (long long)l, grp);
+                progress_beat();
+            } else {
+                // ======================= QSA =======================
+                const int64_t qi = qsa_idx_[(size_t)l];
+                const QsaState& st = ss.qsa_states[qi];
+                const WeightRef *wik = need(v, "indexer.k_proj.weight", err), *wq = need(v, "attn_q.weight", err),
+                                *wk = need(v, "attn_k.weight", err), *wv = need(v, "attn_v.weight", err),
+                                *wo = need(v, "attn_output.weight", err), *wiq = need(v, "indexer.q_proj.weight", err),
+                                *wqn = need(v, "attn_q_norm.weight", err), *wkn = need(v, "attn_k_norm.weight", err),
+                                *wiqn = need(v, "indexer.q_norm.weight", err),
+                                *wikn = need(v, "indexer.k_norm.weight", err);
+                if (!wik || !wq || !wk || !wv || !wo || !wiq || !wqn || !wkn || !wiqn || !wikn) return false;
+                if (!native_of(wq, v.name("attn_q.weight"), err) || !native_of(wk, v.name("attn_k.weight"), err) ||
+                    !native_of(wv, v.name("attn_v.weight"), err) || !native_of(wo, v.name("attn_output.weight"), err))
+                    return false;
+                // #783 PR-f (stuchapin909): the per-head RMSNorm and the rope in one launch, bit-identical to the pair
+                // (rope_parity check 6); STRATA_NO_NORM_ROPE=1 keeps the two; off on HIP until its parity check passes
+                const bool fuse_nr = native_qsa_enabled() && native_rope_enabled() && native_norm_rope_usable((int)HD, (int)s.n_rot);
+                auto norm_rope = [&](float* data, const WeightRef* norm, int rows, int cols, const int32_t* pos) {
+                    if (fuse_nr && native_norm_rope_usable(cols, (int)s.n_rot)) {
+                        native_qsa_rms_norm_rope(data, cols, (const float*)norm->data, data, rows, cols, (int)s.n_rot, EPS,
+                                                 rope_scaling(), pos, cs);
+                        return;
+                    }
+                    if (native_qsa_enabled())
+                        native_qsa_rms_norm_weighted(data, (const float*)norm->data, data, cols, rows, EPS, cs);
+                    else
+                        rms_norm_weighted(data, (const float*)norm->data, rows, cols, EPS, cs);
+                    if (native_rope_enabled())
+                        native_rope_apply(data, data, rows, cols, (int)s.n_rot, rope_scaling(), pos, cs);
+                    else
+                        rope_neox_apply(data, data, rows, cols, (int)s.n_rot, st.cos_tab, st.sin_tab, pos, cs);
+                };
+                float* idx_raw = idx_raw_L_ + (size_t)qi * MT * ID;
+                // the per-token GEMVs / norms / RoPEs / copies of this layer as one launch over the
+                // window's rows each - row-wise identical arithmetic (STRATA_DEC_BATCH=0: token by token)
+                static const bool qb_q4 = [] {
+                    const char* e = std::getenv("STRATA_DF_QB_Q4");
+                    return e == nullptr || std::atoi(e) != 0;
+                }();
+                const bool qb = dec_batch && n > 1 && native_qsa_enabled() && native_rope_enabled() && (!st.kv_q4 || qb_q4);
+                native_quantize_q8_1(xm, xq_, (int)N, n, cs);
+                if (qb)
+                    bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*)wik->data, idx_raw + tb * ID, ID, N,
+                                              ID, n, cs);
+                else
+                    for (int t = tb; t < te; ++t)
+                        bf16_gemv_fp32_mmvf(mixed_ + t * N, (const uint16_t*)wik->data, idx_raw + t * ID, (int)N,
+                                            (int)ID, cs);
+                stamp(l, 7, grp, cs);
+                native_mmvq(wk->native_type, wk->native_data, xq_, kcur_ + tb * NKV * HD, (int)N, (int)(NKV * HD), n,
+                            cs);
+                native_mmvq(wv->native_type, wv->native_data, xq_, vcur_ + tb * NKV * HD, (int)N, (int)(NKV * HD), n,
+                            cs);
+                if (qb)
+                    norm_rope(kcur_ + tb * NKV * HD, wkn, (int)(n * NKV), (int)HD, pos_k + tb * NKV);
+                else
+                    for (int t = tb; t < te; ++t)
+                        norm_rope(kcur_ + t * NKV * HD, wkn, (int)NKV, (int)HD, pos_ + t * NH);
+                if (st.kv_rot) {  // K and V rotated before they are stored (kv_q4.hpp)
+                    fwht256_inplace_cuda(kcur_ + tb * NKV * HD, (int64_t)n * NKV, cs);
+                    fwht256_inplace_cuda(vcur_ + tb * NKV * HD, (int64_t)n * NKV, cs);
+                } else if (st.kv_hybrid) {  // K8V4: only V is rotated
+                    fwht256_inplace_cuda(vcur_ + tb * NKV * HD, (int64_t)n * NKV, cs);
+                }
+                stamp(l, 8, grp, cs);
+                if (grp == 0) copy_from_mapped(tail_snap_ + (size_t)qi * TS, st.idx_tail, TS, cs);
+                const int32_t* const step_kv_base = tree_rec_ ? step_append_ : step_;
+                if (dec_batch && !g_no_batch_kv) {
+                    const int32_t* step_b = step_kv_base + tb * kStepCount;
+                    const float* kc_b = kcur_ + tb * NKV * HD;
+                    const float* vc_b = vcur_ + tb * NKV * HD;
+                    if (st.kv_hybrid) {  // K8V4: the unused half's lanes folded onto the used pool (layer.cpp)
+                        const KvHostPools hk = kv_hybrid_k_half(st.host), hv = kv_hybrid_v_half(st.host);
+                        const bool mirror = st.host.present();
+                        kv_append_q8_steps(st.k_q, st.k_q, st.k_scale, st.k_scale, st.page_table, step_b, kStepCount,
+                                           kc_b, kc_b, (int)(NKV * HD), n, s, cs, mirror ? &hk : nullptr);
+                        kv_append_q4_steps(st.v_q4, st.v_q4, st.page_table, step_b, kStepCount, n, vc_b, vc_b, s, cs,
+                                           mirror ? &hv : nullptr);
+                    } else if (st.kv_q4)
+                        kv_append_q4_steps(st.k_q4, st.v_q4, st.page_table, step_b, kStepCount, n, kc_b, vc_b, s, cs,
+                                           &st.host);
+                    else if (st.kv_int8)
+                        kv_append_q8_steps(st.k_q, st.v_q, st.k_scale, st.v_scale, st.page_table, step_b, kStepCount,
+                                           kc_b, vc_b, (int)(NKV * HD), n, s, cs, &st.host);
+                    else
+                        for (int t = tb; t < te; ++t)
+                            kv_append_step(st.k_pool, st.v_pool, st.page_table, step_kv_base + t * kStepCount,
+                                           kcur_ + t * NKV * HD, vcur_ + t * NKV * HD, s, cs, &st.host);
+                } else {
+                    for (int t = tb; t < te; ++t) {
+                        const int32_t* step_t = step_kv_base + t * kStepCount;
+                        if (st.kv_hybrid) {  // K8V4: the unused half's lanes folded onto the used pool (layer.cpp)
+                            const KvHostPools hk = kv_hybrid_k_half(st.host), hv = kv_hybrid_v_half(st.host);
+                            const bool mirror = st.host.present();
+                            kv_append_q8_step(st.k_q, st.k_q, st.k_scale, st.k_scale, st.page_table, step_t,
+                                              kcur_ + t * NKV * HD, kcur_ + t * NKV * HD, s, cs, mirror ? &hk : nullptr);
+                            kv_append_q4_step(st.v_q4, st.v_q4, st.page_table, step_t, vcur_ + t * NKV * HD,
+                                              vcur_ + t * NKV * HD, s, cs, mirror ? &hv : nullptr);
+                        } else if (st.kv_q4)
+                            kv_append_q4_step(st.k_q4, st.v_q4, st.page_table, step_t, kcur_ + t * NKV * HD,
+                                              vcur_ + t * NKV * HD, s, cs, &st.host);
+                        else if (st.kv_int8)
+                            kv_append_q8_step(st.k_q, st.v_q, st.k_scale, st.v_scale, st.page_table, step_t,
+                                              kcur_ + t * NKV * HD, vcur_ + t * NKV * HD, s, cs, &st.host);
+                        else
+                            kv_append_step(st.k_pool, st.v_pool, st.page_table, step_t, kcur_ + t * NKV * HD,
+                                           vcur_ + t * NKV * HD, s, cs, &st.host);
+                    }
+                }
+                const QsaIndexerBuffers ib{st.idx_tail, st.idx_dead, st.idx_pooled, st.idx_block_pos};
+                const int n_idx = tree_rec_ ? (tb == 0 ? 1 : 0) : n;
+                if (n_idx > 0) {
+                    if (dec_batch && !g_no_batch_kv) {
+                        native_qsa_indexer_append_steps(idx_raw + tb * ID, step_ + tb * kStepCount + kStepPos,
+                                                        kStepCount, n_idx, 0, (const float*)wikn->data, EPS, ib, s,
+                                                        st.max_cells, rope_scaling(), cs);
+                    } else {
+                        const int te_idx = tb + n_idx;
+                        for (int t = tb; t < te_idx; ++t)
+                            native_qsa_indexer_append(idx_raw + t * ID, step_ + t * kStepCount + kStepPos, 0,
+                                                      (const float*)wikn->data, EPS, ib, s, st.max_cells,
+                                                      rope_scaling(), cs);
+                    }
+                }
+                stamp(l, 9, grp, cs);
+                native_mmvq(wq->native_type, wq->native_data, xq_, qfull_ + tb * NH * 2 * HD, (int)N,
+                            (int)(NH * 2 * HD), n, cs);
+                if (qb) {
+                    if (fuse_nr) {   // the q/gate split reads q straight out of the q|gate rows (stride 2 * HD)
+                        native_qsa_rms_norm_rope(qfull_ + tb * NH * 2 * HD, (int)(2 * HD), (const float*)wqn->data,
+                                                 qcur_ + tb * NH * HD, (int)(n * NH), (int)HD, (int)s.n_rot, EPS,
+                                                 rope_scaling(), pos_ + tb * NH, cs);
+                    } else {
+                        float* dst_p = qcur_ + tb * NH * HD;
+                        const float* src_p = qfull_ + tb * NH * 2 * HD;
+                        const size_t total_rows = (size_t)(n * NH);
+                        const size_t hd_elems = (size_t)HD;
+                        cs->parallel_for(sycl::range<2>(total_rows, hd_elems), [=](sycl::id<2> id) {
+                            size_t r = id[0];
+                            size_t c = id[1];
+                            dst_p[r * hd_elems + c] = src_p[r * (hd_elems * 2) + c];
+                        });
+                        norm_rope(qcur_ + tb * NH * HD, wqn, (int)(n * NH), (int)HD, pos_ + tb * NH);
+                    }
+                    if (st.kv_rot)
+                        fwht256_inplace_cuda(qcur_ + tb * NH * HD, (int64_t)n * NH, cs);  // <Hq, Hk> = <q, k>
+                    bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*)wiq->data, qidx_ + tb * IQ * ID,
+                                              IQ * ID, N, IQ * ID, n, cs);
+                    norm_rope(qidx_ + tb * IQ * ID, wiqn, (int)(n * IQ), (int)ID, pos_i + tb * IQ);
+                } else {
+                    for (int t = tb; t < te; ++t) {
+                        float* qc = qcur_ + t * NH * HD;
+                        if (fuse_nr) {
+                            native_qsa_rms_norm_rope(qfull_ + t * NH * 2 * HD, (int)(2 * HD), (const float*)wqn->data, qc,
+                                                     (int)NH, (int)HD, (int)s.n_rot, EPS, rope_scaling(), pos_ + t * NH, cs);
+                        } else {
+                            const float* src_p = qfull_ + t * NH * 2 * HD;
+                            const size_t total_rows = (size_t)NH;
+                            const size_t hd_elems = (size_t)HD;
+                            cs->parallel_for(sycl::range<2>(total_rows, hd_elems), [=](sycl::id<2> id) {
+                                size_t r = id[0];
+                                size_t c = id[1];
+                                qc[r * hd_elems + c] = src_p[r * (hd_elems * 2) + c];
+                            });
+                            norm_rope(qc, wqn, (int)NH, (int)HD, pos_ + t * NH);
+                        }
+                        if (st.kv_rot) fwht256_inplace_cuda(qc, NH, cs);  // <Hq, Hk> = <q, k>
+                    }
+                    for (int t = tb; t < te; ++t) {
+                        float* qx = qidx_ + t * IQ * ID;
+                        bf16_gemv_fp32_mmvf(mixed_ + t * N, (const uint16_t*)wiq->data, qx, (int)N, (int)(IQ * ID), cs);
+                        norm_rope(qx, wiqn, (int)IQ, (int)ID, pos_ + t * NH);
+                    }
+                }
+                stamp(l, 10, grp, cs);
+                if (sel_long_) {
+                    qsa_block_scores_long(st.idx_pooled, st.idx_dead, qidx_ + tb * IQ * ID, step_ + tb * kStepCount, n,
+                                          max_blocks_, s, scores_ + (size_t)tb * max_blocks_, cs, -1);
+                    qsa_block_topk_long(scores_ + (size_t)tb * max_blocks_, step_ + tb * kStepCount, n, max_blocks_,
+                                        cap_, s, sel_ + (size_t)tb * cap_, cs, -1, topk_scratch_);
+                } else {
+                    qsa_block_scores(st.idx_pooled, st.idx_dead, qidx_ + tb * IQ * ID, step_ + tb * kStepCount, n,
+                                     max_blocks_, s, scores_ + (size_t)tb * max_blocks_, cs);
+                    qsa_block_topk(scores_ + (size_t)tb * max_blocks_, step_ + tb * kStepCount, n, max_blocks_, cap_, s,
+                                   sel_ + (size_t)tb * cap_, cs);
+                }
+                if (tree_rec_) qsa_remap_tree_sel(sel_ + (size_t)tb * cap_, step_ + tb * kStepCount, n, cap_, tree_d_, cs);
+                stamp(l, 11, grp, cs);
+                // KV streaming: the n selections' blocks resident (device-side, inside the graph)
+                qsa_kv_resolve(st, *g_, sel_ + (size_t)tb * cap_, step_ + tb * kStepCount, n, cap_, cs);
+                stamp(l, 12, grp, cs);
+                const QsaAttnPools pools = qsa_attn_pools(st);
+                qsa_decode_attn_batch(qcur_ + tb * NH * HD, pools, sel_ + (size_t)tb * cap_, step_ + tb * kStepCount,
+                                      cap_, s, attn_scratch_ + (size_t)tb * attn_scratch_floats_, attn_ + tb * NH * HD,
+                                      n, cs);
+                stamp(l, 13, grp, cs);
+                if (st.kv_rot || st.kv_hybrid)
+                    fwht256_inplace_cuda(attn_ + tb * NH * HD, (int64_t)n * NH, cs);  // back: H^-1 = H
+                if (qb)
+                    native_qsa_gate_apply(attn_ + tb * NH * HD, qfull_ + tb * NH * 2 * HD, attn32_ + tb * NH * HD,
+                                          (int)(n * NH), (int)HD, cs);
+                else
+                    for (int t = tb; t < te; ++t) {
+                        if (native_qsa_enabled())
+                            native_qsa_gate_apply(attn_ + t * NH * HD, qfull_ + t * NH * 2 * HD, attn32_ + t * NH * HD,
+                                                  (int)NH, (int)HD, cs);
+                        else
+                            qsa_gate_apply_f32(attn_ + t * NH * HD, qfull_ + t * NH * 2 * HD, s, attn32_ + t * NH * HD,
+                                               cs);
+                    }
+                stamp(l, 14, grp, cs);
+                native_quantize_q8_1(attn32_ + tb * NH * HD, xq_, (int)(NH * HD), n, cs);
+                native_mmvq(wo->native_type, wo->native_data, xq_, bo_ + tb * N, (int)(NH * HD), (int)N, n, cs);
+            }
+        } catch (const std::exception& e) {
+            /*
+            DPCT1109:32: Virtual functions cannot be called in SYCL device code.
+            You need to adjust the code.
+            */
+            err = "verify layer " + std::to_string(l) + ": " + e.what();
+            return false;
+        }
+        stamp(l, 16, grp, cs);
+        VDBG("layer_pre (l=%lld, grp=%d): gr_read_group 1 start\n", (long long)l, grp);
+        gr_read_group(1, true, inj_, inj2_);
+        VDBG("layer_pre (l=%lld, grp=%d): gr_read_group 1 done\n", (long long)l, grp);
+        progress_beat();
+        // the window's rows routed in 2 launches (one router GEMV reading the weight once, one
+        // top-10) instead of 2 per token; every row's arithmetic is the single-token call's (STRATA_DEC_BATCH=0: old)
+        const WeightRef* w_router = v.get("ffn_gate_inp.weight");
+        VDBG("layer_pre (l=%lld, grp=%d): router start\n", (long long)l, grp);
+        if (dec_batch && n > 1 && w_router != nullptr && native_router_enabled() && NE == 512 && K == 10) {
+            try {
+                bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*)w_router->data, logits_ + tb * NE, NE, N,
+                                          NE, n, cs);
+                native_router_top10_multi(logits_ + tb * NE, ids_ + tb * K, w_ + tb * K, n, cs);
+            } catch (const std::exception& e) {
+                err = "verify router: " + std::string(e.what());
+                return false;
+            }
+        } else
+            for (int t = tb; t < te; ++t) {
+                MoEBuffers mb = ss.moe;
+                mb.logits = logits_ + t * NE;
+                mb.ids = ids_ + t * K;
+                mb.weights = w_ + t * K;
+                if (!moe_route(wt, g, l, K, mb, mixed_ + t * N, cs, err, nullptr)) return false;
+            }
+        VDBG("layer_pre (l=%lld, grp=%d): router done\n", (long long)l, grp);
+        progress_beat();
+        const float route_prior = g_route_prior(cs);
+        if (route_prior > 0.0f && NE == 512 && K == 10 && hits_.d_res != nullptr) {
+            VDBG("layer_pre (l=%lld, grp=%d): route_prior_top10\n", (long long)l, grp);
+            route_prior_top10(logits_ + tb * NE, hits_.d_res + l * g.n_expert, route_prior, ids_ + tb * K, w_ + tb * K,
+                              n, cs);
+        }
+        static const auto route_resident_cfg = [] {
+            struct {
+                float margin = 0.0f;
+                int lo = 6, hi = 9;
+                float edge = -1.0f;
+                float budget = 0.0f;
+                float budget_tail = 0.0f;
+            } c;
+            if (const char* v = std::getenv("STRATA_ROUTE_RESIDENT")) c.margin = (float)std::atof(v);
+            if (const char* v = std::getenv("STRATA_ROUTE_RESIDENT_RANKS")) std::sscanf(v, "%d-%d", &c.lo, &c.hi);
+            if (const char* v = std::getenv("STRATA_ROUTE_RESIDENT_EDGE")) c.edge = (float)std::atof(v);
+            if (const char* v = std::getenv("STRATA_ROUTE_BUDGET")) c.budget = std::max(0.0f, (float)std::atof(v));
+            if (const char* v = std::getenv("STRATA_ROUTE_BUDGET_TAIL"))
+                c.budget_tail = std::max(0.0f, (float)std::atof(v));
+            if (c.margin > 0.0f || c.edge >= 0.0f || c.budget > 0.0f || c.budget_tail > 0.0f) {
+                std::fprintf(stderr,
+                             "strata hotrod: route_resident active (margin=%.3g ranks=%d-%d edge=%.3g budget=%.4g "
+                             "budget_tail=%.4g; changes output)\n",
+                             (double)c.margin, c.lo, c.hi, (double)c.edge, (double)c.budget, (double)c.budget_tail);
+            }
+            return c;
+        }();
+        if ((route_resident_cfg.margin > 0.0f || route_resident_cfg.edge >= 0.0f ||
+             route_resident_cfg.budget > 0.0f || route_resident_cfg.budget_tail > 0.0f) &&
+            NE == 512 && K == 10 && hits_.d_res != nullptr) {
+            try {
+                VDBG("layer_pre (l=%lld, grp=%d): native_route_resident_ext\n", (long long)l, grp);
+                native_route_resident_ext(logits_ + tb * NE, ids_ + tb * K, w_ + tb * K,
+                                          hits_.d_res + l * g.n_expert, n, route_resident_cfg.margin,
+                                          route_resident_cfg.lo, route_resident_cfg.hi, route_resident_cfg.edge,
+                                          route_resident_cfg.budget, route_resident_cfg.budget_tail, nullptr, cs);
+            } catch (const std::exception& e) {
+                err = "verify route-resident: " + std::string(e.what());
+                return false;
+            }
+        }
+        if ((device_plan_ || recording_res_) && hits_.d_res != nullptr) {
+            VDBG("layer_pre (l=%lld, grp=%d): resident_plan\n", (long long)l, grp);
+            if (lean && mstage_ != nullptr)
+                resident_plan_set_stage(mstage_, mstage_stride_, msrc_ + (size_t)grp * (size_t)(max_t_ * K), mring_ && G == 1);
+            resident_plan(ids_ + tb * K, n * (int)K, (int)K, hits_.d_res + l * g.n_expert, (int)g.n_expert,
+                          hits_.cache_base, slot_off_d_, (long long)hits_.blob,
+                          plan_ + (size_t)grp * (size_t)(plan_i32_ + 16), (long long)max_t_ * K, skip_ + grp,
+                          (uint32_t)((l - lb_) * G + grp + 1), cs);
+            if (lean && mstage_ != nullptr)
+                resident_plan_set_stage(nullptr, 0, nullptr);
+        }
+        if (!lean && !recording_res_) {
+            const uint32_t want = (uint32_t)((l - lb_) * G + grp + 1);
+            VDBG("layer_pre (l=%lld, grp=%d): doorbell_publish_value (m_seq_=%p, want=%u, n=%d, k=%ld)\n",
+                 (long long)l, grp, m_seq_, want, n, (long)K);
+            doorbell_publish_value(xm, ids_ + tb * K, w_ + tb * K, (int64_t)n * N, (int64_t)n * K, m_x_ + tb * N,
+                                   m_ids_ + tb * K, m_w_ + tb * K, m_seq_, want, cs);
+            VDBG("layer_pre (l=%lld, grp=%d): doorbell_publish_value done\n", (long long)l, grp);
+        }
+        stamp(l, 17, grp, cs);
+        {
+            VDBG("layer_pre (l=%lld, grp=%d): shared_expert start\n", (long long)l, grp);
+            const WeightRef *wgi = need(v, "ffn_gate_inp_shexp.weight", err),
+                            *wsg = need(v, "ffn_gate_shexp.weight", err), *wsu = need(v, "ffn_up_shexp.weight", err),
+                            *wsd = need(v, "ffn_down_shexp.weight", err);
+            if (!wgi || !wsg || !wsu || !wsd) return false;
+            if (!native_of(wsg, v.name("ffn_gate_shexp.weight"), err) ||
+                !native_of(wsu, v.name("ffn_up_shexp.weight"), err) ||
+                !native_of(wsd, v.name("ffn_down_shexp.weight"), err))
+                return false;
+            NativeSharedWeights nsw;
+            nsw.gate_type = wsg->native_type;
+            nsw.gate_data = wsg->native_data;
+            nsw.up_type = wsu->native_type;
+            nsw.up_data = wsu->native_data;
+            nsw.down_type = wsd->native_type;
+            nsw.down_data = wsd->native_data;
+            nsw.q8_1 = xq_;
+            static const bool qdedup_env = [] {
+                const char* e = std::getenv("STRATA_VERIFY_QDEDUP");
+                return e != nullptr && e[0] == '1';
+            }();
+            const bool qdedup = qdedup_env && strata::kernels::cpu::expert_layout().native;
+            if (qdedup) quantize_q8_1_rows(xm, n, N, nat_xq_ + (size_t)tb * (N / 32) * 36, cs);
+            if (!shared_expert_native_bf16_enabled()) {
+                if (dec_batch)
+                    f32_to_bf16_bulk(mixed_ + tb * N, sh_bf16_ + tb * N, (int64_t)n * N, cs);  // contiguous rows
+                else
+                    for (int t = tb; t < te; ++t)
+                        f32_to_bf16_bulk(mixed_ + t * N, sh_bf16_ + t * N, N, cs);
+            }
+            try {
+                shared_expert_multi(n, xm, sh_bf16_ + tb * N, nsw, (const uint16_t*)wgi->data,
+                                    sh_gate_ + (size_t)tb * g.n_ff, sh_up_ + (size_t)tb * g.n_ff, sh_g_ + tb,
+                                    shared_ + tb * N, N, g.n_ff, cs,
+                                    qdedup ? (const void*)(nat_xq_ + (size_t)tb * (N / 32) * 36) : nullptr);
+            } catch (const std::exception& e) {
+                /*
+                DPCT1109:34: Virtual functions cannot be called in SYCL device
+                code. You need to adjust the code.
+                */
+                err = std::string("verify shared expert: ") + e.what();
+                return false;
+            }
+            VDBG("layer_pre (l=%lld, grp=%d): shared_expert done\n", (long long)l, grp);
+            progress_beat();
+            VDBG("layer_pre (l=%lld, grp=%d): quantize start\n", (long long)l, grp);
+            if (strata::kernels::cpu::expert_layout().native) {
+                if (!qdedup) quantize_q8_1_rows(xm, n, N, nat_xq_ + (size_t)tb * (N / 32) * 36, cs);
+            } else {
+                quantize_q8_0_scaled(xm, hit_xq_ + (size_t)tb * (N / 32) * 34, hit_xs_ + (size_t)tb * (N / 32),
+                                     (int64_t)n * N, cs);
+            }
+        }
+        stamp(l, 18, grp, cs);
+        VDBG("layer_pre (l=%lld, grp=%d): end\n", (long long)l, grp);
+        progress_beat();
+        return true;
+
+} catch (const std::exception& exc) {
+    err = std::string("Verifier::record_layer_pre: ") + exc.what();
+    return false;
+} catch (...) {
+    err = "Verifier::record_layer_pre: unknown exception";
+    return false;
+}
+
+
+bool Verifier::record_layer_post(int T, int64_t l, int grp, sycl::queue* cs, std::string& err) try {
+    VDBG("layer_post (l=%lld, grp=%d): begin\n", (long long)l, grp);
+    progress_at("verify window: layer post", l);
+    progress_beat();
+    using namespace strata::kernels;
+    const ModelGeometry& g = *g_;
+    SessionState& ss = *ss_;
+    const int64_t N = g.n_embd, HC = g.hc, K = ss.k;
+    const GrShapes gs{g.n_embd, g.hc, g.hc_lr};
+    const int G = (!tree_rec_ && split_ && T >= 2) ? 2 : 1;
+    static const bool dec_batch = [] {
+        const char* v = std::getenv("STRATA_DEC_BATCH");
+        return v == nullptr || std::atoi(v) != 0;
+    }();
+    const bool lean = is_lean();
+
+    const int tb_[2] = {0, (T + 1) / 2}, te_[2] = {G == 2 ? (T + 1) / 2 : T, T};
+    const int tb = tb_[grp], te = te_[grp], n = te - tb;
+
+        const uint32_t ring = (uint32_t)((l - lb_) * G + grp + 1);
+        const int64_t cap = (int64_t)n * K, capx = (int64_t)max_t_ * K;
+        int32_t* pl = plan_ + (size_t)grp * (size_t)(plan_i32_ + 16);
+        if (recording_res_) {
+            // the plan resident_plan built in pre(l)
+        } else if (device_plan_) {  // E-6: skipped when the device planned this group (all its experts resident)
+            if (!lean) {
+                VDBG("layer_post (l=%lld, grp=%d): wait_flag_ge_or flagA ring=%u\n", (long long)l, grp, ring);
+                wait_flag_ge_or(m_flagA_, ring, skip_ + grp, cs);
+            }
+            if (!lean) {
+                VDBG("layer_post (l=%lld, grp=%d): copy_i32_from_mapped_unless plan\n", (long long)l, grp);
+                copy_i32_from_mapped_unless(pl, m_plan_ + (size_t)grp * (size_t)(plan_i32_), plan_i32_, skip_ + grp, ring,
+                                            cs);
+            }
+        } else {
+            if (fuse_wait_env()) {
+                VDBG("layer_post (l=%lld, grp=%d): wait_copy_i32_from_mapped ring=%u\n", (long long)l, grp, ring);
+                wait_copy_i32_from_mapped(m_flagA_, ring, pl, m_plan_ + (size_t)grp * (size_t)(plan_i32_), plan_i32_,
+                                          cs);
+            } else {
+                VDBG("layer_post (l=%lld, grp=%d): wait_flag_ge flagA ring=%u\n", (long long)l, grp, ring);
+                wait_flag_ge(m_flagA_, ring, cs);  // the pool published this group's GPU plan
+                copy_i32_from_mapped(pl, m_plan_ + (size_t)grp * (size_t)(plan_i32_), plan_i32_, cs);
+            }
+        }
+        stamp(l, 19, grp, cs);
+        const int32_t* p_counts = pl;
+        const int32_t* p_start = pl + 4;
+        const int32_t* p_dst = p_start + capx + 1;
+        const int32_t* p_tok = p_dst + capx;
+        const int64_t ptr_off = ((4 + (capx + 1) + 2 * capx) + 1) & ~1ll;
+        const unsigned long long* p_ptr = (const unsigned long long*)(pl + ptr_off);
+        const unsigned long long* p_ptr2 = p_ptr + capx;
+        const int32_t* p_start2 = pl + ptr_off + 4 * capx;
+        float* hit_out = hit_out_ + (size_t)tb * K * N;
+        const auto& lay = strata::kernels::cpu::expert_layout();
+        // plan v0.3 P6: the VRAM groups now; the PCIe groups once the copy engine has landed them in staging
+        auto grouped = [&](const unsigned long long* gp, const int32_t* gs, const int32_t* gn, int64_t grid_groups = 0) {
+            if (lay.native) {
+                // the layer's GGUF formats (i-quant gate/up, Q2_0 / IQ4_NL down)
+                const auto& f = lay.fmt[(size_t)l];
+                const NativeExpertLayout L = native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff);
+                native_expert_grouped(L, gp, gs, gn, p_dst, p_tok, cap, cap, nat_xq_ + (size_t)tb * (N / 32) * 36,
+                                      hit_scratch_, hit_out, cs, grid_groups);
+            } else {
+                moe_grouped_s2(gp, gs, gn, p_dst, p_tok, cap, cap, hit_xq_ + (size_t)tb * (N / 32) * 34,
+                               hit_xs_ + (size_t)tb * (N / 32), hit_scratch_, hit_out, cs);
+            }
+        };
+        if (lean && mstage_ != nullptr)   // STRATA_MIRROR_STAGE: the plan's mirrored list into VRAM first
+            mirror_stage(pl, capx, (long long)lay.blob_bytes(l), msrc_ + (size_t)grp * (size_t)capx, cs);
+        const bool pf_early = pf_cs_ != nullptr && !lean && sink_.pcie_mode == 2 && !device_plan_ && !recording_res_ &&
+                              (!capturing_graph_ || pcie_early_env() == 2);
+        sycl::event ev_pf_join;
+        if (pf_early) {
+            // STRATA_PCIE_EARLY: overlap pcie_mode==2 staging copy on pf_cs_ beside VRAM experts on cs.
+            sycl::event ev_pf_fork = cs->ext_oneapi_submit_barrier();
+            pf_cs_->ext_oneapi_submit_barrier({ev_pf_fork});
+            wait_flag_ge(m_flagB_, ring, pf_cs_);
+            const int64_t per_e = G == 2 ? kStagingBlobs / 2 : kStagingBlobs;
+            uint8_t* stage_e = staging_ + (size_t)(grp * per_e) * lay.max_blob;
+            fetch_blobs(p_ptr2, p_counts + 2, stage_e, (int64_t)lay.blob_bytes(l), (int)per_e, pf_cs_);
+            rebase_ptrs((unsigned long long*)p_ptr2, p_counts + 2, stage_e, (int64_t)lay.blob_bytes(l), pf_cs_);
+            ev_pf_join = pf_cs_->ext_oneapi_submit_barrier();
+        }
+        VDBG("layer_post (l=%lld, grp=%d): grouped 0 (VRAM) start\n", (long long)l, grp);
+        grouped(p_ptr, p_start, p_counts);
+        VDBG("layer_post (l=%lld, grp=%d): grouped 0 (VRAM) done\n", (long long)l, grp);
+        stamp(l, 20, grp, cs);
+        if (!recording_res_) {
+            if (device_plan_) {
+                if (!lean) {
+                    VDBG("layer_post (l=%lld, grp=%d): wait_flag_ge_or flagB ring=%u\n", (long long)l, grp, ring);
+                    wait_flag_ge_or(m_flagB_, ring, skip_ + grp, cs);
+                }
+            } else {
+                VDBG("layer_post (l=%lld, grp=%d): wait_flag_ge flagB ring=%u\n", (long long)l, grp, ring);
+                wait_flag_ge(m_flagB_, ring, cs);  // the PCIe share is in staging (DMA) or mapped
+            }
+            if (pf_early) {
+                cs->ext_oneapi_submit_barrier({ev_pf_join});
+            } else if (!lean && sink_.pcie_mode == 2) {   // stage it with a copy kernel, then point at staging
+                VDBG("layer_post (l=%lld, grp=%d): pcie staging copy\n", (long long)l, grp);
+                const int64_t per = G == 2 ? kStagingBlobs / 2 : kStagingBlobs;
+                uint8_t* stage = staging_ + (size_t)(grp * per) * lay.max_blob;
+                fetch_blobs(p_ptr2, p_counts + 2, stage, (int64_t)lay.blob_bytes(l), (int)per, cs);
+                rebase_ptrs((unsigned long long*)p_ptr2, p_counts + 2, stage, (int64_t)lay.blob_bytes(l), cs);
+            }
+        }
+        stamp(l, 21, grp, cs);
+        if (!lean && !recording_res_) {
+            VDBG("layer_post (l=%lld, grp=%d): grouped 1 (PCIe) start\n", (long long)l, grp);
+            constexpr int64_t kPcieGroupRows = 4;
+            grouped(p_ptr2, p_start2, p_counts + 2, kPcieGroupRows);
+            VDBG("layer_post (l=%lld, grp=%d): grouped 1 (PCIe) done\n", (long long)l, grp);
+        }
+        stamp(l, 22, grp, cs);
+        if (recording_res_) {
+            copy_or_zero_from_mapped(parts_ + (size_t)tb * K * N, m_ymiss_ + (size_t)tb * K * N, (long long)n * K * N,
+                                     skip_ + grp, ring, cs);
+        } else if (device_plan_) {  // no CPU share when the device planned the group: its rows are zeros
+            if (!lean) {
+                VDBG("layer_post (l=%lld, grp=%d): wait_flag_ge_or flag ring=%u\n", (long long)l, grp, ring);
+                wait_flag_ge_or(m_flag_, ring, skip_ + grp, cs);
+            }
+            VDBG("layer_post (l=%lld, grp=%d): copy_or_zero_from_mapped start\n", (long long)l, grp);
+            copy_or_zero_from_mapped(parts_ + (size_t)tb * K * N, m_ymiss_ + (size_t)tb * K * N, (long long)n * K * N,
+                                     skip_ + grp, ring, cs);
+        } else {
+            VDBG("layer_post (l=%lld, grp=%d): wait_flag_ge flag ring=%u\n", (long long)l, grp, ring);
+            wait_flag_ge(m_flag_, ring, cs);  // the CPU's share is in the mapped rows
+            stamp(l, 23, grp, cs);
+            VDBG("layer_post (l=%lld, grp=%d): copy rows from mapped\n", (long long)l, grp);
+            if (dec_batch)  // only the CPU rows cross PCIe (p_dst[0, counts[1]) = the GPU's own rows)
+                copy_rows_from_mapped(parts_ + (size_t)tb * K * N, m_ymiss_ + (size_t)tb * K * N, (int64_t)n * K, N,
+                                      p_dst, p_counts + 1, cs);
+            else
+                copy_from_mapped(parts_ + (size_t)tb * K * N, m_ymiss_ + (size_t)tb * K * N, (int64_t)n * K * N, cs);
+        }
+        const bool hits_in_combine = dec_batch && n >= 1 &&
+            native_moe_combine_hits_supported(parts_ + (size_t)tb * K * N, shared_ + tb * N, bo_ + tb * N, N, K, n) &&
+            ((uintptr_t)hit_out & 15u) == 0;
+        VDBG("layer_post (l=%lld, grp=%d): moe_combine start (hits_in_combine=%d)\n", (long long)l, grp, (int)hits_in_combine);
+        if (!hits_in_combine)
+            moe_hit_add(parts_ + (size_t)tb * K * N, hit_out, p_dst, p_counts + 1, cap, N, cs);
+        if (hits_in_combine) {
+            try {
+                native_moe_combine_multi_hits_added(parts_ + (size_t)tb * K * N, hit_out, p_dst, p_counts + 1,
+                                                    w_ + tb * K, shared_ + tb * N, bo_ + tb * N, N, K, n, cs);
+            } catch (const std::exception& e) {
+                err = "verify combine: " + std::string(e.what());
+                return false;
+            }
+        } else if (dec_batch && n >= 1 && native_moe_combine_enabled()) {
+            try {
+                native_moe_combine_multi(parts_ + (size_t)tb * K * N, w_ + tb * K, shared_ + tb * N, bo_ + tb * N, N, K,
+                                         n, cs);
+            } catch (const std::exception& e) {
+                err = "verify combine: " + std::string(e.what());
+                return false;
+            }
+        } else
+            for (int t = tb; t < te; ++t) {
+                MoEBuffers mb = ss.moe;
+                mb.weights = w_ + t * K;
+                mb.shared = shared_ + t * N;
+                if (!moe_combine_parts(g, l, K, mb, parts_ + (size_t)t * K * N, bo_ + t * N, cs, err)) return false;
+            }
+        VDBG("layer_post (l=%lld, grp=%d): moe_combine done\n", (long long)l, grp);
+        stamp(l, 24, grp, cs);
+        if (l == g.n_layers - 1) {
+            VDBG("layer_post (l=%lld, grp=%d): final layer residual write\n", (long long)l, grp);
+            if (dec_batch && n > 1)
+                gr_write_multi(Rt(tb), bo_ + tb * N, inj2_ + tb * HC, gs, Rt(tb), n, cs);
+            else
+                for (int t = tb; t < te; ++t)
+                    gr_write(Rt(t), bo_ + t * N, inj2_ + t * HC, gs, Rt(t), cs);
+            if (cvec().covers(l)) cvec_apply(Rt(tb), l, n, HC * N, nullptr, 0, nullptr, 0, false, cs);
+        } else if (cvec().covers(l)) {
+            VDBG("layer_post (l=%lld, grp=%d): cvec apply\n", (long long)l, grp);
+            cvec_apply(Rt(tb), l, n, HC * N, bo_ + tb * N, N, inj2_ + tb * HC, HC, true, cs);
+        }
+#if defined(STRATA_HAVE_DFLASH2)
+        if (tap_on_ && !batch_rec_ && l < (int64_t) tap_slot_.size() && tap_slot_[(size_t) l] >= 0) {
+            const int64_t nt = (int64_t) tap_layers_.size();
+            strata::kernels::df2_tap_gr(Rt(tb), HC * N, bo_ + tb * N, N, inj2_ + tb * HC, HC,
+                                        tap_dev_ + ((size_t) tb * nt + (size_t) tap_slot_[(size_t) l]) * N,
+                                        nt * N, n, N, (int) HC, cs);
+        }
+#endif
+        VDBG("layer_post (l=%lld, grp=%d): end\n", (long long)l, grp);
+        return true;
+
+} catch (const std::exception& exc) {
+    err = std::string("Verifier::record_layer_post: ") + exc.what();
+    return false;
+} catch (...) {
+    err = "Verifier::record_layer_post: unknown exception";
+    return false;
+}
+
+
+bool Verifier::record_window_epilogue(int T, sycl::queue* cs, std::string& err) try {
+    VDBG("epilogue (T=%d): begin\n", T);
+    progress_at("verify window: epilogue", T);
+    progress_beat();
+    using namespace strata::kernels;
+    const ModelGeometry& g = *g_;
+    const WeightTable& wt = *wt_;
+    SessionState& ss = *ss_;
+    const int64_t N = g.n_embd, HC = g.hc;
+    const int64_t HB = Verifier::handoff_floats(g);
+
+    if (le_ < g.n_layers) {  // a layer split's earlier stage: hand the residual on, no head
+        VDBG("epilogue (T=%d): handoff copy\n", T);
+        for (int t = 0; t < T; ++t) {
+            copy_from_mapped(hand_out_ + (size_t)t * HB, Rt(t), HC * N, cs);
+            copy_from_mapped(hand_out_ + (size_t)t * HB + HC * N, bo_ + (size_t)t * N, N, cs);
+            copy_from_mapped(hand_out_ + (size_t)t * HB + HC * N + N, inj2_ + (size_t)t * HC, HC, cs);
+        }
+        return true;
+    }
+
+    // ---- the head, T columns, and the argmax of each
+    stamp(g.n_layers, 0, 0, cs);
+    {
+        const WeightRef *hn = wt.find("output_hc_norm.weight"), *hd = wt.find("output_hc_down.weight"),
+                        *hu = wt.find("output_hc_up.weight");
+        if (!hn || !hd || !hu) {
+            err = "verify: an output_hc_* weight is missing";
+            return false;
+        }
+        VDBG("epilogue (T=%d): head mix start\n", T);
+        for (int t = 0; t < T; ++t) {
+            BlockBuffers bb = ss.block;
+            bb.R = Rt(t);
+            bb.mixed = head_mixed_ + t * N;
+            if (head_ != nullptr && head_->loaded()) {
+                if (!lm_head_mix(wt, g, bb, cs, err)) return false;
+            } else if (!lm_head(wt, g, bb, head_logits_ + (size_t)t * n_vocab_, cs, err)) {
+                return false;
+            }
+        }
+        VDBG("epilogue (T=%d): head mix done\n", T);
+        if (head_ != nullptr && head_->loaded()) {
+            try {
+                VDBG("epilogue (T=%d): native head mmvq start\n", T);
+                native_quantize_q8_1(head_mixed_, xq_, (int)N, T, cs);
+                native_mmvq(head_->type(), head_->weights(), xq_, head_logits_, (int)N, (int)n_vocab_, T, cs);
+                VDBG("epilogue (T=%d): native head mmvq done\n", T);
+            } catch (const std::exception& e) {
+                err = std::string("verify head: ") + e.what();
+                return false;
+            }
+        }
+        // Greedy, the default, is recorded here as before (no extra launch or sync per window). A request that
+        // samples or penalizes is sampled again host-side after the replay (run()) with its own parameters and a
+        // fresh draw counter: a captured sampler would bake them in and replay the same draws forever.
+        SamplerParams sp;
+        sp.greedy = true;
+        sp.temperature = 0.0f;
+        VDBG("epilogue (T=%d): sample_tokens start\n", T);
+        sample_tokens(head_logits_, T, (int)n_vocab_, nullptr, 0, sp, m_out_, cs);
+        VDBG("epilogue (T=%d): sample_tokens done\n", T);
+        // #879: whether each row's logits are all finite, beside the pick (read after the window's own sync)
+        if (nan_guard_on()) {
+            VDBG("epilogue (T=%d): logits_nonfinite_rows start\n", T);
+            strata::kernels::logits_nonfinite_rows(head_logits_, T, (int)n_vocab_, m_nf_, cs);
+            VDBG("epilogue (T=%d): logits_nonfinite_rows done\n", T);
+        }
+    }
+    stamp(g.n_layers, 1, 0, cs);
+    VDBG("epilogue (T=%d): end\n", T);
+    return true;
+
+} catch (const std::exception& exc) {
+    err = std::string("Verifier::record_window_epilogue: ") + exc.what();
+    return false;
+} catch (...) {
+    err = "Verifier::record_window_epilogue: unknown exception";
+    return false;
+}
+
+
+namespace {
+struct ChunkRecorder {
+    sycl::queue* q = nullptr;
+    std::vector<void*>* out_execs = nullptr;
+    bool capturing = false;
+
+    ChunkRecorder(sycl::queue* queue, std::vector<void*>* execs)
+        : q(queue), out_execs(execs) {}
+
+    ~ChunkRecorder() {
+        if (capturing && q) {
+            cudaGraph_t graph = nullptr;
+            cudaStreamEndCapture(q, &graph);
+            if (graph) cudaGraphDestroy(graph);
+            capturing = false;
+        }
+    }
+
+    bool start() {
+        if (!out_execs) return true;
+        if (cudaStreamBeginCapture(q, cudaStreamCaptureModeThreadLocal) != 0) {
+            return false;
+        }
+        capturing = true;
+        return true;
+    }
+
+    bool finish(std::string& err) {
+        if (!out_execs || !capturing) return true;
+        capturing = false;
+        cudaGraph_t graph = nullptr;
+        const int ce = cudaStreamEndCapture(q, &graph);
+        if (ce != 0 || !graph) {
+            err = "end chunk capture failed: " + std::to_string(ce);
+            return false;
+        }
+        void* exec = nullptr;
+        const int ie = cudaGraphInstantiate(&exec, graph, 0);
+        cudaGraphDestroy(graph);
+        if (ie != 0 || !exec) {
+            err = "instantiate chunk failed: " + std::to_string(ie);
+            return false;
+        }
+        out_execs->push_back(exec);
+        return true;
+    }
+};
+}  // namespace
+
+bool Verifier::record_window(int T, sycl::queue* cs, std::string& err, void* chunk_rec) try {
+    ChunkRecorder* rec = static_cast<ChunkRecorder*>(chunk_rec);
+    const bool prev_cap = capturing_graph_;
+    if (rec != nullptr || verify_graph_mode() != VerifyGraphMode::Direct) capturing_graph_ = true;
+    struct CapGuard {
+        bool& f;
+        bool p;
+        ~CapGuard() { f = p; }
+    } cap_guard{capturing_graph_, prev_cap};
+    if (rec && !rec->start()) {
+        err = "verify: begin prologue capture failed";
+        return false;
+    }
+    const int G = (!tree_rec_ && split_ && T >= 2) ? 2 : 1;
+    if (!tree_rec_) groups_[T] = G;
+    if (!record_window_prologue(T, cs, err)) return false;
+    for (int grp = 0; grp < G; ++grp) {
+        if (!record_layer_pre(T, lb_, grp, cs, err)) return false;
+    }
+    if (rec && !rec->finish(err)) return false;
+
+    const int chunk_layers = verify_graph_chunk_layers();
+    int layers_in_chunk = 0;
+
+    for (int64_t l = lb_; l < le_; ++l) {
+        if (rec && layers_in_chunk == 0 && !rec->start()) {
+            err = "verify: begin layer " + std::to_string(l) + " chunk capture failed";
+            return false;
+        }
+        for (int grp = 0; grp < G; ++grp) {
+            if (!record_layer_post(T, l, grp, cs, err)) return false;
+            if (l + 1 < le_ && !record_layer_pre(T, l + 1, grp, cs, err)) return false;
+        }
+        layers_in_chunk++;
+        if (rec && (layers_in_chunk >= chunk_layers || l + 1 == le_)) {
+            if (!rec->finish(err)) return false;
+            layers_in_chunk = 0;
+        }
+    }
+    if (rec && !rec->start()) {
+        err = "verify: begin epilogue capture failed";
+        return false;
+    }
+    if (!record_window_epilogue(T, cs, err)) return false;
+    if (rec && !rec->finish(err)) return false;
+    return true;
+} catch (const std::exception& exc) {
+    std::cerr << "Verifier::record_window exception: " << exc.what() << std::endl;
+    return false;
+} catch (...) {
+    return false;
+}
+
+
+std::string Verifier::profile_report() {
+    if (!prof_on_ || prof_windows_ == 0) return std::string();
+    static const char* names[kProfPer] = {"-",
+                                          "hc-read0",
+                                          "q8+qkv/q-idx gemv",
+                                          "conv",
+                                          "ab",
+                                          "z",
+                                          "rec",
+                                          "q8+kv-idx",
+                                          "k/v+norm-rope",
+                                          "kv+idx append",
+                                          "q+q-idx",
+                                          "scores+topk",
+                                          "kv-resolve",
+                                          "attention",
+                                          "gate",
+                                          "",
+                                          "out-proj",
+                                          "hc-read1+router",
+                                          "shared+quant",
+                                          "waitA",
+                                          "VRAM hits",
+                                          "waitB",
+                                          "PCIe grp",
+                                          "waitCPU",
+                                          "copy+combine",
+                                          "(gap)",
+                                          "head",
+                                          "  hc0 norm",
+                                          "  hc0 down",
+                                          "  hc0 up",
+                                          "",
+                                          "",
+                                          ""};
+    std::string out;
+    char b[80];
+    double total = 0;
+    for (int k = 0; k < 2; ++k) {
+        out += k == 0 ? " GDN layers:" : " | QSA layers:";
+        for (int i = 0; i < kProfPer; ++i) {
+            if (prof_sum_[k][i] <= 0) continue;
+            total += prof_sum_[k][i];
+            std::snprintf(b, sizeof b, " %s %.2f", names[i], prof_sum_[k][i] / 1e6 / (double)prof_windows_);
+            out += b;
+        }
+    }
+    std::snprintf(b, sizeof b, " | total %.2f ms/window over %lld windows", total / 1e6 / (double)prof_windows_,
+                  (long long)prof_windows_);
+    out += b;
+    for (auto& r : prof_sum_)
+        for (double& d : r)
+            d = 0;
+    prof_windows_ = 0;
+    return out;
+}
+
+bool Verifier::capture(int T, std::string& err) try {
+    if (exec_[T] != nullptr || !exec_chunks_[T].empty()) return true;
+    const VerifyGraphMode mode = verify_graph_mode();
+    if (mode == VerifyGraphMode::Direct) {
+        VDBG("capture bypassed: direct execution mode active for T=%d (STRATA_VERIFY_GRAPH=direct)\n", T);
+        return true;
+    }
+    const Clock::time_point t_start = Clock::now();
+
+    if (mode == VerifyGraphMode::Split) {
+        const int chunk_layers = verify_graph_chunk_layers();
+        VDBG("capture start (split mode, chunk_layers=%d): T=%d\n", chunk_layers, T);
+        strata::core::progress_at("verify window: capturing graph chunks", (int64_t)T);
+        strata::core::progress_beat();
+        ChunkRecorder rec(cs_, &exec_chunks_[T]);
+        std::string rerr;
+        const bool ok = record_window(T, cs_, rerr, &rec);
+        if (!ok || exec_chunks_[T].empty()) {
+            for (void* e : exec_chunks_[T]) {
+                if (e) cudaGraphExecDestroy_mock(e);
+            }
+            exec_chunks_[T].clear();
+            std::fprintf(stderr, "strata verify: split graph chunk capture failed (%s), falling back to direct execution\n",
+                         rerr.c_str());
+            return true;
+        }
+        VDBG("capture complete: T=%d in %.2f ms total (%zu chunks)\n", T, ms_since(t_start), exec_chunks_[T].size());
+        strata::core::progress_beat();
+        std::fprintf(stderr, "strata verify: captured %zu graph chunks for the %d-token window (chunk_layers=%d)\n",
+                     exec_chunks_[T].size(), T, chunk_layers);
+        return true;
+    }
+
+    // mode == VerifyGraphMode::Whole
+    strata::core::progress_at("verify window: capturing whole graph", (int64_t)T);
+    strata::core::progress_beat();
+    VDBG("capture start (whole mode): T=%d\n", T);
+    if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != 0) {
+        err = "verify: begin capture failed";
+        return false;
+    }
+    std::string rerr;
+    const bool ok = record_window(T, cs_, rerr, nullptr);
+    cudaGraph_t graph = nullptr;
+    const int ce = cudaStreamEndCapture(cs_, &graph);
+    if (!ok) {
+        if (graph) cudaGraphDestroy(graph);
+        err = rerr;
+        return false;
+    }
+    if (ce != 0) {
+        err = "verify: end capture error: " + std::to_string(ce);
+        return false;
+    }
+    VDBG("capture recorded: T=%d in %.2f ms, instantiating graph\n", T, ms_since(t_start));
+    strata::core::progress_at("verify window: instantiating graph", (int64_t)T);
+    const int ie = cudaGraphInstantiate(&exec_[T], graph, 0);
+    cudaGraphDestroy(graph);
+    if (ie != 0) {
+        std::fprintf(stderr, "strata verify: whole graph instantiation failed (code %d), falling back to direct execution\n", ie);
+        exec_[T] = nullptr;
+        return true;
+    }
+    VDBG("capture complete: T=%d in %.2f ms total\n", T, ms_since(t_start));
+    strata::core::progress_beat();
+    std::fprintf(stderr, "strata verify: captured whole graph for the %d-token window\n", T);
+    return true;
+} catch (const std::exception& exc) {
+    std::cerr << "Verifier::capture exception: " << exc.what() << std::endl;
+    return false;
+} catch (...) {
+    return false;
+}
+
+bool Verifier::capture_res(int T, std::string& err) try {
+    if (exec_res_[T] != nullptr) return true;
+    const Clock::time_point t_start = Clock::now();
+    strata::core::progress_at("verify window: capturing resident graph", (int64_t)T);
+    strata::core::progress_beat();
+    VDBG("capture_res start: T=%d\n", T);
+    if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != 0) {
+        err = "verify: begin capture failed";
+        return false;
+    }
+    std::string rerr;
+    bool ok = false;
+    recording_res_ = true;
+    try {
+        ok = record_window(T, cs_, rerr, nullptr);
+    } catch (const std::exception& e) {
+        rerr = std::string("verify: window capture: ") + e.what();
+    }
+    recording_res_ = false;
+    cudaGraph_t graph = nullptr;
+    const int ce = cudaStreamEndCapture(cs_, &graph);
+    if (!ok) {
+        if (graph) cudaGraphDestroy(graph);
+        err = rerr;
+        return false;
+    }
+    if (ce != 0) {
+        err = "verify: end capture error: " + std::to_string(ce);
+        return false;
+    }
+    VDBG("capture_res recorded: T=%d in %.2f ms, instantiating graph\n", T, ms_since(t_start));
+    strata::core::progress_at("verify window: instantiating resident graph", (int64_t)T);
+    const int ie = cudaGraphInstantiate(&exec_res_[T], graph, 0);
+    cudaGraphDestroy(graph);
+    if (ie != 0) {
+        std::fprintf(stderr, "strata verify: resident graph instantiation failed (code %d)\n", ie);
+        exec_res_[T] = nullptr;
+        err = "verify: resident graph instantiation failed: " + std::to_string(ie);
+        return false;
+    }
+    cs_->wait();
+    VDBG("capture_res complete: T=%d in %.2f ms total\n", T, ms_since(t_start));
+    strata::core::progress_beat();
+    std::fprintf(stderr, "strata verify: captured the %d-token window with every expert resident\n", T);
+    return true;
+} catch (const std::exception& exc) {
+    recording_res_ = false;
+    err = std::string("verify capture_res exception: ") + exc.what();
+    return false;
+}
+
+bool Verifier::capture_tree(int T, std::string& err) try {
+    if (T < 1 || T > strata::kernels::kVerifyNarrowT) {
+        err = "verify: tree window size out of range";
+        return false;
+    }
+    if (tree_gdn_snap_ == nullptr) {
+        const size_t snap_bytes = (size_t)strata::kernels::kVerifyNarrowT * (size_t)g_->ssm_state_size *
+                                  (size_t)g_->ssm_v_heads * (size_t)g_->ssm_state_size * sizeof(float);
+        try {
+            tree_gdn_snap_ = (float*)sycl::malloc_device(snap_bytes, get_default_queue());
+        } catch (...) {
+            tree_gdn_snap_ = nullptr;
+        }
+        if (tree_gdn_snap_ == nullptr) {
+            err = "verify: out of memory allocating tree GDN snapshot scratch";
+            return false;
+        }
+        get_default_queue().memset(tree_gdn_snap_, 0, snap_bytes).wait();
+    }
+    const bool res = res_graph_ && all_resident();
+    void*& exec_t = res ? exec_tree_res_[T] : exec_tree_[T];
+    if (exec_t != nullptr) return true;
+    const VerifyGraphMode mode = verify_graph_mode();
+    if (!res && mode == VerifyGraphMode::Direct) {
+        VDBG("capture_tree bypassed: direct execution mode active for T=%d (STRATA_VERIFY_GRAPH=direct)\n", T);
+        return true;
+    }
+    const Clock::time_point t_start = Clock::now();
+    strata::core::progress_at(res ? "verify window: capturing resident tree graph" : "verify window: capturing tree graph",
+                              (int64_t)T);
+    strata::core::progress_beat();
+    if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != 0) {
+        err = "verify: begin tree capture failed";
+        return false;
+    }
+    struct TreeScope {
+        bool& tree;
+        bool& rec_res;
+        TreeScope(bool& t, bool& rr, bool rval) : tree(t), rec_res(rr) {
+            tree = true;
+            rec_res = rval;
+        }
+        ~TreeScope() {
+            tree = false;
+            rec_res = false;
+        }
+    } tree_scope(tree_rec_, recording_res_, res);
+    std::string rerr;
+    bool ok = false;
+    try {
+        ok = record_window(T, cs_, rerr, nullptr);
+    } catch (const std::exception& e) {
+        rerr = std::string("verify: tree window capture: ") + e.what();
+    }
+    cudaGraph_t graph = nullptr;
+    const int ce = cudaStreamEndCapture(cs_, &graph);
+    if (!ok) {
+        if (graph) cudaGraphDestroy(graph);
+        err = rerr;
+        return false;
+    }
+    if (ce != 0) {
+        err = "verify: end tree capture error: " + std::to_string(ce);
+        return false;
+    }
+    const int ie = cudaGraphInstantiate(&exec_t, graph, 0);
+    cudaGraphDestroy(graph);
+    if (ie != 0) {
+        std::fprintf(stderr, "strata verify: tree graph instantiation failed (code %d), falling back to direct execution\n", ie);
+        exec_t = nullptr;
+        return true;
+    }
+    cs_->wait();
+    strata::core::progress_beat();
+    std::fprintf(stderr, "strata verify: captured %s %d-token tree window in %.2f ms\n",
+                 res ? "resident" : "whole", T, ms_since(t_start));
+    return true;
+} catch (const std::exception& exc) {
+    tree_rec_ = false;
+    recording_res_ = false;
+    err = std::string("Verifier::capture_tree exception: ") + exc.what();
+    return false;
+} catch (...) {
+    tree_rec_ = false;
+    recording_res_ = false;
+    return false;
+}
+
+bool Verifier::record_commit(sycl::queue* cs, std::string& err) {
+    VDBG("record_commit: begin\n");
+    using namespace strata::kernels;
+    const ModelGeometry& g = *g_;
+    SessionState& ss = *ss_;
+    const QsaShapes s = shapes_of(g);
+    const int64_t C = g.ssm_conv_channels, HV = g.ssm_v_heads, ID = g.idx_key_dim, MT = max_t_;
+    const uint64_t gdn_floats = (uint64_t)g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size +
+                                (uint64_t)g.ssm_conv_channels * (g.ssm_d_conv - 1);
+    const int64_t TS = (s.idx_block - 1) * ID;
+    const int64_t HS = (int64_t)NG_HIST * NG_HC_DIM;
+    try {
+        VDBG("record_commit: copy commit_ input\n");
+        copy_i32_from_mapped(commit_, m_commit_, 2 + MT, cs);
+        int64_t qsa_index = 0, gdn_index = 0;
+        for (int64_t l = 0; l < lb_; ++l)
+            (is_qsa_layer(g, l) ? qsa_index : gdn_index) += 1;
+        // Opt-in STRATA_COMMIT_BATCH=1: collapse all GDN commits into 2 launches (gdn_commit_layers) and all QSA
+        // tail-restore + indexer appends into 1 launch (native_qsa_indexer_append_steps_layers). Bitwise identical.
+        static const bool commit_batch = [] {
+            const char* e = std::getenv("STRATA_COMMIT_BATCH");
+            return e != nullptr && e[0] == '1';
+        }();
+        bool gdn_batched = false;
+        if (commit_batch) {
+            int64_t n_gdn = 0;
+            bool norms_ok = true;
+            for (int64_t l = lb_; l < le_ && norms_ok; ++l)
+                if (!is_qsa_layer(g, l)) {
+                    ++n_gdn;
+                    norms_ok = need(LayerView(*wt_, l), "ssm_norm.weight", err) != nullptr;
+                }
+            if (!norms_ok) return false;
+            if (n_gdn > 0)
+                gdn_batched = gdn_commit_layers(
+                    ss.gdn_state + (size_t)(gdn_index - ss.gdn_ord0) * gdn_floats, (int64_t)gdn_floats,
+                    (int64_t)g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size, qkv_L_ + (size_t)gdn_index * MT * C,
+                    MT * C, h_L_ + (size_t)gdn_index * MT * C, MT * C, gate_L_ + (size_t)gdn_index * MT * HV,
+                    beta_L_ + (size_t)gdn_index * MT * HV, MT * HV, (int)C, (int)g.ssm_k_heads, (int)HV, (int)MT,
+                    (int)n_gdn, commit_, cs);
+        }
+        bool qsa_batched = false;
+        if (commit_batch) {
+            QsaIndexerLayers il;
+            int nq = 0;
+            int64_t mc = -1;
+            bool fits = true;
+            for (int64_t l = lb_, qi = qsa_index; l < le_ && fits; ++l) {
+                if (!is_qsa_layer(g, l)) continue;
+                const WeightRef* wikn = need(LayerView(*wt_, l), "indexer.k_norm.weight", err);
+                if (!wikn) return false;
+                const QsaState& st = ss.qsa_states[qi];
+                if (nq >= QsaIndexerLayers::kMax || (mc >= 0 && st.max_cells != mc)) {
+                    fits = false;
+                    break;
+                }
+                mc = st.max_cells;
+                il.gamma[nq] = (const float*)wikn->data;
+                il.tail_src[nq] = tail_snap_ + (size_t)qi * TS;
+                il.tail[nq] = st.idx_tail;
+                il.dead[nq] = st.idx_dead;
+                il.pooled[nq] = st.idx_pooled;
+                il.block_pos[nq] = st.idx_block_pos;
+                ++nq;
+                ++qi;
+            }
+            if (fits && nq > 0) {
+                native_qsa_indexer_append_steps_layers(idx_raw_L_ + (size_t)qsa_index * MT * ID, MT * ID, commit_ + 2,
+                                                       1, (int)MT, 0, EPS, il, nq, s, mc, rope_scaling(), cs);
+                qsa_batched = true;
+            }
+        }
+        for (int64_t l = lb_; l < le_; ++l) {
+            const LayerView v(*wt_, l);
+            if (is_qsa_layer(g, l) && qsa_batched) {
+                ++qsa_index;
+            } else if (!is_qsa_layer(g, l) && gdn_batched) {
+                ++gdn_index;
+            } else if (!is_qsa_layer(g, l)) {
+                const WeightRef* wnm = need(v, "ssm_norm.weight", err);
+                if (!wnm) return false;
+                float* state = ss.gdn_state + (size_t)(gdn_index - ss.gdn_ord0) * gdn_floats;
+                float* conv = state + (uint64_t)g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size;
+                const float* qkv = qkv_L_ + (size_t)gdn_index * MT * C;
+                gdn_conv_commit(conv, qkv, (int)C, commit_, cs);
+                gdn_step_norm_multi(state, h_L_ + (size_t)gdn_index * MT * C, (int)C,
+                                    gate_L_ + (size_t)gdn_index * MT * HV, beta_L_ + (size_t)gdn_index * MT * HV, z_,
+                                    (const float*)wnm->data, EPS, y_dummy_, (int)g.ssm_k_heads, (int)HV, (int)MT,
+                                    commit_, cs, (int)MT);
+                ++gdn_index;
+            } else {
+                const QsaState& st = ss.qsa_states[qsa_index];
+                const WeightRef* wikn = need(v, "indexer.k_norm.weight", err);
+                if (!wikn) return false;
+                copy_from_mapped(st.idx_tail, tail_snap_ + (size_t)qsa_index * TS, TS, cs);
+                const QsaIndexerBuffers ib{st.idx_tail, st.idx_dead, st.idx_pooled, st.idx_block_pos};
+                if (commit_batch) {
+                    native_qsa_indexer_append_steps(idx_raw_L_ + (size_t)qsa_index * MT * ID, commit_ + 2, 1, (int)MT,
+                                                    0, (const float*)wikn->data, EPS, ib, s, st.max_cells,
+                                                    rope_scaling(), cs);
+                } else {
+                    for (int64_t t = 0; t < MT; ++t)
+                        native_qsa_indexer_append(idx_raw_L_ + (size_t)(qsa_index * MT + t) * ID, commit_ + 2 + t, 0,
+                                                  (const float*)wikn->data, EPS, ib, s, st.max_cells, rope_scaling(),
+                                                  cs);
+                }
+                ++qsa_index;
+            }
+        }
+        if (ss.ple.ready() && ple_stage()) {
+            VDBG("record_commit: ple copy_indexed\n");
+            copy_indexed(ss.ple.hist, hist_snap_, HS, commit_ + 1, HS, cs);
+        }
+    } catch (const std::exception& e) {
+        err = std::string("verify commit: ") + e.what();
+        return false;
+    }
+    VDBG("record_commit: end\n");
+    return true;
+}
+
+bool Verifier::capture_commit(std::string& err) try {
+    (void)err;
+    // Commit graph instantiation (33 monolithic nodes across all layers) triggers Level Zero
+    // JIT compiler hangs on Intel Arc Xe2. Direct queue execution in commit() (record_commit)
+    // submits in <0.05 ms with zero host-GPU synchronization.
+    commit_exec_ = nullptr;
+    return true;
+} catch (...) {
+    return true;
+}
+
+bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool, void* user, int32_t* out,
+                   std::string& err) try {
+    using namespace strata::kernels;
+    const VerifyTreeMap* const tspec = tree_spec_;
+    struct TreeSpecClear {
+        const VerifyTreeMap*& ptr;
+        ~TreeSpecClear() { ptr = nullptr; }
+    } tree_spec_clear{tree_spec_};
+    const OnDevice on_device(device_);
+    const bool is_tree = tspec != nullptr;
+    last_tree_ = is_tree;
+    if (T < 1 || T > max_t_) {
+        err = "verify: window size out of range";
+        return false;
+    }
+    if (is_tree && (!can_tree_verify() || T < 2 || T > kVerifyNarrowT || tspec->n_tok != T || tspec->pos0 != pos0)) {
+        err = "verify: invalid tree window state or topology";
+        return false;
+    }
+    if (released_.load()) {
+        err = "verify: an earlier window never finished on the GPU (#267); restart the engine";
+        return false;
+    }
+    const ModelGeometry& g = *g_;
+    SessionState& ss = *ss_;
+    if (pos0 + T > ss.qsa_states[ss.qsa_primary()].max_cells) {
+        err = "verify: the window runs past the context";
+        return false;
+    }
+    VDBG("run start: T=%d, pos0=%lld, tokens=[%d%s], exec=%p, is_tree=%d\n",
+         T, (long long)pos0, tokens ? tokens[0] : -1, T > 1 ? ", ..." : "", (void*)exec_[T], (int)is_tree);
+    const bool res = res_graph_ && all_resident();
+    if (!(is_tree ? capture_tree(T, err) : (res ? capture_res(T, err) : capture(T, err))) || !capture_commit(err))
+        return false;
+    VDBG("captured; staging (res=%d, is_tree=%d)\n", (int)res, (int)is_tree);
+    const Clock::time_point t0 = Clock::now();
+    const QsaShapes s = shapes_of(g);
+    int32_t* const pk = h_pos_ + (size_t)max_t_ * g.n_head;
+    int32_t* const pi = pk + (size_t)max_t_ * g.n_head_kv;
+    if (is_tree) {
+        *h_tree_ = *tspec;
+        for (int t = 0; t < T; ++t) {
+            h_tok_[t] = tokens[t];
+            const int64_t lpos = pos0 + tspec->depth[t];
+            qsa_step_fill(h_step_ + t * kStepCount, lpos, s);
+            qsa_step_fill(h_step_append_ + t * kStepCount, pos0 + t, s);
+            const int32_t pos_t = (int32_t)lpos;
+            for (int64_t h = 0; h < g.n_head; ++h) h_pos_[t * g.n_head + h] = pos_t;
+            for (int64_t h = 0; h < g.n_head_kv; ++h) pk[t * g.n_head_kv + h] = pos_t;
+            for (int64_t h = 0; h < g.idx_q_heads; ++h) pi[t * g.idx_q_heads + h] = pos_t;
+        }
+    } else {
+        for (int t = 0; t < T; ++t) {
+            h_tok_[t] = tokens[t];
+            qsa_step_fill(h_step_ + t * kStepCount, pos0 + t, s);
+            for (int64_t h = 0; h < g.n_head; ++h) h_pos_[t * g.n_head + h] = (int32_t)(pos0 + t);
+            for (int64_t h = 0; h < g.n_head_kv; ++h) pk[t * g.n_head_kv + h] = (int32_t)(pos0 + t);
+            for (int64_t h = 0; h < g.idx_q_heads; ++h) pi[t * g.idx_q_heads + h] = (int32_t)(pos0 + t);
+        }
+    }
+    if (ss.ple.ready() && ple_stage()) {
+        uint32_t rows[kVerifyMaxT * PLE_N_HEADS];
+        if (is_tree) {
+            int32_t node_prev[kVerifyMaxT][2] = {};
+            for (int t = 0; t < T; ++t) {
+                int32_t prev[2];
+                if (t == 0) {
+                    prev[0] = ss.ple_prev[0];
+                    prev[1] = ss.ple_prev[1];
+                } else {
+                    const int par = tspec->parent[t];
+                    prev[0] = node_prev[par][0];
+                    prev[1] = node_prev[par][1];
+                }
+                ngram_rows(&tokens[t], prev, 1, ss.ple.consts, rows + t * PLE_N_HEADS);
+                node_prev[t][0] = prev[1];
+                node_prev[t][1] = tokens[t];
+            }
+        } else {
+            int32_t prev[2] = {ss.ple_prev[0], ss.ple_prev[1]};
+            for (int t = 0; t < T; ++t) {
+                ngram_rows(&tokens[t], prev, 1, ss.ple.consts, rows + t * PLE_N_HEADS);
+                prev[0] = prev[1];
+                prev[1] = tokens[t];
+            }
+        }
+        if (!ss.ple.table->gather_batch(rows, (size_t)T, h_ple_, err)) return false;
+    }
+    *(volatile uint32_t*)h_seq_ = 0;
+    *(volatile uint32_t*)h_flag_ = 0;
+    *(volatile uint32_t*)h_flagA_ = 0;
+    *(volatile uint32_t*)h_flagB_ = 0;
+    copy_used_ = false;
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    last_t_ = T;
+    last_pos0_ = pos0;
+    sel_long_ = select_long_on() && pos0 + T >= select_long_at() ? 1 : 0;
+    for (int t = 0; t < T; ++t)
+        last_tokens_[t] = tokens[t];
+    ms_host += ms_since(t0);
+    const int G = is_tree ? 1 : ((split_ && T >= 2) ? 2 : 1);
+    if (!is_tree) groups_[T] = G;
+    void* to_launch = is_tree ? (res ? exec_tree_res_[T] : exec_tree_[T]) : (res ? exec_res_[T] : exec_[T]);
+    const bool run_res = res && to_launch != nullptr;
+    const bool progressive = (to_launch == nullptr) && (is_tree || res || exec_chunks_[T].empty());
+    struct DirectTreeScope {
+        bool& flag;
+        bool active;
+        DirectTreeScope(bool& f, bool a) : flag(f), active(a) {
+            if (active) flag = true;
+        }
+        ~DirectTreeScope() {
+            if (active) flag = false;
+        }
+    } direct_tree_scope(tree_rec_, progressive && is_tree);
+    VDBG("staged in %.2f ms; launching (exec=%p, chunks=%zu, progressive=%d, G=%d, res=%d, is_tree=%d)\n",
+         ms_since(t0), to_launch, exec_chunks_[T].size(), (int)progressive, G, (int)res, (int)is_tree);
+    progress_at("verify window: launching", (int64_t)T);
+    struct AllowScope {
+        explicit AllowScope(int64_t seconds) { progress_allow(seconds); }
+        ~AllowScope() { progress_allow(0); }
+    } allow_scope(300);  // Allow up to 300 s for cold JIT compilation of SPIR-V modules on Intel Arc
+    progress_beat();
+    if (to_launch != nullptr) {
+        VDBG("launching %s graph exec=%p\n", res ? "resident" : "whole", to_launch);
+        const int le = cudaGraphLaunch_mock(to_launch, cs_);
+        if (le != 0) {
+            err = std::string("verify: launch: error ") + std::to_string(le);
+            return false;
+        }
+    } else if (!is_tree && !exec_chunks_[T].empty() && !res) {
+        VDBG("launching %zu graph chunks for T=%d\n", exec_chunks_[T].size(), T);
+        for (void* ch : exec_chunks_[T]) {
+            const int le = cudaGraphLaunch_mock(ch, cs_);
+            if (le != 0) {
+                err = std::string("verify: launch chunk: error ") + std::to_string(le);
+                return false;
+            }
+        }
+    } else {
+        std::string rerr;
+        VDBG("direct prologue start (T=%d)\n", T);
+        if (!record_window_prologue(T, cs_, rerr)) {
+            err = "verify direct prologue: " + rerr;
+            return false;
+        }
+        VDBG("direct prologue done\n");
+        for (int grp = 0; grp < G; ++grp) {
+            VDBG("direct layer pre start (l=%lld, grp=%d)\n", (long long)lb_, grp);
+            if (!record_layer_pre(T, lb_, grp, cs_, rerr)) {
+                err = "verify direct layer pre: " + rerr;
+                return false;
+            }
+            VDBG("direct layer pre done (l=%lld, grp=%d)\n", (long long)lb_, grp);
+        }
+    }
+    VDBG("queue flush start\n");
+    try {
+        (void)cs_->ext_oneapi_empty();
+    } catch (...) {
+    }
+    VDBG("queue flush done\n");
+    VDBG("launched\n");
+    volatile uint32_t* const seq = h_seq_;
+    volatile uint32_t* const flag = h_flag_;
+    const int gtb[2] = {0, (T + 1) / 2}, gte[2] = {G == 2 ? (T + 1) / 2 : T, T};
+    const int64_t steps = (le_ - lb_) * G;
+    const bool test_stall = g_test_stall > 0 && windows + 1 == g_test_stall;  // #267 test hook (off: false)
+    const bool lean = is_lean();
+    const bool bal_active = bal_disp_ != nullptr && bal_disp_->pcie_model.on && !run_res && !lean && steps <= 512;
+    Clock::time_point bal_t_arrive[512], bal_t_pub[512];
+    double bal_cpu_ms[512] = {};
+    int bal_nc[512] = {}, bal_np[512] = {};
+    bool bal_ok[512] = {};
+    VDBG("waiting loop starting: lean=%d, test_stall=%d, steps=%lld, G=%d\n", (int)lean, (int)test_stall, (long long)steps, G);
+    for (int64_t k = 0; (!run_res && (!lean || test_stall)) && k < steps; ++k) {
+        const int64_t l = lb_ + k / G;
+        const int grp = (int)(k % G);
+        const uint32_t want = (uint32_t)(k + 1);
+        const Clock::time_point a = Clock::now();
+        auto last_flush = a;
+        auto last_hb = a;
+        uint32_t spins = 0;
+        progress_at("verify window: waiting for the GPU to reach layer", l);
+        VDBG("step k=%lld (layer %lld, grp=%d): waiting for GPU seq to reach want=%u (initial *seq=%u)\n",
+             (long long)k, (long long)l, grp, want, *seq);
+        while (*seq < want) {
+            _mm_pause();
+            if ((++spins & 1023u) != 0) continue;
+            const auto now = Clock::now();
+            if (now - last_hb > std::chrono::milliseconds(500)) {
+                last_hb = now;
+                progress_beat();
+                bool is_empty = false;
+                try { is_empty = cs_->ext_oneapi_empty(); } catch (...) {}
+                VDBG("step k=%lld (layer %lld, grp=%d): still waiting want=%u, *seq=%u, *flag=%u, *flagA=%u, *flagB=%u, spins=%u, elapsed=%.1f ms, empty=%d\n",
+                     (long long)k, (long long)l, grp, want, *seq, *flag,
+                     h_flagA_ ? *(volatile uint32_t*)h_flagA_ : 0u,
+                     h_flagB_ ? *(volatile uint32_t*)h_flagB_ : 0u,
+                     spins, std::chrono::duration<double, std::milli>(now - a).count(), (int)is_empty);
+            }
+            if (now - last_flush > std::chrono::milliseconds(50)) {
+                last_flush = now;
+                bool is_empty = false;
+                try {
+                    is_empty = cs_->ext_oneapi_empty();
+                } catch (...) {
+                }
+                std::atomic_thread_fence(std::memory_order_seq_cst);
+                if (is_empty && *seq < want) {
+                    try { cs_->wait(); } catch (...) {}
+                    std::atomic_thread_fence(std::memory_order_seq_cst);
+                    if (*seq < want) {
+                        err = "verify: layer " + std::to_string(l) + " never rang";
+                        return false;
+                    }
+                }
+            }
+            if (now - a > std::chrono::seconds(60)) {
+                // #267: the caller ends the engine; no spin kernel may outlive it
+                err = "verify: timed out at layer " + std::to_string(l) + released_note(release_gpu_waits(10000));
+                return false;
+            }
+        }
+        const Clock::time_point b = Clock::now();
+        VDBG("layer %lld (grp %d) rang after %.2f ms (spins=%u, *seq=%u)\n", (long long)l, grp,
+             std::chrono::duration<double, std::milli>(b - a).count(), spins, *seq);
+        cur_layer_ = want - 1;
+        set_plan_slot(grp);
+        const int tb = gtb[grp], n = gte[grp] - gtb[grp];
+        progress_at("verify window: the CPU experts of layer", l);
+        VDBG("layer %lld: dispatching CPU experts (tb=%d, n=%d, k=%ld)\n", (long long)l, tb, n, (long)ss.k);
+        const auto t_pool_start = Clock::now();
+        if (pool != nullptr) {
+            strata::core::expert_dispatch_set_weights(h_w_ + (size_t)tb * ss.k);
+            pool(user, h_x_ + (size_t)tb * g.n_embd, h_ids_ + (size_t)tb * ss.k, n, ss.k,
+                 h_ymiss_ + (size_t)tb * ss.k * g.n_embd, l);
+            strata::core::expert_dispatch_set_weights(nullptr);
+        }
+        const auto t_pool_end = Clock::now();
+        if (bal_active) {
+            bal_t_arrive[k] = b;
+            bal_t_pub[k] = t_pool_start;
+            bal_cpu_ms[k] = std::chrono::duration<double, std::milli>(t_pool_end - t_pool_start).count();
+            bal_nc[k] = bal_disp_->last_n_cpu;
+            bal_np[k] = bal_disp_->last_n_pcie;
+            bal_ok[k] = true;
+        }
+        VDBG("layer %lld: CPU experts served in %.2f ms\n", (long long)l,
+             std::chrono::duration<double, std::milli>(t_pool_end - t_pool_start).count());
+        progress_tick();
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        _mm_sfence();
+        if (*(volatile uint32_t*)h_flagA_ != want) {  // the pool did not publish a plan: an empty one
+            sink_.counts[0] = 0;
+            sink_.counts[1] = 0;
+            sink_.counts[2] = 0;
+            sink_.start[0] = 0;
+            sink_.start2[0] = 0;
+            std::atomic_thread_fence(std::memory_order_seq_cst);
+            *(volatile uint32_t*)h_flagA_ = want;
+            raise_flag_b_ordered(want);
+        }
+        if (!(test_stall && k + 1 == steps)) *flag = want;
+        VDBG("layer %lld: flags updated (want=%u, flagA=%u, flagB=%u, flag=%u)\n",
+             (long long)l, want, *(volatile uint32_t*)h_flagA_, *(volatile uint32_t*)h_flagB_, *flag);
+        if (progressive) {
+            std::string rerr;
+            VDBG("layer %lld (grp %d): dispatching record_layer_post\n", (long long)l, grp);
+            if (!record_layer_post(T, l, grp, cs_, rerr)) {
+                err = "verify direct layer post: " + rerr;
+                return false;
+            }
+            if (l + 1 < le_) {
+                VDBG("layer %lld -> %lld (grp %d): dispatching next record_layer_pre\n",
+                     (long long)l, (long long)(l + 1), grp);
+                if (!record_layer_pre(T, l + 1, grp, cs_, rerr)) {
+                    err = "verify direct layer pre: " + rerr;
+                    return false;
+                }
+            }
+        }
+        ms_wait += std::chrono::duration<double, std::milli>(b - a).count();
+        ms_pool += ms_since(b);
+    }
+    if (progressive) {
+        if (lean && !test_stall) {
+            std::string rerr;
+            for (int64_t l = lb_; l < le_; ++l) {
+                for (int grp = 0; grp < G; ++grp) {
+                    if (!record_layer_post(T, l, grp, cs_, rerr)) {
+                        err = "verify direct layer post: " + rerr;
+                        return false;
+                    }
+                    if (l + 1 < le_ && !record_layer_pre(T, l + 1, grp, cs_, rerr)) {
+                        err = "verify direct layer pre: " + rerr;
+                        return false;
+                    }
+                }
+            }
+        }
+        std::string rerr;
+        VDBG("direct epilogue start (T=%d)\n", T);
+        if (!record_window_epilogue(T, cs_, rerr)) {
+            err = "verify direct epilogue: " + rerr;
+            return false;
+        }
+        VDBG("direct epilogue done\n");
+    }
+    if ((run_res || lean) && !test_stall) {
+        cur_layer_ = (uint32_t)(steps > 0 ? steps - 1 : 0);
+    }
+    progress_at("verify window: waiting for the GPU to finish the window (flags A/B/M raised)", (int64_t)T);
+    const auto t_wait_start = Clock::now();
+    auto last_empty_hb = t_wait_start;
+    VDBG("waiting for cs_ queue completion (start)\n");
+    while (true) {
+        bool is_empty = false;
+        try {
+            is_empty = cs_->ext_oneapi_empty();
+        } catch (...) {}
+        if (is_empty) break;
+        const auto now = Clock::now();
+        if (now - last_empty_hb > std::chrono::milliseconds(500)) {
+            last_empty_hb = now;
+            progress_beat();
+            VDBG("still waiting for cs_ queue completion: elapsed=%.1f ms, empty=%d\n",
+                 std::chrono::duration<double, std::milli>(now - t_wait_start).count(), (int)is_empty);
+        }
+        if (now - t_wait_start > std::chrono::seconds(60)) {
+            err = "verify: timed out waiting for GPU graph execution to complete" +
+                  released_note(release_gpu_waits(10000));
+            return false;
+        }
+        _mm_pause();
+        std::this_thread::yield();
+    }
+    VDBG("cs_ queue empty reached in %.2f ms\n",
+         std::chrono::duration<double, std::milli>(Clock::now() - t_wait_start).count());
+    try {
+        cs_->wait();
+    } catch (const sycl::exception& e) {
+        err = std::string("verify: GPU execution failed: ") + e.what();
+        return false;
+    }
+    VDBG("cs_->wait() finished\n");
+    if ((res || lean) && !test_stall) {
+        ms_wait += std::chrono::duration<double, std::milli>(Clock::now() - t_wait_start).count();
+    }
+    progress_at("verify window: waiting for the expert copies", (int64_t)T);
+    copy_->wait();             // no host function of this window may raise flag B in the next one
+    if (prof_on_ && G == 1) {  // the window's GPU stage stamps
+        cs_->memcpy(prof_h_.data(), prof_, prof_h_.size() * 8).wait();
+        const int64_t L = g.n_layers;
+        auto at = [&](int64_t l, int i) { return prof_h_[(size_t)(l * kProfPer + i)]; };
+        // D8: the derived columns below read stamps the hc-read kernels write themselves or the next
+        // layer's first.  A slot no kernel stamped is 0 and its unsigned difference wrapped to ~1e19 ns -
+        // which is why (gap)/head/hc0 printed ~1e14 ms per window.  A missing or out-of-order stamp now
+        // contributes nothing.
+        const auto gap = [](unsigned long long to, unsigned long long from) {
+            return (from != 0 && to != 0 && to >= from) ? (double)(to - from) : 0.0;
+        };
+        for (int64_t l = 0; l < L; ++l) {
+            const int kind = is_qsa_layer(g, l) ? 1 : 0;
+            unsigned long long prev = at(l, 0);
+            for (int i = 1; i <= 24; ++i) {
+                const unsigned long long x = at(l, i);
+                if (x == 0 || x < prev) continue;
+                prof_sum_[kind][i] += (double)(x - prev);
+                prev = x;
+            }
+            if (l + 1 < L) prof_sum_[kind][25] += gap(at(l + 1, 0), at(l, 24));
+            const double dn = gap(at(l, 27), at(l, 0)), dd = gap(at(l, 28), at(l, 27)), du = gap(at(l, 1), at(l, 28));
+            if (dn > 0 && dd > 0 && du > 0) {                   // the split exists: show it split, not twice
+                prof_sum_[kind][27] += dn;                      // hc-read0: norm
+                prof_sum_[kind][28] += dd;                      //           down
+                prof_sum_[kind][29] += du;                      //           up (through both halves, as before)
+                prof_sum_[kind][1] -= gap(at(l, 1), at(l, 0));  // (hc-read0 shown split)
+            }
+        }
+        prof_sum_[0][26] += gap(at(L, 1), at(L, 0));
+        ++prof_windows_;
+    }
+    // ---- a sampled or penalized request: the head's sampling again, host-side so its parameters are this call's
+    // own (a captured kernel would replay the same draws forever).  Row t's draw is Philox(seed, pos0 + t): tied to
+    // the POSITION it samples, not to how the text was cut into windows, so a seed replays the same text whatever
+    // the drafts were. Exact: a rejected row's draw is discarded, and no kept decision depends on a reused draw.
+    if (le_ < g.n_layers) {  // a layer split's earlier stage: the hand-off is written (synced above)
+        ++windows;
+        return next_ == nullptr || next_->run(T, tokens, pos0, pool, next_user_, out, err);
+    }
+    const bool sampled = !sampling_.greedy && sampling_.temperature > 0.0f;
+    if (head_sampling_ && (sampled || hist_d_ != nullptr)) {
+        SamplerParams sp = sampling_;
+        sp.counter = (uint64_t)pos0;
+        sample_tokens(head_logits_, T, (int)n_vocab_, hist_d_, hist_len_, sp, m_out_, cs_);
+        cs_->wait();  // m_out_ is the mapped h_out_: synced, it is readable
+    }
+    for (int t = 0; t < T; ++t) {
+        out[t] = ((volatile int32_t*)h_out_)[t];
+        if (static const bool dbg = std::getenv("STRATA_DBG_VERIFY") != nullptr; dbg) {
+            std::fprintf(stderr, "strata dbg: verify pos0=%lld t=%d emitted token=%d\n", (long long)pos0, t, out[t]);
+        }
+    }
+    note_nonfinite(T, nullptr);
+    if (static const bool dbg = std::getenv("STRATA_DBG_NAN") != nullptr; dbg) {  // debug: the first non-finite head
+        static bool reported = false;
+        if (!reported) {
+            std::vector<float> h((size_t)T * (size_t)n_vocab_);
+            get_default_queue().memcpy(h.data(), head_logits_, h.size() * 4).wait();
+            for (int t = 0; t < T && !reported; ++t) {
+                int64_t bad = 0;
+                for (int64_t v = 0; v < n_vocab_; ++v)
+                    bad += !std::isfinite(h[(size_t)t * n_vocab_ + v]);
+                if (bad) {
+                    reported = true;
+                    std::fprintf(stderr,
+                                 "strata dbg: verify window at position %lld, row %d: %lld of %lld logits non-finite "
+                                 "(token out %d)\n",
+                                 (long long)pos0, t, (long long)bad, (long long)n_vocab_, out[t]);
+                }
+            }
+        }
+    }
+    VDBG("window done\n");
+    if (bal_active) {
+        for (int64_t k = 0; k < steps; ++k) {
+            if (!bal_ok[k]) continue;
+            double gpu_ms = 0.0;
+            if (k + G < steps && bal_ok[k + G]) {
+                const double step_ms =
+                    std::chrono::duration<double, std::milli>(bal_t_arrive[k + G] - bal_t_pub[k]).count();
+                // Feed GPU timing when CPU did not stall m_flag_ (n_c == 0 or GPU step clearly exceeded CPU pool).
+                if (step_ms > 0.0 && step_ms < 500.0 && (bal_nc[k] == 0 || step_ms > bal_cpu_ms[k] * 1.10))
+                    gpu_ms = step_ms;
+            }
+            bal_disp_->pcie_model.sample(bal_nc[k], bal_np[k], bal_cpu_ms[k], gpu_ms);
+        }
+        bal_disp_->pcie_model.solve();
+    }
+    strata::core::expert_dispatch_window_tick((int)g.n_layers);
+    ++windows;
+    progress_at("decode");
+    progress_beat();
+    return true;
+} catch (const std::exception& exc) {
+    std::cerr << "Verifier::run exception: " << exc.what() << std::endl;
+    return false;
+} catch (...) {
+    return false;
+}
+
+void Verifier::set_plan_slot(int grp) {
+    const int64_t cap = sink_.cap;
+    int32_t* base = h_plan_ + (size_t)grp * (size_t)plan_i32_;
+    const int64_t i32 = 4 + (cap + 1) + cap + cap;
+    const int64_t ptr_off = (i32 + 1) & ~1ll;
+    sink_.counts = base;
+    sink_.start = base + 4;
+    sink_.dst = sink_.start + cap + 1;
+    sink_.tok = sink_.dst + cap;
+    sink_.ptr = (unsigned long long*)(base + ptr_off);
+    sink_.ptr2 = sink_.ptr + cap;
+    sink_.start2 = base + ptr_off + 4 * cap;
+    const int G = last_tree_ ? 1 : (groups_[last_t_] > 0 ? groups_[last_t_] : 1);
+    const int64_t per = G == 2 ? kStagingBlobs / 2 : kStagingBlobs;
+    sink_.staging =
+        (unsigned long long)(staging_ + (size_t)(grp * per) * strata::kernels::cpu::expert_layout().max_blob);
+    sink_.staging_cap = per;
+}
+
+// Flag B only rises: a host function of an earlier layer may run after a later layer already raised it directly.
+void Verifier::raise_flag(uint32_t* flag, uint32_t value) {
+#if defined(_WIN32)
+    volatile long* f = (volatile long*)flag;
+    long cur = *f;
+    while ((uint32_t)cur < value) {
+        const long prev = _InterlockedCompareExchange(f, (long)value, cur);
+        if (prev == cur) break;
+        cur = prev;
+    }
+#else
+    uint32_t cur = __atomic_load_n((uint32_t*)flag, __ATOMIC_SEQ_CST);
+    while (cur < value &&
+           !__atomic_compare_exchange_n((uint32_t*)flag, &cur, value, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {
+    }
+#endif
+}
+
+void Verifier::raise_flag_b_ordered(uint32_t want) {
+    if (!copy_used_ || copy_ == nullptr) {
+        raise_flag(h_flagB_, want);
+        return;
+    }
+    FlagSet& fs = flag_sets_[(want - 1) % (sizeof flag_sets_ / sizeof flag_sets_[0])];
+    fs.flag = h_flagB_;
+    fs.value = want;
+    try {
+        copy_->submit([&](sycl::handler& cgh) {
+            cgh.host_task([=]() {
+                raise_flag(fs.flag, fs.value);
+            });
+        });
+    } catch (const sycl::exception& e) {
+        std::fprintf(stderr, "strata DMA: ordered flag B completion failed: %s\n", e.what());
+        std::fflush(stderr);
+        release_gpu_waits(5000);
+        std::abort();
+    }
+}
+
+// Plan v0.3 P6: the PCIe share by DMA.  The copy engine moves the blobs while the CPU computes its own share and the
+// GPU its VRAM experts; a host function raises flag B when they have landed (the graph waits for it before the PCIe
+// groups).  Staging is split between the two token groups of a split window.
+void Verifier::fetch_dma(void* ctx, const uint8_t* const* src, int n, size_t bytes) {
+    Verifier* v = (Verifier*)ctx;
+    const uint32_t want = v->cur_layer_ + 1;
+    VDBG("fetch_dma: layer=%u, want=%u, n=%d, bytes=%zu\n", v->cur_layer_, want, n, bytes);
+    if (n <= 0) {
+        v->raise_flag_b_ordered(want);
+        return;
+    }
+    v->copy_used_ = true;
+    uint8_t* stage = (uint8_t*)v->sink_.staging;  // this group's half in a split window
+    /*
+    DPCT1124:425: cudaMemcpyAsync is migrated to asynchronous memcpy API. While
+    the origin API might be synchronous, it depends on the type of operand
+    memory, so you may need to call wait() on event return by memcpy API to
+    ensure synchronization behavior.
+    */
+    for (int i = 0; i < n; ++i)
+        v->copy_->memcpy(stage + (size_t)i * bytes, src[i], bytes);
+    v->raise_flag_b_ordered(want);
+}
+
+void Verifier::publish_plan(void* ctx) {
+    Verifier* v = (Verifier*)ctx;
+    _mm_sfence();
+    *(volatile uint32_t*)v->h_flagA_ = v->cur_layer_ + 1;
+    VDBG("publish_plan: layer=%u, flagA=%u, counts=(groups=%d, entries=%d, fetches=%d)\n",
+         v->cur_layer_, *(volatile uint32_t*)v->h_flagA_, v->sink_.counts[0], v->sink_.counts[1], v->sink_.counts[2]);
+}
+
+bool Verifier::window_logprobs(const int32_t* targets, int T, int64_t pos0, int32_t extra_id, std::FILE* out,
+                               std::string& err) {
+    if (next_ != nullptr) return next_->window_logprobs(targets, T, pos0, extra_id, out, err);
+    const OnDevice on_device(device_);
+    if (head_logits_ == nullptr || n_vocab_ <= 0 || T <= 0 || targets == nullptr || out == nullptr) {
+        err = "window_logprobs: no head logits for this window";
+        return false;
+    }
+    // run() synchronized cs_ before returning, so the head of this window is complete
+    std::vector<float> h((size_t)T * (size_t)n_vocab_);
+    get_default_queue().memcpy(h.data(), head_logits_, h.size() * sizeof(float)).wait();
+    // STRATA_FORCE_FAULT=<m>:<bias> (test only, off by default, no output): adds <bias> to the logit of every token id divisible by <m>
+    // before the rows are scored, so the token-forcing checker (tools/force_check.py) can be shown to reject a faulty build
+    {
+        static const std::pair<int64_t, float> fault = [] {
+            const char* v = std::getenv("STRATA_FORCE_FAULT");
+            long long m = 0;
+            float b = 0.0f;
+            if (v != nullptr && std::sscanf(v, "%lld:%f", &m, &b) == 2 && m > 0) return std::make_pair((int64_t)m, b);
+            return std::make_pair((int64_t)0, 0.0f);
+        }();
+        if (fault.first > 0)
+            for (int t = 0; t < T; ++t)
+                for (int64_t v = 0; v < n_vocab_; v += fault.first) h[(size_t)t * (size_t)n_vocab_ + (size_t)v] += fault.second;
+    }
+    for (int t = 0; t < T; ++t) {
+        const float* row = h.data() + (size_t)t * (size_t)n_vocab_;
+        const int32_t tgt = targets[t];
+        if (tgt < 0 || (int64_t)tgt >= n_vocab_) continue;
+        int64_t top = 0;
+        for (int64_t v = 1; v < n_vocab_; ++v)
+            if (row[v] > row[top]) top = v;
+        const double maxv = row[top];
+        const bool has_extra = extra_id >= 0 && (int64_t)extra_id < n_vocab_;
+        double sum = 0.0, sum_without = 0.0;  // the second skips extra_id: no cancellation when it holds ~all mass
+        for (int64_t v = 0; v < n_vocab_; ++v) {
+            const double e = std::exp((double)row[v] - maxv);
+            sum += e;
+            if (v != (int64_t)extra_id) sum_without += e;
+        }
+        const double lse = maxv + std::log(sum);
+        const double extra = has_extra ? (double)row[extra_id] - lse : NAN;
+        const double without =
+            has_extra && tgt != extra_id && sum_without > 0.0 ? (double)row[tgt] - (maxv + std::log(sum_without)) : NAN;
+        std::fprintf(out, "%lld\t%d\t%.9f\t%lld\t%.9f\t%d\t%.9f\t%.9f", (long long)(pos0 + t), (int)tgt,
+                     (double)row[tgt] - lse, (long long)top, maxv - lse, (int)(top == (int64_t)tgt), extra, without);
+        // STRATA_LOGPOS_TOPK=K: the K most likely tokens and their log-probabilities too (`id:logprob`), for a
+        // top-k comparison with another engine on the same tokens (docs/UNSLOTH_Q4.md)
+        static const int topk = [] {
+            const char* v = std::getenv("STRATA_LOGPOS_TOPK");
+            return v != nullptr ? std::max(0, std::min(256, std::atoi(v))) : 0;
+        }();
+        if (topk > 0) {
+            std::vector<int32_t> order((size_t)n_vocab_);
+            for (int64_t v = 0; v < n_vocab_; ++v)
+                order[(size_t)v] = (int32_t)v;
+            std::partial_sort(order.begin(), order.begin() + topk, order.end(),
+                              [&](int32_t a, int32_t b) { return row[a] > row[b]; });
+            for (int j = 0; j < topk; ++j)
+                std::fprintf(out, "\t%d:%.6f", order[(size_t)j], (double)row[order[(size_t)j]] - lse);
+        }
+        std::fprintf(out, "\n");
+    }
+    std::fflush(out);
+    return true;
+}
+
+namespace {
+bool g_commit_async = false;
+}
+void Verifier::set_commit_async(bool on) { g_commit_async = on && std::getenv("STRATA_COMMIT_SYNC") == nullptr; }
+
+bool Verifier::compact_tree_path(const int* path, int n_keep, std::string& err) try {
+    using namespace strata::kernels;
+    if (path == nullptr || n_keep < 1 || n_keep > last_t_) {
+        err = "verify: tree compaction count out of range";
+        return false;
+    }
+    const OnDevice on_device(device_);
+    const ModelGeometry& g = *g_;
+    SessionState& ss = *ss_;
+    const QsaShapes s = shapes_of(g);
+    const int64_t N = g.n_embd, HC = g.hc, C = g.ssm_conv_channels, HV = g.ssm_v_heads, ID = g.idx_key_dim;
+    const int64_t MT = max_t_;
+    const int nG = (int)g.n_gdn_layers(), nQ = (int)g.n_qsa_layers();
+    const int64_t HS = (int64_t)NG_HIST * NG_HC_DIM;
+    const bool ple_on = ss.ple.ready() && ple_stage();
+    bool any = false;
+    for (int i = 1; i < n_keep; ++i) {
+        const int src = path[i];
+        if (src == i) continue;
+        if (src < i || src >= last_t_) {
+            err = "verify: non-monotonic tree path in compaction";
+            return false;
+        }
+        any = true;
+        last_tokens_[i] = last_tokens_[src];
+        if (nG > 0) {
+            verify_compact_row(qkv_L_, MT * C, nG, src, i, C, cs_);
+            verify_compact_row(h_L_, MT * C, nG, src, i, C, cs_);
+            verify_compact_row(gate_L_, MT * HV, nG, src, i, HV, cs_);
+            verify_compact_row(beta_L_, MT * HV, nG, src, i, HV, cs_);
+        }
+        if (nQ > 0) {
+            verify_compact_row(idx_raw_L_, MT * ID, nQ, src, i, ID, cs_);
+            for (int qi = 0; qi < nQ; ++qi) {
+                const QsaState& st = ss.qsa_states[qi];
+                kv_copy_cell(qsa_attn_pools(st), st.host, st.page_table, qsa_kv_format(st),
+                             last_pos0_ + src, last_pos0_ + i, s, cs_);
+            }
+        }
+        verify_compact_row(R_, 0, 1, src, i, HC * N, cs_);
+        if (ple_on) verify_compact_row(hist_snap_, 0, 1, src, i, HS, cs_);
+    }
+    if (any) cs_->wait_and_throw();
+    return true;
+} catch (const std::exception& exc) {
+    err = std::string("verify: tree compaction failed: ") + exc.what();
+    return false;
+}
+
+bool Verifier::commit(int n_keep, std::string& err) try {
+    const OnDevice on_device(device_);
+    if (n_keep < 1 || n_keep > last_t_) {
+        err = "verify: commit count out of range";
+        return false;
+    }
+    const Clock::time_point t0 = Clock::now();
+    VDBG("commit start: n_keep=%d, last_t_=%d, last_pos0_=%lld, async=%d, commit_exec_=%p\n",
+         n_keep, last_t_, (long long)last_pos0_, (int)g_commit_async, (void*)commit_exec_);
+    h_commit_[0] = n_keep;
+    h_commit_[1] = n_keep - 1;
+    for (int t = 0; t < max_t_; ++t)
+        h_commit_[2 + t] = t < n_keep ? (int32_t)(last_pos0_ + t) : -1;
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    if (commit_exec_ != nullptr) {
+        VDBG("commit: launching graph %p\n", (void*)commit_exec_);
+        const int le = cudaGraphLaunch_mock(commit_exec_, cs_);
+        if (le != 0) {
+            err = "verify: commit launch error: " + std::to_string(le);
+            return false;
+        }
+    } else {
+        std::string rerr;
+        VDBG("commit: direct record_commit start\n");
+        if (!record_commit(cs_, rerr)) {
+            err = "verify direct commit: " + rerr;
+            return false;
+        }
+        VDBG("commit: direct record_commit done\n");
+    }
+    // set_commit_async: no wait here - the next window runs on the same stream after it, and the drafter (its own
+    // stream) reads only this window's final rows and its own K/V. h_commit_ is next written after the next window's
+    // results are read, i.e. after this graph has run.  Everything else waits on commit_done_ (wait_commit).
+    if (!g_commit_async || next_ != nullptr) {
+        VDBG("commit: synchronous wait on cs_\n");
+        cs_->wait();
+        VDBG("commit: cs_->wait() done\n");
+    } else {
+        VDBG("commit: submitting barrier to cs_\n");
+        *commit_done_ = cs_->ext_oneapi_submit_barrier();
+        commit_pending_ = true;
+    }
+    if (ple_stage())  // stages that share one session must advance it once
+        for (int t = 0; t < n_keep; ++t) {
+            ss_->ple_prev[0] = ss_->ple_prev[1];
+            ss_->ple_prev[1] = last_tokens_[t];
+        }
+    const double ms = ms_since(t0);
+    ms_commit += ms;
+    VDBG("commit complete: n_keep=%d in %.2f ms\n", n_keep, ms);
+    return next_ == nullptr || next_->commit(n_keep, err);
+} catch (sycl::exception const& exc) {
+    std::cerr << exc.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
+    std::exit(1);
+}
+
+bool Verifier::wait_commit(std::string& err) try {
+    VDBG("wait_commit start: commit_pending_=%d\n", (int)commit_pending_);
+    const auto t0 = Clock::now();
+    if (commit_pending_) {
+        const OnDevice on_device(device_);
+        commit_pending_ = false;
+        commit_done_->wait_and_throw();
+    }
+    const double ms = ms_since(t0);
+    VDBG("wait_commit complete in %.2f ms\n", ms);
+    return next_ == nullptr || next_->wait_commit(err);
+} catch (sycl::exception const& exc) {
+    std::cerr << exc.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
+    std::exit(1);
+}
+
+bool Verifier::copy_logits(int t, float* host) const try {
+    if (next_ != nullptr) return next_->copy_logits(t, host);  // a layer split: the head is on the last stage
+    if (head_logits_ == nullptr || host == nullptr || t < 0 || n_vocab_ <= 0) return false;
+    get_default_queue()
+        .memcpy(host, head_logits_ + (size_t)t * (size_t)n_vocab_, (size_t)n_vocab_ * sizeof(float))
+        .wait();
+    return true;
+} catch (const std::exception& exc) {
+    std::cerr << "Verifier::copy_logits exception: " << exc.what() << std::endl;
+    return false;
+} catch (...) {
+    return false;
+}
+
+// #879: STRATA_NAN_GUARD=0 turns the guard off (no kernel is recorded; the graphs are captured once, so it is read once)
+bool Verifier::nan_guard_on() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_NAN_GUARD");
+        return v == nullptr || std::atoi(v) != 0;
+    }();
+    return on;
+}
+
+namespace {
+// #879 debug aid: STRATA_NAN_INJECT=1,5,10 forces the guard to report non-finite on specific verify windows
+// (1-indexed over the lifetime of the process), so fallback and retry paths can be exercised in real runs.
+const std::vector<long long>& nan_inject_list() {
+    static const std::vector<long long> list = [] {
+        std::vector<long long> v;
+        if (const char* e = std::getenv("STRATA_NAN_INJECT"))
+            for (const char* q = e; *q != 0;) {
+                char* end = nullptr;
+                const long long n = std::strtoll(q, &end, 10);
+                if (end == q) break;
+                if (n > 0) v.push_back(n);
+                q = *end == ',' ? end + 1 : end;
+            }
+        return v;
+    }();
+    return list;
+}
+std::atomic<long long> g_nf_windows{0};
+}  // namespace
+
+void Verifier::note_nonfinite(int T, const int64_t* pos_b) {
+    nf_row_ = -1;
+    nf_pos_ = -1;
+    nf_mask_ = 0;
+    if (!nan_guard_on() || h_nf_ == nullptr || !last_stage()) return;  // (a stage without the head checks nothing)
+    const volatile uint32_t* f = h_nf_;
+    for (int t = 0; t < T && t < strata::kernels::kVerifyMaxT; ++t)
+        for (int b = 0; b < strata::kernels::kNonfiniteBlocks; ++b)
+            if (f[t * strata::kernels::kNonfiniteBlocks + b] != 0) {
+                nf_mask_ |= 1u << t;
+                break;
+            }
+    const std::vector<long long>& inject = nan_inject_list();
+    if (!inject.empty()) {
+        const long long k = g_nf_windows.fetch_add(1) + 1;
+        if (nf_mask_ == 0 && std::find(inject.begin(), inject.end(), k) != inject.end()) {
+            nf_mask_ = 1u;
+            std::fprintf(stderr, "strata verify: STRATA_NAN_INJECT: window %lld reported as non-finite\n", k);
+        }
+    }
+    for (int t = 0; t < T && nf_row_ < 0; ++t)
+        if ((nf_mask_ >> t) & 1u) nf_row_ = t;
+    if (nf_row_ >= 0) nf_pos_ = pos_b != nullptr ? pos_b[nf_row_] : last_pos0_ + nf_row_;
+}
+
+}  // namespace strata::core

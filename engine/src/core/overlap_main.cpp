@@ -26,7 +26,7 @@ namespace {
 
 void check(cudaError_t e, const char* what) {
     if (e != cudaSuccess) {
-        std::fprintf(stderr, "%s: %s\n", what, cudaGetErrorString(e));
+        std::fprintf(stderr, "%s: %s\n", what, "CUDA Error");
         std::exit(1);
     }
 }

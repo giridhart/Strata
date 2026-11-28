@@ -203,6 +203,40 @@ template <bool Singleton> struct RowAccumulator;
 template <> struct RowAccumulator<false> { using Type = __m512; };
 template <> struct RowAccumulator<true> { using Type = __m256; };
 
+template <int TY, int NT, bool Singleton>
+inline void accum_block(const uint8_t* blk, int i, const block_q8_K* const* y, const __m512i* acci,
+                        typename RowAccumulator<Singleton>::Type* accf) {
+    if constexpr (Singleton) {
+        const float dx = h2f(u16(blk));
+        for (int t = 0; t < NT; ++t) {
+            // Preserve ggml AVX2's eight integer lanes BEFORE floating conversion.
+            const __m256i folded = _mm256_add_epi32(_mm512_castsi512_si256(acci[t]),
+                                                   _mm512_extracti64x4_epi64(acci[t], 1));
+            accf[t] = _mm256_fmadd_ps(_mm256_set1_ps(dx * y[t][i].d),
+                                     _mm256_cvtepi32_ps(folded), accf[t]);
+        }
+    } else {
+        const float dx = h2f(u16(blk)) * Fmt<TY>::K;
+        for (int t = 0; t < NT; ++t)
+            accf[t] = _mm512_fmadd_ps(_mm512_set1_ps(dx * y[t][i].d), _mm512_cvtepi32_ps(acci[t]), accf[t]);
+    }
+}
+
+template <int TY, int NT, bool Singleton>
+inline void finish_dot(const typename RowAccumulator<Singleton>::Type* accf, float* res) {
+    if constexpr (Singleton) {
+        for (int t = 0; t < NT; ++t) {
+            __m128 sum = _mm256_extractf128_ps(accf[t], 1);
+            sum = _mm_add_ps(sum, _mm256_castps256_ps128(accf[t]));
+            sum = _mm_add_ps(sum, _mm_movehl_ps(sum, sum));
+            sum = _mm_add_ss(sum, _mm_movehdup_ps(sum));
+            res[t] = Fmt<TY>::K * _mm_cvtss_f32(sum);
+        }
+    } else {
+        for (int t = 0; t < NT; ++t) res[t] = _mm512_reduce_add_ps(accf[t]);
+    }
+}
+
 template <int TY, int NT, bool Singleton = false>
 inline void row_dot(const uint8_t* row, int nblocks, const block_q8_K* const* y, float* res) {
     // Decode weights once for the group; select the accumulation order at compile time.
@@ -234,32 +268,60 @@ inline void row_dot(const uint8_t* row, int nblocks, const block_q8_K* const* y,
                 acci[t] = _mm512_dpwssd_epi32(acci[t], _mm512_maddubs_epi16(g, ys), sc);
             }
         }
+        accum_block<TY, NT, Singleton>(blk, i, y, acci, accf);
+    }
+    finish_dot<TY, NT, Singleton>(accf, res);
+}
+
+// Dual-row lockstep dot: decode two weight rows side by side and load y[t][i].qs once per 64-value chunk,
+// applying the exact same Singleton / non-Singleton accumulation order as row_dot.
+template <int TY, int NT, bool Singleton = false>
+inline void rows2_dot(const uint8_t* row0, const uint8_t* row1, int nblocks, const block_q8_K* const* y,
+                      float* res0, float* res1) {
+    using Acc = typename RowAccumulator<Singleton>::Type;
+    Acc accf0[NT], accf1[NT];
+    for (int t = 0; t < NT; ++t) {
         if constexpr (Singleton) {
-            const float dx = h2f(u16(blk));
-            for (int t = 0; t < NT; ++t) {
-                // Preserve ggml AVX2's eight integer lanes BEFORE floating conversion.
-                const __m256i folded = _mm256_add_epi32(_mm512_castsi512_si256(acci[t]),
-                                                       _mm512_extracti64x4_epi64(acci[t], 1));
-                accf[t] = _mm256_fmadd_ps(_mm256_set1_ps(dx * y[t][i].d),
-                                         _mm256_cvtepi32_ps(folded), accf[t]);
-            }
+            accf0[t] = _mm256_setzero_ps();
+            accf1[t] = _mm256_setzero_ps();
         } else {
-            const float dx = h2f(u16(blk)) * Fmt<TY>::K;
-            for (int t = 0; t < NT; ++t)
-                accf[t] = _mm512_fmadd_ps(_mm512_set1_ps(dx * y[t][i].d), _mm512_cvtepi32_ps(acci[t]), accf[t]);
+            accf0[t] = _mm512_setzero_ps();
+            accf1[t] = _mm512_setzero_ps();
         }
     }
-    if constexpr (Singleton) {
+    const __m512i zero = _mm512_setzero_si512();
+    for (int i = 0; i < nblocks; ++i) {
+        const uint8_t* blk0 = row0 + (size_t) i * Fmt<TY>::bytes;
+        const uint8_t* blk1 = row1 + (size_t) i * Fmt<TY>::bytes;
+        if (prefetch_ahead > 0) {
+            _mm_prefetch((const char*) blk0 + prefetch_ahead, _MM_HINT_T0);
+            _mm_prefetch((const char*) blk0 + prefetch_ahead + 64, _MM_HINT_T0);
+            _mm_prefetch((const char*) blk1 + prefetch_ahead, _MM_HINT_T0);
+            _mm_prefetch((const char*) blk1 + prefetch_ahead + 64, _MM_HINT_T0);
+        }
+        __m512i acci0[NT], acci1[NT];
         for (int t = 0; t < NT; ++t) {
-            __m128 sum = _mm256_extractf128_ps(accf[t], 1);
-            sum = _mm_add_ps(sum, _mm256_castps256_ps128(accf[t]));
-            sum = _mm_add_ps(sum, _mm_movehl_ps(sum, sum));
-            sum = _mm_add_ss(sum, _mm_movehdup_ps(sum));
-            res[t] = Fmt<TY>::K * _mm_cvtss_f32(sum);
+            acci0[t] = _mm512_setzero_si512();
+            acci1[t] = _mm512_setzero_si512();
         }
-    } else {
-        for (int t = 0; t < NT; ++t) res[t] = _mm512_reduce_add_ps(accf[t]);
+        for (int j = 0; j < 4; ++j) {
+            __m512i g0, sc0, g1, sc1;
+            __mmask64 m0, m1;
+            Fmt<TY>::decode(blk0, j, g0, m0, sc0);
+            Fmt<TY>::decode(blk1, j, g1, m1, sc1);
+            for (int t = 0; t < NT; ++t) {
+                const __m512i yv = _mm512_loadu_si512((const void*) (y[t][i].qs + 64 * j));
+                const __m512i ys0 = _mm512_mask_sub_epi8(yv, m0, zero, yv);
+                acci0[t] = _mm512_dpwssd_epi32(acci0[t], _mm512_maddubs_epi16(g0, ys0), sc0);
+                const __m512i ys1 = _mm512_mask_sub_epi8(yv, m1, zero, yv);
+                acci1[t] = _mm512_dpwssd_epi32(acci1[t], _mm512_maddubs_epi16(g1, ys1), sc1);
+            }
+        }
+        accum_block<TY, NT, Singleton>(blk0, i, y, acci0, accf0);
+        accum_block<TY, NT, Singleton>(blk1, i, y, acci1, accf1);
     }
+    finish_dot<TY, NT, Singleton>(accf0, res0);
+    finish_dot<TY, NT, Singleton>(accf1, res1);
 }
 
 template <int TY, int NT, bool Singleton = false>
@@ -270,8 +332,12 @@ void gu_rows(const uint8_t* blob, size_t gu_row, size_t up_off, int n, const voi
     const int nb = n / QK_K;
     float g[NT], u[NT];
     for (int r = r0; r < r1; ++r) {
-        row_dot<TY, NT, Singleton>(blob + (size_t) r * gu_row, nb, y, g);
-        row_dot<TY, NT, Singleton>(blob + up_off + (size_t) r * gu_row, nb, y, u);
+        if constexpr (NT <= 4) {
+            rows2_dot<TY, NT, Singleton>(blob + (size_t) r * gu_row, blob + up_off + (size_t) r * gu_row, nb, y, g, u);
+        } else {
+            row_dot<TY, NT, Singleton>(blob + (size_t) r * gu_row, nb, y, g);
+            row_dot<TY, NT, Singleton>(blob + up_off + (size_t) r * gu_row, nb, y, u);
+        }
         for (int t = 0; t < NT; ++t) ff[t][r] = (g[t] / (1.f + std::exp(-g[t]))) * u[t];
     }
 }
@@ -280,9 +346,26 @@ template <int TY, int NT>
 void dot_rows(const uint8_t* w, size_t row_bytes, int n, const void* const* act, float* const* out, int r0, int r1) {
     const block_q8_K* y[NT];
     for (int t = 0; t < NT; ++t) y[t] = (const block_q8_K*) act[t];
+    const int nb = n / QK_K;
+    if constexpr (NT <= 4) {
+        int r = r0;
+        float res0[NT], res1[NT];
+        for (; r + 2 <= r1; r += 2) {
+            rows2_dot<TY, NT>(w + (size_t) r * row_bytes, w + (size_t) (r + 1) * row_bytes, nb, y, res0, res1);
+            for (int t = 0; t < NT; ++t) {
+                out[t][r] = res0[t];
+                out[t][r + 1] = res1[t];
+            }
+        }
+        for (; r < r1; ++r) {
+            row_dot<TY, NT>(w + (size_t) r * row_bytes, nb, y, res0);
+            for (int t = 0; t < NT; ++t) out[t][r] = res0[t];
+        }
+        return;
+    }
     float res[NT];
     for (int r = r0; r < r1; ++r) {
-        row_dot<TY, NT>(w + (size_t) r * row_bytes, n / QK_K, y, res);
+        row_dot<TY, NT>(w + (size_t) r * row_bytes, nb, y, res);
         for (int t = 0; t < NT; ++t) out[t][r] = res[t];
     }
 }
